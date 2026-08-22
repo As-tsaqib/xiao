@@ -13,6 +13,9 @@ candidate.
   detached watchdog; `watchdog.sh` validates PID ownership, bounds logs, applies
   restart backoff, and supplies `HOME`, `XIAO_HOME`, `XIAO_CONFIG`,
   `XIAO_CLIENT_CONFIG`, and `TMPDIR` explicitly to xiaod.
+- WebUI restart keeps that boot-owned watchdog alive, requests replacement of
+  only its `xiaod` child, and waits for the replacement process instead of
+  launching a new supervisor from the short-lived WebUI execution context.
 - The WebUI exposes only Gateway/Daemon status, lifecycle actions, two Telegram
   fields (Bot token and Chat ID), and an OpenAI-compatible Custom provider.
   Codex/Antigravity login remains in Telegram `/login` commands.
@@ -38,8 +41,12 @@ reported both processes active and autostart enabled:
 {"daemon":{"running":true,"pid":16569},"watchdog":{"running":true,"pid":16557},"autostart":true}
 ```
 
-PIDs are observational and may change after restart. IPC was reachable at
-`127.0.0.1:37921`.
+After installing the GitHub Actions artifact for commit `5bec12b`, the first
+WebUI Telegram save validated and persisted both values, but its old full
+supervisor restart left both processes stopped. The token independently passed
+Telegram `getMe`; after lifecycle recovery, the live snapshot reported a valid
+stored token, the requested Chat ID, Gateway `running`, and Telegram `polling`.
+This observation is the regression case for the child-only restart handshake.
 
 The already-installed CLIProxyAPI module exposed
 `http://127.0.0.1:8317/v1/models` with 23 models. The isolated device E2E
@@ -49,15 +56,11 @@ xiao's Command Core:
 
 ```text
 PASS  xiaod boot-style environment started successfully
+PASS  xiao discovered custom model gpt-5.6-luna through CLIProxyAPI /v1/models
 PASS  CLIProxyAPI custom model gpt-5.6-luna returned XIAO_E2E_OK through xiao CommandCore
 ```
 
 The temporary home was removed by the test cleanup trap.
-
-The checked-in `scripts/device-custom-e2e.sh` now also requires xiao's new
-authenticated model-discovery endpoint to return the selected model before it
-applies config. That added leg needs the new GitHub-Actions-built binary and is
-therefore not claimed as executed against the older installed binary.
 
 ## Local validation boundary
 
@@ -82,10 +85,12 @@ and a host release build, then cross-compiles Android arm64 with `cargo-ndk`.
 The Android job packages twice, compares ZIP hashes, verifies the SHA sidecar
 and ZIP integrity, and uploads exactly the module ZIP plus sidecar.
 
-Still deferred until that workflow and a newly flashed artifact are available:
+Commit `5bec12b` passed all of those gates in GitHub Actions run `32577699987`;
+its artifact was the installed binary used for the device evidence above. Each
+later lifecycle correction still requires its own green run and a newly
+flashed artifact.
 
-- Rust compile/test/Clippy/format results for the changed source;
-- deterministic final ZIP name/hash and archive contents;
-- a real reboot after flashing the new Actions artifact;
-- KernelSU WebUI rendering/bridge behavior from that artifact;
+Still deferred for the child-only restart correction:
+
+- a real reboot and WebUI Telegram-save restart using its new Actions artifact;
 - real Codex and Antigravity browser completion, refresh, and generation.

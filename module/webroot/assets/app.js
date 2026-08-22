@@ -40,6 +40,15 @@ const encode = value => {
 
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
+async function waitForDaemon() {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    await wait(attempt === 0 ? 350 : 650);
+    await refresh();
+    if (daemonReady) return;
+  }
+  throw new Error('Daemon belum siap setelah restart. Periksa watchdog log.');
+}
+
 function addValue(root, labelText, valueText, tone = '') {
   const row = document.createElement('div');
   row.className = 'kv';
@@ -164,8 +173,7 @@ $('restart').onclick = async () => {
   try {
     showNotice('Memulai ulang daemon…');
     await run(`${ACTION} restart`);
-    await wait(1800);
-    await refresh();
+    await waitForDaemon();
   } catch (error) {
     showNotice(`Restart gagal: ${error.message}`, false);
   } finally {
@@ -199,6 +207,7 @@ $('fetchModels').onclick = async () => {
 
 $('save').onclick = async () => {
   setBusy('save', true);
+  let applied = false;
   try {
     const chatId = $('chatId').value.trim();
     const botToken = $('botToken').value.trim();
@@ -235,17 +244,24 @@ $('save').onclick = async () => {
 
     showNotice('Memvalidasi dan menyimpan…');
     const result = JSON.parse(await run(`${ACTION} apply-base64 ${encode(JSON.stringify(payload))}`));
+    applied = true;
     $('botToken').value = '';
     $('customKey').value = '';
     if (result.restart_required) {
       showNotice('Tersimpan. Memulai ulang daemon…');
       await run(`${ACTION} restart`);
-      await wait(1800);
+      await waitForDaemon();
+    } else {
+      await refresh();
     }
-    await refresh();
     showNotice('Perubahan tersimpan. Daemon terhubung.');
   } catch (error) {
-    showNotice(`Simpan gagal: ${error.message}`, false);
+    showNotice(
+      applied
+        ? `Konfigurasi tersimpan, tetapi daemon belum aktif: ${error.message}`
+        : `Simpan gagal: ${error.message}`,
+      false
+    );
   } finally {
     setBusy('save', false);
   }

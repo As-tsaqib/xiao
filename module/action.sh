@@ -13,7 +13,7 @@ start_watchdog() {
     xiao_log "Watchdog sudah aktif (PID $watchdog_pid)."
     return 0
   fi
-  rm -f "$XIAO_STOP" "$XIAO_WATCHDOG_PID"
+  rm -f "$XIAO_STOP" "$XIAO_RESTART" "$XIAO_WATCHDOG_PID"
   rotate_xiao_log "$XIAO_WATCHDOG_LOG"
   XIAO_LOG_TO_FILE=1 nohup "$XIAO_WATCHDOG" >/dev/null 2>&1 </dev/null &
   printf '%s\n' "$!" > "$XIAO_WATCHDOG_PID"
@@ -24,9 +24,49 @@ start_watchdog() {
 stop_watchdog() {
   ensure_xiao_dirs || return 1
   touch "$XIAO_STOP"
+  rm -f "$XIAO_RESTART"
   stop_owned_pid_file "$XIAO_WATCHDOG_PID" "$XIAO_WATCHDOG"
   stop_owned_pid_file "$XIAO_DAEMON_PID" "$XIAOD_BINARY"
   xiao_log 'Watchdog dan xiaod dihentikan.'
+}
+
+wait_daemon_replaced() {
+  previous_pid=${1:-}
+  remaining=${2:-20}
+  while [ "$remaining" -gt 0 ]; do
+    current_pid=$(pid_from_file "$XIAO_DAEMON_PID" 2>/dev/null || true)
+    if [ "$current_pid" != "$previous_pid" ] && pid_matches "$current_pid" "$XIAOD_BINARY"; then
+      xiao_log "xiaod siap (PID $current_pid)."
+      return 0
+    fi
+    sleep 1
+    remaining=$((remaining - 1))
+  done
+  xiao_log 'xiaod belum siap setelah 20 detik; periksa watchdog.log dan daemon.log.' >&2
+  return 1
+}
+
+restart_daemon() {
+  ensure_xiao_dirs || return 1
+  previous_pid=$(pid_from_file "$XIAO_DAEMON_PID" 2>/dev/null || true)
+  if ! watchdog_is_running; then
+    xiao_log 'Watchdog tidak aktif; memulai lifecycle xiao.'
+    start_watchdog || return 1
+    wait_daemon_replaced "$previous_pid" 20
+    return
+  fi
+
+  touch "$XIAO_RESTART" || return 1
+  if pid_matches "$previous_pid" "$XIAOD_BINARY"; then
+    kill -TERM "$previous_pid" 2>/dev/null || {
+      rm -f "$XIAO_RESTART"
+      return 1
+    }
+    xiao_log "Restart xiaod diminta melalui watchdog (PID $previous_pid)."
+  else
+    xiao_log 'xiaod tidak aktif; watchdog diminta memulihkannya sekarang.'
+  fi
+  wait_daemon_replaced "$previous_pid" 20
 }
 
 show_status() {
@@ -102,11 +142,7 @@ run_encoded_admin_command() {
 case "${1:-status}" in
   start) start_watchdog ;;
   stop) stop_watchdog ;;
-  restart)
-    stop_watchdog
-    rm -f "$XIAO_STOP"
-    start_watchdog
-    ;;
+  restart) restart_daemon ;;
   status) show_status ;;
   status-json) show_status_json ;;
   snapshot) run_xiao_admin snapshot ;;

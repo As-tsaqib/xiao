@@ -164,6 +164,15 @@ pass 'Custom provider discovers models through authenticated root admin IPC'
     rg -q 'XIAO_CONFIG="\$XIAO_CONFIG" XIAO_CLIENT_CONFIG="\$XIAO_CLIENT_CONFIG"' module/watchdog.sh
 } || fail 'KernelSU watchdog hardening'
 pass 'KernelSU watchdog has boot-safe environment, graceful stop, backoff, auto-restart and bounded logs'
+{
+    rg -q 'XIAO_RESTART=' module/common.sh &&
+    rg -q 'restart_daemon' module/action.sh &&
+    rg -q 'Restart xiaod diminta melalui watchdog' module/action.sh &&
+    rg -q 'karena restart diminta; mulai ulang sekarang' module/watchdog.sh &&
+    rg -q 'waitForDaemon' module/webroot/assets/app.js &&
+    ! sed -n '/restart)/,/;;/p' module/action.sh | rg -q 'stop_watchdog'
+} || fail 'WebUI-safe daemon restart handshake'
+pass 'WebUI restarts only the watchdog child and waits for replacement readiness'
 for f in module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh; do sh -n "$f"; done
 for f in packaging/build-module.sh scripts/acceptance.sh; do bash -n "$f"; done
 pass 'Shell syntax'

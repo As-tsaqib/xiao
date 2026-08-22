@@ -29,6 +29,12 @@ while true; do
     exit 0
   fi
 
+  if [ -f "$XIAO_RESTART" ]; then
+    rm -f "$XIAO_RESTART"
+    backoff=0
+    xiao_log 'Permintaan restart daemon diterapkan.'
+  fi
+
   rotate_xiao_log "$XIAO_DAEMON_LOG"
   started=$(date +%s 2>/dev/null || printf '0')
   case "$started" in ''|*[!0-9]*) started=0 ;; esac
@@ -56,6 +62,13 @@ while true; do
   child=
   rm -f "$XIAO_DAEMON_PID"
 
+  if [ -f "$XIAO_RESTART" ]; then
+    rm -f "$XIAO_RESTART"
+    backoff=0
+    xiao_log "xiaod keluar dengan kode $exit_code karena restart diminta; mulai ulang sekarang."
+    continue
+  fi
+
   if ! auto_restart_enabled; then
     xiao_log "xiaod keluar dengan kode $exit_code; auto_restart=false."
     exit 0
@@ -76,5 +89,13 @@ while true; do
   delay=$backoff
   [ "$delay" -gt 0 ] || delay=$INTERVAL
   xiao_log "xiaod keluar dengan kode $exit_code setelah ${runtime}s; mulai ulang dalam ${delay}s."
-  sleep "$delay"
+  slept=0
+  while [ "$slept" -lt "$delay" ] && [ ! -f "$XIAO_RESTART" ]; do
+    [ -f "$MODDIR/disable" ] || [ -f "$XIAO_DISABLE" ] || [ -f "$XIAO_STOP" ] || {
+      sleep 1
+      slept=$((slept + 1))
+      continue
+    }
+    break
+  done
 done

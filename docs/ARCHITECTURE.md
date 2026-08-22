@@ -46,6 +46,12 @@ Normal Termux commands post to `/v1/command`, so they use the same semantic core
 
 `post-fs-data.sh` initializes private directories and removes reboot-stale runtime PID files. `service.sh` runs during late-start, waits only a bounded time for Android boot completion, synchronizes the Termux wrappers, and detaches `watchdog.sh`. The watchdog tracks the child PID by executable identity, forwards termination, provisions the limited local client config, applies bounded exponential restart backoff, honors `auto_restart`, and bounds log growth. Mutable files live in `/data/adb/xiao`; module updates replace only `/data/adb/modules/xiao` content.
 
+WebUI restart never tears down and respawns the supervisor from the short-lived
+KernelSU WebUI execution context. It writes an explicit restart request, sends
+TERM only to the owned `xiaod` child, and waits until the persistent watchdog
+publishes a replacement PID. Explicit restart bypasses crash backoff, while a
+full stop still shuts down both processes.
+
 The module WebUI is intentionally narrow: one Gateway/Daemon status rail,
 Restart/Refresh, a Telegram form containing only bot token and one Chat ID, and
 an OpenAI-compatible Custom provider form. Codex and Antigravity OAuth never
