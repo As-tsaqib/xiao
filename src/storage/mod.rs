@@ -320,13 +320,14 @@ impl Storage {
         valid_models: &[String],
     ) -> Result<usize> {
         if preferred_model.trim().is_empty() {
-            return Err(anyhow::anyhow!("preferred provider model must not be empty"));
+            return Err(anyhow::anyhow!(
+                "preferred provider model must not be empty"
+            ));
         }
         self.with_conn(|conn| {
             let tx = conn.transaction()?;
             let sessions = {
-                let mut statement =
-                    tx.prepare("SELECT id,model FROM sessions WHERE provider=?")?;
+                let mut statement = tx.prepare("SELECT id,model FROM sessions WHERE provider=?")?;
                 let rows = statement.query_map(params![provider], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?;
@@ -704,17 +705,21 @@ mod tests {
             .unwrap();
 
         let changed = db
-            .reconcile_provider_models(
-                "custom",
-                Some("old"),
-                "new",
-                &["new".into(), "kept".into()],
-            )
+            .reconcile_provider_models("custom", Some("old"), "new", &["new".into(), "kept".into()])
             .unwrap();
         assert_eq!(changed, 3);
-        assert_eq!(db.session("a", &inherited.id).unwrap().unwrap().model, "new");
-        assert_eq!(db.session("b", &placeholder.id).unwrap().unwrap().model, "new");
-        assert_eq!(db.session("c", &explicit.id).unwrap().unwrap().model, "kept");
+        assert_eq!(
+            db.session("a", &inherited.id).unwrap().unwrap().model,
+            "new"
+        );
+        assert_eq!(
+            db.session("b", &placeholder.id).unwrap().unwrap().model,
+            "new"
+        );
+        assert_eq!(
+            db.session("c", &explicit.id).unwrap().unwrap().model,
+            "kept"
+        );
         assert_eq!(db.session("d", &invalid.id).unwrap().unwrap().model, "new");
         assert_eq!(db.session("e", &other.id).unwrap().unwrap().model, "old");
     }

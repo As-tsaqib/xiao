@@ -321,7 +321,10 @@ fn emit(progress: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent)
 
 fn models_with_default(default_model: Option<&str>, fallback_models: Vec<String>) -> Vec<String> {
     let mut models = Vec::with_capacity(fallback_models.len() + 1);
-    if let Some(model) = default_model.map(str::trim).filter(|model| !model.is_empty()) {
+    if let Some(model) = default_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
         models.push(model.to_owned());
     }
     for model in fallback_models {
@@ -505,11 +508,7 @@ impl AntigravityProvider {
         }
     }
 
-    fn request_builder(
-        &self,
-        token: &str,
-        body: &serde_json::Value,
-    ) -> reqwest::RequestBuilder {
+    fn request_builder(&self, token: &str, body: &serde_json::Value) -> reqwest::RequestBuilder {
         let metadata = serde_json::json!({"ideType":"ANTIGRAVITY"});
         self.client
             .post(&self.base)
@@ -722,10 +721,7 @@ fn endpoint_with_suffix(base: &str, suffix: &str) -> String {
     }
 }
 
-async fn ensure_success(
-    response: reqwest::Response,
-    provider: &str,
-) -> Result<reqwest::Response> {
+async fn ensure_success(response: reqwest::Response, provider: &str) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
@@ -947,11 +943,7 @@ async fn consume_antigravity_sse(
                     continue;
                 };
                 for part in parts {
-                    if part
-                        .get("thought")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                    {
+                    if part.get("thought").and_then(serde_json::Value::as_bool) == Some(true) {
                         continue;
                     }
                     if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
@@ -994,8 +986,8 @@ fn extract_output_text(v: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{http::StatusCode, routing::post, Json, Router};
     use crate::storage::Storage;
+    use axum::{http::StatusCode, routing::post, Json, Router};
 
     fn message(role: &str, content: &str) -> MessageRecord {
         MessageRecord {
@@ -1050,7 +1042,10 @@ mod tests {
             &[message("user", "hello")],
             "agent-test",
         );
-        let request = provider.request_builder("access-token", &body).build().unwrap();
+        let request = provider
+            .request_builder("access-token", &body)
+            .build()
+            .unwrap();
         assert_eq!(request.headers()["accept"], "text/event-stream");
         assert_eq!(
             request.headers()["user-agent"],
@@ -1061,10 +1056,9 @@ mod tests {
             request.headers()["client-metadata"],
             r#"{"ideType":"ANTIGRAVITY"}"#
         );
-        let wire_body: serde_json::Value = serde_json::from_slice(
-            request.body().and_then(reqwest::Body::as_bytes).unwrap(),
-        )
-        .unwrap();
+        let wire_body: serde_json::Value =
+            serde_json::from_slice(request.body().and_then(reqwest::Body::as_bytes).unwrap())
+                .unwrap();
         assert_eq!(wire_body["userAgent"], "antigravity");
         assert_eq!(wire_body["requestId"], "agent-test");
     }
@@ -1082,9 +1076,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
@@ -1123,9 +1115,7 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
@@ -1146,10 +1136,8 @@ mod tests {
 
     #[test]
     fn upstream_error_summary_redacts_secret_material() {
-        let summary = upstream_error_summary(
-            br#"{"error":{"message":"api_key=very-secret"}}"#,
-            false,
-        );
+        let summary =
+            upstream_error_summary(br#"{"error":{"message":"api_key=very-secret"}}"#, false);
         assert!(!summary.contains("very-secret"));
         assert!(summary.contains("<redacted>"));
     }

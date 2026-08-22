@@ -51,7 +51,10 @@ fn normalize_messages(messages: &[MessageRecord]) -> NormalizedConversation {
         }
     }
 
-    if normalized.first().is_some_and(|item| item.role == "assistant") {
+    if normalized
+        .first()
+        .is_some_and(|item| item.role == "assistant")
+    {
         normalized.insert(
             0,
             WireMessage {

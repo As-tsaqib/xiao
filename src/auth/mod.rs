@@ -983,9 +983,7 @@ fn antigravity_client_id(config: &crate::config::AntigravityProviderConfig) -> S
         .to_owned()
 }
 
-pub(crate) fn antigravity_user_agent(
-    config: &crate::config::AntigravityProviderConfig,
-) -> &str {
+pub(crate) fn antigravity_user_agent(config: &crate::config::AntigravityProviderConfig) -> &str {
     config
         .user_agent
         .as_deref()
