@@ -968,6 +968,7 @@ mod tests {
         cfg.providers.codex.enabled = false;
         cfg.providers.antigravity.enabled = false;
         cfg.providers.custom.enabled = true;
+        cfg.providers.custom.protocol = "openai_responses".into();
         cfg.providers.custom.base_url = Some(format!("{provider_base}/v1"));
         cfg.providers.custom.models = vec!["m".into()];
         cfg.providers.custom.default_model = Some("m".into());
