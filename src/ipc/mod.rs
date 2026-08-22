@@ -24,10 +24,7 @@ use crate::{
     app::AppState,
     config::parse_id_list,
     event::AppEvent,
-    security::{
-        redact::redact_text,
-        secrets::SecretStore,
-    },
+    security::{redact::redact_text, secrets::SecretStore},
     telegram::client::TelegramClient,
 };
 
