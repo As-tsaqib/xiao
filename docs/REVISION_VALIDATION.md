@@ -48,6 +48,12 @@ Telegram `getMe`; after lifecycle recovery, the live snapshot reported a valid
 stored token, the requested Chat ID, Gateway `running`, and Telegram `polling`.
 This observation is the regression case for the child-only restart handshake.
 
+The same installed artifact received Telegram commands and completed Custom
+provider generation, but Telegram rejected its final outbound message with
+`400 Bad Request: object expected as reply markup`. Request inspection traced
+that to `reply_markup: null`; optional Bot API fields are now omitted when
+absent, with a regression test covering the exact JSON shape.
+
 The already-installed CLIProxyAPI module exposed
 `http://127.0.0.1:8317/v1/models` with 23 models. The isolated device E2E
 procedure used a temporary `/data/adb/xiao-e2e.*` home, left production xiao

@@ -83,7 +83,15 @@ impl TelegramClient {
         self.call("getMe", json!({})).await
     }
     pub async fn get_updates(&self, offset: Option<i64>, timeout: u64) -> Result<Vec<Update>> {
-        self.call("getUpdates", json!({"offset":offset,"timeout":timeout,"allowed_updates":["message","callback_query"]})).await
+        self.call(
+            "getUpdates",
+            with_optional(
+                json!({"timeout":timeout,"allowed_updates":["message","callback_query"]}),
+                "offset",
+                offset.map(Value::from),
+            ),
+        )
+        .await
     }
     pub async fn send_rich(
         &self,
@@ -93,7 +101,11 @@ impl TelegramClient {
     ) -> Result<SentMessage> {
         self.call(
             "sendRichMessage",
-            json!({"chat_id":chat_id,"rich_message":rich,"reply_markup":markup}),
+            with_optional(
+                json!({"chat_id":chat_id,"rich_message":rich}),
+                "reply_markup",
+                markup,
+            ),
         )
         .await
     }
@@ -105,7 +117,11 @@ impl TelegramClient {
     ) -> Result<SentMessage> {
         self.call(
             "sendMessage",
-            json!({"chat_id":chat_id,"text":text,"reply_markup":markup}),
+            with_optional(
+                json!({"chat_id":chat_id,"text":text}),
+                "reply_markup",
+                markup,
+            ),
         )
         .await
     }
@@ -119,7 +135,15 @@ impl TelegramClient {
         rich: Value,
         markup: Option<Value>,
     ) -> Result<SentMessage> {
-        self.call("editMessageText", json!({"chat_id":chat_id,"message_id":message_id,"rich_message":rich,"reply_markup":markup})).await
+        self.call(
+            "editMessageText",
+            with_optional(
+                json!({"chat_id":chat_id,"message_id":message_id,"rich_message":rich}),
+                "reply_markup",
+                markup,
+            ),
+        )
+        .await
     }
     pub async fn edit_plain(
         &self,
@@ -130,7 +154,11 @@ impl TelegramClient {
     ) -> Result<SentMessage> {
         self.call(
             "editMessageText",
-            json!({"chat_id":chat_id,"message_id":message_id,"text":text,"reply_markup":markup}),
+            with_optional(
+                json!({"chat_id":chat_id,"message_id":message_id,"text":text}),
+                "reply_markup",
+                markup,
+            ),
         )
         .await
     }
@@ -142,7 +170,11 @@ impl TelegramClient {
     ) -> Result<SentMessage> {
         self.call(
             "editMessageReplyMarkup",
-            json!({"chat_id":chat_id,"message_id":message_id,"reply_markup":markup}),
+            with_optional(
+                json!({"chat_id":chat_id,"message_id":message_id}),
+                "reply_markup",
+                markup,
+            ),
         )
         .await
     }
@@ -161,10 +193,23 @@ impl TelegramClient {
     ) -> Result<bool> {
         self.call(
             "answerCallbackQuery",
-            json!({"callback_query_id":id,"text":text,"show_alert":show_alert}),
+            with_optional(
+                json!({"callback_query_id":id,"show_alert":show_alert}),
+                "text",
+                text.map(Value::from),
+            ),
         )
         .await
     }
+}
+
+fn with_optional(mut body: Value, key: &str, value: Option<Value>) -> Value {
+    if let Some(value) = value {
+        body.as_object_mut()
+            .expect("Telegram request body must be an object")
+            .insert(key.to_owned(), value);
+    }
+    body
 }
 
 #[async_trait::async_trait]
@@ -212,5 +257,28 @@ impl super::menu::EditTransport for TelegramClient {
         self.edit_markup(chat_id, message_id, Some(json!({"inline_keyboard":[]})))
             .await
             .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_optional_fields_are_omitted_not_serialized_as_null() {
+        let body = with_optional(json!({"chat_id": 7, "text": "ok"}), "reply_markup", None);
+        assert_eq!(body, json!({"chat_id": 7, "text": "ok"}));
+        assert!(!body.as_object().unwrap().contains_key("reply_markup"));
+    }
+
+    #[test]
+    fn present_optional_fields_are_preserved() {
+        let markup = json!({"inline_keyboard": []});
+        let body = with_optional(
+            json!({"chat_id": 7, "text": "ok"}),
+            "reply_markup",
+            Some(markup.clone()),
+        );
+        assert_eq!(body.get("reply_markup"), Some(&markup));
     }
 }

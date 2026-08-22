@@ -40,6 +40,12 @@ pass 'Telegram intake is decoupled from generation with stop/callback regression
 } || fail 'Telegram durable inbox semantics'
 pass 'Telegram durable inbox avoids silent-loss/destructive auto-replay'
 rg -q 'sendRichMessageDraft' src/telegram/client.rs || fail 'Rich draft progress'
+{
+  rg -q 'with_optional' src/telegram/client.rs &&
+    rg -q 'absent_optional_fields_are_omitted_not_serialized_as_null' src/telegram/client.rs &&
+    ! rg -q '"reply_markup":markup' src/telegram/client.rs
+} || fail 'Telegram optional payload fields'
+pass 'Telegram omits absent reply markup instead of sending invalid JSON null'
 rg -q 'Duration::from_millis\(750\)' src/telegram/mod.rs || fail 'Progress throttle'
 rg -q 'HEARTBEAT: Duration = Duration::from_secs\(20\)' src/telegram/mod.rs || fail 'Progress heartbeat'
 pass 'Ephemeral throttled progress path'
