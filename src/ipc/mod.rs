@@ -407,6 +407,40 @@ async fn admin_apply(
             .map_err(bad)?;
     }
     state.app.providers.reload_config(&next);
+    if old.providers.antigravity.default_model != next.providers.antigravity.default_model {
+        let models = state.app.providers.models("antigravity").map_err(bad)?;
+        let preferred = models
+            .first()
+            .ok_or_else(|| bad("provider antigravity has no usable models"))?;
+        state
+            .app
+            .storage
+            .reconcile_provider_models(
+                "antigravity",
+                old.providers.antigravity.default_model.as_deref(),
+                preferred,
+                &models,
+            )
+            .map_err(bad)?;
+    }
+    if old.providers.custom.default_model != next.providers.custom.default_model
+        || old.providers.custom.models != next.providers.custom.models
+    {
+        let models = state.app.providers.models("custom").map_err(bad)?;
+        let preferred = models
+            .first()
+            .ok_or_else(|| bad("provider custom has no usable models"))?;
+        state
+            .app
+            .storage
+            .reconcile_provider_models(
+                "custom",
+                old.providers.custom.default_model.as_deref(),
+                preferred,
+                &models,
+            )
+            .map_err(bad)?;
+    }
     *state.app.config.write().await = next.clone();
     state.app.events.publish(AppEvent::ConfigReloaded);
 

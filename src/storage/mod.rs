@@ -312,6 +312,46 @@ impl Storage {
         })
     }
 
+    pub fn reconcile_provider_models(
+        &self,
+        provider: &str,
+        previous_default: Option<&str>,
+        preferred_model: &str,
+        valid_models: &[String],
+    ) -> Result<usize> {
+        if preferred_model.trim().is_empty() {
+            return Err(anyhow::anyhow!("preferred provider model must not be empty"));
+        }
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            let sessions = {
+                let mut statement =
+                    tx.prepare("SELECT id,model FROM sessions WHERE provider=?")?;
+                let rows = statement.query_map(params![provider], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let previous_default = previous_default
+                .map(str::trim)
+                .filter(|model| !model.is_empty() && *model != preferred_model);
+            let mut changed = 0;
+            for (session_id, model) in sessions {
+                let invalid = !valid_models.iter().any(|candidate| candidate == &model);
+                let inherited_previous_default =
+                    previous_default.is_some_and(|previous| previous == model.as_str());
+                if model == "default" || invalid || inherited_previous_default {
+                    changed += tx.execute(
+                        "UPDATE sessions SET model=? WHERE id=? AND provider=?",
+                        params![preferred_model, session_id, provider],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(changed)
+        })
+    }
+
     pub fn activate_account(
         &self,
         owner: &str,
@@ -643,6 +683,42 @@ mod tests {
         assert!(db.archive_session("a", &b.id).is_err());
         assert!(db.messages("a", &b.id).unwrap().is_empty());
     }
+
+    #[test]
+    fn provider_default_reconciliation_preserves_an_explicit_valid_model() {
+        let db = Storage::open_memory().unwrap();
+        let inherited = db
+            .create_session("a", "inherited", "custom", None, "old", false, None)
+            .unwrap();
+        let placeholder = db
+            .create_session("b", "placeholder", "custom", None, "default", false, None)
+            .unwrap();
+        let explicit = db
+            .create_session("c", "explicit", "custom", None, "kept", false, None)
+            .unwrap();
+        let invalid = db
+            .create_session("d", "invalid", "custom", None, "missing", false, None)
+            .unwrap();
+        let other = db
+            .create_session("e", "other", "codex", None, "old", false, None)
+            .unwrap();
+
+        let changed = db
+            .reconcile_provider_models(
+                "custom",
+                Some("old"),
+                "new",
+                &["new".into(), "kept".into()],
+            )
+            .unwrap();
+        assert_eq!(changed, 3);
+        assert_eq!(db.session("a", &inherited.id).unwrap().unwrap().model, "new");
+        assert_eq!(db.session("b", &placeholder.id).unwrap().unwrap().model, "new");
+        assert_eq!(db.session("c", &explicit.id).unwrap().unwrap().model, "kept");
+        assert_eq!(db.session("d", &invalid.id).unwrap().unwrap().model, "new");
+        assert_eq!(db.session("e", &other.id).unwrap().unwrap().model, "old");
+    }
+
     #[test]
     fn durable_inbox_advances_only_with_persisted_update() {
         let db = Storage::open_memory().unwrap();

@@ -114,10 +114,22 @@ impl AgentEngine {
         let result = async {
             let context = self.sessions.agent_context(principal)?;
             let provider = self.providers.get(&ctx.active.provider)?;
+            let resolved_model = self
+                .providers
+                .resolve_model(&ctx.active.provider, &ctx.active.model)?;
+            if resolved_model != ctx.active.model {
+                self.storage.set_session_provider(
+                    principal,
+                    &ctx.active.id,
+                    &ctx.active.provider,
+                    ctx.active.account_id.as_deref(),
+                    &resolved_model,
+                )?;
+            }
             let request = ProviderRequest {
                 session_id: ctx.active.id.clone(),
                 account_id: ctx.active.account_id.clone(),
-                model: ctx.active.model.clone(),
+                model: resolved_model,
                 messages: context,
             };
             let started = AgentEvent::GenerationStarted;

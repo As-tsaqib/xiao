@@ -43,6 +43,20 @@ CLIProxyAPI, 9Router, and OmniRoute were cross-checked rather than assuming a st
 
 OmniRoute's active catalog on 2026-08-20 shows newer Antigravity IDs including Gemini 3.7 Flash tiers, `gemini-pro-agent` for the live Gemini 3.1 Pro High path, Gemini 3.1 Pro Low, and current Claude 4.6 IDs. xiao uses a small static fallback list of current callable IDs; the adapter boundary is intentionally the place to add authenticated live model discovery later without changing session/command/UI contracts.
 
+The inference payload was then cross-checked against PicoClaw's Cloud Code
+Assist envelope, ZeroClaw's protocol-specific message conversion, and Hermes
+Agent's strict role-alternation boundary. xiao now sends `project`, `model`,
+`request`, `requestType`, `userAgent`, and a unique `requestId`; the inner
+request contains Gemini `user`/`model` contents, and the HTTP request carries
+the configured Antigravity user agent, `Accept: text/event-stream`,
+`X-Goog-Api-Client`, and the minimal `Client-Metadata` object.
+
+This contract was live-probed on the target device without logging credentials.
+With the same OAuth token, project, model, and daily endpoint, xiao's former
+payload returned HTTP 403 `SUBSCRIPTION_REQUIRED`; the complete envelope and
+headers returned HTTP 200. That isolates the failure to client/payload
+classification rather than OAuth validity or account licensing.
+
 ## Custom provider
 
 Custom transport assumptions are explicitly configured: OpenAI
@@ -52,3 +66,18 @@ The root WebUI can query `{base_url}/models`, accepts the common OpenAI
 `{"data":[{"id":"…"}]}` shape plus simple model arrays, sorts/deduplicates
 IDs, and reuses a previously stored Bearer key without exposing it. The live
 CLIProxyAPI module at `http://127.0.0.1:8317/v1` is the device E2E target.
+
+Chat Completions and Responses no longer share a generic message body.
+Adjacent `user` or `assistant` records are merged, empty/unsupported records
+are filtered, and a bounded history that starts with an assistant message gets
+one leading user boundary marker. Chat Completions receives ordinary
+`messages`; Responses receives typed `message` input items whose user text is
+`input_text` and assistant text is `output_text`, with system/developer content
+extracted into `instructions`. The same Responses conversion is used by Codex,
+which also sends its required non-empty default instructions and compatibility
+headers.
+
+Non-2xx provider responses are read through a 16 KiB cap and reduced to a
+redacted upstream message. This preserves the useful HTTP/provider reason in
+Telegram while preventing an unbounded or credential-bearing response body
+from entering logs or chat.

@@ -752,11 +752,7 @@ impl CommandCore {
             .into_iter()
             .find(|a| a.status == "connected")
             .map(|a| a.id);
-        let models = self.providers.models(&provider)?;
-        let default = models
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow!("provider has no usable models"))?;
+        let default = self.providers.preferred_model(&provider)?;
         self.storage.set_session_provider(
             principal,
             &c.active.id,
@@ -795,11 +791,7 @@ impl CommandCore {
         if record.status != "connected" {
             return Err(anyhow!("account is not connected"));
         }
-        let models = self.providers.models(&record.provider)?;
-        let model = models
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow!("provider has no usable models"))?;
+        let model = self.providers.preferred_model(&record.provider)?;
         let c = self.sessions.context_for(principal)?;
         self.storage.activate_account(
             principal,

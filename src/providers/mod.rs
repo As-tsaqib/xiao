@@ -1,3 +1,5 @@
+mod payload;
+
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -10,13 +12,20 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::{
-    auth::AuthManager,
+    auth::{antigravity_user_agent, AuthManager},
     config::{AppConfig, CustomProviderConfig},
+    security::redact::redact_text,
     storage::MessageRecord,
     tools::{ToolCall, ToolResult, ToolRouter},
 };
+
+use self::payload::{antigravity_body, chat_messages, responses_payload};
+
+const CODEX_DEFAULT_INSTRUCTIONS: &str = "You are Xiao, a concise and helpful AI assistant.";
+const MAX_UPSTREAM_ERROR_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -207,6 +216,22 @@ impl ProviderRegistry {
     pub fn models(&self, id: &str) -> Result<Vec<String>> {
         Ok(self.get(id)?.models())
     }
+    pub fn preferred_model(&self, id: &str) -> Result<String> {
+        self.models(id)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("provider {id} has no usable models"))
+    }
+    pub fn resolve_model(&self, id: &str, selected: &str) -> Result<String> {
+        let models = self.models(id)?;
+        if selected != "default" && models.iter().any(|model| model == selected) {
+            return Ok(selected.to_owned());
+        }
+        models
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("provider {id} has no usable models"))
+    }
     pub fn auth(&self) -> Arc<AuthManager> {
         self.auth.clone()
     }
@@ -255,13 +280,21 @@ fn build_providers(
             auth.clone(),
         )),
     );
+    let antigravity = &config.providers.antigravity;
+    let antigravity_base = antigravity.base_url.clone().unwrap_or_else(|| {
+        format!(
+            "{}/v1internal:streamGenerateContent?alt=sse",
+            antigravity.daily_base.trim_end_matches('/')
+        )
+    });
     p.insert(
         "antigravity".into(),
         Arc::new(AntigravityProvider::new(
-            config.providers.antigravity.enabled,
-            true,
-            config.providers.antigravity.base_url.clone(),
-            config.providers.antigravity.default_model.clone(),
+            antigravity.enabled,
+            antigravity_base,
+            antigravity.default_model.clone(),
+            antigravity_user_agent(antigravity).to_owned(),
+            antigravity.x_goog_api_client.clone(),
             auth.clone(),
         )),
     );
@@ -284,6 +317,20 @@ fn emit(progress: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent)
     if let Some(tx) = progress {
         let _ = tx.send(event);
     }
+}
+
+fn models_with_default(default_model: Option<&str>, fallback_models: Vec<String>) -> Vec<String> {
+    let mut models = Vec::with_capacity(fallback_models.len() + 1);
+    if let Some(model) = default_model.map(str::trim).filter(|model| !model.is_empty()) {
+        models.push(model.to_owned());
+    }
+    for model in fallback_models {
+        let model = model.trim();
+        if !model.is_empty() && !models.iter().any(|existing| existing == model) {
+            models.push(model.to_owned());
+        }
+    }
+    models
 }
 
 struct CodexProvider {
@@ -315,13 +362,10 @@ impl Provider for CodexProvider {
         "codex"
     }
     fn models(&self) -> Vec<String> {
-        let mut models = vec!["gpt-5.6-sol".into(), "gpt-5.5".into()];
-        if let Some(v) = &self.default_model {
-            if !models.contains(v) {
-                models.insert(0, v.clone());
-            }
-        }
-        models
+        models_with_default(
+            self.default_model.as_deref(),
+            vec!["gpt-5.6-sol".into(), "gpt-5.5".into()],
+        )
     }
     fn enabled(&self) -> bool {
         self.enabled
@@ -376,15 +420,22 @@ impl Provider for CodexProvider {
             .account_native_id
             .as_deref()
             .ok_or_else(|| anyhow!("ChatGPT account id missing"))?;
-        let mut input = continuation.and_then(|v|v.get("input").and_then(|x|x.as_array()).cloned()).unwrap_or_else(||req.messages.iter().map(|m| serde_json::json!({
-            "role": m.role,
-            "content": [{"type": if m.role == "assistant" { "output_text" } else { "input_text" }, "text": m.content}]
-        })).collect::<Vec<_>>());
+        let payload = responses_payload(&req.messages, Some(CODEX_DEFAULT_INSTRUCTIONS));
+        let mut input = continuation
+            .and_then(|value| value.get("input").and_then(|item| item.as_array()).cloned())
+            .unwrap_or(payload.input);
         for result in tool_results {
             input.push(serde_json::json!({"type":"function_call_output","call_id":result.call_id,"output":result.output}));
         }
         let tools = ToolRouter.definitions();
-        let body = serde_json::json!({"model": req.model, "store": false, "stream": true, "input": input, "tools":tools});
+        let body = serde_json::json!({
+            "model": req.model,
+            "instructions": payload.instructions.unwrap_or_else(|| CODEX_DEFAULT_INSTRUCTIONS.into()),
+            "store": false,
+            "stream": true,
+            "input": input,
+            "tools": tools,
+        });
         emit(
             &progress,
             AgentEvent::Status("Generating with Codex".into()),
@@ -394,12 +445,14 @@ impl Provider for CodexProvider {
             .post(&self.base)
             .bearer_auth(token)
             .header("chatgpt-account-id", native)
-            .header("originator", "xiao")
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "codex_cli_rs")
+            .header("Accept", "text/event-stream")
             .header("session-id", &req.session_id)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let response = ensure_success(response, "Codex").await?;
         let streamed = consume_responses_sse(response, "codex", progress.clone()).await?;
         if !streamed.tool_calls.is_empty() {
             let mut next_input = input;
@@ -425,21 +478,47 @@ impl Provider for CodexProvider {
 
 struct AntigravityProvider {
     enabled: bool,
-    configured: bool,
     base: String,
     default_model: Option<String>,
+    user_agent: String,
+    x_goog_api_client: String,
     auth: Arc<AuthManager>,
     client: Client,
 }
 impl AntigravityProvider {
     fn new(
         enabled: bool,
-        configured: bool,
-        base: Option<String>,
+        base: String,
         default_model: Option<String>,
+        user_agent: String,
+        x_goog_api_client: String,
         auth: Arc<AuthManager>,
     ) -> Self {
-        Self { enabled, configured, base: base.unwrap_or_else(|| "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse".into()), default_model, auth, client: http_client() }
+        Self {
+            enabled,
+            base,
+            default_model,
+            user_agent,
+            x_goog_api_client,
+            auth,
+            client: http_client(),
+        }
+    }
+
+    fn request_builder(
+        &self,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> reqwest::RequestBuilder {
+        let metadata = serde_json::json!({"ideType":"ANTIGRAVITY"});
+        self.client
+            .post(&self.base)
+            .bearer_auth(token)
+            .header("Accept", "text/event-stream")
+            .header("User-Agent", &self.user_agent)
+            .header("X-Goog-Api-Client", &self.x_goog_api_client)
+            .header("Client-Metadata", metadata.to_string())
+            .json(body)
     }
 }
 #[async_trait]
@@ -450,30 +529,24 @@ impl Provider for AntigravityProvider {
     fn models(&self) -> Vec<String> {
         // Conservative current fallback catalog. Authenticated upstream discovery remains
         // provider-owned; these IDs were cross-checked against active Antigravity routers.
-        let mut models = vec![
-            "gemini-pro-agent".into(),
-            "gemini-3.1-pro-low".into(),
-            "gemini-3.7-flash-high".into(),
-            "gemini-3.7-flash-medium".into(),
-            "gemini-3.7-flash-low".into(),
-            "claude-sonnet-4-6".into(),
-            "claude-opus-4-6-thinking".into(),
-        ];
-        if let Some(v) = &self.default_model {
-            if !models.contains(v) {
-                models.insert(0, v.clone());
-            }
-        }
-        models
+        models_with_default(
+            self.default_model.as_deref(),
+            vec![
+                "gemini-pro-agent".into(),
+                "gemini-3.1-pro-low".into(),
+                "gemini-3.7-flash-high".into(),
+                "gemini-3.7-flash-medium".into(),
+                "gemini-3.7-flash-low".into(),
+                "claude-sonnet-4-6".into(),
+                "claude-opus-4-6-thinking".into(),
+            ],
+        )
     }
     fn enabled(&self) -> bool {
         self.enabled
     }
-    fn configured(&self) -> bool {
-        self.configured
-    }
     fn ready(&self) -> bool {
-        self.enabled && self.configured
+        self.enabled
     }
     async fn run(
         &self,
@@ -503,23 +576,18 @@ impl Provider for AntigravityProvider {
         let project = cred.project_id.as_deref().ok_or_else(|| {
             anyhow!("Antigravity project id missing; re-authentication/project discovery required")
         })?;
-        let contents = req.messages.iter().map(|m| serde_json::json!({"role": if m.role == "assistant" { "model" } else { "user" }, "parts": [{"text": m.content}]})).collect::<Vec<_>>();
-        let metadata = serde_json::json!({"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"});
-        let body = serde_json::json!({"project": project, "model": req.model, "request": {"contents": contents}, "requestType": "agent"});
+        let request_id = format!(
+            "agent-{}-{}",
+            chrono::Utc::now().timestamp_millis(),
+            Uuid::new_v4().simple()
+        );
+        let body = antigravity_body(project, &req.model, &req.messages, &request_id);
         emit(
             &progress,
             AgentEvent::Status("Generating with Antigravity".into()),
         );
-        let response = self
-            .client
-            .post(&self.base)
-            .bearer_auth(token)
-            .header("User-Agent", format!("xiao/{}", crate::VERSION))
-            .header("Client-Metadata", metadata.to_string())
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let response = self.request_builder(token, &body).send().await?;
+        let response = ensure_success(response, "Antigravity").await?;
         let answer = consume_antigravity_sse(response, progress.clone()).await?;
         if answer.is_empty() {
             return Err(anyhow!("Antigravity stream contained no assistant text"));
@@ -551,15 +619,12 @@ impl Provider for CustomProvider {
         "custom"
     }
     fn models(&self) -> Vec<String> {
-        if self.cfg.models.is_empty() {
-            vec![self
-                .cfg
-                .default_model
-                .clone()
-                .unwrap_or_else(|| "default".into())]
+        let fallback = if self.cfg.models.is_empty() && self.cfg.default_model.is_none() {
+            vec!["default".into()]
         } else {
             self.cfg.models.clone()
-        }
+        };
+        models_with_default(self.cfg.default_model.as_deref(), fallback)
     }
     fn enabled(&self) -> bool {
         self.cfg.enabled
@@ -591,9 +656,9 @@ impl Provider for CustomProvider {
             AgentEvent::Status("Sending request to custom provider".into()),
         );
         let endpoint = if self.cfg.protocol == "openai_chat_completions" {
-            format!("{}/chat/completions", base.trim_end_matches('/'))
+            endpoint_with_suffix(&base, "/chat/completions")
         } else {
-            format!("{}/responses", base.trim_end_matches('/'))
+            endpoint_with_suffix(&base, "/responses")
         };
         let mut request = self.client.post(endpoint);
         for (name, value) in &self.cfg.headers {
@@ -614,31 +679,119 @@ impl Provider for CustomProvider {
             request = request.bearer_auth(key);
         }
         let body = if self.cfg.protocol == "openai_chat_completions" {
-            serde_json::json!({"model": req.model, "messages": req.messages.iter().map(|m| serde_json::json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(), "stream": false})
+            serde_json::json!({
+                "model": req.model,
+                "messages": chat_messages(&req.messages),
+                "stream": false,
+            })
         } else {
-            serde_json::json!({"model": req.model, "input": req.messages.iter().map(|m| serde_json::json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(), "stream": false})
+            let payload = responses_payload(&req.messages, None);
+            let mut body = serde_json::json!({
+                "model": req.model,
+                "input": payload.input,
+                "stream": false,
+            });
+            if let Some(instructions) = payload.instructions {
+                body["instructions"] = serde_json::Value::String(instructions);
+            }
+            body
         };
-        let value: serde_json::Value = request
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let response = request.json(&body).send().await?;
+        let response = ensure_success(response, "Custom provider").await?;
+        let value: serde_json::Value = response.json().await?;
         let answer = if self.cfg.protocol == "openai_chat_completions" {
-            value
-                .pointer("/choices/0/message/content")
-                .and_then(|x| x.as_str())
-                .map(str::to_owned)
+            extract_chat_content(&value)
         } else {
             extract_output_text(&value)
         }
+        .filter(|answer| !answer.trim().is_empty())
         .ok_or_else(|| anyhow!("custom response contained no assistant text"))?;
         Ok(ProviderResponse {
             events: vec![AgentEvent::Status("Custom provider completed".into())],
             final_answer: answer,
         })
     }
+}
+
+fn endpoint_with_suffix(base: &str, suffix: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with(suffix) {
+        base.to_owned()
+    } else {
+        format!("{base}{suffix}")
+    }
+}
+
+async fn ensure_success(
+    response: reqwest::Response,
+    provider: &str,
+) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let mut body = Vec::new();
+    let mut truncated = false;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = MAX_UPSTREAM_ERROR_BYTES.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+        if body.len() == MAX_UPSTREAM_ERROR_BYTES {
+            truncated = true;
+            break;
+        }
+    }
+    let summary = upstream_error_summary(&body, truncated);
+    Err(anyhow!(
+        "{provider} request failed with HTTP {status}: {summary}"
+    ))
+}
+
+fn upstream_error_summary(body: &[u8], truncated: bool) -> String {
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+                .or_else(|| value.get("detail").and_then(serde_json::Value::as_str))
+                .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    let message = if message.trim().is_empty() {
+        "upstream returned an empty error body".to_owned()
+    } else {
+        message.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let mut safe = redact_text(&message).chars().take(1200).collect::<String>();
+    if truncated || message.chars().count() > 1200 {
+        safe.push('…');
+    }
+    safe
+}
+
+fn extract_chat_content(value: &serde_json::Value) -> Option<String> {
+    let content = value.pointer("/choices/0/message/content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_owned());
+    }
+    let mut output = String::new();
+    for part in content.as_array()? {
+        if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+            output.push_str(text);
+        }
+    }
+    (!output.is_empty()).then_some(output)
 }
 
 struct StreamedResponses {
@@ -656,6 +809,7 @@ async fn consume_responses_sse(
     let mut text = String::new();
     let mut calls = Vec::new();
     let mut items = Vec::new();
+    let mut stream_error = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -671,7 +825,7 @@ async fn consume_responses_sse(
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].trim_end_matches('\r').to_owned();
             buffer.drain(..=pos);
-            let Some(data) = line.strip_prefix("data: ") else {
+            let Some(data) = line.strip_prefix("data:").map(str::trim_start) else {
                 continue;
             };
             if data == "[DONE]" {
@@ -719,9 +873,32 @@ async fn consume_responses_sse(
                         }
                     }
                 }
+                Some("error") => {
+                    stream_error = Some(
+                        value
+                            .pointer("/error/message")
+                            .or_else(|| value.get("message"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| "Responses stream reported an error".into()),
+                    );
+                }
+                Some("response.failed") => {
+                    stream_error = Some(
+                        value
+                            .pointer("/response/error/message")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| "Responses stream failed".into()),
+                    );
+                }
                 _ => {}
             }
         }
+    }
+
+    if let Some(error) = stream_error {
+        return Err(anyhow!("{provider} stream failed: {}", redact_text(&error)));
     }
 
     Ok(StreamedResponses {
@@ -753,7 +930,7 @@ async fn consume_antigravity_sse(
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].trim_end_matches('\r').to_owned();
             buffer.drain(..=pos);
-            let Some(data) = line.strip_prefix("data: ") else {
+            let Some(data) = line.strip_prefix("data:").map(str::trim_start) else {
                 continue;
             };
             if data == "[DONE]" {
@@ -770,6 +947,13 @@ async fn consume_antigravity_sse(
                     continue;
                 };
                 for part in parts {
+                    if part
+                        .get("thought")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        continue;
+                    }
                     if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
                         output.push_str(text);
                     }
@@ -804,5 +988,169 @@ fn extract_output_text(v: &serde_json::Value) -> Option<String> {
         None
     } else {
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{http::StatusCode, routing::post, Json, Router};
+    use crate::storage::Storage;
+
+    fn message(role: &str, content: &str) -> MessageRecord {
+        MessageRecord {
+            role: role.to_owned(),
+            content: content.to_owned(),
+            created_at: "now".into(),
+        }
+    }
+
+    fn request(messages: Vec<MessageRecord>) -> ProviderRequest {
+        ProviderRequest {
+            session_id: "session-a".into(),
+            account_id: None,
+            model: "model-a".into(),
+            messages,
+        }
+    }
+
+    fn test_auth() -> (Arc<AuthManager>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let auth = Arc::new(AuthManager::new(storage, directory.path().into()));
+        (auth, directory)
+    }
+
+    #[test]
+    fn configured_default_is_always_the_first_model() {
+        assert_eq!(
+            models_with_default(
+                Some("model-z"),
+                vec!["model-a".into(), "model-z".into(), "model-b".into()],
+            ),
+            vec!["model-z", "model-a", "model-b"]
+        );
+    }
+
+    #[test]
+    fn antigravity_request_has_the_headers_required_by_cloud_code_assist() {
+        let (auth, _directory) = test_auth();
+        let provider = AntigravityProvider::new(
+            true,
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+                .into(),
+            Some("gemini-pro-agent".into()),
+            "antigravity/hub/2.2.1 darwin/arm64".into(),
+            "gl-node/22.21.1".into(),
+            auth,
+        );
+        let body = antigravity_body(
+            "project-a",
+            "gemini-pro-agent",
+            &[message("user", "hello")],
+            "agent-test",
+        );
+        let request = provider.request_builder("access-token", &body).build().unwrap();
+        assert_eq!(request.headers()["accept"], "text/event-stream");
+        assert_eq!(
+            request.headers()["user-agent"],
+            "antigravity/hub/2.2.1 darwin/arm64"
+        );
+        assert_eq!(request.headers()["x-goog-api-client"], "gl-node/22.21.1");
+        assert_eq!(
+            request.headers()["client-metadata"],
+            r#"{"ideType":"ANTIGRAVITY"}"#
+        );
+        let wire_body: serde_json::Value = serde_json::from_slice(
+            request.body().and_then(reqwest::Body::as_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire_body["userAgent"], "antigravity");
+        assert_eq!(wire_body["requestId"], "agent-test");
+    }
+
+    #[tokio::test]
+    async fn custom_responses_request_reaches_the_wire_with_typed_input() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured_tx = captured_tx.clone();
+                async move {
+                    captured_tx.send(body).unwrap();
+                    Json(serde_json::json!({"output_text":"ok"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (auth, _directory) = test_auth();
+        let mut config = CustomProviderConfig::default();
+        config.enabled = true;
+        config.base_url = Some(format!("http://{address}/v1"));
+        config.protocol = "openai_responses".into();
+        let provider = CustomProvider::new(config, auth);
+        let response = provider
+            .run(
+                request(vec![message("user", "one"), message("user", "two")]),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.final_answer, "ok");
+        let body = captured_rx.recv().await.unwrap();
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][0]["text"], "one\n\ntwo");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_provider_surfaces_a_bounded_upstream_error_message() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error":{"message":"model rejected the payload"}
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (auth, _directory) = test_auth();
+        let mut config = CustomProviderConfig::default();
+        config.enabled = true;
+        config.base_url = Some(format!("http://{address}/v1"));
+        let provider = CustomProvider::new(config, auth);
+        let error = provider
+            .run(request(vec![message("user", "hello")]), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HTTP 400"));
+        assert!(error.contains("model rejected the payload"));
+        server.abort();
+    }
+
+    #[test]
+    fn upstream_error_summary_redacts_secret_material() {
+        let summary = upstream_error_summary(
+            br#"{"error":{"message":"api_key=very-secret"}}"#,
+            false,
+        );
+        assert!(!summary.contains("very-secret"));
+        assert!(summary.contains("<redacted>"));
     }
 }
