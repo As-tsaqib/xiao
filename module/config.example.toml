@@ -1,0 +1,53 @@
+[gateway]
+enabled = true
+auto_restart = true
+
+[daemon]
+log_level = "info"
+
+[telegram]
+enabled = false
+transport = "long_polling"
+
+[telegram.access]
+allowed_chat_ids = []
+allowed_user_ids = []
+
+[telegram.ui]
+menu_ttl_seconds = 900
+progress_detail = "normal"
+menu_close_behavior = "keep_summary"
+
+[ipc]
+bind = "127.0.0.1:37921"
+
+[storage]
+database = "/data/adb/xiao/data/xiao.db"
+
+[paths]
+data_dir = "/data/adb/xiao"
+logs_dir = "/data/adb/xiao/logs"
+secrets_dir = "/data/adb/xiao/secrets"
+
+[providers.codex]
+enabled = true
+default_model = "gpt-5.6-sol"
+# Keep base_url unset to use the built-in ChatGPT Codex transport adapter.
+
+[providers.antigravity]
+enabled = true
+default_model = "gemini-pro-agent"
+# Keep base_url unset to use the built-in Antigravity stream adapter.
+# Create a Google Desktop OAuth client for your own deployment and configure its
+# public client ID here or through KernelSU WebUI. Optional client secrets are
+# stored only in SecretStore through WebUI/admin IPC.
+oauth_client_id = ""
+
+[providers.custom]
+enabled = false
+name = "Custom"
+protocol = "openai_responses"
+models = []
+
+[providers.custom.headers]
+# Non-secret custom headers only. Store API keys through WebUI/SecretStore.

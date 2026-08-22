@@ -1,0 +1,14 @@
+/target
+/dist/
+/xiao-test-data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.pid
+*.tmp
+.env
+secrets/
+config.toml
+*.token
+.DS_Store

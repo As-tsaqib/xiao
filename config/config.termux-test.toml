@@ -1,0 +1,51 @@
+# Standalone non-root Termux test configuration.
+# Set XIAO_CONFIG to this file before `xiao quickstart`; relative paths then
+# stay contained under ./xiao-test-data in the extracted bundle directory.
+
+[gateway]
+enabled = true
+auto_restart = false
+
+[daemon]
+log_level = "info"
+
+[telegram]
+enabled = false
+transport = "long_polling"
+
+[telegram.access]
+allowed_chat_ids = []
+allowed_user_ids = []
+
+[telegram.ui]
+menu_ttl_seconds = 900
+progress_detail = "normal"
+menu_close_behavior = "keep_summary"
+
+[ipc]
+bind = "127.0.0.1:38921"
+
+[storage]
+database = "xiao-test-data/data/xiao.db"
+
+[paths]
+data_dir = "xiao-test-data"
+logs_dir = "xiao-test-data/logs"
+secrets_dir = "xiao-test-data/secrets"
+
+[providers.codex]
+enabled = true
+default_model = "gpt-5.6-sol"
+
+[providers.antigravity]
+enabled = true
+default_model = "gemini-pro-agent"
+oauth_client_id = ""
+
+[providers.custom]
+enabled = false
+name = "Custom"
+protocol = "openai_responses"
+models = []
+
+[providers.custom.headers]

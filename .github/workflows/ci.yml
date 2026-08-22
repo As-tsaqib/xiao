@@ -1,0 +1,37 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo check --locked --all-targets --all-features
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features
+      - run: cargo build --locked --release --all-features
+      - run: ./scripts/acceptance.sh --require-cargo
+  android-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - run: cargo install cargo-ndk --locked
+      - run: cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao
+      - run: ./packaging/build-termux.sh
+      - run: ./packaging/build-module.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xiao-v0.1.0-android-arm64-artifacts
+          path: |
+            dist/xiao-v0.1.0-termux-arm64.zip
+            dist/xiao-v0.1.0-termux-arm64.zip.sha256
+            dist/xiao-v0.1.0-kernelsu-arm64.zip
+            dist/xiao-v0.1.0-kernelsu-arm64.zip.sha256
