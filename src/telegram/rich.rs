@@ -1,5 +1,14 @@
-use crate::presentation::{Block, ProgressState, RichText, View};
+use crate::presentation::{Block, ProgressActivity, ProgressItem, ProgressState, RichText, View};
 use serde_json::{json, Value};
+
+const AI_ACTION_THINKING: &str = "5535034915403333642";
+const AI_ACTION_ANALYZING: &str = "5535457114983497745";
+const AI_ACTION_SEARCHING: &str = "5537511986251694100";
+const AI_ACTION_FETCHING: &str = "5535365052359507996";
+const AI_ACTION_TOOL: &str = "5535458420653555733";
+const AI_ACTION_CODING: &str = "5537247356136718385";
+const AI_ACTION_MEDIA: &str = "5537727026674270220";
+const AI_ACTION_WRITING: &str = "5537203062138994712";
 
 pub fn render(view: &View, draft: bool) -> Value {
     let mut blocks = Vec::new();
@@ -71,9 +80,7 @@ fn render_block(block: &Block, draft: bool) -> Vec<Value> {
         ],
         Block::Progress { items } => {
             if draft {
-                vec![
-                    json!({"type":"thinking","text":items.iter().map(|i|format!("{} {}",icon(&i.state),i.label)).collect::<Vec<_>>().join("\n")}),
-                ]
+                vec![json!({"type":"thinking","text":progress_text(items)})]
             } else {
                 vec![]
             }
@@ -114,6 +121,41 @@ fn rich_text(items: &[RichText]) -> Value {
         Value::Array(values)
     }
 }
+
+fn progress_text(items: &[ProgressItem]) -> Value {
+    let mut text = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            text.push(json!("\n"));
+        }
+        if item.state == ProgressState::Active {
+            text.push(activity_icon(item.activity));
+            text.push(json!(format!(" {}", item.label)));
+        } else {
+            text.push(json!(format!("{} {}", icon(&item.state), item.label)));
+        }
+    }
+    Value::Array(text)
+}
+
+fn activity_icon(activity: ProgressActivity) -> Value {
+    let (custom_emoji_id, alternative_text) = match activity {
+        ProgressActivity::Thinking => (AI_ACTION_THINKING, "💭"),
+        ProgressActivity::Analyzing => (AI_ACTION_ANALYZING, "🧠"),
+        ProgressActivity::Searching => (AI_ACTION_SEARCHING, "🔎"),
+        ProgressActivity::Fetching => (AI_ACTION_FETCHING, "🌐"),
+        ProgressActivity::Tool => (AI_ACTION_TOOL, "⚙️"),
+        ProgressActivity::Coding => (AI_ACTION_CODING, "💻"),
+        ProgressActivity::Media => (AI_ACTION_MEDIA, "🖼️"),
+        ProgressActivity::Writing => (AI_ACTION_WRITING, "✨"),
+    };
+    json!({
+        "type": "custom_emoji",
+        "custom_emoji_id": custom_emoji_id,
+        "alternative_text": alternative_text,
+    })
+}
+
 fn icon(s: &ProgressState) -> &'static str {
     match s {
         ProgressState::Pending => "○",
@@ -204,6 +246,7 @@ pub fn plain(view: &View) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn side_marker_is_native_heading() {
         let mut v = View::info("X", "Y");
@@ -224,5 +267,50 @@ mod tests {
         assert!(blocks.iter().any(|b| b["type"] == "list"));
         assert!(blocks.iter().any(|b| b["type"] == "blockquote"));
         assert!(!j.to_string().contains("thinking"));
+    }
+
+    #[test]
+    fn active_progress_uses_the_official_ai_actions_emoji() {
+        let view = View {
+            title: None,
+            blocks: vec![Block::Progress {
+                items: vec![ProgressItem {
+                    state: ProgressState::Active,
+                    activity: ProgressActivity::Searching,
+                    label: "Searching the web".into(),
+                }],
+            }],
+            actions: vec![],
+            side_mode: false,
+        };
+        let rendered = render(&view, true);
+        assert_eq!(rendered["blocks"][0]["type"], "thinking");
+        assert_eq!(
+            rendered["blocks"][0]["text"][0]["custom_emoji_id"],
+            AI_ACTION_SEARCHING
+        );
+        assert_eq!(
+            rendered["blocks"][0]["text"][0]["alternative_text"],
+            "🔎"
+        );
+        assert_eq!(rendered["blocks"][0]["text"][1], " Searching the web");
+    }
+
+    #[test]
+    fn completed_progress_is_quiet_and_not_animated() {
+        let view = View {
+            title: None,
+            blocks: vec![Block::Progress {
+                items: vec![ProgressItem {
+                    state: ProgressState::Done,
+                    activity: ProgressActivity::Fetching,
+                    label: "Fetched the page".into(),
+                }],
+            }],
+            actions: vec![],
+            side_mode: false,
+        };
+        let rendered = render(&view, true);
+        assert_eq!(rendered["blocks"][0]["text"], json!(["✓ Fetched the page"]));
     }
 }

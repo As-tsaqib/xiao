@@ -9,7 +9,12 @@ Research was performed against the current official Telegram Bot API documentati
 - Inline callback data remains limited to 1–64 bytes, which is why xiao stores menu state server-side and sends only compact menu/revision/action identifiers.
 - Callback queries must be acknowledged quickly; xiao ACKs before waiting on the per-menu serialization lock or executing semantics.
 - Rich Messages are available through `sendRichMessage`; ephemeral draft progress is available through `sendRichMessageDraft`. Reusing the same non-zero `draft_id` updates the draft. Drafts are not used as final history.
-- `thinking` is draft-only in xiao. Final views intentionally drop progress blocks.
+- `thinking` is draft-only in xiao. Its `text` field accepts structured
+  `RichText`, including animated custom emoji. Telegram explicitly recommends
+  the official `AIActions` emoji set for these blocks; xiao uses stable IDs
+  from that set with ordinary Unicode alternative text for older clients.
+  Only the current activity is animated, and final views intentionally drop
+  all progress blocks.
 - Rich table/list/details block payloads are emitted using current structured block shapes rather than embedding Telegram-specific formatting into Command Core.
 
 ## KernelSU Next modules/WebUI
@@ -76,6 +81,12 @@ one leading user boundary marker. Chat Completions receives ordinary
 extracted into `instructions`. The same Responses conversion is used by Codex,
 which also sends its required non-empty default instructions and compatibility
 headers.
+
+[The official OpenAI Responses streaming reference](https://developers.openai.com/api/reference/resources/responses)
+defines semantic lifecycle events for web/file search, code interpreter, image
+generation, and MCP calls.
+xiao maps those events to typed progress activities; it does not infer search
+or tool work from elapsed time or expose hidden reasoning text.
 
 Non-2xx provider responses are read through a 16 KiB cap and reduced to a
 redacted upstream message. This preserves the useful HTTP/provider reason in

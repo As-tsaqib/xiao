@@ -22,7 +22,9 @@ use crate::{
     app::AppState,
     auth::{AuthChallenge, AuthEvent},
     command::CommandResult,
-    presentation::{Action, ActionTarget, Block, ProgressItem, ProgressState, View},
+    presentation::{
+        Action, ActionTarget, Block, ProgressActivity, ProgressItem, ProgressState, View,
+    },
     providers::AgentEvent,
     security::secrets::SecretStore,
 };
@@ -676,101 +678,241 @@ fn paginate_final_view(view: &View, max_chars: usize) -> Vec<View> {
 }
 
 struct ProgressAggregator {
-    items: Vec<String>,
-    failed: Option<String>,
+    items: Vec<ProgressItem>,
+    active_tool: Option<String>,
     detail: String,
     stream_chunks: usize,
 }
+
+struct ToolProgress {
+    activity: ProgressActivity,
+    active: String,
+    completed: String,
+    failed: String,
+}
+
 impl ProgressAggregator {
     fn new(detail: String) -> Self {
         Self {
             items: vec![],
-            failed: None,
+            active_tool: None,
             detail,
             stream_chunks: 0,
         }
     }
+
     fn push(&mut self, event: AgentEvent) {
-        let text = match event {
-            AgentEvent::GenerationStarted => Some("Starting request".to_string()),
-            AgentEvent::Status(text) => Some(safe_progress(&text)),
+        match event {
+            AgentEvent::GenerationStarted => {
+                self.set_active("Thinking".into(), ProgressActivity::Thinking)
+            }
+            AgentEvent::Status(text) => {
+                let (label, activity) = status_progress(&text);
+                self.set_active(label, activity);
+            }
             AgentEvent::ToolStarted(tool) => {
-                if self.detail == "minimal" {
-                    None
-                } else {
-                    Some(format!("Using {}", safe_progress(&tool)))
-                }
+                let progress = tool_progress(&tool);
+                self.set_active_for_tool(progress.active, progress.activity, tool);
             }
             AgentEvent::ToolCompleted { tool, summary } => {
-                if self.detail == "minimal" {
-                    None
-                } else if self.detail == "detailed" {
-                    Some(format!(
-                        "{}: {}",
-                        safe_progress(&tool),
-                        safe_progress(&summary)
-                    ))
-                } else {
-                    Some(format!("{} completed", safe_progress(&tool)))
-                }
+                self.complete_tool(&tool, &summary);
             }
-            AgentEvent::StreamChunk { bytes, .. } => {
-                self.stream_chunks += 1;
-                if self.detail == "detailed" && self.stream_chunks.is_multiple_of(8) {
-                    Some(format!(
-                        "Receiving response · {} chunks · {} bytes latest",
-                        self.stream_chunks, bytes
-                    ))
-                } else {
-                    None
-                }
+            AgentEvent::StreamChunk { .. } => self.stream_chunk(),
+            AgentEvent::GenerationCompleted => {
+                self.set_active("Finishing response".into(), ProgressActivity::Writing)
             }
-            AgentEvent::GenerationCompleted => Some("Finalizing answer".to_string()),
-            AgentEvent::GenerationFailed(error) => {
-                self.failed = Some(safe_progress(&error));
-                None
-            }
-        };
-        if let Some(text) = text {
-            if self.items.last() != Some(&text) {
-                self.items.push(text);
-            }
-            let max = if self.detail == "detailed" {
-                8
-            } else if self.detail == "minimal" {
-                2
-            } else {
-                4
-            };
-            if self.items.len() > max {
-                self.items.remove(0);
-            }
+            AgentEvent::GenerationFailed(error) => self.fail(&error),
         }
     }
-    fn view(&self) -> View {
-        let mut items = self
+
+    fn set_active(&mut self, label: String, activity: ProgressActivity) {
+        self.set_active_entry(label, activity, None);
+    }
+
+    fn set_active_for_tool(
+        &mut self,
+        label: String,
+        activity: ProgressActivity,
+        tool: String,
+    ) {
+        self.set_active_entry(label, activity, Some(normalize_tool_name(&tool)));
+    }
+
+    fn set_active_entry(
+        &mut self,
+        label: String,
+        activity: ProgressActivity,
+        tool: Option<String>,
+    ) {
+        if self
             .items
-            .iter()
-            .enumerate()
-            .map(|(i, label)| ProgressItem {
-                state: if i + 1 == self.items.len() {
-                    ProgressState::Active
+            .last()
+            .is_some_and(|item| item.state == ProgressState::Active)
+        {
+            if self
+                .items
+                .last()
+                .is_some_and(|item| item.activity == activity)
+            {
+                self.items.last_mut().expect("active item exists").label = label;
+                self.active_tool = tool;
+                return;
+            }
+            let retain = self.items.last().is_some_and(|item| {
+                !matches!(
+                    item.activity,
+                    ProgressActivity::Thinking | ProgressActivity::Writing
+                )
+            });
+            if retain {
+                let previous_tool = self.active_tool.take();
+                let item = self.items.last_mut().expect("active item exists");
+                item.state = ProgressState::Done;
+                if let Some(previous_tool) = previous_tool {
+                    item.label = tool_progress(&previous_tool).completed;
+                }
+            } else {
+                self.items.pop();
+                self.active_tool = None;
+            }
+        }
+        self.items.push(ProgressItem {
+            state: ProgressState::Active,
+            activity,
+            label,
+        });
+        self.active_tool = tool;
+        self.trim();
+    }
+
+    fn complete_tool(&mut self, tool: &str, summary: &str) {
+        let progress = tool_progress(tool);
+        let safe_summary = safe_progress(summary);
+        let failed = safe_summary.to_ascii_lowercase().starts_with("failed");
+        let mut label = if failed {
+            progress.failed
+        } else {
+            progress.completed
+        };
+        if self.detail == "detailed" && !matches!(safe_summary.as_str(), "completed" | "failed") {
+            let detail = safe_summary
+                .strip_prefix("failed: ")
+                .unwrap_or(&safe_summary);
+            label.push_str(" · ");
+            label.push_str(detail);
+        }
+        let state = if failed {
+            ProgressState::Failed
+        } else {
+            ProgressState::Done
+        };
+        let tool_key = normalize_tool_name(tool);
+        if self.active_tool.as_deref() == Some(tool_key.as_str()) {
+            let Some(active) = self
+                .items
+                .last_mut()
+                .filter(|item| item.state == ProgressState::Active)
+            else {
+                self.active_tool = None;
+                return;
+            };
+            active.state = state;
+            active.activity = progress.activity;
+            active.label = label;
+            self.active_tool = None;
+        } else if self.active_tool.is_some() {
+            // A late completion from an older or parallel tool must never
+            // complete the tool that is currently shown as active.
+            return;
+        } else {
+            if let Some(active) = self
+                .items
+                .last()
+                .filter(|item| item.state == ProgressState::Active)
+            {
+                if matches!(
+                    active.activity,
+                    ProgressActivity::Thinking | ProgressActivity::Writing
+                ) {
+                    self.items.pop();
                 } else {
-                    ProgressState::Done
-                },
-                label: label.clone(),
-            })
-            .collect::<Vec<_>>();
-        if let Some(error) = &self.failed {
-            items.push(ProgressItem {
-                state: ProgressState::Failed,
-                label: error.clone(),
+                    return;
+                }
+            }
+            self.items.push(ProgressItem {
+                state,
+                activity: progress.activity,
+                label,
             });
         }
+        self.trim();
+        self.set_active("Thinking".into(), ProgressActivity::Thinking);
+    }
+
+    fn stream_chunk(&mut self) {
+        self.stream_chunks += 1;
+        if self.items.last().is_some_and(|item| {
+            item.state == ProgressState::Active
+                && !matches!(
+                    item.activity,
+                    ProgressActivity::Thinking | ProgressActivity::Writing
+                )
+        }) {
+            return;
+        }
+        if let Some(active) = self.items.last_mut().filter(|item| {
+            item.state == ProgressState::Active && item.activity == ProgressActivity::Writing
+        }) {
+            if self.detail == "detailed" && self.stream_chunks.is_multiple_of(8) {
+                active.label = format!("Writing response · {} chunks", self.stream_chunks);
+            }
+            return;
+        }
+        self.set_active("Writing response".into(), ProgressActivity::Writing);
+    }
+
+    fn fail(&mut self, error: &str) {
+        self.active_tool = None;
+        let label = if self.detail == "detailed" {
+            format!("Request failed · {}", safe_progress(error))
+        } else {
+            "Request failed".into()
+        };
+        if let Some(active) = self
+            .items
+            .last_mut()
+            .filter(|item| item.state == ProgressState::Active)
+        {
+            active.state = ProgressState::Failed;
+            active.label = label;
+        } else {
+            self.items.push(ProgressItem {
+                state: ProgressState::Failed,
+                activity: ProgressActivity::Thinking,
+                label,
+            });
+        }
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        let max = match self.detail.as_str() {
+            "minimal" => 1,
+            "detailed" => 6,
+            _ => 3,
+        };
+        if self.items.len() > max {
+            drop(self.items.drain(..self.items.len() - max));
+        }
+    }
+
+    fn view(&self) -> View {
+        let mut items = self.items.clone();
         if items.is_empty() {
             items.push(ProgressItem {
                 state: ProgressState::Active,
-                label: "Working".into(),
+                activity: ProgressActivity::Thinking,
+                label: "Thinking".into(),
             });
         }
         View {
@@ -780,6 +922,129 @@ impl ProgressAggregator {
             side_mode: false,
         }
     }
+}
+
+fn status_progress(value: &str) -> (String, ProgressActivity) {
+    let safe = safe_progress(value);
+    let normalized = safe.to_ascii_lowercase();
+    if normalized.contains("refresh") {
+        ("Refreshing session".into(), ProgressActivity::Analyzing)
+    } else if normalized.contains("web") && normalized.contains("search") {
+        ("Searching the web".into(), ProgressActivity::Searching)
+    } else if normalized.contains("fetch") || normalized.contains("extract") {
+        ("Fetching a page".into(), ProgressActivity::Fetching)
+    } else if normalized.contains("image")
+        || normalized.contains("video")
+        || normalized.contains("audio")
+    {
+        ("Processing media".into(), ProgressActivity::Media)
+    } else if normalized.contains("tool") {
+        ("Preparing a tool".into(), ProgressActivity::Tool)
+    } else if normalized.contains("final") || normalized.contains("completed") {
+        ("Finishing response".into(), ProgressActivity::Writing)
+    } else if normalized.contains("generating")
+        || normalized.contains("preparing")
+        || normalized.contains("sending request")
+    {
+        ("Thinking".into(), ProgressActivity::Thinking)
+    } else {
+        (safe, ProgressActivity::Analyzing)
+    }
+}
+
+fn tool_progress(tool: &str) -> ToolProgress {
+    let normalized = normalize_tool_name(tool);
+    let web = normalized.contains("web")
+        || normalized.contains("browser")
+        || normalized.contains("http")
+        || normalized.contains("url");
+    if normalized.contains("search") {
+        let scope = if web { "the web" } else { "files" };
+        ToolProgress {
+            activity: ProgressActivity::Searching,
+            active: format!("Searching {scope}"),
+            completed: format!("Searched {scope}"),
+            failed: if web {
+                "Web search failed".into()
+            } else {
+                "File search failed".into()
+            },
+        }
+    } else if normalized.contains("fetch")
+        || normalized.contains("extract")
+        || normalized.contains("download")
+        || normalized.contains("open_url")
+    {
+        ToolProgress {
+            activity: ProgressActivity::Fetching,
+            active: "Fetching a page".into(),
+            completed: "Fetched the page".into(),
+            failed: "Page fetch failed".into(),
+        }
+    } else if normalized.contains("image")
+        || normalized.contains("video")
+        || normalized.contains("audio")
+        || normalized.contains("media")
+    {
+        ToolProgress {
+            activity: ProgressActivity::Media,
+            active: "Processing media".into(),
+            completed: "Processed media".into(),
+            failed: "Media processing failed".into(),
+        }
+    } else if normalized.contains("code")
+        || normalized.contains("shell")
+        || normalized.contains("exec")
+        || normalized.contains("terminal")
+        || normalized.contains("command")
+        || normalized.contains("patch")
+        || normalized.contains("edit")
+        || normalized.contains("write")
+    {
+        ToolProgress {
+            activity: ProgressActivity::Coding,
+            active: "Working with code".into(),
+            completed: "Finished code work".into(),
+            failed: "Code work failed".into(),
+        }
+    } else if normalized.contains("context")
+        || normalized.contains("memory")
+        || normalized.contains("read")
+        || normalized.contains("inspect")
+        || normalized.contains("analy")
+    {
+        ToolProgress {
+            activity: ProgressActivity::Analyzing,
+            active: "Checking conversation context".into(),
+            completed: "Checked conversation context".into(),
+            failed: "Context check failed".into(),
+        }
+    } else {
+        let name = humanize_tool_name(tool);
+        ToolProgress {
+            activity: ProgressActivity::Tool,
+            active: format!("Running {name}"),
+            completed: format!("Ran {name}"),
+            failed: format!("{name} failed"),
+        }
+    }
+}
+
+fn humanize_tool_name(tool: &str) -> String {
+    let name = safe_progress(tool)
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if name.is_empty() {
+        "tool".into()
+    } else {
+        name
+    }
+}
+
+fn normalize_tool_name(tool: &str) -> String {
+    tool.trim().to_ascii_lowercase().replace('-', "_")
 }
 
 fn safe_progress(value: &str) -> String {
@@ -899,6 +1164,13 @@ mod tests {
         }
     }
 
+    fn progress_items(view: &View) -> &[ProgressItem] {
+        match view.blocks.first() {
+            Some(Block::Progress { items }) => items,
+            _ => panic!("expected a progress block"),
+        }
+    }
+
     async fn wait_processed(storage: &crate::storage::Storage, id: i64) {
         tokio::time::timeout(Duration::from_secs(2),async {
             loop {
@@ -934,6 +1206,132 @@ mod tests {
         let value = rich::render(&p.view(), true).to_string();
         assert!(!value.contains("very-secret-token"));
         assert!(value.contains("thinking"));
+    }
+
+    #[test]
+    fn progress_maps_real_work_to_semantic_activities() {
+        for (tool, activity, label) in [
+            (
+                "web_search",
+                ProgressActivity::Searching,
+                "Searching the web",
+            ),
+            (
+                "web_fetch",
+                ProgressActivity::Fetching,
+                "Fetching a page",
+            ),
+            (
+                "context_stats",
+                ProgressActivity::Analyzing,
+                "Checking conversation context",
+            ),
+            (
+                "code_interpreter",
+                ProgressActivity::Coding,
+                "Working with code",
+            ),
+            (
+                "image_generation",
+                ProgressActivity::Media,
+                "Processing media",
+            ),
+        ] {
+            let mut progress = ProgressAggregator::new("normal".into());
+            progress.push(AgentEvent::ToolStarted(tool.into()));
+            let view = progress.view();
+            let item = progress_items(&view).last().unwrap();
+            assert_eq!(item.state, ProgressState::Active);
+            assert_eq!(item.activity, activity);
+            assert_eq!(item.label, label);
+        }
+    }
+
+    #[test]
+    fn completed_tool_becomes_quiet_history_then_thinking_resumes() {
+        let mut progress = ProgressAggregator::new("normal".into());
+        progress.push(AgentEvent::GenerationStarted);
+        progress.push(AgentEvent::ToolStarted("web_search".into()));
+        progress.push(AgentEvent::StreamChunk {
+            provider: "codex".into(),
+            bytes: 64,
+        });
+        progress.push(AgentEvent::ToolCompleted {
+            tool: "web_search".into(),
+            summary: "completed".into(),
+        });
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].state, ProgressState::Done);
+        assert_eq!(items[0].label, "Searched the web");
+        assert_eq!(items[1].state, ProgressState::Active);
+        assert_eq!(items[1].activity, ProgressActivity::Thinking);
+        assert_eq!(items[1].label, "Thinking");
+    }
+
+    #[test]
+    fn stream_progress_updates_one_writing_step_in_place() {
+        let mut progress = ProgressAggregator::new("detailed".into());
+        progress.push(AgentEvent::GenerationStarted);
+        for _ in 0..16 {
+            progress.push(AgentEvent::StreamChunk {
+                provider: "codex".into(),
+                bytes: 64,
+            });
+        }
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].activity, ProgressActivity::Writing);
+        assert_eq!(items[0].label, "Writing response · 16 chunks");
+    }
+
+    #[test]
+    fn minimal_progress_keeps_only_the_current_animation() {
+        let mut progress = ProgressAggregator::new("minimal".into());
+        progress.push(AgentEvent::GenerationStarted);
+        progress.push(AgentEvent::ToolStarted("web_fetch".into()));
+        let active = progress.view();
+        assert_eq!(progress_items(&active).len(), 1);
+        assert_eq!(
+            progress_items(&active)[0].activity,
+            ProgressActivity::Fetching
+        );
+        progress.push(AgentEvent::ToolCompleted {
+            tool: "web_fetch".into(),
+            summary: "completed".into(),
+        });
+        let resumed = progress.view();
+        assert_eq!(progress_items(&resumed).len(), 1);
+        assert_eq!(
+            progress_items(&resumed)[0].activity,
+            ProgressActivity::Thinking
+        );
+    }
+
+    #[test]
+    fn late_tool_completion_never_completes_a_different_active_tool() {
+        let mut progress = ProgressAggregator::new("normal".into());
+        progress.push(AgentEvent::ToolStarted("web_search".into()));
+        progress.push(AgentEvent::ToolStarted("code_interpreter".into()));
+        progress.push(AgentEvent::ToolCompleted {
+            tool: "web_search".into(),
+            summary: "completed".into(),
+        });
+
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.state == ProgressState::Active)
+                .count(),
+            1
+        );
+        let active = items.last().unwrap();
+        assert_eq!(active.activity, ProgressActivity::Coding);
+        assert_eq!(active.label, "Working with code");
     }
 
     #[test]

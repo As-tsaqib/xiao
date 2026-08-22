@@ -37,9 +37,9 @@ or provider account remain explicit device integration checks.
 | A26 | `/account` view/selection/logout/login management. |
 | A27 | `/provider` selection and session rebinding. |
 | A28 | Typed `Provider` trait/registry. |
-| A29 | Progress uses `sendRichMessageDraft`, separate from final send; a 20-second heartbeat refreshes the same draft while active. |
+| A29 | Progress uses one `sendRichMessageDraft`, separate from final send; a 20-second heartbeat refreshes the same draft while active. The current activity uses the official animated AI Actions emoji with a Unicode fallback. |
 | A30 | No CoT type exists; only typed safe `AgentEvent` statuses reach presentation. |
-| A31 | Telegram progress labels are truncated/redacted/aggregated, never raw tool stdout. |
+| A31 | Telegram progress labels are truncated/redacted/aggregated, never raw tool stdout; tool names map to semantic thinking/search/fetch/code/media states and meaningful completed work becomes a quiet check row. |
 | A32 | `Progress` blocks are omitted for non-draft rendering; final-output unit test. |
 | A33 | Progress updater ticks at ~750 ms with missed-tick skipping. |
 | A34 | Adapter-level fake Telegram + fake slow-provider regression starts a long generation, processes principal B `/status` and a callback concurrently, then processes `/stop` and verifies cancellation happens before natural provider completion with no assistant row. |

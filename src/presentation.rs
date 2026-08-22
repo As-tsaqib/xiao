@@ -78,7 +78,23 @@ impl RichText {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProgressItem {
     pub state: ProgressState,
+    #[serde(default)]
+    pub activity: ProgressActivity,
     pub label: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressActivity {
+    #[default]
+    Thinking,
+    Analyzing,
+    Searching,
+    Fetching,
+    Tool,
+    Coding,
+    Media,
+    Writing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

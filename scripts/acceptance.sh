@@ -50,6 +50,12 @@ rg -q 'Duration::from_millis\(750\)' src/telegram/mod.rs || fail 'Progress throt
 rg -q 'HEARTBEAT: Duration = Duration::from_secs\(20\)' src/telegram/mod.rs || fail 'Progress heartbeat'
 pass 'Ephemeral throttled progress path'
 {
+  rg -q 'AI_ACTION_SEARCHING' src/telegram/rich.rs &&
+    rg -q 'ProgressActivity::Fetching' src/telegram/mod.rs &&
+    rg -q 'progress_maps_real_work_to_semantic_activities' src/telegram/mod.rs
+} || fail 'Semantic animated Telegram progress'
+pass 'Telegram progress uses native thinking with semantic AI Actions'
+{
   rg -q 'View::from_markdown' src/telegram/mod.rs &&
     rg -q 'RichTable' src/presentation.rs &&
     rg -q 'markdown_final_becomes_native_rich_blocks' src/telegram/rich.rs

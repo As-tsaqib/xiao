@@ -795,6 +795,47 @@ struct StreamedResponses {
     tool_calls: Vec<ToolCall>,
     function_items: Vec<serde_json::Value>,
 }
+
+fn responses_tool_progress_event(value: &serde_json::Value) -> Option<AgentEvent> {
+    let event_type = value.get("type")?.as_str()?;
+    let tool = if event_type.contains("web_search_call") {
+        "web_search"
+    } else if event_type.contains("file_search_call") {
+        "file_search"
+    } else if event_type.contains("code_interpreter_call") {
+        "code_interpreter"
+    } else if event_type.contains("image_generation_call") {
+        "image_generation"
+    } else if event_type.contains("mcp_call") {
+        value
+            .get("name")
+            .or_else(|| value.pointer("/item/name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("mcp_tool")
+    } else {
+        return None;
+    };
+    if event_type.ends_with(".completed") {
+        Some(AgentEvent::ToolCompleted {
+            tool: tool.into(),
+            summary: "completed".into(),
+        })
+    } else if event_type.ends_with(".failed") {
+        Some(AgentEvent::ToolCompleted {
+            tool: tool.into(),
+            summary: "failed".into(),
+        })
+    } else if event_type.ends_with(".in_progress")
+        || event_type.ends_with(".searching")
+        || event_type.ends_with(".interpreting")
+        || event_type.ends_with(".generating")
+    {
+        Some(AgentEvent::ToolStarted(tool.into()))
+    } else {
+        None
+    }
+}
+
 async fn consume_responses_sse(
     response: reqwest::Response,
     provider: &str,
@@ -831,7 +872,11 @@ async fn consume_responses_sse(
                 continue;
             };
 
-            match value.get("type").and_then(|value| value.as_str()) {
+            let event_type = value.get("type").and_then(|value| value.as_str());
+            if let Some(event) = responses_tool_progress_event(&value) {
+                emit(&progress, event);
+            }
+            match event_type {
                 Some("response.output_text.delta") => {
                     if let Some(delta) = value.get("delta").and_then(|value| value.as_str()) {
                         text.push_str(delta);
@@ -1144,5 +1189,31 @@ mod tests {
             upstream_error_summary(br#"{"error":{"message":"api_key=very-secret"}}"#, false);
         assert!(!summary.contains("very-secret"));
         assert!(summary.contains("<redacted>"));
+    }
+
+    #[test]
+    fn responses_server_tools_emit_semantic_progress_events() {
+        assert_eq!(
+            responses_tool_progress_event(&serde_json::json!({
+                "type":"response.web_search_call.searching"
+            })),
+            Some(AgentEvent::ToolStarted("web_search".into()))
+        );
+        assert_eq!(
+            responses_tool_progress_event(&serde_json::json!({
+                "type":"response.web_search_call.completed"
+            })),
+            Some(AgentEvent::ToolCompleted {
+                tool: "web_search".into(),
+                summary: "completed".into(),
+            })
+        );
+        assert_eq!(
+            responses_tool_progress_event(&serde_json::json!({
+                "type":"response.mcp_call.in_progress",
+                "name":"web_fetch"
+            })),
+            Some(AgentEvent::ToolStarted("web_fetch".into()))
+        );
     }
 }
