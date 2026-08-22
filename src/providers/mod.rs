@@ -1081,10 +1081,12 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let (auth, _directory) = test_auth();
-        let mut config = CustomProviderConfig::default();
-        config.enabled = true;
-        config.base_url = Some(format!("http://{address}/v1"));
-        config.protocol = "openai_responses".into();
+        let config = CustomProviderConfig {
+            enabled: true,
+            base_url: Some(format!("http://{address}/v1")),
+            protocol: "openai_responses".into(),
+            ..Default::default()
+        };
         let provider = CustomProvider::new(config, auth);
         let response = provider
             .run(
@@ -1120,9 +1122,11 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let (auth, _directory) = test_auth();
-        let mut config = CustomProviderConfig::default();
-        config.enabled = true;
-        config.base_url = Some(format!("http://{address}/v1"));
+        let config = CustomProviderConfig {
+            enabled: true,
+            base_url: Some(format!("http://{address}/v1")),
+            ..Default::default()
+        };
         let provider = CustomProvider::new(config, auth);
         let error = provider
             .run(request(vec![message("user", "hello")]), None)
