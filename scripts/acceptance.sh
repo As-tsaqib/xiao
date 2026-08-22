@@ -7,7 +7,9 @@ require_cargo=0
 pass(){ printf 'PASS  %s\n' "$1"; }
 fail(){ printf 'FAIL  %s\n' "$1" >&2; exit 1; }
 
-[ -f Cargo.toml ] && [ -f src/main.rs ] || fail 'Rust project layout'
+if [ ! -f Cargo.toml ] || [ ! -f src/main.rs ]; then
+  fail 'Rust project layout'
+fi
 pass 'Rust project layout'
 {
   rg -q 'owner_principal' src/storage/mod.rs &&

@@ -9,10 +9,10 @@ case "$MODE" in
   standalone)
     XIAO_SOURCE=${2:-./xiao}
     XIAOD_SOURCE=${3:-./xiaod}
-    [ -x "$XIAO_SOURCE" ] && [ -x "$XIAOD_SOURCE" ] || {
+    if [ ! -x "$XIAO_SOURCE" ] || [ ! -x "$XIAOD_SOURCE" ]; then
       echo "Usage: install-client.sh standalone [/path/to/xiao] [/path/to/xiaod]" >&2
       exit 2
-    }
+    fi
     install -m 0755 "$XIAO_SOURCE" "$PREFIX/bin/xiao"
     install -m 0755 "$XIAOD_SOURCE" "$PREFIX/bin/xiaod"
     echo "Installed xiao and xiaod."
@@ -22,10 +22,10 @@ case "$MODE" in
     XIAO_SOURCE=${2:-./xiao}
     PAIRING_FILE=${3:-}
     CFG="$HOME/.config/xiao/client.toml"
-    [ -x "$XIAO_SOURCE" ] && [ -n "$PAIRING_FILE" ] && [ -f "$PAIRING_FILE" ] || {
+    if [ ! -x "$XIAO_SOURCE" ] || [ -z "$PAIRING_FILE" ] || [ ! -f "$PAIRING_FILE" ]; then
       echo "Usage: install-client.sh pair [/path/to/xiao] /path/to/pairing.toml" >&2
       exit 2
-    }
+    fi
     install -m 0755 "$XIAO_SOURCE" "$PREFIX/bin/xiao"
     mkdir -p "$(dirname "$CFG")"
     umask 077

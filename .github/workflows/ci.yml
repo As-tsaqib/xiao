@@ -11,7 +11,7 @@ jobs:
         with:
           components: clippy,rustfmt
       - run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
-      - run: shellcheck -x -s sh module/*.sh
+      - run: shellcheck -x -s sh module/*.sh termux/install-client.sh
       - run: shellcheck -s bash packaging/*.sh scripts/acceptance.sh
       - run: cargo fmt --all -- --check
       - run: cargo check --locked --all-targets --all-features
