@@ -1,93 +1,119 @@
 #!/system/bin/sh
 
 MODDIR=${0%/*}
-DATA=/data/adb/xiao
-PIDFILE="$DATA/xiaod.pid"
-SUPERVISOR_PID="$DATA/ipc/supervisor.pid"
-SUPERVISOR_LOG="$DATA/logs/supervisor.log"
+# shellcheck source=module/common.sh
+. "$MODDIR/common.sh"
+# shellcheck source=module/termux.sh
+. "$MODDIR/termux.sh"
 
-valid_pid() {
-  case "${1:-}" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "$1" -gt 1 ] 2>/dev/null
-}
-
-pid_matches() {
-  check_pid=$1
-  check_text=$2
-  valid_pid "$check_pid" || return 1
-  kill -0 "$check_pid" 2>/dev/null || return 1
-  tr '\000' ' ' < "/proc/$check_pid/cmdline" 2>/dev/null | grep -Fq "$check_text"
-}
-
-stop_supervisor() {
-  supervisor=$(cat "$SUPERVISOR_PID" 2>/dev/null || true)
-  if pid_matches "$supervisor" "$MODDIR/supervisor.sh"; then
-    kill -TERM "$supervisor" 2>/dev/null || true
-  fi
-  i=0
-  while pid_matches "$supervisor" "$MODDIR/supervisor.sh" && [ "$i" -lt 20 ]; do
-    sleep 1
-    i=$((i + 1))
-  done
-  if pid_matches "$supervisor" "$MODDIR/supervisor.sh"; then
-    kill -KILL "$supervisor" 2>/dev/null || true
-  fi
-  rm -f "$SUPERVISOR_PID"
-}
-
-stop_daemon() {
-  daemon=$(cat "$PIDFILE" 2>/dev/null || true)
-  if pid_matches "$daemon" "$MODDIR/bin/xiaod"; then
-    kill -TERM "$daemon" 2>/dev/null || true
-    i=0
-    while pid_matches "$daemon" "$MODDIR/bin/xiaod" && [ "$i" -lt 15 ]; do
-      sleep 1
-      i=$((i + 1))
-    done
-    if pid_matches "$daemon" "$MODDIR/bin/xiaod"; then
-      kill -KILL "$daemon" 2>/dev/null || true
-    fi
-  fi
-  rm -f "$PIDFILE"
-}
-
-start_supervisor() {
-  mkdir -p "$DATA/logs" "$DATA/ipc"
-  supervisor=$(cat "$SUPERVISOR_PID" 2>/dev/null || true)
-  if pid_matches "$supervisor" "$MODDIR/supervisor.sh"; then
+start_watchdog() {
+  ensure_xiao_dirs || return 1
+  watchdog_pid=$(pid_from_file "$XIAO_WATCHDOG_PID" 2>/dev/null || true)
+  if pid_matches "$watchdog_pid" "$XIAO_WATCHDOG"; then
+    xiao_log "Watchdog sudah aktif (PID $watchdog_pid)."
     return 0
   fi
-  rm -f "$SUPERVISOR_PID"
-  nohup "$MODDIR/supervisor.sh" >>"$SUPERVISOR_LOG" 2>&1 </dev/null &
+  rm -f "$XIAO_STOP" "$XIAO_WATCHDOG_PID"
+  rotate_xiao_log "$XIAO_WATCHDOG_LOG"
+  XIAO_LOG_TO_FILE=1 nohup "$XIAO_WATCHDOG" >/dev/null 2>&1 </dev/null &
+  printf '%s\n' "$!" > "$XIAO_WATCHDOG_PID"
+  chmod 0600 "$XIAO_WATCHDOG_PID" 2>/dev/null || true
+  xiao_log 'Watchdog dimulai.'
 }
 
-case "${1:-restart}" in
+stop_watchdog() {
+  ensure_xiao_dirs || return 1
+  touch "$XIAO_STOP"
+  stop_owned_pid_file "$XIAO_WATCHDOG_PID" "$XIAO_WATCHDOG"
+  stop_owned_pid_file "$XIAO_DAEMON_PID" "$XIAOD_BINARY"
+  xiao_log 'Watchdog dan xiaod dihentikan.'
+}
+
+show_status() {
+  ensure_xiao_dirs || return 1
+  wrapper_status=$(termux_wrappers_status)
+  [ "$wrapper_status" = ready ] || install_termux_wrappers >/dev/null 2>&1 || true
+  echo '===================================='
+  echo '       xiao Diagnostic Panel'
+  echo '===================================='
+  echo "Date: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo
+  if daemon_is_running; then
+    echo "✓ xiaod     : RUNNING (PID $(pid_from_file "$XIAO_DAEMON_PID"))"
+  else
+    echo '✗ xiaod     : STOPPED'
+  fi
+  if watchdog_is_running; then
+    echo "✓ Watchdog  : ACTIVE (PID $(pid_from_file "$XIAO_WATCHDOG_PID"))"
+  else
+    echo '✗ Watchdog  : STOPPED'
+  fi
+  echo "✓ Termux CLI: $(termux_wrappers_status)"
+  echo "✓ Config    : $XIAO_CONFIG"
+  echo "✓ Data      : $XIAO_DATA_DIR"
+  if [ -f "$MODDIR/disable" ] || [ -f "$XIAO_DISABLE" ]; then
+    echo '⚠ Autostart : DISABLED'
+  else
+    echo '✓ Autostart : ENABLED'
+  fi
+  echo
+  echo '[RECENT WATCHDOG LOG]'
+  tail -n 8 "$XIAO_WATCHDOG_LOG" 2>/dev/null || true
+  echo '===================================='
+}
+
+show_status_json() {
+  ensure_xiao_dirs || return 1
+  json_daemon_running=false
+  json_daemon_pid=null
+  if daemon_is_running; then
+    json_daemon_running=true
+    json_daemon_pid=$(pid_from_file "$XIAO_DAEMON_PID")
+  fi
+  json_watchdog_running=false
+  json_watchdog_pid=null
+  if watchdog_is_running; then
+    json_watchdog_running=true
+    json_watchdog_pid=$(pid_from_file "$XIAO_WATCHDOG_PID")
+  fi
+  json_autostart=true
+  if [ -f "$MODDIR/disable" ] || [ -f "$XIAO_DISABLE" ]; then
+    json_autostart=false
+  fi
+  printf '{"daemon":{"running":%s,"pid":%s},"watchdog":{"running":%s,"pid":%s},"autostart":%s}\n' \
+    "$json_daemon_running" "$json_daemon_pid" \
+    "$json_watchdog_running" "$json_watchdog_pid" "$json_autostart"
+}
+
+run_encoded_admin_command() {
+  [ "$#" -eq 2 ] || {
+    echo "usage: action.sh $1 PAYLOAD" >&2
+    return 2
+  }
+  case "$2" in
+    ''|*[!A-Za-z0-9_-]*)
+      echo 'invalid base64url admin payload' >&2
+      return 2
+      ;;
+  esac
+  run_xiao_admin "$1" "$2"
+}
+
+case "${1:-status}" in
+  start) start_watchdog ;;
+  stop) stop_watchdog ;;
   restart)
-    stop_supervisor
-    stop_daemon
-    start_supervisor
-    echo 'xiao daemon and supervisor restart requested.'
+    stop_watchdog
+    rm -f "$XIAO_STOP"
+    start_watchdog
     ;;
-  start)
-    start_supervisor
-    echo 'xiao supervisor start requested.'
-    ;;
-  stop)
-    stop_supervisor
-    stop_daemon
-    echo 'xiao daemon and supervisor stopped.'
-    ;;
-  status)
-    XIAO_CONFIG="$DATA/config.toml" "$MODDIR/bin/xiao" admin snapshot
-    ;;
-  logs)
-    XIAO_CONFIG="$DATA/config.toml" "$MODDIR/bin/xiao" admin logs "${2:-120}"
-    ;;
-  pair)
-    echo 'Warning: pairing output contains the limited client credential.' >&2
-    XIAO_CONFIG="$DATA/config.toml" "$MODDIR/bin/xiao" admin client-config
-    ;;
-  *) echo "usage: action.sh [start|stop|restart|status|logs [N]|pair]"; exit 2;;
+  status) show_status ;;
+  status-json) show_status_json ;;
+  snapshot) run_xiao_admin snapshot ;;
+  apply-base64) run_encoded_admin_command apply-base64 "${2:-}" ;;
+  fetch-models-base64) run_encoded_admin_command fetch-models-base64 "${2:-}" ;;
+  logs) tail -n "${2:-120}" "$XIAO_DAEMON_LOG" 2>/dev/null ;;
+  pair) echo 'Pairing manual tidak diperlukan; wrapper Termux dikelola module.' ;;
+  wrappers) install_termux_wrappers ;;
+  *) echo 'usage: action.sh [start|stop|restart|status|status-json|snapshot|apply-base64 PAYLOAD|fetch-models-base64 PAYLOAD|logs [N]|wrappers]'; exit 2 ;;
 esac

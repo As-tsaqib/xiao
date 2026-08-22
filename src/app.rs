@@ -133,10 +133,6 @@ impl AppState {
         let auth = Arc::new(AuthManager::with_config(
             storage.clone(),
             cfg.paths.secrets_dir.clone(),
-            format!(
-                "http://{}/v1/auth/antigravity/browser-callback",
-                cfg.ipc.bind
-            ),
             config.clone(),
         ));
         let providers = Arc::new(ProviderRegistry::new(cfg.clone(), auth.clone()));

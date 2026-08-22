@@ -1,42 +1,21 @@
-# Isolated Android arm64 binary test
+# Module artifact validation
 
-The Termux bundle can be tested without installation and without touching a
-normal xiao home. The supplied test config uses loopback port `38921` and keeps
-all mutable state below the extracted directory.
+Do not compile or package xiao locally. Trigger `.github/workflows/ci.yml` with
+a push, pull request, or `workflow_dispatch`. The workflow is responsible for:
 
-```sh
-unzip xiao-v0.1.0-termux-arm64.zip -d xiao-binary-test
-cd xiao-binary-test
-chmod 755 xiao xiaod
-export XIAO_CONFIG="$PWD/config.termux-test.toml"
-export XIAO_CLIENT_CONFIG="$PWD/xiao-test-data/client.toml"
-./xiao quickstart
-```
+1. locked Rust fmt/check/Clippy/test/release gates;
+2. an Android arm64 `cargo-ndk` build of `xiao` and `xiaod`;
+3. two independent invocations of `packaging/build-module.sh`;
+4. identical SHA-256 results for both ZIP builds;
+5. sidecar verification and `unzip -t` integrity;
+6. an artifact containing only the ZIP and `.zip.sha256` sidecar.
 
-If the bundle does not include the optional test config, copy
-`config/config.termux-test.toml` from the source tree first. Then exercise the
-same public CLI that an installed build uses:
+The archive must place `module.prop`, `customize.sh`, `post-fs-data.sh`,
+`service.sh`, `watchdog.sh`, `action.sh`, `uninstall.sh`, `bin/`, `termux/`, and
+`webroot/` directly at ZIP root. It must not contain a parent `xiao/` directory,
+runtime databases, account secrets, logs, PID files, or client credentials.
 
-```sh
-./xiao config check
-./xiao daemon status
-./xiao status
-./xiao doctor
-./xiao new
-./xiao session
-./xiao btw
-./xiao context
-./xiao daemon restart
-./xiao daemon stop
-```
-
-`xiao quickstart` can be rerun before or after these commands; it must preserve
-the config, client principal, database, and secrets. After `restart`, session
-renames/provider/model selection must still be present.
-
-Codex/Antigravity generation requires an authorized user account. Antigravity
-also requires the deployment's own OAuth client ID. Telegram is disabled in
-the isolated config so this smoke test cannot accidentally poll a real bot.
-
-Test state remains in `./xiao-test-data`. Remove only that explicit directory
-when you intentionally want to discard the isolated database and credentials.
+After downloading and flashing the Actions artifact on arm64 Android, run
+`xiao-ctl status`, `xiao status`, and `xiao doctor`. Then verify a real reboot,
+wrapper repair, bounded logs, module update with preserved `/data/adb/xiao`,
+OAuth callbacks, and uninstall restoration of pre-existing Termux commands.

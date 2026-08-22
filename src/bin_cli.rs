@@ -333,9 +333,25 @@ async fn admin(paths: &CliPaths, args: &[String]) -> Result<()> {
                 .with_context(|| format!("read token file {}", path.display()))?;
             test_telegram_token(&client, &endpoint, &token, token_value.trim()).await?;
         }
-        _ => bail!(
-            "admin usage: snapshot | logs [N] | client-config | apply-file JSON | apply-base64 PAYLOAD | test-token-file FILE | test-token-base64 TOKEN"
-        ),
+        Some("fetch-models-base64") => {
+            let encoded = args
+                .get(1)
+                .ok_or_else(|| anyhow!("base64 model-discovery payload required"))?;
+            let payload = String::from_utf8(URL_SAFE_NO_PAD.decode(encoded)?)?;
+            post_admin_json(
+                &client,
+                &endpoint,
+                &token,
+                "/v1/admin/custom/models",
+                &payload,
+            )
+            .await?;
+        }
+        _ => bail!(concat!(
+            "admin usage: snapshot | logs [N] | client-config | apply-file JSON | ",
+            "apply-base64 PAYLOAD | test-token-file FILE | test-token-base64 TOKEN | ",
+            "fetch-models-base64 PAYLOAD"
+        )),
     }
     Ok(())
 }
@@ -346,10 +362,20 @@ async fn apply_admin_json(
     token: &str,
     payload: &str,
 ) -> Result<()> {
+    post_admin_json(client, endpoint, token, "/v1/admin/apply", payload).await
+}
+
+async fn post_admin_json(
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+    path: &str,
+    payload: &str,
+) -> Result<()> {
     let value: serde_json::Value = serde_json::from_str(payload)?;
     print_response(
         client
-            .post(format!("{endpoint}/v1/admin/apply"))
+            .post(format!("{endpoint}{path}"))
             .bearer_auth(token)
             .json(&value)
             .send()

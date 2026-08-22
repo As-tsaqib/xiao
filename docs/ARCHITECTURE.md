@@ -30,7 +30,7 @@ Provider-specific HTTP/auth details live behind `Provider` and `AuthManager` bou
 
 The agent loop is typed: a provider can return `ToolCalls`, `ToolRouter` applies the v0.1.0 allowlist/policy and timeout/output limits, results are emitted as safe `AgentEvent`s and returned to the provider for continuation. v0.1.0 intentionally exposes only bounded internal tools (for example context statistics); there is no model-controlled arbitrary process or root-shell executor. Provider streaming consumes SSE incrementally rather than buffering an entire response before emitting progress.
 
-Credentials are per account and stored separately in SecretStore. Refresh uses per-account async locks to avoid concurrent refresh races. Codex and Antigravity adapters can change endpoint/auth details without changing Telegram/Termux or Command Core.
+Credentials are per account and stored separately in SecretStore. Refresh uses per-account async locks to avoid concurrent refresh races. Codex browser login follows CLIProxyAPI's Authorization Code + PKCE contract and binds its localhost callback only for the active transaction. Antigravity follows CLIProxyAPI's installed-app OAuth flow, userinfo lookup, and `loadCodeAssist`/`onboardUser` project bootstrap. Its localhost callback is likewise transaction-scoped. Both adapters can change endpoint/auth details without changing Telegram/Termux or Command Core.
 
 ## Storage
 
@@ -38,16 +38,29 @@ SQLite enables WAL and foreign keys. Versioned, additive migrations create/upgra
 
 ## IPC and Termux
 
-IPC refuses non-loopback binds. Bearer credentials are split by privilege and compared in constant time: the normal client token reaches command/status/log routes, while a separate root-only admin token is required for snapshot/config/token-test/client-provisioning routes. Both are generated on first daemon start and stored as secrets. The Termux client receives only the limited client token and additionally refuses non-loopback pairing endpoints.
+IPC refuses non-loopback binds. Bearer credentials are split by privilege and compared in constant time: the limited client token reaches command/status/log routes, while a separate root-only admin token is required for snapshot/config/token-test/client-provisioning routes. Both are generated on first daemon start and stored as secrets. The module watchdog writes a root-owned client config from only the limited token; the managed Termux wrapper never prints or copies it into the Termux home.
 
-Normal Termux commands post to `/v1/command`, so they use the same semantic core as Telegram. `xiao logs` calls the redacted log endpoint. Standalone `xiao quickstart` creates private XDG config/data paths, launches a detached sibling/installed `xiaod`, waits for authenticated readiness, and writes the limited client config without printing its token. The lifecycle state includes PID, executable identity, and config identity so stale/PID-reuse records are discarded rather than signaled. `admin` subcommands require the separate local admin credential; they are for the runtime owner or the root-owned module/WebUI context, not ordinary client commands.
+Normal Termux commands post to `/v1/command`, so they use the same semantic core as Telegram. `xiao logs` calls the redacted log endpoint. The flashable module installs a managed Termux wrapper that elevates only the fixed module CLI, points it at the root-owned limited client config, and quotes every forwarded argument. `admin` subcommands require the separate local admin credential; they are for the root-owned module/WebUI context, not model-generated commands.
 
 ## KernelSU lifecycle
 
-`service.sh` runs during late-start, waits only a bounded time for Android boot completion, and detaches `supervisor.sh`. The supervisor tracks the child PID, forwards termination, applies bounded exponential restart backoff, and bounds log growth. Mutable files live in `/data/adb/xiao`; module updates replace only `/data/adb/modules/xiao` content.
+`post-fs-data.sh` initializes private directories and removes reboot-stale runtime PID files. `service.sh` runs during late-start, waits only a bounded time for Android boot completion, synchronizes the Termux wrappers, and detaches `watchdog.sh`. The watchdog tracks the child PID by executable identity, forwards termination, provisions the limited local client config, applies bounded exponential restart backoff, honors `auto_restart`, and bounds log growth. Mutable files live in `/data/adb/xiao`; module updates replace only `/data/adb/modules/xiao` content.
 
-The module WebUI has separate Gateway and Daemon status cards, Telegram status/config/test, provider status/config, Termux provisioning, redacted logs, and Save & Apply. Validation occurs before atomic configuration commit. ACL and Custom provider changes hot reload; Telegram enable/token and logging changes request a daemon restart.
+The module WebUI is intentionally narrow: one Gateway/Daemon status rail,
+Restart/Refresh, a Telegram form containing only bot token and one Chat ID, and
+an OpenAI-compatible Custom provider form. Codex and Antigravity OAuth never
+appear as WebUI credential fields; `/login` in Telegram owns those flows. The
+Custom form discovers `/models` through authenticated root admin IPC and can
+reuse the stored API key without returning it to JavaScript. All WebUI admin
+commands pass through `action.sh`, which supplies the same explicit root paths
+as the watchdog. Telegram ACL and Custom provider changes hot reload; a new bot
+token requests a daemon restart after validation.
 
 ## Security invariants
 
-There is no generic shell tool callable by the model. Root shell execution exists only in fixed KernelSU lifecycle/WebUI administration scripts whose arguments are encoded and whose binaries are fixed paths. Telegram authorization happens before agent execution. The IPC socket is loopback-only and bearer-authenticated. Secret values are never returned by normal snapshot APIs; Telegram token is masked. Surfaced log/error text passes through redaction.
+There is no generic shell tool callable by the model. Root shell execution
+exists only in fixed KernelSU lifecycle/WebUI administration scripts whose
+arguments are encoded and whose binaries are fixed paths. Telegram
+authorization happens before agent execution. The IPC socket is loopback-only
+and bearer-authenticated. Snapshot APIs return only whether a token/key is
+configured, never its value. Surfaced log/error text passes through redaction.

@@ -381,8 +381,7 @@ impl CommandCore {
                 let provider = normalize_provider(&provider);
                 let challenge = self.auth.begin_login(&provider).await?;
                 let transaction_id = match &challenge {
-                    AuthChallenge::DeviceCode { transaction_id, .. }
-                    | AuthChallenge::BrowserUrl { transaction_id, .. } => transaction_id.clone(),
+                    AuthChallenge::BrowserUrl { transaction_id, .. } => transaction_id.clone(),
                     AuthChallenge::ApiKey { .. } => "local-api-key".into(),
                 };
                 self.events.publish(AppEvent::AuthStarted {

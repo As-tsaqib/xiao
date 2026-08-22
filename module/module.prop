@@ -1,6 +1,6 @@
 id=xiao
 name=xiao
-version=v0.1.0
-versionCode=100
+version=v@MODULE_VERSION@
+versionCode=@VERSION_CODE@
 author=As-tsaqib
-description=Telegram-first AI agent gateway daemon for rooted Android, with KernelSU WebUI and non-root Termux client.
+description=Telegram-first AI gateway with watchdog, KernelSU WebUI, and managed Termux wrappers.

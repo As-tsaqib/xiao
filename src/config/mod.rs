@@ -323,7 +323,8 @@ pub struct AntigravityProviderConfig {
     pub default_model: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
-    /// Public OAuth client identifier created by the xiao operator (Desktop app).
+    /// Optional Desktop OAuth client override. When unset, xiao uses the same
+    /// installed-app client as CLIProxyAPI's Antigravity authenticator.
     #[serde(default)]
     pub oauth_client_id: Option<String>,
     #[serde(default = "default_agy_scopes")]
@@ -464,7 +465,7 @@ fn default_secrets_dir() -> PathBuf {
     PathBuf::from("/data/adb/xiao/secrets")
 }
 fn default_custom_protocol() -> String {
-    "openai_responses".into()
+    "openai_chat_completions".into()
 }
 fn default_google_auth_url() -> String {
     "https://accounts.google.com/o/oauth2/v2/auth".into()
@@ -482,14 +483,13 @@ fn default_agy_daily_base() -> String {
     "https://daily-cloudcode-pa.googleapis.com".into()
 }
 fn default_agy_x_goog() -> String {
-    "gl-rust/xiao".into()
+    "gl-node/22.21.1".into()
 }
 fn default_agy_scopes() -> Vec<String> {
     vec![
-        "openid".into(),
-        "email".into(),
-        "profile".into(),
         "https://www.googleapis.com/auth/cloud-platform".into(),
+        "https://www.googleapis.com/auth/userinfo.email".into(),
+        "https://www.googleapis.com/auth/userinfo.profile".into(),
         "https://www.googleapis.com/auth/cclog".into(),
         "https://www.googleapis.com/auth/experimentsandconfigs".into(),
     ]

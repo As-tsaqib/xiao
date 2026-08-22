@@ -1,66 +1,44 @@
-# xiao standalone Termux bundle v0.1.0
+# xiao managed Termux wrapper
 
-This bundle contains both Android arm64 binaries:
+There is no separate Termux package. Flashing the xiao module installs two
+managed commands directly into the existing Termux prefix:
 
-- `xiao`: non-root CLI and standalone lifecycle manager;
-- `xiaod`: the daemon and single source of truth.
+- `xiao` runs the module CLI against the module-owned daemon;
+- `xiao-ctl` controls and diagnoses the watchdog lifecycle.
 
-Run them directly from the extracted directory:
+The wrapper is installed during module customization, synchronized again at
+boot, and repaired from the module Action screen. If an unrelated command with
+the same name already exists, it is moved to a module-owned backup first. The
+backup is restored when xiao is uninstalled.
 
-```sh
-chmod 755 xiao xiaod install-client.sh
-./xiao quickstart
-./xiao daemon status
-./xiao status
-./xiao doctor
-```
-
-Because `xiaod` is beside `xiao`, daemon discovery is automatic. The generated
-client credential is private and is not printed by quickstart.
-
-To install both binaries into the current Termux prefix:
-
-```sh
-./install-client.sh standalone ./xiao ./xiaod
-xiao quickstart
-```
-
-Lifecycle commands are idempotent and scoped to the selected xiao config:
-
-```sh
-xiao daemon start
-xiao daemon foreground
-xiao daemon status
-xiao daemon logs 100
-xiao daemon restart
-xiao daemon stop
-```
-
-Agent/session examples:
+Examples:
 
 ```sh
 xiao status
+xiao doctor
 xiao session
-xiao new
-xiao btw
-xiao context
-xiao provider
-xiao model
 xiao login codex
+xiao login antigravity
 xiao chat "Explain the current session"
-xiao logs 100
+xiao daemon status
+xiao daemon restart
+xiao daemon logs 100
+xiao-ctl status
 ```
 
-Provider generation requires an authorized account or configured custom API.
-Until then, chat/retry returns a clear error such as `account not selected`;
-daemon/session/status/doctor/setup functions remain usable.
+The wrapper locates KernelSU's `su`, shell-quotes every forwarded argument, and
+executes only fixed files below `/data/adb/modules/xiao`. It supplies:
 
-For a CLI paired to the KernelSU daemon instead of a standalone daemon, use a
-private pairing TOML file:
-
-```sh
-./install-client.sh pair ./xiao /private/path/pairing.toml
+```text
+XIAO_CONFIG=/data/adb/xiao/config.toml
+XIAO_CLIENT_CONFIG=/data/adb/xiao/client.toml
+XIAO_HOME=/data/adb/xiao
 ```
 
-Normal CLI operation talks only to authenticated loopback HTTP and never uses
-`su`. The client rejects non-loopback endpoints in v0.1.0.
+`watchdog.sh` creates the private loopback client config after xiaod generates
+its role-limited IPC credential. That file remains root-owned under
+`/data/adb/xiao`; it is never copied into a normal Termux home or printed by the
+wrapper.
+
+Codex and Antigravity login URLs should be opened on the same Android device so
+their browser redirects can reach xiao's temporary localhost callback listener.

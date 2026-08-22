@@ -558,16 +558,9 @@ impl TelegramAdapter {
     }
 
     fn watch_auth(&self, challenge: AuthChallenge, menu: Arc<tokio::sync::Mutex<MenuSession>>) {
-        let (transaction_id, device_interval) = match &challenge {
-            AuthChallenge::DeviceCode {
-                transaction_id,
-                interval_seconds,
-                ..
-            } => (Some(transaction_id.clone()), Some(*interval_seconds)),
-            AuthChallenge::BrowserUrl { transaction_id, .. } => {
-                (Some(transaction_id.clone()), None)
-            }
-            AuthChallenge::ApiKey { .. } => (None, None),
+        let transaction_id = match &challenge {
+            AuthChallenge::BrowserUrl { transaction_id, .. } => Some(transaction_id.clone()),
+            AuthChallenge::ApiKey { .. } => None,
         };
         let Some(transaction_id) = transaction_id else {
             return;
@@ -616,22 +609,6 @@ impl TelegramAdapter {
                 }
             }
         });
-        if let Some(seconds) = device_interval {
-            let auth = self.app.auth.clone();
-            tokio::spawn(async move {
-                for _ in 0..120 {
-                    sleep(Duration::from_secs(seconds.max(2))).await;
-                    match auth.poll_codex(&transaction_id).await {
-                        Ok(Some(_)) => break,
-                        Ok(None) => continue,
-                        Err(error) => {
-                            auth.fail_transaction(&transaction_id, error.to_string());
-                            break;
-                        }
-                    }
-                }
-            });
-        }
     }
 }
 
@@ -830,15 +807,15 @@ fn result_view(result: CommandResult) -> Result<View> {
 
 fn auth_view(challenge: &AuthChallenge) -> View {
     match challenge {
-        AuthChallenge::DeviceCode { verification_url, user_code, transaction_id, .. } => View {
-            title: Some("CODEX LOGIN".into()),
-            blocks: vec![Block::Paragraph { text: format!("Code: {user_code}\nWaiting for authentication…") }],
-            actions: vec![vec![Action::url("Open Login Page", verification_url)], vec![Action::command("Cancel", format!("/login cancel {transaction_id}")), Action::back()]],
-            side_mode: false,
-        },
-        AuthChallenge::BrowserUrl { url, transaction_id } => View {
-            title: Some("AGY LOGIN".into()),
-            blocks: vec![Block::Paragraph { text: "Open the login page. The browser callback returns to the local xiao service and this same menu is updated on completion.".into() }],
+        AuthChallenge::BrowserUrl { provider, url, transaction_id } => View {
+            title: Some(format!("{} LOGIN", if provider == "codex" { "CODEX" } else { "AGY" })),
+            blocks: vec![Block::Paragraph {
+                text: concat!(
+                    "Open the login page on this Android device. The localhost OAuth callback ",
+                    "returns to xiao and this same menu updates automatically."
+                )
+                .into(),
+            }],
             actions: vec![vec![Action::url("Open Login Page", url)], vec![Action::command("Cancel", format!("/login cancel {transaction_id}")), Action::back()]],
             side_mode: false,
         },

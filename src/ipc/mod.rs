@@ -1,19 +1,21 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
-    response::Html,
     routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use futures_util::StreamExt;
 use rand::{distributions::Alphanumeric, Rng};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
@@ -23,7 +25,7 @@ use crate::{
     config::parse_id_list,
     event::AppEvent,
     security::{
-        redact::{mask_token, redact_text},
+        redact::redact_text,
         secrets::SecretStore,
     },
     telegram::client::TelegramClient,
@@ -73,16 +75,9 @@ pub struct TestTokenRequest {
     pub token: Option<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AntigravityCallbackRequest {
-    pub transaction_id: String,
-    pub code: String,
-    pub state: String,
-}
-#[derive(Debug, Deserialize)]
-struct AntigravityBrowserQuery {
-    code: Option<String>,
-    state: Option<String>,
-    error: Option<String>,
+pub struct FetchModelsRequest {
+    pub base_url: String,
+    pub api_key: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct LogsQuery {
@@ -112,12 +107,8 @@ pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
         .route("/v1/admin/snapshot", get(admin_snapshot))
         .route("/v1/admin/apply", post(admin_apply))
         .route("/v1/admin/telegram/test", post(test_telegram))
+        .route("/v1/admin/custom/models", post(custom_models))
         .route("/v1/admin/client-config", get(client_config))
-        .route("/v1/auth/antigravity/callback", post(antigravity_callback))
-        .route(
-            "/v1/auth/antigravity/browser-callback",
-            get(antigravity_browser_callback),
-        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "local authenticated IPC listening");
@@ -240,6 +231,9 @@ async fn admin_snapshot(
     let cfg = state.app.config.read().await.clone();
     let store = SecretStore::new(cfg.paths.secrets_dir.clone());
     let bot = store.get("telegram-bot-token").map_err(bad)?;
+    let custom_api_key_configured = stored_provider_api_key(&state.app, "custom")
+        .map_err(bad)?
+        .is_some();
     let health = state
         .app
         .health
@@ -249,7 +243,6 @@ async fn admin_snapshot(
             state.app.providers.states(),
         )
         .await;
-    let provider_status = provider_status(&state.app).map_err(bad)?;
     Ok(Json(json!({
         "gateway": health.clone(),
         "daemon": {
@@ -261,57 +254,20 @@ async fn admin_snapshot(
             "auto_restart": cfg.gateway.auto_restart
         },
         "telegram": {
-            "enabled": cfg.telegram.enabled,
-            "transport": cfg.telegram.transport,
-            "polling": health.telegram_polling,
-            "last_update_at": health.telegram_last_update_at,
-            "inbox_problem_count": state.app.storage.telegram_inbox_problem_count().unwrap_or(0),
             "token_configured": bot.is_some(),
-            "masked_token": bot.as_deref().map(mask_token),
-            "allowed_chat_ids": cfg.telegram.access.allowed_chat_ids,
-            "allowed_user_ids": cfg.telegram.access.allowed_user_ids,
-            "bot_identity": state.app.storage.setting("telegram_bot_identity").ok().flatten().and_then(|x| serde_json::from_str::<Value>(&x).ok())
+            "allowed_chat_ids": cfg.telegram.access.allowed_chat_ids
         },
-        "providers": provider_status,
         "config": {
-            "gateway": {"enabled":cfg.gateway.enabled,"auto_restart":cfg.gateway.auto_restart},
-            "log_level": cfg.daemon.log_level,
-            "telegram_ui":{"progress_detail":cfg.telegram.ui.progress_detail,"menu_close_behavior":cfg.telegram.ui.menu_close_behavior},
-            "antigravity":{
-                "enabled":cfg.providers.antigravity.enabled,
-                "oauth_client_id":cfg.providers.antigravity.oauth_client_id,
-                "oauth_client_secret_configured":state.app.auth.antigravity_client_secret_configured(),
-                "default_model":cfg.providers.antigravity.default_model
-            },
             "custom": {
                 "enabled": cfg.providers.custom.enabled,
-                "name": cfg.providers.custom.name,
                 "base_url": cfg.providers.custom.base_url,
                 "protocol": cfg.providers.custom.protocol,
                 "models": cfg.providers.custom.models,
                 "default_model": cfg.providers.custom.default_model,
-                "headers": cfg.providers.custom.headers
+                "api_key_configured": custom_api_key_configured
             }
         }
     })))
-}
-
-fn provider_status(app: &AppState) -> Result<Value> {
-    let mut map = serde_json::Map::new();
-    for provider in ["codex", "antigravity", "custom"] {
-        let accounts = app.auth.accounts(Some(provider))?;
-        let state = app.providers.state(provider);
-        let status = serde_json::to_value(&state)?
-            .as_str()
-            .unwrap_or("error")
-            .to_owned();
-        map.insert(provider.into(), json!({
-            "status": status,
-            "runtime_ready": matches!(state,crate::providers::ProviderState::Ready),
-            "accounts": accounts.iter().map(|a| json!({"id":a.id,"label":a.label,"status":a.status})).collect::<Vec<_>>()
-        }));
-    }
-    Ok(Value::Object(map))
 }
 
 async fn admin_apply(
@@ -495,6 +451,134 @@ async fn test_telegram(
     ))
 }
 
+async fn custom_models(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<FetchModelsRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !authorized_admin(&headers, &state) {
+        return Err(deny());
+    }
+    let cfg = state.app.config.read().await.clone();
+    let supplied_key = req
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let api_key = match supplied_key {
+        Some(value) => Some(value),
+        None => stored_provider_api_key(&state.app, "custom").map_err(bad)?,
+    };
+    let models = fetch_custom_models(
+        &req.base_url,
+        &cfg.providers.custom.headers,
+        api_key.as_deref(),
+    )
+    .await
+    .map_err(bad)?;
+    Ok(Json(json!({"ok":true,"models":models})))
+}
+
+fn stored_provider_api_key(app: &AppState, provider: &str) -> Result<Option<String>> {
+    app.auth.provider_api_key(provider)
+}
+
+async fn fetch_custom_models(
+    base_url: &str,
+    headers: &BTreeMap<String, String>,
+    api_key: Option<&str>,
+) -> Result<Vec<String>> {
+    const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
+    let endpoint = custom_models_endpoint(base_url)?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let mut request = client.get(endpoint);
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "custom model discovery failed with HTTP {status}; check Base URL and API key"
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CATALOG_BYTES as u64)
+    {
+        return Err(anyhow!("custom model catalog exceeds 4 MiB"));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > MAX_CATALOG_BYTES {
+            return Err(anyhow!("custom model catalog exceeds 4 MiB"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let value: Value = serde_json::from_slice(&body).context("parse custom model catalog")?;
+    let models = custom_model_ids(&value);
+    if models.is_empty() {
+        return Err(anyhow!(
+            "custom /models response does not contain any model IDs"
+        ));
+    }
+    Ok(models)
+}
+
+fn custom_models_endpoint(base_url: &str) -> Result<url::Url> {
+    let mut url = url::Url::parse(base_url.trim()).context("invalid custom provider Base URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(anyhow!("custom provider Base URL must use HTTP or HTTPS"));
+    }
+    if url.host_str().is_none() {
+        return Err(anyhow!("custom provider Base URL must include a host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(anyhow!(
+            "custom provider Base URL must not contain credentials"
+        ));
+    }
+    let path = format!("{}/models", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn custom_model_ids(value: &Value) -> Vec<String> {
+    let items = if let Some(items) = value.get("data").and_then(Value::as_array) {
+        items
+    } else if let Some(items) = value.get("models").and_then(Value::as_array) {
+        items
+    } else if let Some(items) = value.as_array() {
+        items
+    } else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            item.as_str()
+                .or_else(|| item.get("id").and_then(Value::as_str))
+                .or_else(|| item.get("name").and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 async fn client_config(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -508,76 +592,6 @@ async fn client_config(
         "token": state.client_token.as_str(),
         "principal": "termux:default"
     })))
-}
-
-async fn antigravity_callback(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(req): Json<AntigravityCallbackRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if !authorized_admin(&headers, &state) {
-        return Err(deny());
-    }
-    let account = state
-        .app
-        .auth
-        .complete_antigravity(&req.transaction_id, &req.code, &req.state)
-        .await
-        .map_err(bad)?;
-    Ok(Json(
-        json!({"ok":true,"account":{"id":account.id,"label":account.label,"provider":account.provider}}),
-    ))
-}
-
-async fn antigravity_browser_callback(
-    State(state): State<ApiState>,
-    Query(query): Query<AntigravityBrowserQuery>,
-) -> (StatusCode, Html<String>) {
-    if let Some(error) = query.error {
-        return (
-            StatusCode::BAD_REQUEST,
-            Html(format!(
-                "<h1>xiao login failed</h1><p>{}</p>",
-                html_escape(&error)
-            )),
-        );
-    }
-    let (Some(code), Some(returned_state)) = (query.code, query.state) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Html("<h1>xiao login failed</h1><p>Missing OAuth code/state.</p>".into()),
-        );
-    };
-    match state
-        .app
-        .auth
-        .complete_antigravity_by_state(&code, &returned_state)
-        .await
-    {
-        Ok((_tx, account)) => (
-            StatusCode::OK,
-            Html(format!(
-                "<h1>xiao connected</h1><p>{}</p><p>You can close this tab.</p>",
-                html_escape(&account.label)
-            )),
-        ),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Html(format!(
-                "<h1>xiao login failed</h1><p>{}</p>",
-                html_escape(&redact_text(&error.to_string()))
-            )),
-        ),
-    }
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 pub fn encode_admin_payload(json: &str) -> String {
@@ -602,5 +616,17 @@ mod tests {
         assert!(!bearer_matches(&headers, "secret"));
         headers.insert("authorization", "Bearer secret".parse().unwrap());
         assert!(bearer_matches(&headers, "secret"));
+    }
+
+    #[test]
+    fn custom_models_url_appends_models_to_versioned_base() {
+        let url = custom_models_endpoint("http://127.0.0.1:8317/v1/?ignored=true").unwrap();
+        assert_eq!(url.as_str(), "http://127.0.0.1:8317/v1/models");
+    }
+
+    #[test]
+    fn custom_model_catalog_is_sorted_deduplicated_and_accepts_openai_shape() {
+        let value = json!({"data":[{"id":"z-model"},{"id":"a-model"},{"id":"a-model"}]});
+        assert_eq!(custom_model_ids(&value), vec!["a-model", "z-model"]);
     }
 }

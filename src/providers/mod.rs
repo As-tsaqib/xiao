@@ -259,13 +259,7 @@ fn build_providers(
         "antigravity".into(),
         Arc::new(AntigravityProvider::new(
             config.providers.antigravity.enabled,
-            config
-                .providers
-                .antigravity
-                .oauth_client_id
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|x| !x.is_empty()),
+            true,
             config.providers.antigravity.base_url.clone(),
             config.providers.antigravity.default_model.clone(),
             auth.clone(),
@@ -605,12 +599,19 @@ impl Provider for CustomProvider {
         for (name, value) in &self.cfg.headers {
             request = request.header(name.as_str(), value.as_str());
         }
-        if let Some(account) = req.account_id.as_deref() {
-            if let Some(cred) = self.auth.credential(account)? {
-                if let Some(key) = cred.api_key {
-                    request = request.bearer_auth(key);
-                }
-            }
+        let selected_api_key = match req.account_id.as_deref() {
+            Some(account) => self
+                .auth
+                .credential(account)?
+                .and_then(|credential| credential.api_key),
+            None => None,
+        };
+        let api_key = match selected_api_key {
+            Some(key) if !key.trim().is_empty() => Some(key),
+            _ => self.auth.provider_api_key("custom")?,
+        };
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
         }
         let body = if self.cfg.protocol == "openai_chat_completions" {
             serde_json::json!({"model": req.model, "messages": req.messages.iter().map(|m| serde_json::json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(), "stream": false})

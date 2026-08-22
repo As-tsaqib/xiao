@@ -1,0 +1,48 @@
+#!/system/bin/sh
+# XIAO_MODULE_WRAPPER=1
+
+MODULE_DIR=/data/adb/modules/xiao
+DATA_DIR=/data/adb/xiao
+XIAO_BIN=$MODULE_DIR/bin/xiao
+CONTROL=$MODULE_DIR/action.sh
+command_name=${0##*/}
+
+su_bin=
+for candidate in /system/bin/su /system/xbin/su /sbin/su; do
+  if [ -x "$candidate" ]; then
+    su_bin=$candidate
+    break
+  fi
+done
+[ -n "$su_bin" ] || su_bin=$(command -v su 2>/dev/null || true)
+[ -n "$su_bin" ] || { echo 'xiao: command su dari KernelSU tidak ditemukan.' >&2; exit 126; }
+
+quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+if [ "$command_name" = xiao-ctl ]; then
+  root_command="exec $(quote "$CONTROL")"
+else
+  case "${1:-}:${2:-}" in
+    daemon:start) root_command="exec $(quote "$CONTROL") start"; shift 2 ;;
+    daemon:stop) root_command="exec $(quote "$CONTROL") stop"; shift 2 ;;
+    daemon:restart) root_command="exec $(quote "$CONTROL") restart"; shift 2 ;;
+    daemon:status) root_command="exec $(quote "$CONTROL") status"; shift 2 ;;
+    daemon:logs) root_command="exec $(quote "$CONTROL") logs"; shift 2 ;;
+    *)
+      root_command="export HOME=$(quote "$DATA_DIR");"
+      root_command="$root_command export XIAO_HOME=$(quote "$DATA_DIR");"
+      root_command="$root_command export XIAO_CONFIG=$(quote "$DATA_DIR/config.toml");"
+      root_command="$root_command export XIAO_CLIENT_CONFIG=$(quote "$DATA_DIR/client.toml");"
+      root_command="$root_command export TMPDIR=$(quote "$DATA_DIR/tmp");"
+      root_command="$root_command exec $(quote "$XIAO_BIN")"
+      ;;
+  esac
+fi
+
+for forwarded_arg in "$@"; do
+  root_command="$root_command $(quote "$forwarded_arg")"
+done
+
+exec "$su_bin" -p -c "$root_command"

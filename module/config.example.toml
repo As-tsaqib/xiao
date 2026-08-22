@@ -38,15 +38,15 @@ default_model = "gpt-5.6-sol"
 enabled = true
 default_model = "gemini-pro-agent"
 # Keep base_url unset to use the built-in Antigravity stream adapter.
-# Create a Google Desktop OAuth client for your own deployment and configure its
-# public client ID here or through KernelSU WebUI. Optional client secrets are
-# stored only in SecretStore through WebUI/admin IPC.
+# Login works out of the box with CLIProxyAPI-compatible installed-app OAuth.
+# Set oauth_client_id only to override it with your own Desktop OAuth client;
+# its optional secret belongs in SecretStore through the root admin API.
 oauth_client_id = ""
 
 [providers.custom]
 enabled = false
 name = "Custom"
-protocol = "openai_responses"
+protocol = "openai_chat_completions"
 models = []
 
 [providers.custom.headers]

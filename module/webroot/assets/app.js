@@ -1,27 +1,254 @@
 import { exec } from './ksu-bridge.js';
-const BIN='/data/adb/modules/xiao/bin/xiao', ACTION='/data/adb/modules/xiao/action.sh';
-const $=id=>document.getElementById(id);let snap=null;
-const formatBytes=v=>v==null?'Unavailable':v<1024?`${v} B`:v<1048576?`${(v/1024).toFixed(1)} KiB`:`${(v/1048576).toFixed(1)} MiB`;
-const formatDuration=s=>{s=Number(s||0);const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);return [d&&`${d}d`,h&&`${h}h`,m&&`${m}m`,`${s%60}s`].filter(Boolean).join(' ')};
-const enc=s=>{const bytes=new TextEncoder().encode(s);let bin='';bytes.forEach(b=>bin+=String.fromCharCode(b));return btoa(bin).replaceAll('+','-').replaceAll('/','_').replace(/=+$/,'')};
-function kv(root,k,v,good=true){const d=document.createElement('div');d.className='kv';const label=document.createElement('span');label.textContent=k;const value=document.createElement('span');value.className=`value ${good?'ok':'bad'}`;value.textContent=String(v);d.append(label,value);root.appendChild(d)}
-async function run(cmd){const r=await exec(cmd);if(Number(r.errno)!==0)throw new Error((r.stderr||`exit ${r.errno}`).trim());return (r.stdout||'').trim()}
-function notice(text,ok=true){$('notice').textContent=text;$('notice').className=`card ${ok?'ok':'bad'}`}
-async function refresh(){try{snap=JSON.parse(await run(`${BIN} admin snapshot`));notice('Connected to local daemon IPC');render()}catch(e){notice(`Daemon unavailable: ${e.message}`,false)}}
-function render(){
- const g=$('gateway');g.innerHTML='';kv(g,'Status',snap.gateway.gateway,snap.gateway.gateway==='running');kv(g,'Version',snap.gateway.version);kv(g,'Database',snap.gateway.db_healthy?'Healthy':'Error',snap.gateway.db_healthy);kv(g,'Providers ready',snap.gateway.providers_ready);
- const d=$('daemon');d.innerHTML='';kv(d,'Process',snap.daemon.status,snap.daemon.status==='running');kv(d,'PID',snap.daemon.pid);kv(d,'Uptime',formatDuration(snap.daemon.uptime_seconds));kv(d,'RAM',formatBytes(snap.daemon.memory_bytes));kv(d,'Started at boot',snap.daemon.boot_start?'Yes':'No');kv(d,'Auto restart',snap.daemon.auto_restart?'Enabled':'Disabled');
- const t=$('telegramStatus');t.innerHTML='';kv(t,'Transport',snap.telegram.transport);kv(t,'Polling',snap.telegram.polling?'Active':'Inactive',snap.telegram.polling||!snap.telegram.enabled);kv(t,'Token',snap.telegram.token_configured?snap.telegram.masked_token:'Not configured',snap.telegram.token_configured||!snap.telegram.enabled);if(snap.telegram.last_update_at)kv(t,'Last update',snap.telegram.last_update_at,true);if(snap.telegram.bot_identity)kv(t,'Bot',snap.telegram.bot_identity.username?`@${snap.telegram.bot_identity.username}`:(snap.telegram.bot_identity.first_name||snap.telegram.bot_identity.id));
- $('gatewayEnabled').checked=!!snap.config.gateway.enabled;$('autoRestart').checked=!!snap.config.gateway.auto_restart;
- $('chatIds').value=(snap.telegram.allowed_chat_ids||[]).join(', ');$('userIds').value=(snap.telegram.allowed_user_ids||[]).join(', ');$('telegramEnabled').checked=!!snap.telegram.enabled;$('progressDetail').value=snap.config.telegram_ui.progress_detail||'normal';$('closeBehavior').value=snap.config.telegram_ui.menu_close_behavior||'remove_keyboard';
- const a=snap.config.antigravity||{};$('agyEnabled').checked=!!a.enabled;$('agyClientId').value=a.oauth_client_id||'';$('agyModel').value=a.default_model||'';$('agyClientSecret').placeholder=a.client_secret_configured?'Keep existing secret':'Optional OAuth client secret';
- const c=snap.config.custom;$('customEnabled').checked=!!c.enabled;$('customName').value=c.name||'';$('customBase').value=c.base_url||'';$('customProtocol').value=c.protocol;$('customModel').value=c.default_model||'';$('customModels').value=(c.models||[]).join(', ');$('customHeaders').value=JSON.stringify(c.headers||{},null,2);
- const p=$('providers');p.innerHTML='';for(const [name,x] of Object.entries(snap.providers||{})){kv(p,name,x.status,x.status==='ready'||x.status==='disabled');if((x.accounts||[]).length)kv(p,`${name} accounts`,x.accounts.map(a=>`${a.label} (${a.status})`).join(', '),true)}
+
+const ACTION = '/data/adb/modules/xiao/action.sh';
+const $ = id => document.getElementById(id);
+let snapshot = null;
+let fetchedModels = [];
+let daemonReady = false;
+
+const operationButtons = ['restart', 'refresh', 'fetchModels', 'save'];
+
+function syncControls() {
+  const busy = operationButtons.some(id => $(id).getAttribute('aria-busy') === 'true');
+  $('restart').disabled = busy;
+  $('refresh').disabled = busy;
+  $('save').disabled = busy || !daemonReady;
+  $('fetchModels').disabled = busy || !daemonReady;
 }
-$('refresh').onclick=refresh;
-$('restart').onclick=async()=>{try{await run(`${ACTION} restart`);notice('Restart requested; supervisor will relaunch the daemon.')}catch(e){notice(e.message,false)}};
-$('testToken').onclick=async()=>{try{const token=$('botToken').value;if(!token)throw new Error('Enter a token to test.');const v=JSON.parse(await run(`${BIN} admin test-token-base64 ${enc(token)}`));notice(`Token valid: ${v.bot.username?'@'+v.bot.username:v.bot.first_name}`)}catch(e){notice(`Token test failed: ${e.message}`,false)}};
-$('logs').onclick=async()=>{try{const v=JSON.parse(await run(`${BIN} admin logs 160`));$('logOutput').textContent=(v.lines||[]).join('\n')||'(no log lines)'}catch(e){$('logOutput').textContent=`Unable to read logs: ${e.message}`}};
-$('pair').onclick=async()=>{try{const v=JSON.parse(await run(`${BIN} admin client-config`));$('pairing').textContent=`endpoint = ${JSON.stringify(v.endpoint)}\ntoken = ${JSON.stringify(v.token)}\nprincipal = ${JSON.stringify(v.principal)}\n`;$('pairing').classList.remove('hidden');notice('Pairing configuration displayed. Treat it as a secret and close WebUI after provisioning.')}catch(e){notice(`Pairing failed: ${e.message}`,false)}};
-$('save').onclick=async()=>{try{let headers={};try{headers=JSON.parse($('customHeaders').value||'{}')}catch{throw new Error('Additional headers must be a JSON object.')}if(!headers||Array.isArray(headers)||typeof headers!=='object')throw new Error('Additional headers must be a JSON object.');const payload={gateway_enabled:$('gatewayEnabled').checked,gateway_auto_restart:$('autoRestart').checked,telegram_enabled:$('telegramEnabled').checked,telegram_bot_token:$('botToken').value||null,allowed_chat_ids:$('chatIds').value,allowed_user_ids:$('userIds').value,progress_detail:$('progressDetail').value,menu_close_behavior:$('closeBehavior').value,antigravity_enabled:$('agyEnabled').checked,antigravity_oauth_client_id:$('agyClientId').value,antigravity_oauth_client_secret:$('agyClientSecret').value||null,antigravity_default_model:$('agyModel').value,custom_enabled:$('customEnabled').checked,custom_name:$('customName').value,custom_base_url:$('customBase').value,custom_protocol:$('customProtocol').value,custom_models:$('customModels').value.split(',').map(x=>x.trim()).filter(Boolean),custom_default_model:$('customModel').value,custom_headers:headers,custom_api_key:$('customKey').value||null};const v=JSON.parse(await run(`${BIN} admin apply-base64 ${enc(JSON.stringify(payload))}`));$('botToken').value='';$('agyClientSecret').value='';$('customKey').value='';notice(v.restart_required?'Saved and validated. Restart daemon to activate transport/gateway changes.':'Saved, validated, and hot-reloaded.');await refresh()}catch(e){notice(`Save rejected: ${e.message}`,false)}};
+
+function setBusy(id, busy) {
+  $(id).setAttribute('aria-busy', String(busy));
+  syncControls();
+}
+
+const formatDuration = value => {
+  const seconds = Number(value || 0);
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return [days && `${days}d`, hours && `${hours}h`, minutes && `${minutes}m`, `${seconds % 60}s`]
+    .filter(Boolean)
+    .join(' ');
+};
+
+const encode = value => {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  bytes.forEach(byte => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+};
+
+const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+function addValue(root, labelText, valueText, tone = '') {
+  const row = document.createElement('div');
+  row.className = 'kv';
+  const label = document.createElement('span');
+  label.textContent = labelText;
+  const value = document.createElement('span');
+  value.className = `value ${tone}`.trim();
+  value.textContent = String(valueText);
+  row.append(label, value);
+  root.appendChild(row);
+}
+
+async function run(command) {
+  const result = await exec(command);
+  if (Number(result.errno) !== 0) {
+    throw new Error((result.stderr || `exit ${result.errno}`).trim());
+  }
+  return (result.stdout || '').trim();
+}
+
+function showNotice(text, good = true) {
+  $('notice').textContent = text;
+  $('notice').className = `notice ${good ? 'ok' : 'bad'}`;
+}
+
+function showModelNotice(text, tone = '') {
+  $('modelNotice').textContent = text;
+  $('modelNotice').className = `field-note ${tone || 'muted'}`;
+}
+
+function renderModels(models) {
+  fetchedModels = [...new Set(models.map(value => String(value).trim()).filter(Boolean))].sort();
+  const list = $('customModelList');
+  list.innerHTML = '';
+  for (const model of fetchedModels) {
+    const option = document.createElement('option');
+    option.value = model;
+    list.appendChild(option);
+  }
+}
+
+function render() {
+  const online = snapshot.daemon.status === 'running';
+  $('liveMark').className = `live-mark ${online ? '' : 'offline'}`.trim();
+  $('liveMark').querySelector('span').textContent = online ? 'LOKAL' : 'OFFLINE';
+
+  const gateway = $('gateway');
+  gateway.innerHTML = '';
+  const gatewayState = snapshot.gateway.gateway || 'stopped';
+  const gatewayTone = gatewayState === 'running' ? 'ok' : gatewayState === 'degraded' ? 'warn' : 'bad';
+  const gatewayLabel = { running: 'Aktif', degraded: 'Terganggu', error: 'Error', stopped: 'Berhenti' }[gatewayState] || gatewayState;
+  addValue(gateway, 'Status', gatewayLabel, gatewayTone);
+  const telegramState = !snapshot.gateway.telegram_enabled
+    ? 'Nonaktif'
+    : snapshot.gateway.telegram_polling ? 'Polling' : 'Menunggu';
+  addValue(gateway, 'Telegram', telegramState, snapshot.gateway.telegram_polling ? 'ok' : '');
+
+  const daemon = $('daemon');
+  daemon.innerHTML = '';
+  addValue(daemon, 'Proses', snapshot.daemon.status === 'running' ? 'Berjalan' : 'Berhenti', snapshot.daemon.status === 'running' ? 'ok' : 'bad');
+  addValue(daemon, 'Watchdog', snapshot.daemon.watchdog_running ? 'Aktif' : 'Berhenti', snapshot.daemon.watchdog_running ? 'ok' : 'bad');
+  addValue(daemon, 'Mulai otomatis', snapshot.daemon.autostart ? 'Aktif' : 'Nonaktif', snapshot.daemon.autostart ? 'ok' : 'bad');
+  addValue(daemon, 'Waktu aktif', formatDuration(snapshot.daemon.uptime_seconds));
+
+  $('chatId').value = (snapshot.telegram.allowed_chat_ids || [])[0] || '';
+  $('botToken').placeholder = snapshot.telegram.token_configured
+    ? 'Sudah tersimpan — kosongkan untuk mempertahankan'
+    : 'Masukkan bot token';
+
+  const custom = snapshot.config.custom || {};
+  $('customEnabled').checked = Boolean(custom.enabled);
+  $('customBase').value = custom.base_url || '';
+  $('customProtocol').value = custom.protocol || 'openai_chat_completions';
+  $('customModel').value = custom.default_model || '';
+  $('customKey').placeholder = custom.api_key_configured
+    ? 'Sudah tersimpan — kosongkan untuk mempertahankan'
+    : 'Masukkan API key';
+  renderModels(custom.models || []);
+}
+
+async function refresh() {
+  setBusy('refresh', true);
+  let lifecycle = null;
+  try {
+    lifecycle = JSON.parse(await run(`${ACTION} status-json`));
+    snapshot = JSON.parse(await run(`${ACTION} snapshot`));
+    snapshot.daemon.watchdog_running = Boolean(lifecycle.watchdog.running);
+    snapshot.daemon.autostart = Boolean(lifecycle.autostart);
+    daemonReady = true;
+    render();
+    showNotice('Terhubung ke daemon xiao');
+  } catch (error) {
+    daemonReady = false;
+    snapshot = {
+      gateway: { gateway: 'stopped', telegram_enabled: false, telegram_polling: false },
+      daemon: {
+        status: lifecycle?.daemon?.running ? 'running' : 'stopped',
+        uptime_seconds: 0,
+        watchdog_running: Boolean(lifecycle?.watchdog?.running),
+        autostart: Boolean(lifecycle?.autostart)
+      },
+      telegram: { token_configured: false, allowed_chat_ids: [] },
+      config: { custom: {} }
+    };
+    render();
+    console.error('Gagal membaca status xiao:', error);
+    showNotice(
+      lifecycle
+        ? 'Daemon tidak merespons. Coba mulai ulang.'
+        : 'Kontrol root tidak tersedia. Buka dari KernelSU Manager.',
+      false
+    );
+  } finally {
+    setBusy('refresh', false);
+  }
+}
+
+$('refresh').onclick = refresh;
+
+$('restart').onclick = async () => {
+  setBusy('restart', true);
+  try {
+    showNotice('Memulai ulang daemon…');
+    await run(`${ACTION} restart`);
+    await wait(1800);
+    await refresh();
+  } catch (error) {
+    showNotice(`Restart gagal: ${error.message}`, false);
+  } finally {
+    setBusy('restart', false);
+  }
+};
+
+$('fetchModels').onclick = async () => {
+  setBusy('fetchModels', true);
+  try {
+    const baseUrl = $('customBase').value.trim();
+    if (!baseUrl) throw new Error('Base URL wajib diisi.');
+    showModelNotice('Mengambil model…');
+    const payload = {
+      base_url: baseUrl,
+      api_key: $('customKey').value.trim() || null
+    };
+    const result = JSON.parse(await run(`${ACTION} fetch-models-base64 ${encode(JSON.stringify(payload))}`));
+    renderModels(result.models || []);
+    if (!fetchedModels.length) throw new Error('Endpoint tidak mengembalikan model.');
+    if (!fetchedModels.includes($('customModel').value.trim())) {
+      $('customModel').value = fetchedModels[0];
+    }
+    showModelNotice(`${fetchedModels.length} model tersedia.`, 'ok');
+  } catch (error) {
+    showModelNotice(`Fetch gagal: ${error.message}`, 'bad');
+  } finally {
+    setBusy('fetchModels', false);
+  }
+};
+
+$('save').onclick = async () => {
+  setBusy('save', true);
+  try {
+    const chatId = $('chatId').value.trim();
+    const botToken = $('botToken').value.trim();
+    if (chatId && !/^-?[1-9]\d*$/.test(chatId)) {
+      throw new Error('Chat ID harus berupa angka non-zero.');
+    }
+    if (chatId && !botToken && !snapshot.telegram.token_configured) {
+      throw new Error('Bot token wajib diisi saat Telegram pertama kali diaktifkan.');
+    }
+
+    const customEnabled = $('customEnabled').checked;
+    const customBase = $('customBase').value.trim();
+    const customModel = $('customModel').value.trim();
+    if (customEnabled && (!customBase || !customModel)) {
+      throw new Error('Base URL dan default model wajib diisi untuk custom provider.');
+    }
+    const customModels = [...new Set([...fetchedModels, customModel].filter(Boolean))];
+    const telegramEnabled = Boolean(chatId && (botToken || snapshot.telegram.token_configured));
+    const payload = {
+      gateway_enabled: true,
+      gateway_auto_restart: true,
+      telegram_enabled: telegramEnabled,
+      telegram_bot_token: botToken || null,
+      allowed_chat_ids: chatId,
+      allowed_user_ids: '',
+      custom_enabled: customEnabled,
+      custom_name: 'Custom',
+      custom_base_url: customBase,
+      custom_protocol: $('customProtocol').value,
+      custom_models: customModels,
+      custom_default_model: customModel,
+      custom_api_key: $('customKey').value.trim() || null
+    };
+
+    showNotice('Memvalidasi dan menyimpan…');
+    const result = JSON.parse(await run(`${ACTION} apply-base64 ${encode(JSON.stringify(payload))}`));
+    $('botToken').value = '';
+    $('customKey').value = '';
+    if (result.restart_required) {
+      showNotice('Tersimpan. Memulai ulang daemon…');
+      await run(`${ACTION} restart`);
+      await wait(1800);
+    }
+    await refresh();
+    showNotice('Perubahan tersimpan. Daemon terhubung.');
+  } catch (error) {
+    showNotice(`Simpan gagal: ${error.message}`, false);
+  } finally {
+    setBusy('save', false);
+  }
+};
+
 refresh();

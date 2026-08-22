@@ -1,17 +1,22 @@
 # v0.1.0 acceptance coverage
 
-This document maps the specification acceptance matrix to implementation and automated/device validation. `scripts/acceptance.sh` performs repository/static checks and, when Cargo is available, runs the Rust test suite. GitHub Actions additionally performs the Android arm64 binary cross-build and packages both the Termux and KernelSU archives. Tests needing a real KernelSU install/reboot, Telegram bot credential, or provider account remain explicit device integration checks rather than being falsely simulated as upstream success.
+This document maps the specification acceptance matrix to implementation and
+automated/device validation. `scripts/acceptance.sh` is source-only and never
+invokes Cargo. GitHub Actions is the sole authority for Rust formatting,
+compilation, Clippy, tests, the Android arm64 build, and packaging the single
+KernelSU module archive. Tests needing a real reboot, Telegram bot credential,
+or provider account remain explicit device integration checks.
 
 | ID | Coverage |
 |---|---|
-| A01 | `Cargo.toml`, CI `cargo test/clippy/fmt`; `--require-cargo` acceptance gate. |
-| A02 | CI `cargo-ndk` arm64 build plus Termux and KernelSU packaging; local native Android arm64 packaging and archive checks pass. |
-| A03 | KernelSU `service.sh` + persistent `supervisor.sh`; device reboot check documented. |
+| A01 | GitHub Actions runs locked Rust fmt/check/test/Clippy/release gates; local acceptance is static-only. |
+| A02 | CI `cargo-ndk` arm64 build plus one deterministic root-layout KernelSU module ZIP and SHA sidecar. |
+| A03 | KernelSU `post-fs-data.sh` + `service.sh` + persistent `watchdog.sh`; device reboot check documented. |
 | A04 | Module mutable paths use `/data/adb/xiao`; standalone quickstart uses private XDG config/data paths. Both remain outside replaceable binaries/module content. |
 | A05 | Telegram adapter implements only `getUpdates` long polling in v0.1.0. |
 | A06 | `telegram::acl` unit test and ACL-before-dispatch ordering. |
-| A07 | `config::parse_id_list` unit test; WebUI sends comma-separated signed IDs to validated admin apply. |
-| A08 | Snapshot returns only `masked_token`; WebUI never receives the stored full bot token. |
+| A07 | `config::parse_id_list` unit test; the simplified WebUI submits one validated signed Chat ID. |
+| A08 | Snapshot returns only `token_configured`; WebUI never receives the stored bot token. |
 | A09 | WebUI/API token test calls Telegram `getMe` before config commit for a new token. |
 | A10 | Session persistence/archive unit tests; `/new` calls `create_and_switch`. |
 | A11 | `/session` is 5/page with table, numbered buttons, paging and management actions. |
@@ -42,13 +47,13 @@ This document maps the specification acceptance matrix to implementation and aut
 | A36 | `/status` includes gateway, daemon, Telegram, provider/model/session/mode. |
 | A37 | `/context` reports main/effective messages and isolation mode. |
 | A38 | `/help` has edit-first Chat/AI/Accounts/Advanced categories plus direct topic help including `btw`, `session`, `model`, `account`, and `settings`. |
-| A39 | Termux client has no `su`; normal path uses loopback bearer IPC. Quickstart/lifecycle path and private pairing are covered by standalone tests/live smoke. |
+| A39 | Flashing the one module ZIP installs managed `xiao`/`xiao-ctl` wrappers; arguments are shell-quoted, only fixed module paths are elevated, and uninstall restores backed-up commands. |
 | A40 | Termux `/v1/command` and Telegram both call `CommandCore`. |
 | A41 | config validation rejects non-loopback IPC; unit test. |
 | A42 | exact constant-time bearer check; separate limited client/admin tokens; unit test. |
-| A43 | WebUI separate Gateway and Daemon cards. |
+| A43 | WebUI has only a compact Gateway/Daemon status rail plus lifecycle actions. |
 | A44 | admin apply validates config and externally tests any new Telegram token before atomic save. |
-| A45 | ACL + custom provider config update in memory without restart; event emitted. |
+| A45 | Chat ID ACL + Custom provider config update in memory without restart; event emitted. |
 | A46 | SQLite reopen persistence unit test, WAL mode. |
 | A47 | redaction unit test and redacted `/v1/logs`/error surface. |
 | A48 | no provider/agent unrestricted shell tool; static acceptance grep. |
@@ -58,7 +63,7 @@ This document maps the specification acceptance matrix to implementation and aut
 | A52 | Effective agent context is bounded while complete conversation history remains persisted; `/compact` is intentionally not exposed in v0.1.0. |
 | A53 | `/usage` provides session message/character usage. |
 | A54 | `/doctor` reports DB, IPC, Telegram transport, provider registration, and root-shell invariant. |
-| A55 | Intentionally not enabled in v0.1.0: enrollment cannot bypass the “ACL before all Telegram work” invariant. Operators enroll IDs explicitly in KernelSU WebUI. |
+| A55 | Intentionally not enabled in v0.1.0: enrollment cannot bypass the “ACL before all Telegram work” invariant. Operators set the Chat ID explicitly in KernelSU WebUI. |
 
 ## Revision blocker regression gates
 
@@ -68,7 +73,12 @@ The v0.1.0 completion pass adds direct regression coverage for the release block
 - **Responsive Telegram intake:** the adapter-level fake-server test proves a slow provider generation does not block another principal, callbacks, or `/stop`.
 - **Rich final answers:** parser/renderer tests cover headings, paragraphs, fenced code with language, tables, bullet/ordered lists, blockquotes, inline emphasis/code/links, malformed markup preservation, and oversized answer pagination.
 - **Atomic account activation:** tests cover fresh Custom→Codex, Custom→AGY, two Codex accounts, Codex→AGY, invalid/disconnected accounts, no-model failure, and complete rollback on failure.
-- **Deployable AGY auth:** static acceptance verifies OAuth Client ID is normal config/WebUI state, optional client secret is SecretStore-only, and the legacy shell environment dependency is absent.
+- **Deployable OAuth:** static acceptance checks the CLIProxyAPI-compatible
+  Codex PKCE parameters and Antigravity installed-app constants/scopes/project
+  bootstrap. Neither login depends on a WebUI credential form.
+- **Custom endpoint E2E:** the isolated device script starts xiaod with its
+  boot-style environment, configures the already-installed CLIProxyAPI endpoint,
+  activates the Custom provider, and requires a real `XIAO_E2E_OK` model reply.
 - **Typed tool loop and streaming:** an agent test proves provider→typed tool→result→provider continuation; static acceptance rejects generic shell/root execution and checks incremental SSE consumption.
 - **Durable update intake:** database tests cover accepted-but-unclaimed replay, duplicate acceptance idempotence, processing-crash quarantine, and failed-processing quarantine.
 - **Termux alias parsing:** tests cover aliases with zero/one/multiple arguments, slash forms, explicit `chat`, and quoted natural-language prompts.
@@ -78,11 +88,11 @@ The v0.1.0 completion pass adds direct regression coverage for the release block
 After automated binary/archive acceptance, validate on an arm64 KernelSU Next device:
 
 1. Install module, reboot, verify daemon PID/log/status and persistence under `/data/adb/xiao`.
-2. Configure a real Telegram bot and two allowed chat/user combinations; verify unauthorized updates cause no session/message/provider mutation.
+2. Configure a real Telegram bot and Chat ID; verify updates from another chat cause no session/message/provider mutation.
 3. Exercise `/session` paging/detail/rename/select/archive and intentionally force/edit an older menu to confirm stale callbacks do nothing.
 4. Run a generation and inspect Telegram history: progress must be draft-only; final must contain no progress/CoT. Test `/stop` and `/retry`.
 5. Enter/exit `/btw`; query something relying on MAIN context; confirm SQLite MAIN history contains none of the SIDE messages/reply.
 6. Complete Codex and Antigravity OAuth with authorized test accounts and verify the existing login menu updates, token refresh, multi-account selection, and model calls.
-7. Configure a disposable OpenAI-compatible custom endpoint and key; verify Save & Apply rejects bad URL/header/model input and hot-reloads valid config.
-8. Pair Termux once, then run `xiao status`, commands/chat, and logs from a normal non-root Termux shell.
+7. Configure a disposable OpenAI-compatible custom endpoint and key; fetch its model catalog, verify invalid URL/model input is rejected, and confirm valid config hot-reloads.
+8. Verify the module-created `xiao`/`xiao-ctl` Termux wrappers, then run status, commands/chat, logs, restart, and uninstall/backup-restore checks.
 9. Restart daemon and reboot device; verify sessions, accounts, config, and Telegram offset remain durable.

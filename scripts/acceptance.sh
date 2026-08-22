@@ -2,8 +2,10 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-require_cargo=0
-[ "${1:-}" = "--require-cargo" ] && require_cargo=1
+case "${1:-}" in
+  ''|--static-only) ;;
+  *) printf 'usage: %s [--static-only]\n' "$0" >&2; exit 2 ;;
+esac
 pass(){ printf 'PASS  %s\n' "$1"; }
 fail(){ printf 'FAIL  %s\n' "$1" >&2; exit 1; }
 
@@ -11,6 +13,8 @@ if [ ! -f Cargo.toml ] || [ ! -f src/main.rs ]; then
   fail 'Rust project layout'
 fi
 pass 'Rust project layout'
+rg -q 'GITHUB_ACTIONS' packaging/build-module.sh || fail 'GitHub-Actions-only packaging guard'
+pass 'Module packaging is guarded to GitHub Actions'
 {
   rg -q 'owner_principal' src/storage/mod.rs &&
     rg -q 'cross_principal_operations_are_rejected' src/storage/mod.rs &&
@@ -61,11 +65,17 @@ pass 'Side-chat isolation implementation'
 ! rg -q 'SetAccount' src/command/mod.rs || fail 'Legacy non-atomic SetAccount path remains'
 pass 'Login/account activation is atomic across provider/account/model'
 {
-  rg -q 'oauth_client_id' src/config/mod.rs &&
-    rg -q 'agyClientId' webui/index.html
-} || fail 'Deployable Antigravity configuration'
-! rg -q 'XIAO_AGY_CLIENT_ID' src config webui module docs README.md || fail 'Legacy Antigravity environment-variable dependency remains'
-pass 'Antigravity OAuth is configurable through daemon/WebUI without shell env dependency'
+  rg -q 'ANTIGRAVITY_CLIENT_ID' src/auth/mod.rs &&
+    rg -q 'ANTIGRAVITY_OAUTH_REDIRECT_URI' src/auth/mod.rs &&
+    rg -q 'loadCodeAssist' src/auth/mod.rs &&
+    rg -q 'onboardUser' src/auth/mod.rs
+} || fail 'CLIProxyAPI-compatible Antigravity OAuth flow'
+{
+  rg -q 'CODEX_OAUTH_AUTHORIZE_URL' src/auth/mod.rs &&
+    rg -q 'codex_cli_simplified_flow' src/auth/mod.rs &&
+    rg -q 'code_challenge_method' src/auth/mod.rs
+} || fail 'CLIProxyAPI-compatible Codex OAuth flow'
+pass 'Codex and Antigravity OAuth follow CLIProxyAPI browser login contracts'
 {
   rg -q 'ToolRouter' src/agent/mod.rs src/tools/mod.rs &&
     rg -q 'ProviderStep::ToolCalls' src/agent/mod.rs &&
@@ -88,13 +98,18 @@ pass 'Authenticated loopback IPC'
     rg -q 'authorized_client' src/ipc/mod.rs
 } || fail 'IPC role separation'
 pass 'Separate client/admin IPC credentials'
-! rg -n '\bsu\b' src/bin_cli.rs termux/install-client.sh >/dev/null || fail 'Termux normal client contains su'
-pass 'Termux normal path has no su'
 {
-  rg -q 'masked_token' src/ipc/mod.rs &&
+  rg -q 'XIAO_MODULE_WRAPPER=1' module/termux/xiao-wrapper &&
+    rg -q 'install_termux_wrappers' module/customize.sh module/service.sh module/action.sh &&
+    rg -q 'remove_termux_wrappers' module/uninstall.sh
+} || fail 'Managed Termux wrapper lifecycle'
+pass 'Termux wrapper is installed automatically and removed/restored safely'
+{
+  rg -q 'token_configured' src/ipc/mod.rs &&
+    ! rg -q '"token"[[:space:]]*:[[:space:]]*bot' src/ipc/mod.rs &&
     rg -q 'redact_text' src/ipc/mod.rs
-} || fail 'Secret masking/redaction'
-pass 'Secret masking and redacted logs'
+} || fail 'Secret presence-only snapshot/redaction'
+pass 'Snapshot exposes secret presence only and logs/errors are redacted'
 pass 'No unrestricted AI root shell'
 {
   rg -q 'normalize_cli' src/bin_cli.rs &&
@@ -123,22 +138,37 @@ pass 'Gateway/provider health distinguishes readiness from daemon liveness'
 [ "$(rg -n '"compact"[[:space:]]*=>' src/command/mod.rs | wc -l)" -eq 0 ] || fail 'Fake /compact command still exposed'
 pass 'No fake /compact command is exposed'
 {
-  [ -f webui/index.html ] &&
-    rg -q 'id="gateway"' webui/index.html &&
-    rg -q 'id="daemon"' webui/index.html
+  [ -f module/webroot/index.html ] &&
+    rg -q 'id="gateway"' module/webroot/index.html &&
+    rg -q 'id="daemon"' module/webroot/index.html &&
+    rg -q 'id="botToken"' module/webroot/index.html &&
+    rg -q 'id="chatId"' module/webroot/index.html &&
+    rg -q 'id="fetchModels"' module/webroot/index.html &&
+    rg -q "const ACTION = '/data/adb/modules/xiao/action.sh'" module/webroot/assets/app.js &&
+    rg -Fq 'run(`${ACTION} snapshot`)' module/webroot/assets/app.js &&
+    ! rg -q 'agyClient|userIds|progressDetail|closeBehavior|customHeaders' module/webroot/index.html module/webroot/assets/app.js
 } || fail 'WebUI gateway/daemon surfaces'
-pass 'WebUI Gateway and Daemon surfaces'
+pass 'WebUI is limited to gateway/daemon status, two-field Telegram setup and custom model discovery'
 {
-  rg -q 'auto_restart_enabled' module/supervisor.sh &&
-    rg -q '2097152' module/supervisor.sh &&
-    rg -q 'trap.*cleanup' module/supervisor.sh
-} || fail 'KernelSU supervisor hardening'
-pass 'KernelSU supervisor has graceful stop, backoff policy, auto-restart policy and bounded logs'
-for f in module/*.sh termux/install-client.sh; do sh -n "$f"; done
-for f in packaging/*.sh scripts/acceptance.sh; do bash -n "$f"; done
+  rg -q '/v1/admin/custom/models' src/ipc/mod.rs src/bin_cli.rs &&
+    rg -q 'custom_model_catalog_is_sorted_deduplicated' src/ipc/mod.rs &&
+    rg -q 'provider_api_key' src/auth/mod.rs src/providers/mod.rs
+} || fail 'Custom provider model discovery'
+pass 'Custom provider discovers models through authenticated root admin IPC'
+{
+    rg -q 'auto_restart_enabled' module/watchdog.sh module/common.sh &&
+    rg -q '2097152' module/common.sh &&
+    rg -q 'rotate_xiao_log.*XIAO_WATCHDOG_LOG' module/common.sh &&
+    rg -q "trap 'cleanup'" module/watchdog.sh &&
+    rg -q 'HOME="\$XIAO_DATA_DIR" XIAO_HOME="\$XIAO_DATA_DIR"' module/watchdog.sh &&
+    rg -q 'XIAO_CONFIG="\$XIAO_CONFIG" XIAO_CLIENT_CONFIG="\$XIAO_CLIENT_CONFIG"' module/watchdog.sh
+} || fail 'KernelSU watchdog hardening'
+pass 'KernelSU watchdog has boot-safe environment, graceful stop, backoff, auto-restart and bounded logs'
+for f in module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh; do sh -n "$f"; done
+for f in packaging/build-module.sh scripts/acceptance.sh; do bash -n "$f"; done
 pass 'Shell syntax'
-node --check webui/assets/app.js >/dev/null
-node --check webui/assets/ksu-bridge.js >/dev/null
+node --check module/webroot/assets/app.js >/dev/null
+node --check module/webroot/assets/ksu-bridge.js >/dev/null
 pass 'WebUI JavaScript syntax'
 python - <<'PY'
 import tomllib
@@ -151,17 +181,5 @@ for p in [
 PY
 pass 'Example TOML parses'
 
-if command -v cargo >/dev/null 2>&1; then
-  cargo fmt --all -- --check
-  cargo check --locked --all-targets --all-features
-  cargo test --locked --all-targets --all-features
-  cargo clippy --locked --all-targets --all-features -- -D warnings
-  cargo build --locked --release --all-features
-  [ -f Cargo.lock ] || fail 'Cargo.lock missing after Cargo validation'
-  pass 'Rust format/check/tests/clippy/release build'
-elif [ "$require_cargo" -eq 1 ]; then
-  fail 'Cargo required but not installed'
-else
-  printf 'SKIP  Cargo unavailable in this environment; CI is the compile/test authority.\n'
-fi
+printf 'SKIP  Rust format/check/test/build run only in GitHub Actions.\n'
 printf '\nStatic acceptance checks completed successfully. Device/provider integration items remain per docs/ACCEPTANCE.md.\n'

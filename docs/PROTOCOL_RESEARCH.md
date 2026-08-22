@@ -14,24 +14,41 @@ Research was performed against the current official Telegram Bot API documentati
 
 ## KernelSU Next modules/WebUI
 
-The module follows the current KernelSU module lifecycle: `module.prop`, `customize.sh`, `service.sh`, optional action script, and `webroot/index.html` as WebUI entry point. WebUI is a thin root administration surface over the module's fixed `xiao` binary; application state remains in the daemon and persistent `/data/adb/xiao` directory.
+The module follows the current KernelSU module lifecycle: `module.prop`, `customize.sh`, `post-fs-data.sh`, `service.sh`, action/watchdog scripts, and `webroot/index.html` as WebUI entry point. WebUI is a thin root administration surface routed through `action.sh`; application state remains in the daemon and persistent `/data/adb/xiao` directory.
 
-The JavaScript bridge is isolated in `webui/assets/ksu-bridge.js` so changes in the KernelSU injected execution bridge can be updated without touching application logic.
+The JavaScript bridge is isolated in `module/webroot/assets/ksu-bridge.js` so changes in the KernelSU injected execution bridge can be updated without touching application logic.
 
 ## OpenAI Codex authentication and transport
 
-Cross-checks against current CLIProxyAPI implementation found the device authorization flow using OpenAI's device-auth endpoints and the ChatGPT Codex Responses transport. xiao localizes those endpoints/constants in `AuthManager`/`CodexProvider`; it does not expose them to the Command Core.
+Cross-checks against CLIProxyAPI commit
+`0a14eb70ce19fac1d114bcdb4a476d61adc819e2` found its default Codex login uses
+browser Authorization Code + PKCE with the Codex CLI client, localhost
+callback, offline scope, organization claims, and simplified-flow flag. xiao
+implements that contract in `AuthManager`; the ChatGPT Codex Responses
+transport remains isolated in `CodexProvider`.
+
+[Official OpenAI Codex authentication documentation](https://developers.openai.com/codex/auth/)
+confirms that ChatGPT sign-in opens a browser, returns credentials through a
+local callback, and uses `localhost:1455` for the standard browser flow. The
+exact OAuth query/form compatibility parameters in this patch come from the
+CLIProxyAPI source requested for this implementation.
 
 At the implementation snapshot, CLIProxyAPI's Codex client catalog includes `gpt-5.6-sol` and retains `gpt-5.5` as a required template. xiao therefore uses those as a conservative fallback model list while still allowing config-selected defaults.
 
-The device polling adapter treats HTTP 403/404 as pending states, extracts the ChatGPT account identifier from token claims, stores per-account refresh credentials, and refreshes under an account-scoped lock.
+The callback adapter validates transaction state, extracts the ChatGPT account identifier from token claims, stores per-account refresh credentials, and refreshes under an account-scoped lock. The callback listener exists only while a login transaction is active and expires after five minutes.
 
 ## Antigravity authentication, project discovery, and models
 
-CLIProxyAPI, 9Router, and OmniRoute were cross-checked rather than assuming a static “Gemini OAuth” flow. Current implementations use Google OAuth with offline access, followed by `loadCodeAssist` project/tier discovery and `onboardUser` when no companion project is already available. xiao follows that sequence while requiring the deployment's own Google Desktop OAuth client ID through normal daemon configuration/KernelSU WebUI. An optional OAuth client secret is stored only in `SecretStore`; it is never copied from a third-party project or returned unmasked.
+CLIProxyAPI, 9Router, and OmniRoute were cross-checked rather than assuming a static “Gemini OAuth” flow. xiao's first compatibility patch now follows CLIProxyAPI's installed-app client, scopes, localhost callback, offline consent, userinfo lookup, `loadCodeAssist` project/tier discovery, and `onboardUser` fallback. Operators may override the installed-app client ID and keep its optional secret in `SecretStore`; the default needs no extra WebUI setup.
 
 OmniRoute's active catalog on 2026-08-20 shows newer Antigravity IDs including Gemini 3.7 Flash tiers, `gemini-pro-agent` for the live Gemini 3.1 Pro High path, Gemini 3.1 Pro Low, and current Claude 4.6 IDs. xiao uses a small static fallback list of current callable IDs; the adapter boundary is intentionally the place to add authenticated live model discovery later without changing session/command/UI contracts.
 
 ## Custom provider
 
-Custom transport assumptions are explicitly configured: OpenAI Responses-compatible or Chat Completions-compatible. Base URL, models, and non-secret headers are normal config. API keys are written only to SecretStore. This avoids silently assuming every OpenAI-compatible server has identical auth or endpoint behavior.
+Custom transport assumptions are explicitly configured: OpenAI
+Responses-compatible or Chat Completions-compatible. Base URL, models, and
+non-secret headers are normal config. API keys are written only to SecretStore.
+The root WebUI can query `{base_url}/models`, accepts the common OpenAI
+`{"data":[{"id":"…"}]}` shape plus simple model arrays, sorts/deduplicates
+IDs, and reuses a previously stored Bearer key without exposing it. The live
+CLIProxyAPI module at `http://127.0.0.1:8317/v1` is the device E2E target.

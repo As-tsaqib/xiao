@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+[ "${GITHUB_ACTIONS:-}" = true ] || {
+  echo 'Module packaging is GitHub-Actions-only; trigger the ci workflow.' >&2
+  exit 1
+}
+
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 RUST_TARGET=${XIAO_TARGET:-aarch64-linux-android}
 PROFILE=${PROFILE:-release}
 OUT="$ROOT/dist"
-ARCHIVE="$OUT/xiao-v0.1.0-kernelsu-arm64.zip"
+MODULE_VERSION=${VERSION:-$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$ROOT/Cargo.toml")}
+VERSION_CODE=${VERSION_CODE:-$(awk -F. '{ print ($1 * 10000) + ($2 * 100) + $3 }' <<< "$MODULE_VERSION")}
+ARCHIVE="$OUT/xiao-v${MODULE_VERSION}-kernelsu-arm64.zip"
 
 if [ "$RUST_TARGET" = native ]; then
   BUILD="$ROOT/target/$PROFILE"
@@ -30,10 +37,12 @@ cleanup() { rm -rf -- "$STAGE"; }
 trap cleanup EXIT
 
 cp -a "$ROOT/module/." "$STAGE/"
-rm -rf -- "$STAGE/webroot"
-cp -a "$ROOT/webui" "$STAGE/webroot"
-cp "$ROOT/config/config.example.toml" "$STAGE/config.example.toml"
 mkdir -p "$STAGE/bin"
+rm -f "$STAGE/bin/.gitkeep"
+sed -i \
+  -e "s/@MODULE_VERSION@/$MODULE_VERSION/g" \
+  -e "s/@VERSION_CODE@/$VERSION_CODE/g" \
+  "$STAGE/module.prop"
 install -m 0755 "$BUILD/xiaod" "$STAGE/bin/xiaod"
 install -m 0755 "$BUILD/xiao" "$STAGE/bin/xiao"
 
@@ -41,12 +50,16 @@ find "$STAGE" -type d -exec chmod 0755 {} +
 find "$STAGE" -type f -exec chmod 0644 {} +
 find "$STAGE" -type f -name '*.sh' -exec chmod 0755 {} +
 chmod 0755 "$STAGE/bin/xiao" "$STAGE/bin/xiaod"
+chmod 0755 "$STAGE/termux/xiao-wrapper"
 
 required=(
   module.prop
   customize.sh
+  common.sh
+  termux.sh
+  post-fs-data.sh
   service.sh
-  supervisor.sh
+  watchdog.sh
   action.sh
   uninstall.sh
   skip_mount
@@ -57,6 +70,7 @@ required=(
   webroot/assets/app.js
   webroot/assets/app.css
   webroot/assets/ksu-bridge.js
+  termux/xiao-wrapper
 )
 for entry in "${required[@]}"; do
   [ -e "$STAGE/$entry" ] || {
@@ -72,13 +86,25 @@ for script in "$STAGE"/*.sh; do
     exit 1
   }
 done
+sh -n "$STAGE/termux/xiao-wrapper"
+head -n 1 "$STAGE/termux/xiao-wrapper" | grep -Fxq '#!/system/bin/sh'
 
 grep -Fxq 'id=xiao' "$STAGE/module.prop"
+grep -Fxq "version=v$MODULE_VERSION" "$STAGE/module.prop"
+grep -Fxq "versionCode=$VERSION_CODE" "$STAGE/module.prop"
+if grep -Fq '@MODULE_VERSION@' "$STAGE/module.prop"; then
+  echo 'Unresolved module version placeholder' >&2
+  exit 1
+fi
+if grep -Fq '@VERSION_CODE@' "$STAGE/module.prop"; then
+  echo 'Unresolved module version-code placeholder' >&2
+  exit 1
+fi
 grep -Fq '/data/adb/xiao' "$STAGE/config.example.toml"
-cmp "$ROOT/webui/index.html" "$STAGE/webroot/index.html"
-cmp "$ROOT/webui/assets/app.js" "$STAGE/webroot/assets/app.js"
-cmp "$ROOT/webui/assets/app.css" "$STAGE/webroot/assets/app.css"
-cmp "$ROOT/webui/assets/ksu-bridge.js" "$STAGE/webroot/assets/ksu-bridge.js"
+cmp "$ROOT/module/webroot/index.html" "$STAGE/webroot/index.html"
+cmp "$ROOT/module/webroot/assets/app.js" "$STAGE/webroot/assets/app.js"
+cmp "$ROOT/module/webroot/assets/app.css" "$STAGE/webroot/assets/app.css"
+cmp "$ROOT/module/webroot/assets/ksu-bridge.js" "$STAGE/webroot/assets/ksu-bridge.js"
 
 if find "$STAGE" -type f \( -name '*.db' -o -name '*.db-*' -o -name '*.secret' \
   -o -name '*.log' -o -name '*.pid' -o -name 'client.toml' \) | grep -q .; then
