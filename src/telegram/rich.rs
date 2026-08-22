@@ -289,10 +289,7 @@ mod tests {
             rendered["blocks"][0]["text"][0]["custom_emoji_id"],
             AI_ACTION_SEARCHING
         );
-        assert_eq!(
-            rendered["blocks"][0]["text"][0]["alternative_text"],
-            "🔎"
-        );
+        assert_eq!(rendered["blocks"][0]["text"][0]["alternative_text"], "🔎");
         assert_eq!(rendered["blocks"][0]["text"][1], " Searching the web");
     }
 

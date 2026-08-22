@@ -729,12 +729,7 @@ impl ProgressAggregator {
         self.set_active_entry(label, activity, None);
     }
 
-    fn set_active_for_tool(
-        &mut self,
-        label: String,
-        activity: ProgressActivity,
-        tool: String,
-    ) {
+    fn set_active_for_tool(&mut self, label: String, activity: ProgressActivity, tool: String) {
         self.set_active_entry(label, activity, Some(normalize_tool_name(&tool)));
     }
 
@@ -1216,11 +1211,7 @@ mod tests {
                 ProgressActivity::Searching,
                 "Searching the web",
             ),
-            (
-                "web_fetch",
-                ProgressActivity::Fetching,
-                "Fetching a page",
-            ),
+            ("web_fetch", ProgressActivity::Fetching, "Fetching a page"),
             (
                 "context_stats",
                 ProgressActivity::Analyzing,
