@@ -26,6 +26,8 @@ pub struct AppConfig {
     pub providers: ProvidersConfig,
     #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub attachments: AttachmentConfig,
 }
 
 impl AppConfig {
@@ -104,6 +106,20 @@ impl AppConfig {
             return Err(anyhow!(
                 "agent.summary_threshold_chars must be at least 1024 and not exceed agent.context_max_chars"
             ));
+        }
+        if !(64 * 1024..=100 * 1024 * 1024).contains(&self.attachments.max_image_bytes)
+            || !(64 * 1024..=200 * 1024 * 1024).contains(&self.attachments.max_document_bytes)
+            || self.attachments.max_session_bytes < self.attachments.max_document_bytes
+            || self.attachments.max_session_bytes > 1024 * 1024 * 1024
+        {
+            return Err(anyhow!("attachment byte limits are invalid"));
+        }
+        if !(1_000_000..=100_000_000).contains(&self.attachments.max_image_pixels)
+            || !(512..=16_384).contains(&self.attachments.chunk_chars)
+            || !(1..=20).contains(&self.attachments.retrieval_chunks)
+            || !(1..=120).contains(&self.attachments.processing_timeout_seconds)
+        {
+            return Err(anyhow!("attachment processing limits are invalid"));
         }
         if !(1_024..=65_536).contains(&self.agent.tool_output_max_chars) {
             return Err(anyhow!(
@@ -214,6 +230,41 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentConfig {
+    #[serde(default = "default_attachment_image_bytes")]
+    pub max_image_bytes: u64,
+    #[serde(default = "default_attachment_document_bytes")]
+    pub max_document_bytes: u64,
+    #[serde(default = "default_attachment_session_bytes")]
+    pub max_session_bytes: u64,
+    #[serde(default = "default_attachment_image_pixels")]
+    pub max_image_pixels: u64,
+    #[serde(default = "default_attachment_text_chars")]
+    pub max_extracted_text_chars: usize,
+    #[serde(default = "default_attachment_chunk_chars")]
+    pub chunk_chars: usize,
+    #[serde(default = "default_attachment_retrieval_chunks")]
+    pub retrieval_chunks: usize,
+    #[serde(default = "default_attachment_processing_timeout")]
+    pub processing_timeout_seconds: u64,
+}
+
+impl Default for AttachmentConfig {
+    fn default() -> Self {
+        Self {
+            max_image_bytes: default_attachment_image_bytes(),
+            max_document_bytes: default_attachment_document_bytes(),
+            max_session_bytes: default_attachment_session_bytes(),
+            max_image_pixels: default_attachment_image_pixels(),
+            max_extracted_text_chars: default_attachment_text_chars(),
+            chunk_chars: default_attachment_chunk_chars(),
+            retrieval_chunks: default_attachment_retrieval_chunks(),
+            processing_timeout_seconds: default_attachment_processing_timeout(),
+        }
     }
 }
 
@@ -572,6 +623,30 @@ fn default_summary_threshold_chars() -> usize {
 }
 fn default_tool_output_max_chars() -> usize {
     4_096
+}
+fn default_attachment_image_bytes() -> u64 {
+    20 * 1024 * 1024
+}
+fn default_attachment_document_bytes() -> u64 {
+    50 * 1024 * 1024
+}
+fn default_attachment_session_bytes() -> u64 {
+    200 * 1024 * 1024
+}
+fn default_attachment_image_pixels() -> u64 {
+    40_000_000
+}
+fn default_attachment_text_chars() -> usize {
+    2_000_000
+}
+fn default_attachment_chunk_chars() -> usize {
+    4_000
+}
+fn default_attachment_retrieval_chunks() -> usize {
+    6
+}
+fn default_attachment_processing_timeout() -> u64 {
+    30
 }
 fn default_google_auth_url() -> String {
     "https://accounts.google.com/o/oauth2/v2/auth".into()

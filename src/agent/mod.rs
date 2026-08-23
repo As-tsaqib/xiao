@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    attachments::AttachmentManager,
     config::AgentConfig,
     context::{ContextEngine, SessionHistoryStore},
     learning::{LearningEvaluator, LearningTrace, SafeToolObservation},
@@ -69,6 +70,7 @@ pub struct AgentEngine {
     memory_store: Arc<MemoryStore>,
     skill_registry: Arc<SkillRegistry>,
     context_engine: ContextEngine,
+    attachments: Option<Arc<AttachmentManager>>,
 }
 
 impl AgentEngine {
@@ -128,6 +130,7 @@ impl AgentEngine {
         providers: Arc<ProviderRegistry>,
         config: AgentConfig,
         runtime: Arc<RuntimeState>,
+        attachments: Option<Arc<AttachmentManager>>,
     ) -> Self {
         let tools = Arc::new(ToolRegistry::with_runtime(
             ToolPolicy::default(),
@@ -220,7 +223,15 @@ impl AgentEngine {
                 .register(AndroidXiaoRestartTool::new(broker))
                 .expect("register typed Android restart tool");
         }
-        Self::with_registry_runtime(sessions, storage, providers, config, tools, Some(runtime))
+        Self::with_registry_runtime(
+            sessions,
+            storage,
+            providers,
+            config,
+            tools,
+            Some(runtime),
+            attachments,
+        )
     }
 
     pub fn with_registry(
@@ -230,7 +241,7 @@ impl AgentEngine {
         config: AgentConfig,
         tools: Arc<ToolRegistry>,
     ) -> Self {
-        Self::with_registry_runtime(sessions, storage, providers, config, tools, None)
+        Self::with_registry_runtime(sessions, storage, providers, config, tools, None, None)
     }
 
     fn with_registry_runtime(
@@ -240,6 +251,7 @@ impl AgentEngine {
         config: AgentConfig,
         tools: Arc<ToolRegistry>,
         runtime: Option<Arc<RuntimeState>>,
+        attachments: Option<Arc<AttachmentManager>>,
     ) -> Self {
         let memory = Arc::new(if let Some(runtime) = &runtime {
             MemoryStore::with_workspace(storage.clone(), runtime.workspace())
@@ -247,7 +259,12 @@ impl AgentEngine {
             MemoryStore::new(storage.clone())
         });
         let context_engine = if let Some(runtime) = &runtime {
-            ContextEngine::with_runtime(storage.clone(), config.clone(), runtime.clone())
+            ContextEngine::with_runtime_and_attachments(
+                storage.clone(),
+                config.clone(),
+                runtime.clone(),
+                attachments.clone(),
+            )
         } else {
             ContextEngine::new(storage.clone(), config.clone())
         };
@@ -275,6 +292,7 @@ impl AgentEngine {
             memory_store: memory,
             skill_registry,
             context_engine,
+            attachments,
         }
     }
 
@@ -395,26 +413,31 @@ impl AgentEngine {
                 return Err(error);
             }
         };
-        let resolved_model = match self
-            .providers
-            .resolve_model(&ctx.active.provider, &ctx.active.model)
-        {
+        let resolved_model = match self.providers.resolve_model_for(
+            &ctx.active.provider,
+            &ctx.active.model,
+            ctx.active.account_id.as_deref(),
+        ) {
             Ok(model) => model,
             Err(error) => {
                 self.active.lock().unwrap().remove(&active_key);
                 return Err(error);
             }
         };
-        let semantic = Arc::new(if provider.supports_semantic_evaluation(&resolved_model) {
-            SemanticEvaluator::with_provider(
-                provider.clone(),
-                ctx.active.id.clone(),
-                ctx.active.account_id.clone(),
-                resolved_model.clone(),
-            )
-        } else {
-            SemanticEvaluator::deterministic()
-        });
+        let semantic = Arc::new(
+            if provider
+                .supports_semantic_evaluation_for(&resolved_model, ctx.active.account_id.as_deref())
+            {
+                SemanticEvaluator::with_provider(
+                    provider.clone(),
+                    ctx.active.id.clone(),
+                    ctx.active.account_id.clone(),
+                    resolved_model.clone(),
+                )
+            } else {
+                SemanticEvaluator::deterministic()
+            },
+        );
         let memory_evaluator = Arc::new(MemoryEvaluator::with_semantic(
             self.memory_store.clone(),
             semantic.clone(),
@@ -502,7 +525,36 @@ impl AgentEngine {
                 cancellation: token.clone(),
                 progress: Some(tool_progress_tx),
             };
-            let provider_capabilities = provider.capabilities(&resolved_model);
+            let provider_capabilities = provider.capabilities_for(
+                &resolved_model,
+                ctx.active.account_id.as_deref(),
+            );
+            let images = if let Some(attachments) = &self.attachments {
+                let referenced = attachments.recent_for_prompt(
+                    principal,
+                    &ctx.active.id,
+                    prompt,
+                    4,
+                )?;
+                if let Some(document) = referenced
+                    .iter()
+                    .find(|attachment| attachment.processing_status == "needs_ocr")
+                {
+                    return Err(anyhow!(
+                        "{} has no meaningful embedded text. OCR or an explicit PDF-to-image vision path is required; Xiao will not pretend the document was read.",
+                        document.original_name
+                    ));
+                }
+                let images = attachments.normalized_images(principal, &ctx.active.id, prompt)?;
+                if !images.is_empty() && !provider_capabilities.vision {
+                    return Err(anyhow!(
+                        "selected provider/model does not declare vision capability. Switch to a vision-capable model in /model before asking Xiao to inspect this image"
+                    ));
+                }
+                images
+            } else {
+                Vec::new()
+            };
             if provider_capabilities.tool_protocol == ToolProtocol::ChatOnly
                 && tokio::select! {
                     _ = token.cancelled() => return Err(anyhow!("generation cancelled during task classification")),
@@ -525,6 +577,7 @@ impl AgentEngine {
                 model: resolved_model,
                 messages: context,
                 tools: available_tools,
+                images,
             };
             let started = AgentEvent::GenerationStarted;
             if let Some(tx) = &progress { let _ = tx.send(started.clone()); }
@@ -791,7 +844,7 @@ impl AgentEngine {
                             self.storage.set_tool_run_status(&tool_run_id, "running", None, None)?;
                             let tool_remaining = std::time::Duration::from_secs(self.config.max_runtime_seconds)
                                 .saturating_sub(run_started.elapsed());
-                            let execution=tokio::select!{
+                            let mut execution=tokio::select!{
                                 _=token.cancelled()=>{
                                     self.storage.set_tool_run_status(
                                         &tool_run_id,
@@ -812,6 +865,53 @@ impl AgentEngine {
                                 },
                                 result=self.tools.execute(&call,&tool_context)=>result
                             };
+                            if execution.status == crate::tools::ToolRunStatus::AwaitingApproval {
+                                self.storage.set_tool_run_status(
+                                    &tool_run_id,
+                                    "awaiting_approval",
+                                    None,
+                                    Some(&execution.result.output),
+                                )?;
+                                self.storage.set_agent_run_status(
+                                    principal,
+                                    &agent_run_id,
+                                    "awaiting_approval",
+                                    None,
+                                )?;
+                                let approval_status = AgentEvent::Status(format!(
+                                    "Owner approval required before continuing: {}",
+                                    execution.result.output
+                                ));
+                                if let Some(tx) = &progress { let _ = tx.send(approval_status.clone()); }
+                                provider_events.push(approval_status);
+                                let wait_for = tool_remaining.min(std::time::Duration::from_secs(15 * 60));
+                                match self.tools.wait_for_exact_approval(
+                                    &call,
+                                    &tool_context,
+                                    wait_for,
+                                    token.clone(),
+                                ).await? {
+                                    crate::tools::ApprovalWaitStatus::Approved => {
+                                        self.storage.set_agent_run_status(principal, &agent_run_id, "running", None)?;
+                                        self.storage.set_tool_run_status(&tool_run_id, "running", None, None)?;
+                                        execution = self.tools.execute(&call, &tool_context).await;
+                                    }
+                                    crate::tools::ApprovalWaitStatus::Denied => {
+                                        self.storage.set_agent_run_status(principal, &agent_run_id, "running", None)?;
+                                        execution.status = crate::tools::ToolRunStatus::Denied;
+                                        execution.result.output = "owner denied this exact operation".into();
+                                    }
+                                    crate::tools::ApprovalWaitStatus::Expired => {
+                                        execution.result.output = "exact approval expired before it could be consumed".into();
+                                    }
+                                    crate::tools::ApprovalWaitStatus::TimedOut => {
+                                        execution.result.output = "approval wait reached the bounded runtime limit".into();
+                                    }
+                                    crate::tools::ApprovalWaitStatus::Cancelled => {
+                                        return Err(anyhow!("generation cancelled while awaiting approval"));
+                                    }
+                                }
+                            }
                             if execution.approval_mode.is_some()
                                 || execution.policy_original.is_some()
                             {
@@ -833,14 +933,6 @@ impl AgentEngine {
                                 output,
                                 error,
                             )?;
-                            if execution.status == crate::tools::ToolRunStatus::AwaitingApproval {
-                                let approval_status = AgentEvent::Status(format!(
-                                    "Owner approval required before continuing: {}",
-                                    result.output
-                                ));
-                                if let Some(tx) = &progress { let _ = tx.send(approval_status.clone()); }
-                                provider_events.push(approval_status);
-                            }
                             if result.is_error {
                                 failed_actions.insert(action_signature);
                             } else {
@@ -1524,6 +1616,10 @@ mod tests {
         }
         fn capabilities(&self, _model: &str) -> ProviderCapabilities {
             ProviderCapabilities {
+                text: true,
+                vision: false,
+                file_input: false,
+                native_tools: self.protocol == ToolProtocol::Native,
                 tool_protocol: self.protocol,
                 model_discovery: self.id.starts_with("custom"),
                 structured_output: true,

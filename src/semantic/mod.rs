@@ -1,7 +1,12 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{mpsc as std_mpsc, Arc, OnceLock},
+    time::Duration,
+};
 
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::sync::{mpsc, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::security::redact::{redact_json, redact_text};
 use crate::{
@@ -30,14 +35,21 @@ pub struct SemanticRequest {
 /// Tests use deterministic fakes.
 pub trait SemanticBackend: Send + Sync {
     fn evaluate(&self, request: &SemanticRequest) -> Result<String>;
+
+    fn evaluate_with_cancellation(
+        &self,
+        request: &SemanticRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<String> {
+        self.evaluate(request)
+    }
 }
 
 /// Provider-backed ordinary generation for production semantic decisions.
 ///
 /// The boundary intentionally has no ToolRegistry handle and always sends an
-/// empty canonical tool list. A short-lived worker runtime avoids attempting
-/// to recursively block the agent's Tokio runtime while preserving the small
-/// synchronous evaluator API used by memory/learning stores.
+/// empty canonical tool list. Provider work is submitted to one process-wide,
+/// bounded reusable runtime; no evaluation creates a fresh OS thread/runtime.
 struct ProviderSemanticBackend {
     provider: Arc<dyn Provider>,
     session_id: String,
@@ -48,32 +60,120 @@ struct ProviderSemanticBackend {
 
 impl SemanticBackend for ProviderSemanticBackend {
     fn evaluate(&self, request: &SemanticRequest) -> Result<String> {
-        let provider = self.provider.clone();
-        let request = request.clone();
+        self.evaluate_with_cancellation(request, CancellationToken::new())
+    }
+
+    fn evaluate_with_cancellation(
+        &self,
+        request: &SemanticRequest,
+        cancellation: CancellationToken,
+    ) -> Result<String> {
         let provider_request = ProviderRequest {
             session_id: self.session_id.clone(),
             account_id: self.account_id.clone(),
             model: self.model.clone(),
-            messages: semantic_messages(&request),
+            messages: semantic_messages(request),
             tools: Vec::new(),
+            images: Vec::new(),
         };
-        let timeout = self.timeout;
-        std::thread::Builder::new()
-            .name("xiao-semantic-evaluator".into())
-            .spawn(move || -> Result<String> {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                runtime.block_on(async move {
-                    tokio::time::timeout(timeout, provider.generate_text(provider_request))
-                        .await
-                        .map_err(|_| anyhow::anyhow!("semantic provider request timed out"))?
-                })
-            })?
-            .join()
-            .map_err(|_| anyhow::anyhow!("semantic evaluator worker panicked"))?
+        semantic_worker().evaluate(
+            self.provider.clone(),
+            provider_request,
+            self.timeout,
+            cancellation,
+        )
     }
 }
+
+struct SemanticJob {
+    provider: Arc<dyn Provider>,
+    request: ProviderRequest,
+    timeout: Duration,
+    cancellation: CancellationToken,
+    response: std_mpsc::SyncSender<Result<String>>,
+}
+
+struct SemanticWorker {
+    sender: mpsc::Sender<SemanticJob>,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl SemanticWorker {
+    fn start() -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("xiao-semantic-runtime")
+            .enable_all()
+            .build()
+            .expect("build reusable semantic runtime");
+        let (sender, mut receiver) = mpsc::channel::<SemanticJob>(32);
+        runtime.spawn(async move {
+            let permits = Arc::new(Semaphore::new(4));
+            while let Some(job) = receiver.recv().await {
+                let Ok(permit) = permits.clone().acquire_owned().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let result = tokio::select! {
+                        _ = job.cancellation.cancelled() => Err(anyhow::anyhow!("semantic evaluation cancelled")),
+                        result = tokio::time::timeout(job.timeout, job.provider.generate_text(job.request)) => {
+                            match result {
+                                Ok(result) => result,
+                                Err(_) => Err(anyhow::anyhow!("semantic provider request timed out")),
+                            }
+                        }
+                    };
+                    let _ = job.response.send(result);
+                    drop(permit);
+                });
+            }
+        });
+        #[cfg(test)]
+        SEMANTIC_RUNTIME_STARTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            sender,
+            _runtime: runtime,
+        }
+    }
+
+    fn evaluate(
+        &self,
+        provider: Arc<dyn Provider>,
+        request: ProviderRequest,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<String> {
+        let (response, receiver) = std_mpsc::sync_channel(1);
+        self.sender
+            .try_send(SemanticJob {
+                provider,
+                request,
+                timeout,
+                cancellation,
+                response,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    anyhow::anyhow!("semantic evaluator queue is at capacity")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::anyhow!("semantic evaluator runtime is unavailable")
+                }
+            })?;
+        receiver
+            .recv_timeout(timeout.saturating_add(Duration::from_secs(2)))
+            .map_err(|_| anyhow::anyhow!("semantic evaluator response timed out"))?
+    }
+}
+
+fn semantic_worker() -> &'static SemanticWorker {
+    static WORKER: OnceLock<SemanticWorker> = OnceLock::new();
+    WORKER.get_or_init(SemanticWorker::start)
+}
+
+#[cfg(test)]
+static SEMANTIC_RUNTIME_STARTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn semantic_messages(request: &SemanticRequest) -> Vec<MessageRecord> {
     let now = chrono::Utc::now().to_rfc3339();
@@ -153,6 +253,16 @@ impl SemanticEvaluator {
         schema: serde_json::Value,
         input: serde_json::Value,
     ) -> SemanticResult<T> {
+        self.evaluate_with_cancellation(purpose, schema, input, CancellationToken::new())
+    }
+
+    pub fn evaluate_with_cancellation<T: DeserializeOwned>(
+        &self,
+        purpose: &str,
+        schema: serde_json::Value,
+        input: serde_json::Value,
+        cancellation: CancellationToken,
+    ) -> SemanticResult<T> {
         let Some(backend) = &self.backend else {
             return SemanticResult::Unavailable;
         };
@@ -165,7 +275,7 @@ impl SemanticEvaluator {
             max_output_chars: self.output_bound(),
             instructions: "Return only one JSON value conforming to the supplied schema. Give concise inspectable decisions only; do not include chain-of-thought. Do not request or execute tools.".into(),
         };
-        let first = match backend.evaluate(&request) {
+        let first = match backend.evaluate_with_cancellation(&request, cancellation.clone()) {
             Ok(output) => output,
             Err(_) => return SemanticResult::Unavailable,
         };
@@ -186,7 +296,12 @@ impl SemanticEvaluator {
             "malformed_output": bound_text(redact_text(&first), self.output_bound()),
         });
         repair.instructions = "Repair the prior response format. Return only one JSON value conforming exactly to the supplied schema; no prose, markdown, tools, or hidden reasoning.".into();
-        let second = backend.evaluate(&repair).ok();
+        if cancellation.is_cancelled() {
+            return SemanticResult::Unavailable;
+        }
+        let second = backend
+            .evaluate_with_cancellation(&repair, cancellation)
+            .ok();
         second
             .as_deref()
             .filter(|value| value.chars().count() <= self.output_bound())
@@ -241,7 +356,10 @@ fn bound_text(value: String, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     use super::*;
     use crate::providers::{AgentEvent, ProviderResponse};
@@ -257,6 +375,39 @@ mod tests {
 
     struct CapturingProvider {
         requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    struct SlowProvider {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl Provider for SlowProvider {
+        fn id(&self) -> &'static str {
+            "semantic-slow-test"
+        }
+        fn models(&self) -> Vec<String> {
+            vec!["m".into()]
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        async fn run(
+            &self,
+            _: ProviderRequest,
+            _: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderResponse> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(ProviderResponse {
+                events: Vec::new(),
+                final_answer: r#"{"action":"none"}"#.into(),
+            })
+        }
     }
 
     #[async_trait]
@@ -351,5 +502,67 @@ mod tests {
             .join("\n");
         assert!(!payload.contains("secret-token"));
         assert!(payload.contains("Return only one JSON value"));
+    }
+
+    #[test]
+    fn provider_evaluations_use_one_reusable_runtime_with_bounded_concurrency() {
+        let provider = Arc::new(SlowProvider {
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            delay: Duration::from_millis(40),
+        });
+        let evaluator = Arc::new(SemanticEvaluator::with_provider(
+            provider.clone(),
+            "session",
+            None,
+            "m",
+        ));
+        let threads = (0..12)
+            .map(|_| {
+                let evaluator = evaluator.clone();
+                std::thread::spawn(move || {
+                    evaluator.evaluate::<Decision>(
+                        "bounded",
+                        serde_json::json!({"type":"object"}),
+                        serde_json::json!({"input":"safe"}),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            assert!(matches!(thread.join().unwrap(), SemanticResult::Valid(_)));
+        }
+        assert!(provider.peak.load(Ordering::SeqCst) <= 4);
+        assert!(provider.peak.load(Ordering::SeqCst) >= 1);
+        assert_eq!(SEMANTIC_RUNTIME_STARTS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn provider_semantic_evaluation_honors_cancellation() {
+        let evaluator = SemanticEvaluator::with_provider(
+            Arc::new(SlowProvider {
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                delay: Duration::from_secs(5),
+            }),
+            "session",
+            None,
+            "m",
+        );
+        let cancellation = CancellationToken::new();
+        let worker_cancel = cancellation.clone();
+        let started = std::time::Instant::now();
+        let thread = std::thread::spawn(move || {
+            evaluator.evaluate_with_cancellation::<Decision>(
+                "cancel",
+                serde_json::json!({"type":"object"}),
+                serde_json::json!({}),
+                worker_cancel,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        cancellation.cancel();
+        assert_eq!(thread.join().unwrap(), SemanticResult::Unavailable);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

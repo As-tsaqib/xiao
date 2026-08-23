@@ -26,6 +26,7 @@ use tokio::{
 use crate::{
     agent::AgentAnswer,
     app::AppState,
+    attachments::{AttachmentIngest, AttachmentKind},
     auth::{AuthChallenge, AuthEvent},
     command::CommandResult,
     presentation::{
@@ -52,6 +53,14 @@ pub struct TelegramAdapter {
     /// two callbacks/commands cannot race a multi-step UI/state transition. Long
     /// generation deliberately does not hold this lane; `/stop` remains a fast path.
     principal_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+}
+
+struct CustomInputContext<'a> {
+    scope: TelegramScope,
+    user_id: i64,
+    update_id: i64,
+    message_id: i64,
+    principal: &'a str,
 }
 
 impl TelegramAdapter {
@@ -172,8 +181,9 @@ impl TelegramAdapter {
     async fn allowed(&self, chat_id: i64, user_id: Option<i64>, kind: &str) -> bool {
         self.policy().await.allows(chat_id, user_id, kind)
     }
-    fn principal(chat_id: i64, user_id: i64) -> String {
-        format!("telegram:{chat_id}:{user_id}")
+    #[cfg(test)]
+    fn principal(user_id: i64) -> String {
+        crate::owner::OwnerIdentity::telegram(user_id).owner_id
     }
     fn principal_lock(&self, principal: &str) -> Arc<AsyncMutex<()>> {
         let mut lanes = self
@@ -200,6 +210,7 @@ impl TelegramAdapter {
     }
 
     async fn handle_update(&self, update: Update) -> Result<()> {
+        self.cleanup_expired_custom_credentials();
         if let Some(callback) = update.callback_query {
             return self.handle_callback(callback).await;
         }
@@ -207,6 +218,12 @@ impl TelegramAdapter {
             return self.handle_message(update.update_id, message).await;
         }
         Ok(())
+    }
+
+    fn cleanup_expired_custom_credentials(&self) {
+        for reference in self.custom_logins.take_expired_credential_refs() {
+            let _ = self.app.auth.logout(&reference);
+        }
     }
 
     async fn handle_message(&self, update_id: i64, message: Message) -> Result<()> {
@@ -219,61 +236,95 @@ impl TelegramAdapter {
         {
             return Ok(());
         }
-        let Some(text) = message.text.as_deref() else {
-            return Ok(());
-        };
         let scope = message.scope();
-        let principal = Self::principal(message.chat.id, user.id);
+        let principal = self.app.resolve_telegram_owner(user.id)?.owner_id;
 
         // UI capture is checked after ACL but before slash parsing or agent dispatch.
         if let Some(menu) = self.menus.pending_for_scope(scope, user.id) {
             let mut guard = menu.lock().await;
-            if let Some(prefix) = guard.pending_input.take() {
-                if prefix.starts_with("custom:") {
-                    if let Err(error) = self
-                        .handle_custom_input(
-                            &mut guard,
-                            scope,
-                            user.id,
-                            message.message_id,
-                            &prefix,
-                            text,
-                        )
-                        .await
-                    {
-                        guard.current_view = View::info("CUSTOM LOGIN", error.to_string());
-                        guard.current_view.actions = vec![vec![Action::close()]];
-                    }
-                    guard.revision += 1;
-                    self.edit_first(&mut guard).await?;
-                    return Ok(());
-                }
-                let command = format!("{} {}", prefix, text.trim());
-                match self.execute_serialized(&principal, scope, &command).await {
-                    Ok(result) => {
-                        let next = result_view(result)?;
-                        guard.current_view = next;
+            if let Some(text) = message.text.as_deref() {
+                if let Some(prefix) = guard.pending_input.take() {
+                    if prefix.starts_with("custom:") {
+                        if let Err(error) = self
+                            .handle_custom_input(
+                                &mut guard,
+                                &prefix,
+                                text,
+                                CustomInputContext {
+                                    scope,
+                                    user_id: user.id,
+                                    update_id,
+                                    message_id: message.message_id,
+                                    principal: &principal,
+                                },
+                            )
+                            .await
+                        {
+                            let wizard_id = prefix.split(':').nth(1).unwrap_or_default();
+                            let endpoint = self
+                                .custom_logins
+                                .get(wizard_id)
+                                .and_then(|wizard| wizard.try_lock().ok()?.endpoint.clone());
+                            guard.current_view = login::failure_view(
+                                wizard_id,
+                                endpoint.as_deref(),
+                                &classify_custom_error(&error),
+                            );
+                        }
                         guard.revision += 1;
-                        self.edit_first(&mut guard).await?;
+                        self.advance_menu_prompt(&mut guard).await?;
                         return Ok(());
                     }
-                    Err(error) => {
-                        guard.pending_input = Some(prefix);
-                        guard.current_view = View {
-                            title: Some("RENAME SESSION".into()),
-                            blocks: vec![Block::Paragraph {
-                                text: format!("{}\nSend another name or use Back.", error),
-                            }],
-                            actions: vec![vec![Action::back(), Action::close()]],
-                            side_mode: false,
-                        };
-                        guard.revision += 1;
-                        self.edit_first(&mut guard).await?;
-                        return Ok(());
+                    let command = format!("{} {}", prefix, text.trim());
+                    match self.execute_serialized(&principal, scope, &command).await {
+                        Ok(result) => {
+                            let next = result_view(result)?;
+                            guard.current_view = next;
+                            guard.revision += 1;
+                            self.edit_first(&mut guard).await?;
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            guard.pending_input = Some(prefix);
+                            guard.current_view = View {
+                                title: Some("RENAME SESSION".into()),
+                                blocks: vec![Block::Paragraph {
+                                    text: format!("{}\nSend another name or use Back.", error),
+                                }],
+                                actions: vec![vec![Action::back(), Action::close()]],
+                                side_mode: false,
+                            };
+                            guard.revision += 1;
+                            self.edit_first(&mut guard).await?;
+                            return Ok(());
+                        }
                     }
                 }
             }
         }
+
+        let attachment_prompt = match self
+            .ingest_telegram_attachment(&principal, scope, &message)
+            .await
+        {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.send_view(
+                    scope,
+                    &View::info(
+                        "ATTACHMENT ERROR",
+                        crate::security::redact::redact_text(&error.to_string()),
+                    ),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let text = match attachment_prompt.as_deref().or(message.text.as_deref()) {
+            Some(text) => text,
+            None => return Ok(()),
+        };
 
         let is_agent_request =
             !text.trim_start().starts_with('/') || text.trim_start().starts_with("/retry");
@@ -308,6 +359,109 @@ impl TelegramAdapter {
                 .await
                 .map(|_| ()),
         }
+    }
+
+    async fn ingest_telegram_attachment(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        message: &Message,
+    ) -> Result<Option<String>> {
+        let selected = if let Some(photo) = message
+            .photo
+            .iter()
+            .max_by_key(|photo| u64::from(photo.width).saturating_mul(u64::from(photo.height)))
+        {
+            Some((
+                AttachmentKind::Image,
+                photo.file_id.as_str(),
+                photo.file_unique_id.as_str(),
+                format!("photo-{}.jpg", message.message_id),
+                None,
+                photo.file_size,
+            ))
+        } else {
+            message.document.as_ref().map(|document| {
+                (
+                    AttachmentKind::Document,
+                    document.file_id.as_str(),
+                    document.file_unique_id.as_str(),
+                    document
+                        .file_name
+                        .clone()
+                        .unwrap_or_else(|| format!("document-{}", message.message_id)),
+                    document.mime_type.clone(),
+                    document.file_size,
+                )
+            })
+        };
+        let Some((kind, file_id, unique_id, original_name, declared_mime, declared_size)) =
+            selected
+        else {
+            return Ok(None);
+        };
+        let max_bytes = self.app.attachments.max_download_bytes(kind);
+        if declared_size.is_some_and(|size| size > max_bytes) {
+            return Err(anyhow!(
+                "Telegram attachment exceeds the configured {} byte limit",
+                max_bytes
+            ));
+        }
+        let file = self.client.get_file(file_id).await?;
+        if file.file_size.is_some_and(|size| size > max_bytes) {
+            return Err(anyhow!(
+                "Telegram attachment exceeds the configured {} byte limit",
+                max_bytes
+            ));
+        }
+        let bytes = self
+            .client
+            .download_file_bounded(&file.file_path, max_bytes)
+            .await?;
+        let context = self.app.sessions.context_for_telegram(principal, scope)?;
+        let manager = self.app.attachments.clone();
+        let processing_timeout = manager.processing_timeout();
+        let owner = principal.to_owned();
+        let session_id = context.active.id;
+        let telegram_file_id = file_id.to_owned();
+        let telegram_unique_id = unique_id.to_owned();
+        let processing = tokio::task::spawn_blocking(move || {
+            manager.ingest(AttachmentIngest {
+                owner_id: owner,
+                session_id,
+                telegram_file_id: Some(telegram_file_id),
+                telegram_unique_id: Some(telegram_unique_id),
+                original_name,
+                declared_mime,
+                expected_kind: kind,
+                bytes,
+            })
+        });
+        let record = tokio::time::timeout(processing_timeout, processing)
+            .await
+            .map_err(|_| anyhow!("attachment processing exceeded the configured timeout"))?
+            .map_err(|_| anyhow!("attachment processor terminated unexpectedly"))??;
+        let caption = message
+            .caption
+            .as_deref()
+            .map(str::trim)
+            .filter(|caption| !caption.is_empty())
+            .unwrap_or(match kind {
+                AttachmentKind::Image => {
+                    "Describe this image and answer based only on what is visibly supported."
+                }
+                AttachmentKind::Document => {
+                    "Read this document and summarize the relevant content."
+                }
+            });
+        Ok(Some(format!(
+            "Attachment received: {} (id={}, type={}, status={}). {}",
+            record.original_name,
+            record.attachment_id,
+            record.detected_mime,
+            record.processing_status,
+            caption
+        )))
     }
 
     async fn execute_with_draft(
@@ -455,7 +609,18 @@ impl TelegramAdapter {
             .await?;
         let menu_id = menu.lock().await.id.clone();
         let wizard = self.custom_logins.begin(scope, user_id, menu_id);
-        let wizard_id = wizard.lock().await.id.clone();
+        let mut wizard_guard = wizard.lock().await;
+        wizard_guard.protocol = self
+            .app
+            .config
+            .read()
+            .await
+            .providers
+            .custom
+            .protocol
+            .clone();
+        let wizard_id = wizard_guard.id.clone();
+        drop(wizard_guard);
         let mut guard = menu.lock().await;
         guard.current_view = login::endpoint_view(&wizard_id);
         guard.pending_input = Some(format!("custom:{wizard_id}:endpoint"));
@@ -466,11 +631,9 @@ impl TelegramAdapter {
     async fn handle_custom_input(
         &self,
         menu: &mut MenuSession,
-        scope: TelegramScope,
-        user_id: i64,
-        message_id: i64,
         pending: &str,
         text: &str,
+        context: CustomInputContext<'_>,
     ) -> Result<()> {
         let parts = pending.split(':').collect::<Vec<_>>();
         if parts.len() != 3 || parts[0] != "custom" {
@@ -481,7 +644,7 @@ impl TelegramAdapter {
             .get(parts[1])
             .ok_or_else(|| anyhow!("custom login expired; run /login again"))?;
         let mut wizard = wizard.lock().await;
-        if !wizard.valid_for(user_id, scope, &menu.id) {
+        if !wizard.valid_for(context.user_id, context.scope, &menu.id) {
             return Err(anyhow!(
                 "custom login state does not belong to this topic/menu"
             ));
@@ -489,24 +652,64 @@ impl TelegramAdapter {
         match parts[2] {
             "endpoint" if wizard.phase == CustomLoginPhase::Endpoint => {
                 let endpoint = validate_custom_endpoint(text)?;
+                if wizard.endpoint.as_deref() != Some(endpoint.as_str()) {
+                    self.clear_custom_wizard_credential(&mut wizard)?;
+                }
                 wizard.endpoint = Some(endpoint);
+                wizard.models.clear();
+                wizard.selected_index = None;
+                wizard.capability = None;
                 wizard.phase = CustomLoginPhase::ApiKey;
                 menu.pending_input = Some(format!("custom:{}:api_key", wizard.id));
                 menu.current_view = login::api_key_view(&wizard.id);
             }
             "api_key" if wizard.phase == CustomLoginPhase::ApiKey => {
+                // Credential messages are an exceptional input class: retire
+                // the Telegram copy and scrub Xiao's durable inbox payload as
+                // soon as the expected scoped wizard state recognizes it.
+                let _ = self
+                    .client
+                    .delete_message(context.scope.chat_id, context.message_id)
+                    .await;
+                self.app
+                    .storage
+                    .scrub_telegram_update_payload(context.update_id)?;
                 let key = text.trim();
                 if key.is_empty() || key.chars().count() > 16_384 {
                     menu.pending_input = Some(pending.into());
                     return Err(anyhow!("API key is empty or too long"));
                 }
-                wizard.api_key = Some(zeroize::Zeroizing::new(key.to_owned()));
+                let credential = self.app.auth.create_api_key_credential(
+                    "custom",
+                    &format!("custom-wizard-{}", wizard.id),
+                    key,
+                )?;
+                if let Err(error) = self
+                    .app
+                    .storage
+                    .set_account_owner(context.principal, &credential.id)
+                {
+                    let _ = self.app.auth.logout(&credential.id);
+                    menu.pending_input = Some(pending.into());
+                    return Err(error);
+                }
+                let replacement = credential.id;
+                if let Some(previous) = wizard.credential_ref.replace(replacement.clone()) {
+                    if let Err(error) = self.app.auth.logout(&previous) {
+                        wizard.credential_ref = Some(previous);
+                        let _ = self.app.auth.logout(&replacement);
+                        menu.pending_input = Some(pending.into());
+                        return Err(error.context("replace transient Custom credential"));
+                    }
+                }
+                self.app.storage.audit(
+                    context.principal,
+                    "custom_profile_credential_captured",
+                    &format!("wizard_id={}", wizard.id),
+                )?;
                 wizard.phase = CustomLoginPhase::Alias;
                 menu.pending_input = Some(format!("custom:{}:alias", wizard.id));
                 menu.current_view = login::alias_view(&wizard.id);
-                // Best effort: deletion may be unavailable in some chats, but
-                // the secret is never copied into logs/views/callback data.
-                let _ = self.client.delete_message(scope.chat_id, message_id).await;
             }
             "alias" if wizard.phase == CustomLoginPhase::Alias => {
                 wizard.alias = validate_custom_alias(text)?;
@@ -528,25 +731,37 @@ impl TelegramAdapter {
             .endpoint
             .as_deref()
             .ok_or_else(|| anyhow!("custom endpoint is missing"))?;
-        let headers = self
-            .app
-            .config
-            .read()
+        // Enter the discovery phase before I/O. A failed request can then be
+        // retried or navigated back without confusing it with alias input.
+        wizard.phase = CustomLoginPhase::Models;
+        wizard.models.clear();
+        wizard.selected_index = None;
+        wizard.capability = None;
+        let headers = std::collections::BTreeMap::new();
+        let api_key = match wizard.credential_ref.as_deref() {
+            Some(reference) => self
+                .app
+                .auth
+                .credential(reference)?
+                .and_then(|credential| credential.api_key),
+            None => None,
+        };
+        let models = crate::ipc::fetch_custom_models(endpoint, &headers, api_key.as_deref())
             .await
-            .providers
-            .custom
-            .headers
-            .clone();
-        let models = crate::ipc::fetch_custom_models(
-            endpoint,
-            &headers,
-            wizard.api_key.as_deref().map(|key| key.as_str()),
-        )
-        .await
-        .map_err(|_| anyhow!("endpoint validation/model discovery failed"))?;
+            .map_err(|error| anyhow!(classify_custom_error(&error)))?;
         wizard.models = models;
         wizard.page = 1;
-        wizard.phase = CustomLoginPhase::Models;
+        Ok(())
+    }
+
+    fn clear_custom_wizard_credential(&self, wizard: &mut login::CustomLoginWizard) -> Result<()> {
+        let Some(reference) = wizard.credential_ref.take() else {
+            return Ok(());
+        };
+        if let Err(error) = self.app.auth.logout(&reference) {
+            wizard.credential_ref = Some(reference);
+            return Err(error.context("clear transient Custom credential"));
+        }
         Ok(())
     }
 
@@ -577,7 +792,7 @@ impl TelegramAdapter {
         }
         match parts[1] {
             "skip_key" if wizard.phase == CustomLoginPhase::ApiKey => {
-                wizard.api_key = None;
+                self.clear_custom_wizard_credential(&mut wizard)?;
                 wizard.phase = CustomLoginPhase::Alias;
                 menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
                 menu.current_view = login::alias_view(wizard_id);
@@ -605,13 +820,21 @@ impl TelegramAdapter {
                     .endpoint
                     .as_deref()
                     .ok_or_else(|| anyhow!("custom endpoint is missing"))?;
-                let custom = self.app.config.read().await.providers.custom.clone();
+                let headers = std::collections::BTreeMap::new();
+                let api_key = match wizard.credential_ref.as_deref() {
+                    Some(reference) => self
+                        .app
+                        .auth
+                        .credential(reference)?
+                        .and_then(|credential| credential.api_key),
+                    None => None,
+                };
                 wizard.capability = Some(
                     crate::providers::probe_custom_tool_capability(
                         endpoint,
-                        &custom.headers,
-                        wizard.api_key.as_deref().map(|key| key.as_str()),
-                        &custom.protocol,
+                        &headers,
+                        api_key.as_deref(),
+                        &wizard.protocol,
                         &model,
                     )
                     .await,
@@ -635,6 +858,79 @@ impl TelegramAdapter {
                     vec![vec![Action::command("Model", "/model"), Action::close()]];
                 self.custom_logins.remove(wizard_id);
             }
+            "retry" => match wizard.phase {
+                CustomLoginPhase::Endpoint => {
+                    menu.pending_input = Some(format!("custom:{wizard_id}:endpoint"));
+                    menu.current_view = login::endpoint_view(wizard_id);
+                }
+                CustomLoginPhase::ApiKey => {
+                    menu.pending_input = Some(format!("custom:{wizard_id}:api_key"));
+                    menu.current_view = login::api_key_view(wizard_id);
+                }
+                CustomLoginPhase::Alias => {
+                    menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                    menu.current_view = login::alias_view(wizard_id);
+                }
+                CustomLoginPhase::Models => {
+                    self.discover_custom_models(&mut wizard).await?;
+                    menu.pending_input = None;
+                    menu.current_view = login::model_view(&wizard);
+                }
+                CustomLoginPhase::Confirm => {
+                    self.commit_custom_login(principal, &wizard).await?;
+                    let model = wizard
+                        .selected_index
+                        .and_then(|index| wizard.models.get(index))
+                        .cloned()
+                        .ok_or_else(|| anyhow!("selected model disappeared"))?;
+                    menu.pending_input = None;
+                    menu.current_view = View::info(
+                        "CUSTOM LOGIN",
+                        format!("CONNECTED\n{} · {model}", wizard.alias),
+                    );
+                    menu.current_view.actions =
+                        vec![vec![Action::command("Model", "/model"), Action::close()]];
+                    self.custom_logins.remove(wizard_id);
+                }
+            },
+            "edit_endpoint" => {
+                // Endpoint edits cross a trust boundary. The next endpoint
+                // must explicitly capture or skip its own credential.
+                self.clear_custom_wizard_credential(&mut wizard)?;
+                wizard.phase = CustomLoginPhase::Endpoint;
+                wizard.endpoint = None;
+                wizard.models.clear();
+                wizard.selected_index = None;
+                wizard.capability = None;
+                menu.pending_input = Some(format!("custom:{wizard_id}:endpoint"));
+                menu.current_view = login::endpoint_view(wizard_id);
+            }
+            "wizard_back" => match wizard.phase {
+                CustomLoginPhase::Endpoint => {
+                    menu.pending_input = Some(format!("custom:{wizard_id}:endpoint"));
+                    menu.current_view = login::endpoint_view(wizard_id);
+                }
+                CustomLoginPhase::ApiKey => {
+                    wizard.phase = CustomLoginPhase::Endpoint;
+                    menu.pending_input = Some(format!("custom:{wizard_id}:endpoint"));
+                    menu.current_view = login::endpoint_view(wizard_id);
+                }
+                CustomLoginPhase::Alias => {
+                    wizard.phase = CustomLoginPhase::ApiKey;
+                    menu.pending_input = Some(format!("custom:{wizard_id}:api_key"));
+                    menu.current_view = login::api_key_view(wizard_id);
+                }
+                CustomLoginPhase::Models => {
+                    wizard.phase = CustomLoginPhase::Alias;
+                    menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                    menu.current_view = login::alias_view(wizard_id);
+                }
+                CustomLoginPhase::Confirm => {
+                    wizard.phase = CustomLoginPhase::Models;
+                    menu.pending_input = None;
+                    menu.current_view = login::model_view(&wizard);
+                }
+            },
             _ => return Err(anyhow!("custom login action is stale or out of sequence")),
         }
         Ok(())
@@ -650,65 +946,100 @@ impl TelegramAdapter {
             .and_then(|index| wizard.models.get(index))
             .cloned()
             .ok_or_else(|| anyhow!("select a model before confirmation"))?;
-        let mut next = self.app.config.read().await.clone();
-        next.providers.custom.enabled = true;
-        next.providers.custom.name = Some(wizard.alias.clone());
-        next.providers.custom.base_url = wizard.endpoint.clone();
-        next.providers.custom.models = wizard.models.clone();
-        next.providers.custom.default_model = Some(model.clone());
         let capability = wizard
             .capability
             .as_ref()
             .ok_or_else(|| anyhow!("selected model capability was not probed"))?;
-        // Capability is model-specific and lives in provider_capabilities;
-        // keep config on auto so switching to an unprobed model becomes
-        // explicitly ChatOnly instead of inheriting a false global grant.
-        next.providers.custom.tool_protocol = "auto".into();
-        next.validate()?;
-        if let Some(path) = &self.app.config_path {
-            next.save_atomic(path.as_ref())?;
-        }
-        let account_id = if let Some(key) = wizard.api_key.as_deref() {
-            Some(
-                self.app
-                    .auth
-                    .configure_api_key("custom", &wizard.alias, key.as_str())?
-                    .id,
-            )
-        } else {
-            None
-        };
-        self.app.providers.reload_config(&next);
-        *self.app.config.write().await = next;
         let context = self
             .app
             .sessions
             .context_for_telegram(principal, wizard.scope)?;
-        self.app.storage.set_session_provider(
-            principal,
-            &context.active.id,
-            "custom",
-            account_id.as_deref(),
-            &model,
-        )?;
-        self.app
-            .storage
-            .upsert_provider_capability(&crate::storage::ProviderCapabilityRecord {
-                provider: "custom".into(),
-                model: model.clone(),
-                tool_protocol: capability.tool_protocol.as_str().into(),
-                native_tool_calls: capability.tool_protocol
-                    == crate::providers::ToolProtocol::Native,
-                structured_output: capability.structured_output,
-                continuation: capability.continuation,
-                probed_at: chrono::Utc::now().to_rfc3339(),
-                evidence: capability.evidence.clone(),
-            })?;
-        self.app.storage.audit(
-            principal,
-            "custom_provider_configured",
-            &format!("session_id={};model={model}", context.active.id),
-        )?;
+        let previous_selection = (
+            context.active.provider.clone(),
+            context.active.account_id.clone(),
+            context.active.model.clone(),
+        );
+        let profile_store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
+        let profile = profile_store.create(crate::storage::ProviderProfileInput {
+            profile_id: None,
+            owner_id: principal.into(),
+            alias: wizard.alias.clone(),
+            endpoint: wizard
+                .endpoint
+                .clone()
+                .ok_or_else(|| anyhow!("custom endpoint is missing"))?,
+            protocol: wizard.protocol.clone(),
+            credential_ref: wizard.credential_ref.clone(),
+            safe_headers_json: "{}".into(),
+        })?;
+        let profile_models = wizard
+            .models
+            .iter()
+            .map(|candidate| {
+                let selected = candidate == &model;
+                crate::storage::ProviderProfileModelRecord {
+                    profile_id: profile.profile_id.clone(),
+                    model_id: candidate.clone(),
+                    text_capable: true,
+                    vision_capable: false,
+                    file_input_capable: false,
+                    native_tools: selected
+                        && capability.tool_protocol == crate::providers::ToolProtocol::Native,
+                    structured_output: selected && capability.structured_output,
+                    continuation: selected && capability.continuation,
+                    model_discovery: true,
+                    tool_protocol: if selected {
+                        capability.tool_protocol.as_str().into()
+                    } else {
+                        "chat_only".into()
+                    },
+                    evidence: if selected {
+                        capability.evidence.clone()
+                    } else {
+                        "discovered but not capability-probed".into()
+                    },
+                    probed_at: chrono::Utc::now().to_rfc3339(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let commit = (|| -> Result<()> {
+            profile_store.replace_models(principal, &profile.profile_id, &profile_models)?;
+            self.app.storage.set_session_provider(
+                principal,
+                &context.active.id,
+                "custom",
+                Some(&profile.profile_id),
+                &model,
+            )?;
+            self.app.storage.audit(
+                principal,
+                "custom_provider_configured",
+                &format!(
+                    "session_id={};profile_id={};model={model}",
+                    context.active.id, profile.profile_id
+                ),
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = commit {
+            // Compensate the cross-table wizard commit. The transient
+            // credential remains owned by the wizard so Retry can safely
+            // resume instead of silently losing the owner's key.
+            let restore = self.app.storage.set_session_provider(
+                principal,
+                &context.active.id,
+                &previous_selection.0,
+                previous_selection.1.as_deref(),
+                &previous_selection.2,
+            );
+            let remove = profile_store.delete(principal, &profile.profile_id);
+            if let Err(rollback) = restore.and(remove.map(|_| ())) {
+                return Err(anyhow!(
+                    "Custom profile commit failed ({error}); rollback also failed ({rollback})"
+                ));
+            }
+            return Err(anyhow!("commit Custom profile selection: {error}"));
+        }
         Ok(())
     }
 
@@ -818,7 +1149,10 @@ impl TelegramAdapter {
         match action.target {
             ActionTarget::Noop => return Ok(()),
             ActionTarget::Close => {
-                let principal = Self::principal(guard.chat_id, guard.owner_user_id);
+                let principal = self
+                    .app
+                    .resolve_telegram_owner(guard.owner_user_id)?
+                    .owner_id;
                 let configured = self
                     .app
                     .config
@@ -848,6 +1182,9 @@ impl TelegramAdapter {
                         )
                         .await;
                 }
+                for reference in self.custom_logins.remove_uncommitted_by_menu(&menu_id) {
+                    let _ = self.app.auth.logout(&reference);
+                }
                 self.menus.remove(&menu_id);
                 return Ok(());
             }
@@ -862,12 +1199,32 @@ impl TelegramAdapter {
             }
             ActionTarget::Url(_) => return Ok(()),
             ActionTarget::Command(command) => {
-                let principal = Self::principal(guard.chat_id, guard.owner_user_id);
+                let principal = self
+                    .app
+                    .resolve_telegram_owner(guard.owner_user_id)?
+                    .owner_id;
                 if command.starts_with("/_custom:") {
-                    self.handle_custom_action(&mut guard, &principal, &command)
-                        .await?;
+                    if let Err(error) = self
+                        .handle_custom_action(&mut guard, &principal, &command)
+                        .await
+                    {
+                        let wizard_id = command
+                            .trim_start_matches("/_custom:")
+                            .split(':')
+                            .next()
+                            .unwrap_or_default();
+                        let endpoint = self
+                            .custom_logins
+                            .get(wizard_id)
+                            .and_then(|wizard| wizard.try_lock().ok()?.endpoint.clone());
+                        guard.current_view = login::failure_view(
+                            wizard_id,
+                            endpoint.as_deref(),
+                            &classify_custom_error(&error),
+                        );
+                    }
                     guard.revision += 1;
-                    self.edit_first(&mut guard).await?;
+                    self.advance_menu_prompt(&mut guard).await?;
                     return Ok(());
                 }
                 let fast = command.split_whitespace().next().is_some_and(|x| {
@@ -928,6 +1285,27 @@ impl TelegramAdapter {
         let rendered = rich::render(&guard.current_view, false);
         let plain = rich::plain(&guard.current_view);
         menu::edit_first(&self.client, guard, rendered, plain, markup).await
+    }
+
+    /// Wizard state transitions are chronological: retire the previous
+    /// keyboard, then send a distinct prompt message for the new state.
+    async fn advance_menu_prompt(&self, guard: &mut MenuSession) -> Result<()> {
+        if guard.message_id != 0 {
+            let _ = self
+                .client
+                .edit_markup(
+                    guard.chat_id,
+                    guard.message_id,
+                    Some(json!({"inline_keyboard":[]})),
+                )
+                .await;
+        }
+        let scope = TelegramScope::new(guard.chat_id, guard.message_thread_id);
+        let markup = keyboard(&guard.current_view, &guard.id, guard.revision);
+        guard.message_id = self
+            .send_view(scope, &guard.current_view, Some(markup))
+            .await?;
+        Ok(())
     }
 
     fn watch_auth(&self, challenge: AuthChallenge, menu: Arc<tokio::sync::Mutex<MenuSession>>) {
@@ -1037,7 +1415,34 @@ fn validate_custom_alias(value: &str) -> Result<String> {
             "custom alias must be 1–48 letters, numbers, spaces, hyphens, or underscores"
         ));
     }
-    Ok(value.to_owned())
+    Ok(value.to_ascii_lowercase().replace(' ', "-"))
+}
+
+fn classify_custom_error(error: &anyhow::Error) -> String {
+    let raw = crate::security::redact::redact_text(&error.to_string());
+    let lower = raw.to_ascii_lowercase();
+    let category = if lower.contains("connection refused") {
+        "Connection refused"
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "Connection timed out"
+    } else if lower.contains("tls") || lower.contains("certificate") {
+        "TLS validation failed"
+    } else if lower.contains("401") {
+        "HTTP 401: authentication rejected"
+    } else if lower.contains("403") {
+        "HTTP 403: access forbidden"
+    } else if lower.contains("404") {
+        "HTTP 404: models endpoint not found"
+    } else if lower.contains("json") || lower.contains("decode") || lower.contains("parse") {
+        "Endpoint returned invalid JSON"
+    } else if lower.contains("no model") || lower.contains("model id") {
+        "Endpoint returned an empty model list"
+    } else if lower.contains("endpoint") || lower.contains("url") {
+        "Endpoint is invalid or unsupported"
+    } else {
+        "Provider could not be reached or validated"
+    };
+    format!("{category}. {}", raw.chars().take(240).collect::<String>())
 }
 
 fn paginate_final_view(view: &View, max_chars: usize) -> Vec<View> {
@@ -1610,6 +2015,9 @@ mod tests {
                 },
                 from: Some(user(user_id)),
                 text: Some(text.into()),
+                caption: None,
+                photo: Vec::new(),
+                document: None,
             }),
             callback_query: None,
         }
@@ -1651,6 +2059,9 @@ mod tests {
                     },
                     from: Some(user(user_id)),
                     text: None,
+                    caption: None,
+                    photo: Vec::new(),
+                    document: None,
                 }),
                 data: Some(data),
             }),
@@ -1902,7 +2313,7 @@ mod tests {
                     .into(),
             })
             .unwrap();
-        let principal_a = TelegramAdapter::principal(100, 10);
+        let principal_a = TelegramAdapter::principal(10);
         let main = app.sessions.ensure_default_session(&principal_a).unwrap();
         app.storage
             .set_session_provider(&principal_a, &main.id, "custom", None, "m")
@@ -1973,6 +2384,9 @@ mod tests {
                     },
                     from: Some(user(10)),
                     text: None,
+                    caption: None,
+                    photo: Vec::new(),
+                    document: None,
                 }),
                 data: Some(menu::callback_data(&menu_id, revision, 0)),
             }),
@@ -2037,7 +2451,7 @@ mod tests {
             .await
             .unwrap();
 
-        let principal = TelegramAdapter::principal(100, 10);
+        let principal = TelegramAdapter::principal(10);
         let topic_10 = app
             .sessions
             .context_for_telegram(&principal, TelegramScope::new(100, Some(10)))
@@ -2184,7 +2598,7 @@ mod tests {
             .await
             .unwrap();
 
-        let principal = TelegramAdapter::principal(100, 10);
+        let principal = TelegramAdapter::principal(10);
         let session = app
             .sessions
             .context_for_telegram(&principal, TelegramScope::new(100, Some(10)))
@@ -2192,21 +2606,410 @@ mod tests {
             .active;
         assert_eq!(session.provider, "custom");
         assert_eq!(session.model, "model-05");
-        let capability = app
-            .storage
-            .provider_capability("custom", "model-05")
+        let profile_id = session
+            .account_id
+            .clone()
+            .expect("Custom session profile selection");
+        let profile_store = crate::providers::ProviderProfileStore::new(app.storage.clone());
+        let capability = profile_store
+            .model(&profile_id, "model-05")
             .unwrap()
             .unwrap();
         assert_eq!(capability.tool_protocol, "native");
-        assert!(capability.native_tool_calls);
+        assert!(capability.native_tools);
         assert_eq!(
-            app.config.read().await.providers.custom.tool_protocol,
-            "auto"
+            app.providers.state("custom"),
+            crate::providers::ProviderState::Ready
         );
         let saved = crate::config::AppConfig::load(&config_path).unwrap();
-        assert_eq!(
-            saved.providers.custom.default_model.as_deref(),
-            Some("model-05")
+        assert!(saved.providers.custom.default_model.is_none());
+        let profiles = profile_store.list(&principal).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].alias, "custom");
+        assert_eq!(profiles[0].profile_id, profile_id);
+
+        let requests = telegram_probe.requests.lock().unwrap();
+        let prompt_indexes = requests
+            .iter()
+            .enumerate()
+            .filter(|(_, (method, _))| matches!(method.as_str(), "sendRichMessage" | "sendMessage"))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert!(
+            prompt_indexes.len() >= 5,
+            "wizard stages must use new prompt messages"
         );
+        for pair in prompt_indexes.windows(2).skip(1) {
+            assert!(
+                requests[pair[0]..pair[1]]
+                    .iter()
+                    .any(|(method, body)| method == "editMessageReplyMarkup"
+                        && body.pointer("/reply_markup/inline_keyboard") == Some(&json!([]))),
+                "the previous wizard keyboard must be retired before the next prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_wizard_retry_and_back_are_phase_aware_and_replace_transient_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.storage.database = temp.path().join("xiao.db");
+        cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.logs_dir = temp.path().join("logs");
+        cfg.paths.secrets_dir = temp.path().join("secrets");
+        let app = AppState::build(cfg).await.unwrap();
+        let scope = TelegramScope::new(100, Some(10));
+        let menus = Arc::new(MenuStore::new(Duration::from_secs(60)));
+        let menu = menus.prepare_scoped(scope, 10, View::info("LOGIN", "test"));
+        let menu_id = menu.lock().await.id.clone();
+        menus.insert(menu.clone(), menu_id.clone());
+        let custom_logins = Arc::new(CustomLoginStore::new(Duration::from_secs(60)));
+        let wizard = custom_logins.begin(scope, 10, menu_id);
+        let wizard_id = wizard.lock().await.id.clone();
+        let adapter = TelegramAdapter {
+            app: app.clone(),
+            client: TelegramClient::with_base("test-token".into(), "http://127.0.0.1:9".into())
+                .unwrap(),
+            menus,
+            custom_logins,
+            principal_locks: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let principal = app.resolve_telegram_owner(10).unwrap().owner_id;
+
+        {
+            let mut guard = menu.lock().await;
+            adapter
+                .handle_custom_action(
+                    &mut guard,
+                    &principal,
+                    &format!("/_custom:{wizard_id}:retry"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                guard.pending_input.as_deref(),
+                Some(format!("custom:{wizard_id}:endpoint").as_str())
+            );
+            assert_eq!(
+                guard.current_view.title.as_deref(),
+                Some("CUSTOM LOGIN · ENDPOINT")
+            );
+        }
+
+        {
+            let mut state = wizard.lock().await;
+            state.endpoint = Some("https://provider.example/v1".into());
+            state.phase = CustomLoginPhase::ApiKey;
+        }
+        {
+            let mut guard = menu.lock().await;
+            adapter
+                .handle_custom_action(
+                    &mut guard,
+                    &principal,
+                    &format!("/_custom:{wizard_id}:retry"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                guard.pending_input.as_deref(),
+                Some(format!("custom:{wizard_id}:api_key").as_str())
+            );
+            assert_eq!(
+                guard.current_view.title.as_deref(),
+                Some("CUSTOM LOGIN · API KEY")
+            );
+        }
+
+        let first = app
+            .auth
+            .create_api_key_credential("custom", "wizard-old", "OLD_KEY_SENTINEL")
+            .unwrap();
+        app.storage
+            .set_account_owner(&principal, &first.id)
+            .unwrap();
+        {
+            let mut state = wizard.lock().await;
+            state.credential_ref = Some(first.id.clone());
+            state.phase = CustomLoginPhase::Alias;
+        }
+        {
+            let mut guard = menu.lock().await;
+            adapter
+                .handle_custom_action(
+                    &mut guard,
+                    &principal,
+                    &format!("/_custom:{wizard_id}:wizard_back"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(wizard.lock().await.phase, CustomLoginPhase::ApiKey);
+            adapter
+                .handle_custom_input(
+                    &mut guard,
+                    &format!("custom:{wizard_id}:api_key"),
+                    "NEW_KEY_SENTINEL",
+                    CustomInputContext {
+                        scope,
+                        user_id: 10,
+                        update_id: 99,
+                        message_id: 99,
+                        principal: &principal,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert!(app.auth.credential(&first.id).unwrap().is_none());
+        let replacement = wizard
+            .lock()
+            .await
+            .credential_ref
+            .clone()
+            .expect("replacement credential reference");
+        assert_ne!(replacement, first.id);
+        assert_eq!(
+            app.auth
+                .credential(&replacement)
+                .unwrap()
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("NEW_KEY_SENTINEL")
+        );
+
+        {
+            let mut state = wizard.lock().await;
+            state.phase = CustomLoginPhase::ApiKey;
+        }
+        {
+            let mut guard = menu.lock().await;
+            adapter
+                .handle_custom_action(
+                    &mut guard,
+                    &principal,
+                    &format!("/_custom:{wizard_id}:skip_key"),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(app.auth.credential(&replacement).unwrap().is_none());
+        assert!(wizard.lock().await.credential_ref.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_custom_wizard_commit_restores_session_and_removes_partial_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.storage.database = temp.path().join("xiao.db");
+        cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.logs_dir = temp.path().join("logs");
+        cfg.paths.secrets_dir = temp.path().join("secrets");
+        let app = AppState::build(cfg).await.unwrap();
+        let scope = TelegramScope::new(100, Some(10));
+        let principal = app.resolve_telegram_owner(10).unwrap().owner_id;
+        let before = app
+            .sessions
+            .context_for_telegram(&principal, scope)
+            .unwrap()
+            .active;
+        app.storage
+            .with_conn(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER reject_custom_commit BEFORE INSERT ON audit_events
+                     WHEN NEW.action='custom_provider_configured'
+                     BEGIN SELECT RAISE(FAIL,'synthetic audit failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let menus = Arc::new(MenuStore::new(Duration::from_secs(60)));
+        let menu = menus.prepare_scoped(scope, 10, View::info("LOGIN", "rollback"));
+        let menu_id = menu.lock().await.id.clone();
+        menus.insert(menu.clone(), menu_id.clone());
+        let custom_logins = Arc::new(CustomLoginStore::new(Duration::from_secs(60)));
+        let wizard = custom_logins.begin(scope, 10, menu_id);
+        let wizard_id = {
+            let mut state = wizard.lock().await;
+            state.phase = CustomLoginPhase::Confirm;
+            state.endpoint = Some("https://rollback.example/v1".into());
+            state.protocol = "openai_chat_completions".into();
+            state.alias = "rollback-profile".into();
+            state.models = vec!["model-a".into()];
+            state.selected_index = Some(0);
+            state.capability = Some(crate::providers::ProviderCapabilities::native(
+                "rollback fixture",
+            ));
+            state.id.clone()
+        };
+        let adapter = TelegramAdapter {
+            app: app.clone(),
+            client: TelegramClient::with_base("test-token".into(), "http://127.0.0.1:9".into())
+                .unwrap(),
+            menus,
+            custom_logins: custom_logins.clone(),
+            principal_locks: Arc::new(Mutex::new(HashMap::new())),
+        };
+        {
+            let mut guard = menu.lock().await;
+            assert!(adapter
+                .handle_custom_action(
+                    &mut guard,
+                    &principal,
+                    &format!("/_custom:{wizard_id}:confirm"),
+                )
+                .await
+                .is_err());
+        }
+        let after = app
+            .storage
+            .session(&principal, &before.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.provider, before.provider);
+        assert_eq!(after.account_id, before.account_id);
+        assert_eq!(after.model, before.model);
+        assert!(
+            crate::providers::ProviderProfileStore::new(app.storage.clone())
+                .list(&principal)
+                .unwrap()
+                .is_empty()
+        );
+
+        app.storage
+            .with_conn(|connection| {
+                connection.execute_batch("DROP TRIGGER reject_custom_commit;")?;
+                Ok(())
+            })
+            .unwrap();
+        {
+            let mut guard = menu.lock().await;
+            adapter
+                .handle_custom_action(
+                    &mut guard,
+                    &principal,
+                    &format!("/_custom:{wizard_id}:retry"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(guard.current_view.title.as_deref(), Some("CUSTOM LOGIN"));
+        }
+        assert!(custom_logins.get(&wizard_id).is_none());
+        let selected = app
+            .storage
+            .session(&principal, &before.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.provider, "custom");
+        assert_eq!(selected.model, "model-a");
+        assert_eq!(
+            crate::providers::ProviderProfileStore::new(app.storage.clone())
+                .list(&principal)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_photo_and_document_are_downloaded_scoped_and_indexed() {
+        async fn get_file(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let file_id = body["file_id"].as_str().unwrap_or_default();
+            let (unique, path, size) = if file_id == "photo-file" {
+                ("photo-unique", "files/photo.png", 68)
+            } else {
+                ("document-unique", "files/note.txt", 53)
+            };
+            Json(json!({"ok":true,"result":{
+                "file_id":file_id,"file_unique_id":unique,"file_size":size,"file_path":path
+            }}))
+        }
+        async fn photo_download() -> Vec<u8> {
+            vec![
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 252,
+                255, 31, 0, 3, 3, 2, 0, 238, 254, 95, 91, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+                130,
+            ]
+        }
+        async fn document_download() -> &'static str {
+            "Telegram document sentinel content for indexed retrieval."
+        }
+
+        let telegram_probe = Arc::new(TelegramRequestProbe::default());
+        let telegram_base = serve(
+            Router::new()
+                .route("/bottest-token/getFile", post(get_file))
+                .route("/file/bottest-token/files/photo.png", get(photo_download))
+                .route("/file/bottest-token/files/note.txt", get(document_download))
+                .fallback(post(scoped_telegram_stub))
+                .with_state(telegram_probe),
+        )
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.storage.database = temp.path().join("xiao.db");
+        cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.logs_dir = temp.path().join("logs");
+        cfg.paths.secrets_dir = temp.path().join("secrets");
+        cfg.telegram.enabled = true;
+        cfg.telegram.access.allowed_user_ids = vec![10];
+        cfg.telegram.access.allowed_chat_ids = vec![100];
+        let app = AppState::build(cfg).await.unwrap();
+        let adapter = TelegramAdapter {
+            app: app.clone(),
+            client: TelegramClient::with_base("test-token".into(), telegram_base).unwrap(),
+            menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
+            custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
+            principal_locks: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let mut document = topic_message(70, 100, 7, 10, "");
+        let message = document.message.as_mut().unwrap();
+        message.text = None;
+        message.caption = Some("Summarize this document".into());
+        message.document = Some(types::Document {
+            file_id: "document-file".into(),
+            file_unique_id: "document-unique".into(),
+            file_name: Some("note.txt".into()),
+            mime_type: Some("text/plain".into()),
+            file_size: Some(53),
+        });
+        adapter.handle_update(document).await.unwrap();
+
+        let mut photo = topic_message(71, 100, 7, 10, "");
+        let message = photo.message.as_mut().unwrap();
+        message.text = None;
+        message.caption = Some("What is in this image?".into());
+        message.photo = vec![types::PhotoSize {
+            file_id: "photo-file".into(),
+            file_unique_id: "photo-unique".into(),
+            width: 1,
+            height: 1,
+            file_size: Some(68),
+        }];
+        adapter.handle_update(photo).await.unwrap();
+
+        let owner = app.resolve_telegram_owner(10).unwrap().owner_id;
+        let session = app
+            .sessions
+            .context_for_telegram(&owner, TelegramScope::new(100, Some(7)))
+            .unwrap()
+            .active;
+        let records = app
+            .storage
+            .recent_attachments(&owner, &session.id, 10)
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| record.kind == "image"));
+        assert!(records
+            .iter()
+            .any(|record| { record.kind == "document" && record.processing_status == "ready" }));
+        assert!(!app
+            .storage
+            .search_attachment_chunks(&owner, &session.id, "sentinel retrieval", 2)
+            .unwrap()
+            .is_empty());
     }
 }

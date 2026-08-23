@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod app;
+pub mod attachments;
 pub mod auth;
 pub mod command;
 pub mod config;
@@ -9,6 +10,7 @@ pub mod identity;
 pub mod ipc;
 pub mod learning;
 pub mod memory;
+pub mod owner;
 pub mod providers;
 pub mod runtime;
 pub mod security;

@@ -18,6 +18,16 @@ context_max_chars = 32000
 summary_threshold_chars = 24000
 tool_output_max_chars = 4096
 
+[attachments]
+max_image_bytes = 20971520
+max_document_bytes = 52428800
+max_session_bytes = 209715200
+max_image_pixels = 40000000
+max_extracted_text_chars = 2000000
+chunk_chars = 4000
+retrieval_chunks = 6
+processing_timeout_seconds = 30
+
 [telegram]
 enabled = false
 transport = "long_polling"

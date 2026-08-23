@@ -1,4 +1,4 @@
-# xiao v0.2.5
+# xiao v0.2.6
 
 xiao is a private, single-owner, persistent Rust AI agent designed primarily
 for a rooted Android device. Telegram is its primary interaction surface and
@@ -8,14 +8,14 @@ living identity/memory files, filesystem skills, and the bounded agent loop.
 The `xiao` CLI and KernelSU WebUI remain administrative adapters over the same
 semantic Command Core.
 
-v0.2.5 preserves the v0.2.0 living workspace and hardens it with explicit
-provider agent protocols, a schema-validated `SemanticEvaluator`, semantic
-memory/skill reconciliation, evidence-driven retries, trusted Termux package
-discovery, and topic-scoped Telegram sessions. Codex and Antigravity use native
-tool continuation; Custom models are probed per model for native tools or a
-strict structured-JSON fallback and are explicitly `ChatOnly` otherwise.
-Existing principal identifiers remain compatibility/authorization keys, not
-multi-tenant product architecture.
+v0.2.6 preserves those foundations while separating stable owner identity from
+Telegram chat/topic scope, binding every approval to one exact run/tool call,
+supporting isolated Custom provider profiles, and retaining bounded multi-turn
+structured-tool continuation. Telegram now ingests validated images and
+documents into private session storage with FTS5 retrieval, and the local Xiao
+Manager exposes typed management views through authenticated `xiaod` admin
+actions. Existing principal identifiers remain compatibility keys during
+migration, never a multi-tenant product boundary.
 
 The release ships as one root-level KernelSU/Magisk-compatible module ZIP.
 Flashing that ZIP installs the daemon, watchdog, WebUI, and managed Termux
@@ -23,7 +23,7 @@ wrappers together. Mutable state stays outside the replaceable module payload.
 
 ## Install
 
-1. Download `xiao-v0.2.5-kernelsu-arm64.zip`.
+1. Download `xiao-v0.2.6-kernelsu-arm64.zip`.
 2. Flash the ZIP in KernelSU Next (or a compatible module manager).
 3. Reboot Android.
 4. Open Termux and run:
@@ -122,16 +122,16 @@ KernelSU WebUI -> admin IPC ─────┘                              │ 
   shell-quoted module binary; model output never reaches this root shell path.
 - Secrets are outside normal config, private where supported, and redacted
   from surfaced logs/errors.
-- `/compact` remains absent in v0.2.5; bounded summary creation is an internal
+- `/compact` remains absent in v0.2.6; bounded summary creation is an internal
   ContextEngine responsibility.
 
 The public Telegram command registry is exactly `/start`, `/help`, `/login`,
-`/logout`, `/model`, `/new`, `/sessions`, `/btw`, `/status`, `/context`,
-`/cancel`, `/retry`, `/yolo`, `/memory`, `/skills`, `/tools`, `/doctor`,
-`/about`, and `/approvals`. `/session` and `/stop` remain hidden compatibility
-aliases; account selection and exact `/approve`/`/deny` actions remain internal
-menu syntax. `/provider`, `/settings`, `/usage`, and `/env` are intentionally
-removed. Termux aliases preserve all arguments, so
+`/model`, `/new`, `/sessions`, `/btw`, `/status`, `/context`, `/cancel`,
+`/retry`, `/yolo`, `/memory`, `/skills`, `/tools`, `/doctor`, and `/approvals`.
+`/session` and `/stop` remain hidden compatibility aliases; account selection
+and exact `/approve`/`/deny` actions remain internal menu syntax. `/provider`,
+`/settings`, `/usage`, `/env`, `/about`, and `/logout` are intentionally absent.
+Termux aliases preserve all arguments, so
 `xiao sessions rename ID New Name` and `xiao model MODEL_ID` reach the same
 Command Core variants.
 
@@ -176,12 +176,12 @@ requires byte-identical ZIP hashes, verifies the checksum and ZIP integrity,
 and uploads exactly these two files:
 
 ```text
-xiao-v0.2.5-kernelsu-arm64.zip
-xiao-v0.2.5-kernelsu-arm64.zip.sha256
+xiao-v0.2.6-kernelsu-arm64.zip
+xiao-v0.2.6-kernelsu-arm64.zip.sha256
 ```
 
 Run the workflow from a push/pull request or `workflow_dispatch`, then download
-the `xiao-v0.2.5-kernelsu-arm64` artifact. Do not use an older local `dist/`
+the `xiao-v0.2.6-kernelsu-arm64` artifact. Do not use an older local `dist/`
 archive after changing source. A local source-only check is available and never
 invokes Cargo:
 

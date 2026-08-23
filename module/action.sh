@@ -148,8 +148,10 @@ case "${1:-status}" in
   snapshot) run_xiao_admin snapshot ;;
   apply-base64) run_encoded_admin_command apply-base64 "${2:-}" ;;
   fetch-models-base64) run_encoded_admin_command fetch-models-base64 "${2:-}" ;;
+  manager-get-base64) run_encoded_admin_command manager-get-base64 "${2:-}" ;;
+  manager-post-base64) run_encoded_admin_command manager-post-base64 "${2:-}" ;;
   logs) tail -n "${2:-120}" "$XIAO_DAEMON_LOG" 2>/dev/null ;;
   pair) echo 'Pairing manual tidak diperlukan; wrapper Termux dikelola module.' ;;
   wrappers) install_termux_wrappers ;;
-  *) echo 'usage: action.sh [start|stop|restart|status|status-json|snapshot|apply-base64 PAYLOAD|fetch-models-base64 PAYLOAD|logs [N]|wrappers]'; exit 2 ;;
+  *) echo 'usage: action.sh [start|stop|restart|status|status-json|snapshot|apply-base64 PAYLOAD|fetch-models-base64 PAYLOAD|manager-get-base64 PAYLOAD|manager-post-base64 PAYLOAD|logs [N]|wrappers]'; exit 2 ;;
 esac

@@ -72,12 +72,23 @@ impl MemoryEvaluator {
     /// extractor is conservative, but general subjects are supported rather
     /// than limiting memory to a small fixed field list.
     pub fn evaluate_explicit(&self, owner: &str, prompt: &str) -> Result<Vec<MemoryDecision>> {
+        self.evaluate_explicit_with_cancellation(owner, prompt, CancellationToken::new())
+    }
+
+    fn evaluate_explicit_with_cancellation(
+        &self,
+        owner: &str,
+        prompt: &str,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<MemoryDecision>> {
         if contains_secret_material(prompt) {
             return Ok(Vec::new());
         }
         self.store.reconcile(owner)?;
         let existing = self.store.list(owner, None, 200)?;
-        match self.semantic.evaluate::<SemanticMemoryOutput>(
+        match self
+            .semantic
+            .evaluate_with_cancellation::<SemanticMemoryOutput>(
             "memory_decision",
             memory_decision_schema(),
             serde_json::json!({
@@ -89,6 +100,7 @@ impl MemoryEvaluator {
                     "Do not create near-duplicates or store secrets/transient task details."
                 ]
             }),
+            cancellation,
         ) {
             SemanticResult::Valid(output) => {
                 return Ok(validate_semantic_decisions(output.decisions, &existing));
@@ -176,7 +188,11 @@ impl MemoryEvaluator {
             if cancellation.is_cancelled() {
                 return Err(anyhow::anyhow!("memory evaluation cancelled"));
             }
-            let decisions = evaluator.evaluate_explicit(&owner, &prompt)?;
+            let decisions = evaluator.evaluate_explicit_with_cancellation(
+                &owner,
+                &prompt,
+                cancellation.clone(),
+            )?;
             if cancellation.is_cancelled() {
                 return Err(anyhow::anyhow!("memory evaluation cancelled"));
             }

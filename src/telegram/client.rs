@@ -1,13 +1,14 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::path::Path;
 
 use super::commands::BotCommand;
-use super::types::{ApiEnvelope, BotIdentity, SentMessage, Update};
+use super::types::{ApiEnvelope, BotIdentity, SentMessage, TelegramFile, Update};
 use super::TelegramScope;
 
 #[derive(Clone)]
@@ -88,6 +89,61 @@ impl TelegramClient {
 
     pub async fn get_me(&self) -> Result<BotIdentity> {
         self.call("getMe", json!({})).await
+    }
+    pub async fn get_file(&self, file_id: &str) -> Result<TelegramFile> {
+        if file_id.trim().is_empty() || file_id.chars().count() > 1_024 {
+            return Err(anyhow!("invalid Telegram file id"));
+        }
+        self.call("getFile", json!({"file_id":file_id})).await
+    }
+
+    pub async fn download_file_bounded(&self, file_path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        if max_bytes == 0 || max_bytes > 200 * 1024 * 1024 {
+            return Err(anyhow!("invalid Telegram download limit"));
+        }
+        let path = Path::new(file_path);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                !matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(anyhow!("unsafe Telegram file path"));
+        }
+        let url = format!(
+            "{}/file/bot{}/{}",
+            self.base,
+            self.token,
+            file_path.trim_start_matches('/')
+        );
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| self.safe_error("file download transport", error))?
+            .error_for_status()
+            .map_err(|error| self.safe_error("file download status", error))?;
+        if response
+            .content_length()
+            .is_some_and(|size| size > max_bytes)
+        {
+            return Err(anyhow!("Telegram attachment exceeds configured size limit"));
+        }
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| self.safe_error("file download", error))?;
+            if (bytes.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
+                return Err(anyhow!(
+                    "Telegram attachment exceeded configured size limit"
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
     pub async fn set_my_commands(&self, commands: &[BotCommand]) -> Result<bool> {
         self.call("setMyCommands", json!({"commands":commands}))

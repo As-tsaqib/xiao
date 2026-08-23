@@ -1,13 +1,16 @@
-# Xiao v0.2.5 Architecture
+# Xiao v0.2.6 Architecture
 
 ## Runtime ownership
 
 `xiaod` remains the only durable application owner. Xiao is a private personal
-agent for one owner; retained principal IDs isolate compatibility/session
-state, not tenants. `AppState` wires configuration, SQLite, the living
-workspace, runtime probing/capabilities, sessions, authentication, providers,
-`CommandCore`, health, and the event bus. Telegram, CLI/IPC, and WebUI remain
-adapters; they do not own independent agent engines or durable state.
+agent for one stable `OwnerIdentity`; retained principal IDs are migration
+compatibility keys, not tenants. Owner-global USER/MEMORY state, skills,
+provider accounts/profiles, credentials, and recall are separated from
+`TelegramScope` (`chat_id + message_thread_id`) and session-specific model,
+YOLO, attachments, and active-run state. `AppState` wires configuration,
+SQLite, the living workspace, runtime/capabilities, sessions, authentication,
+providers, attachments, `CommandCore`, health, and the event bus. Telegram,
+CLI/IPC, and WebUI remain adapters and never become independent durable owners.
 
 Startup create-loads `SOUL.md`, `USER.md`, `MEMORY.md`, and `AGENTS.md` under
 the durable data root, then probes and atomically refreshes `ENVIRONMENT.md`.
@@ -16,7 +19,7 @@ task code has no SOUL write path; hard security rules remain compiled runtime
 policy rather than workspace prose.
 
 `CommandCore` is the semantic convergence point for frontend commands. A chat
-request enters the principal-scoped `AgentEngine`, captures its target session,
+request enters the owner-scoped `AgentEngine`, captures its target session,
 and retains that target even if the frontend switches sessions concurrently.
 Only safe typed `AgentEvent` progress crosses the frontend boundary. Hidden
 provider reasoning is neither modeled nor persisted.
@@ -40,15 +43,21 @@ canonical tools/results through Gemini `functionDeclarations`, `functionCall`,
 and `functionResponse`. Each Custom model is probed for a synthetic native
 function call, then a strict JSON envelope; an unprobed/unsupported model is
 explicitly `ChatOnly`. Xiao never silently removes tools and presents an action
-model as an equivalent agent.
+model as an equivalent agent. Custom configuration is stored in owner-global,
+independently credentialed profiles; requests use only the selected profile's
+endpoint, credential reference, and headers. Structured fallback retains a
+bounded normalized transcript so Tool A/result A can lead to Tool B/result B
+and then a final response without losing relevant prior observations.
 
 `SemanticEvaluator` is a separate no-tools boundary used for task intent,
 completion interpretation, memory lifecycle decisions, trace learning, skill
 synthesis, and skill equivalence. Inputs/outputs are bounded and redacted,
 require schema-conforming JSON, permit one format repair, and fail
 conservatively. Semantic output cannot grant a tool, override `ToolPolicy`, or
-turn model prose into action evidence. Provider-backed decisions run outside
-Tokio workers so Telegram cancellation and callbacks remain responsive.
+turn model prose into action evidence. Provider-backed decisions use one
+reusable bounded worker runtime with concurrency limits, timeout, and
+cancellation so evaluations cannot create a fresh runtime/thread per request or
+accumulate without bounds.
 
 Completion moves through `running → verifying` into `completed`, `blocked`, or
 `failed`. The verifier distinguishes `VerifiedSuccess`, `NotYetVerified`,
@@ -74,7 +83,7 @@ output bound. Providers only translate those canonical definitions to wire
 schemas. Runtime `ToolPolicy` evaluates risk and call arguments; a skill is
 guidance and cannot grant a tool or bypass policy.
 
-The v0.2.5 built-ins are:
+The v0.2.6 built-ins are:
 
 - `context_stats`
 - `memory_search`, `memory_set`, `memory_delete`
@@ -89,7 +98,9 @@ cancellation, stdout, and stderr. A root daemon clears inherited groups, drops
 UID/GID, and enables Linux/Android `no_new_privs` before exec. It rejects root escalation, model-supplied
 shell command strings, unmanaged package mutation, and unsafe installer
 pipelines. Clearly destructive, opaque shell-script, or credential-sensitive
-calls require an exact one-shot approval. There is no generic root-shell tool.
+calls require an exact one-shot approval bound to owner, session, agent run,
+tool call, tool name, argument hash, and expiry. Consumption is atomic and
+one-time. There is no generic root-shell tool.
 
 When a binary is absent, `DependencyResolver` first uses the known trusted
 mapping and can then query trusted Termux repository metadata. A candidate must
@@ -149,6 +160,29 @@ unsummarized middle exceeds the configured threshold, Xiao stores a bounded
 extractive `session_summaries` row and retains recent turns intact; source
 messages remain in SQLite.
 
+## Attachments, vision, and documents
+
+Telegram photo/document updates retain their `TelegramScope`, resolve the
+active Xiao session, and download through bounded Bot API methods into private
+controlled paths. Pre/post-download size limits, per-session quota, sanitized
+names, content sniffing, image decode/dimension checks, and SHA-256 metadata are
+applied before an attachment becomes ready. Telegram/provider wire formats do
+not leak into the normalized attachment and multimodal content model.
+
+Vision content is sent only when the selected provider/model has verified
+vision capability. A non-vision or unknown model receives no image bytes and
+returns a factual capability/model-switch blocker. Provider adapters serialize
+the normalized image/caption into their own protocol and enforce their size
+limits.
+
+TXT, Markdown, source/plain text, JSON, CSV, embedded-text PDF, and DOCX are
+extracted without executing document macros or scripts. An image-only PDF is
+marked `needs_ocr` instead of treating empty output as success. Normalized text
+is chunked into SQLite FTS5; ContextEngine retrieves bounded relevant chunks
+rather than loading an entire large document. Recent session attachment
+references allow phrases such as “file tadi” or “dokumen kedua” to resolve
+without crossing session ownership.
+
 ## Skills and learning
 
 A skill lives at `skills/<name>/SKILL.md` with YAML frontmatter requiring
@@ -182,20 +216,52 @@ audited auto-approval, and never changes `DENY`.
 
 `TelegramCommandRegistry` is the single source for parsing aliases, `/help`,
 ordering, and Bot API `setMyCommands`. Public commands are `/start`, `/help`,
-`/login`, `/logout`, `/model`, `/new`, `/sessions`, `/btw`, `/status`,
-`/context`, `/cancel`, `/retry`, `/yolo`, `/memory`, `/skills`, `/tools`,
-`/doctor`, `/about`, and `/approvals`. `/session` and `/stop` are hidden aliases;
-`/provider`, `/settings`, `/usage`, and `/env` have no route.
+`/login`, `/model`, `/new`, `/sessions`, `/btw`, `/status`, `/context`,
+`/cancel`, `/retry`, `/yolo`, `/memory`, `/skills`, `/tools`, `/doctor`, and
+`/approvals`. `/session` and `/stop` are hidden aliases; `/provider`,
+`/settings`, `/usage`, `/env`, `/about`, and `/logout` have no public route.
+`/model` is the unified AI-management hub for the current provider/profile,
+account, and model plus paginated account/profile/model management.
 
-The Custom `/login` wizard is expiring and owner/chat/topic/menu-bound. It
+The Custom `/login` wizard is expiring and owner/chat/topic/menu-bound. Each
+endpoint/key/alias phase retires the prior keyboard and sends a new prompt. It
 keeps endpoint/key/model blobs out of callback payloads, validates the endpoint,
-accepts an optional zeroized API key, discovers models five per page, probes the
-selected model protocol, and requires confirmation before secure persistence.
+accepts an optional zeroized API key, best-effort deletes the owner's key
+message, scrubs the recognized credential payload from Xiao's durable Telegram
+inbox, discovers models five per page, probes the selected model protocol, and
+requires confirmation before secure persistence. Discovery errors expose a
+concrete reason plus phase-aware Retry/Edit Endpoint/Back/Close recovery
+actions. A selected profile is authoritative independently of the legacy
+singleton flag; failed cross-table commits restore the prior session and remove
+partial profile state.
+
+Before owner-facing memory or skill list/search operations, canonical living
+files are reconciled and stale skill indexes are rescanned. The shared
+five-items-per-page paginator is also used for sessions, accounts, profiles,
+models, approvals, memory, and skills; callbacks remain scoped, revisioned, and
+expiry-checked.
+
+## Xiao Manager and diagnostics
+
+The KernelSU WebUI is a management console, never a second application server:
+`WebUI → authenticated loopback admin API → xiaod → typed managers/stores`.
+Dashboard, Providers, Runtime, Sessions, Tasks, Memory, Skills, Tools, Security,
+Diagnostics, and Logs expose bounded observable state. Mutations use named
+admin actions; the API has no generic SQL, filesystem-write, secret-read, or
+root-shell endpoint. Secrets are masked/write-only and surfaced logs/exports
+are redacted and bounded.
+
+`/doctor` and the Diagnostics page execute independent read-only probes for
+Telegram, DB transaction/schema, identity, memory, skills, Termux,
+CapabilityRegistry, Android broker, selected provider/auth/model and Custom
+reachability, attachment store/FTS, session FTS, and admin backend. Each result
+uses PASS/WARN/FAIL/SKIPPED with concise evidence; one healthy subsystem cannot
+mask another subsystem's failure.
 
 ## Storage and migrations
 
 SQLite keeps WAL, foreign keys, a short mutex boundary, and graceful-shutdown
-checkpointing. v0.2.5 migrations are additive and idempotent and retain every
+checkpointing. v0.2.6 migrations are additive and idempotent and retain every
 v0.1.0 table. Schema versions add:
 
 - version 6: `agent_runs`, `tool_runs` and lookup indexes;
@@ -209,10 +275,16 @@ v0.1.0 table. Schema versions add:
   skill prerequisites; dependency source/validation metadata.
 - version 12: learned/imported `skills.source_kind` and owner-controlled
   `skills.enabled`, including legacy source classification.
+- version 13: stable `owners` plus legacy-principal migration mapping.
+- versions 14–15: exact approval binding fields/indexes, owner-bound provider
+  accounts, isolated Custom profiles, and per-profile model/capability rows.
+- version 16: attachment metadata, extracted chunks, FTS5 index, triggers, and
+  backfill.
 
-Migration tests cover a fresh database, a hand-built v0.1.0 database upgrade,
-repeated `migrate()` calls, FTS backfill consistency, and restart quarantine of
-in-flight runs.
+Migration tests cover a fresh database, hand-built v0.1.0 and representative
+v0.2.5 upgrades, WebUI-first `owner:local` claiming, repeated migrations,
+transactional/idempotent rekeying, history/session/run/profile preservation,
+FTS consistency, and restart quarantine of in-flight runs.
 
 ## Preserved v0.1.0 invariants
 
@@ -228,6 +300,6 @@ in `SecretStore`; snapshot surfaces presence only. The managed Termux wrapper
 elevates only fixed module binaries. KernelSU/WebUI lifecycle shell paths are
 fixed administrative code and are never reachable from model tool calls.
 
-v0.2.5 deliberately does not add MCP, remote/device nodes, subagents, vector
+v0.2.6 deliberately does not add MCP, remote/device nodes, subagents, vector
 databases, autonomous cron, browser automation, a plugin ecosystem, dynamic
 native plugins, or unrestricted root execution.

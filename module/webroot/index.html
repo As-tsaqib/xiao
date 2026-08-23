@@ -1,41 +1,75 @@
 <!doctype html>
-<html lang="id">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="dark">
   <link rel="stylesheet" href="/internal/insets.css">
   <link rel="stylesheet" href="assets/app.css">
-  <title>xiao</title>
+  <title>Xiao Manager</title>
 </head>
 <body>
-<header><div><div class="eyebrow">ANDROID ROOT SERVICE</div><h1>xiao<span>.gateway</span></h1></div><div id="liveMark" class="live-mark offline"><i></i><span>CHECK</span></div></header>
-<div id="notice" class="notice muted" role="status" aria-live="polite">Memuat status…</div>
-<main>
-<section class="status-rail">
-  <div class="status-panel"><div class="panel-label">Gateway</div><div id="gateway" aria-live="polite"></div></div>
-  <div class="status-panel"><div class="panel-label">Daemon</div><div id="daemon" aria-live="polite"></div><div class="toolbar compact"><button id="restart" type="button" class="secondary">Mulai ulang</button><button id="refresh" type="button" class="ghost">Perbarui</button></div></div>
-</section>
-<section class="panel">
-  <div class="section-heading"><div><div class="eyebrow">DELIVERY</div><h2>Telegram</h2></div><p>Satu bot, satu ruang chat.</p></div>
-  <label for="botToken">Bot token</label><input id="botToken" type="password" autocomplete="new-password" placeholder="Masukkan bot token">
-  <label for="chatId">Chat ID</label><input id="chatId" inputmode="numeric" placeholder="123456789 atau -1001234567890">
-  <p class="muted field-note">Token baru diuji sebelum disimpan. Kosongkan Chat ID untuk menonaktifkan Telegram.</p>
-</section>
-<section class="panel">
-  <div class="section-heading"><div><div class="eyebrow">OPENAI-COMPATIBLE</div><h2>Custom provider</h2></div><p>Hubungkan endpoint lokal atau remote.</p></div>
-  <label class="check"><input id="customEnabled" type="checkbox"> Aktifkan custom provider</label>
-  <label for="customBase">Base URL</label><input id="customBase" inputmode="url" placeholder="http://127.0.0.1:8317/v1">
-  <label for="customKey">API key</label><input id="customKey" type="password" autocomplete="new-password" placeholder="Masukkan API key">
-  <label for="customProtocol">Protocol</label><select id="customProtocol"><option value="openai_chat_completions">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option></select>
-  <div class="toolbar"><button id="fetchModels" type="button" class="secondary">Ambil daftar model</button></div>
-  <label for="customModel">Default model</label><input id="customModel" list="customModelList" autocomplete="off" placeholder="Fetch atau masukkan model"><datalist id="customModelList"></datalist>
-  <p id="modelNotice" class="muted field-note" role="status" aria-live="polite">Model diambil melalui daemon; API key tersimpan tidak pernah dikirim kembali ke browser.</p>
-</section>
-<section class="actions-panel">
-  <button id="save" type="button" class="primary">Simpan perubahan <span class="button-arrow" aria-hidden="true">→</span></button>
-  <p class="muted">Login Codex dan Antigravity dilakukan langsung dari Telegram dengan <code>/login codex</code> atau <code>/login antigravity</code>.</p>
-</section>
-</main>
-<script type="module" src="assets/app.js"></script>
-</body></html>
+  <div class="shell">
+    <aside class="signal-spine" aria-label="Xiao Manager">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">肖</span><div><span class="kicker">PRIVATE AGENT</span><strong>Xiao Manager</strong></div></div>
+      <nav id="nav" aria-label="Management sections">
+        <button class="nav-item active" data-view="dashboard"><i>01</i><span>Dashboard</span></button>
+        <button class="nav-item" data-view="providers"><i>02</i><span>Providers</span></button>
+        <button class="nav-item" data-view="runtime"><i>03</i><span>Runtime</span></button>
+        <button class="nav-item" data-view="sessions"><i>04</i><span>Sessions</span></button>
+        <button class="nav-item" data-view="tasks"><i>05</i><span>Tasks</span></button>
+        <button class="nav-item" data-view="memory"><i>06</i><span>Memory</span></button>
+        <button class="nav-item" data-view="skills"><i>07</i><span>Skills</span></button>
+        <button class="nav-item" data-view="tools"><i>08</i><span>Tools</span></button>
+        <button class="nav-item" data-view="security"><i>09</i><span>Security</span></button>
+        <button class="nav-item" data-view="diagnostics"><i>10</i><span>Diagnostics</span></button>
+        <button class="nav-item" data-view="logs"><i>11</i><span>Logs</span></button>
+      </nav>
+      <div class="spine-health"><span id="liveDot" class="pulse"></span><div><b id="liveText">CHECKING</b><small>local xiaod</small></div></div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar"><div><span id="sectionCode" class="kicker">01 / OVERVIEW</span><h1 id="sectionTitle">Dashboard</h1></div><div class="top-actions"><span id="versionPill" class="pill">v—</span><button id="refresh" class="icon-button" type="button" title="Refresh current view" aria-label="Refresh current view">↻</button></div></header>
+      <div id="notice" class="notice" role="status" aria-live="polite">Connecting to the local Xiao daemon…</div>
+
+      <section id="view-dashboard" class="view active" aria-labelledby="sectionTitle">
+        <div class="hero-ledger"><div><span class="kicker">INSTALLATION PULSE</span><p id="heroState" class="hero-state">Reading Xiao’s durable state</p><p class="muted">One owner. Topic-isolated conversations. Observable work only.</p></div><div id="heroRuntime" class="runtime-stamp"></div></div>
+        <div id="dashboardMetrics" class="metric-grid"></div>
+        <div class="two-column"><article class="panel"><div class="panel-head"><h2>Active AI</h2><span class="tag">SESSION</span></div><div id="activeAi" class="data-list"></div></article><article class="panel"><div class="panel-head"><h2>Service health</h2><span class="tag">LIVE</span></div><div id="serviceHealth" class="data-list"></div></article></div>
+      </section>
+
+      <section id="view-providers" class="view" aria-labelledby="sectionTitle">
+        <div class="section-intro"><p>Manage accounts and isolated OpenAI-compatible profiles. Credentials are write-only and never returned here.</p><div class="button-row"><button id="addCodex" class="secondary" type="button">Add Codex</button><button id="addAgy" class="secondary" type="button">Add AGY</button><button id="showAddProvider" class="primary" type="button">Add Custom profile</button></div></div>
+        <form id="providerForm" class="panel form-grid hidden" autocomplete="off"><div class="panel-head full"><h2>New Custom profile</h2><button id="closeProviderForm" class="quiet" type="button">Close</button></div><label>Alias<input id="profileAlias" required maxlength="80" placeholder="studio-local"></label><label>Endpoint<input id="profileEndpoint" required type="url" placeholder="https://api.example.com/v1"></label><label>Protocol<select id="profileProtocol"><option value="openai_chat_completions">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option></select></label><label>API key <small>optional, write-only</small><input id="profileKey" type="password" autocomplete="new-password" placeholder="Leave empty for no Authorization"></label><button class="primary full" type="submit">Create isolated profile</button></form>
+        <article class="panel"><div class="panel-head"><h2>Codex &amp; Antigravity accounts</h2><span id="accountCount" class="tag"></span></div><div id="accountsList" class="card-list"></div><div id="accountsPager" class="pager"></div></article>
+        <article class="panel"><div class="panel-head"><h2>Custom profiles</h2><span id="profileCount" class="tag"></span></div><div id="profilesList" class="card-list"></div><div id="profilesPager" class="pager"></div></article>
+      </section>
+
+      <section id="view-runtime" class="view" aria-labelledby="sectionTitle"><div class="two-column"><article class="panel"><div class="panel-head"><h2>Device environment</h2><span class="tag">PROBED</span></div><div id="runtimeEnvironment" class="data-list"></div></article><article class="panel"><div class="panel-head"><h2>Xiao paths</h2><span class="tag">PRIVATE</span></div><div id="runtimePaths" class="data-list"></div></article></div><article class="panel"><div class="panel-head"><h2>Capability registry</h2><span id="capabilityCount" class="tag"></span></div><div id="runtimeCapabilities" class="table-wrap"></div></article></section>
+
+      <section id="view-sessions" class="view" aria-labelledby="sectionTitle"><div class="section-intro"><p>Conversation state stays bound to its chat and topic. Archive preserves history.</p></div><article class="panel"><div class="panel-head"><h2>Sessions</h2><span class="tag">5 / PAGE</span></div><div id="sessionsList" class="card-list"></div><div id="sessionsPager" class="pager"></div></article></section>
+
+      <section id="view-tasks" class="view" aria-labelledby="sectionTitle"><div class="section-intro"><p>Safe observable run records: goals, tools, dependency installs, outcomes and blockers. No private reasoning.</p></div><article class="panel"><div class="panel-head"><h2>Agent runs</h2><span class="tag">AUDITED</span></div><div id="tasksList" class="card-list"></div><div id="tasksPager" class="pager"></div></article></section>
+
+      <section id="view-memory" class="view" aria-labelledby="sectionTitle">
+        <div class="section-intro"><p>USER.md and MEMORY.md remain canonical, inspectable living state. Opening this page reconciles manual edits first.</p><button id="reconcileMemory" class="secondary" type="button">Reconcile files</button></div>
+        <div class="filter-bar"><select id="memoryScope" aria-label="Memory scope"><option value="all">All memory</option><option value="user">User profile</option><option value="agent">Agent memory</option></select><input id="memorySearch" type="search" placeholder="Search current memory"><button id="memorySearchButton" class="secondary" type="button">Search</button></div>
+        <form id="memoryForm" class="panel form-grid" autocomplete="off"><div class="panel-head full"><h2>Create or replace memory</h2><span class="tag">MANAGED WRITE</span></div><label>Scope<select id="memoryEditScope"><option value="user">User profile</option><option value="agent">Agent memory</option></select></label><label>Category<input id="memoryCategory" required maxlength="80" placeholder="preferences"></label><label>Semantic key<input id="memoryKey" required maxlength="120" placeholder="communication.address"></label><label>Current value<input id="memoryValue" required maxlength="2000" placeholder="Call the owner …"></label><button class="primary full" type="submit">Save current state</button></form>
+        <article class="panel"><div class="panel-head"><h2>Active memory</h2><span class="tag">5 / PAGE</span></div><div id="memoryList" class="card-list"></div><div id="memoryPager" class="pager"></div></article>
+      </section>
+
+      <section id="view-skills" class="view" aria-labelledby="sectionTitle"><div class="section-intro"><p>Filesystem SKILL.md entries are rescanned before each fresh list. Community instructions never bypass ToolPolicy.</p><button id="refreshSkills" class="secondary" type="button">Rescan skills</button></div><div class="filter-bar"><input id="skillsSearch" type="search" placeholder="Search learned or imported skills"><button id="skillsSearchButton" class="secondary" type="button">Search</button></div><article class="panel"><div class="panel-head"><h2>Skill library</h2><span class="tag">5 / PAGE</span></div><div id="skillsList" class="card-list"></div><div id="skillsPager" class="pager"></div></article></section>
+
+      <section id="view-tools" class="view" aria-labelledby="sectionTitle"><div class="section-intro"><p>Current runtime truth includes available, installable, approval-required, unavailable and forbidden capabilities.</p></div><article class="panel"><div class="panel-head"><h2>Capabilities</h2><span class="tag">POLICY ENFORCED</span></div><div id="toolsList" class="table-wrap"></div></article></section>
+
+      <section id="view-security" class="view" aria-labelledby="sectionTitle"><div id="securityBanner" class="security-banner"></div><div class="two-column"><article class="panel"><div class="panel-head"><h2>Pending approvals</h2><span class="tag">EXACT / ONE-SHOT</span></div><div id="approvalsList" class="card-list"></div></article><article class="panel"><div class="panel-head"><h2>YOLO sessions</h2><span class="tag warning">ASK ONLY</span></div><div id="yoloList" class="card-list"></div></article></div><article class="panel"><div class="panel-head"><h2>Recently denied actions</h2><span class="tag warning">POLICY</span></div><div id="deniedList" class="card-list"></div></article><article class="panel"><div class="panel-head"><h2>Recent security audit</h2><span class="tag">REDACTED</span></div><div id="auditList" class="timeline"></div></article></section>
+
+      <section id="view-diagnostics" class="view" aria-labelledby="sectionTitle"><div class="section-intro"><p>Independent, read-only probes. A healthy database cannot hide a broken memory or skills index.</p><button id="runDoctor" class="primary" type="button">Run diagnostics</button></div><article class="panel"><div class="panel-head"><h2>Doctor report</h2><span id="doctorTime" class="tag"></span></div><div id="doctorReport" class="doctor-grid"></div></article></section>
+
+      <section id="view-logs" class="view" aria-labelledby="sectionTitle"><div class="section-intro"><p>Bounded daemon logs are redacted by xiaod before they reach the browser.</p><div class="button-row"><select id="logLines" aria-label="Log line count"><option>100</option><option>250</option><option>500</option></select><button id="exportLogs" class="secondary" type="button">Export safe text</button></div></div><article class="log-panel"><pre id="logsOutput">No logs loaded.</pre></article></section>
+    </main>
+  </div>
+  <dialog id="modelDialog" aria-labelledby="modelDialogTitle"><div class="dialog-head"><div><span class="kicker">SESSION MODEL</span><h2 id="modelDialogTitle">Models</h2></div><button id="closeModelDialog" class="quiet" type="button">Close</button></div><p id="modelDialogMeta" class="muted"></p><div id="modelPickerList" class="model-picker"></div><div id="modelPickerPager" class="pager"></div></dialog>
+  <script type="module" src="assets/app.js"></script>
+</body>
+</html>

@@ -7,11 +7,12 @@ use std::{
 use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     runtime::{CapabilityRegistry, CapabilityStatus},
     security::redact::redact_text,
-    storage::Storage,
+    storage::{ApprovalBinding, ApprovalRequest, Storage},
     tools::{
         PolicyDecision, Tool, ToolCall, ToolContext, ToolExecution, ToolPolicy, ToolResult,
         ToolRunStatus, ToolSpec,
@@ -25,6 +26,15 @@ pub struct ToolRegistry {
     max_output_chars: usize,
     capabilities: Option<Arc<CapabilityRegistry>>,
     approvals: Option<Arc<Storage>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalWaitStatus {
+    Approved,
+    Denied,
+    Expired,
+    TimedOut,
+    Cancelled,
 }
 
 impl ToolRegistry {
@@ -180,8 +190,15 @@ impl ToolRegistry {
                         return self.error(call, ToolRunStatus::Denied, &reason);
                     };
                     let arguments_hash = approval_hash(&spec.name, &call.arguments);
-                    match storage.consume_approval(&context.principal, &spec.name, &arguments_hash)
-                    {
+                    let binding = ApprovalBinding {
+                        owner_id: &context.principal,
+                        session_id: &context.session_id,
+                        agent_run_id: &context.agent_run_id,
+                        tool_call_id: &call.call_id,
+                        tool_name: &spec.name,
+                        arguments_hash: &arguments_hash,
+                    };
+                    match storage.consume_approval(binding) {
                         Ok(true) => {
                             approval_mode = Some("explicit_owner_approval".into());
                             policy_original = Some("ask".into());
@@ -192,13 +209,12 @@ impl ToolRegistry {
                                 .first()
                                 .map(String::as_str)
                                 .unwrap_or("tool.approval");
-                            match storage.request_approval(
-                                &context.principal,
+                            match storage.request_approval(ApprovalRequest {
+                                binding,
                                 capability,
-                                &spec.name,
-                                &arguments_hash,
-                                &reason,
-                            ) {
+                                risk: spec.risk.as_str(),
+                                summary: &reason,
+                            }) {
                                 Ok(approval) => {
                                     return self.error(
                                         call,
@@ -254,6 +270,56 @@ impl ToolRegistry {
             },
             Ok(Err(error)) => self.error(call, ToolRunStatus::Failed, &error.to_string()),
             Err(_) => self.error(call, ToolRunStatus::Failed, "tool timed out"),
+        }
+    }
+
+    /// Wait for the owner to decide the exact grant belonging to this active
+    /// run. This enables safe continuation without converting the grant into
+    /// a reusable cross-run approval.
+    pub async fn wait_for_exact_approval(
+        &self,
+        call: &ToolCall,
+        context: &ToolContext,
+        max_wait: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<ApprovalWaitStatus> {
+        let Some(storage) = &self.approvals else {
+            return Ok(ApprovalWaitStatus::Denied);
+        };
+        let canonical_name = self
+            .aliases
+            .read()
+            .ok()
+            .and_then(|aliases| aliases.get(&call.name).cloned())
+            .unwrap_or_else(|| call.name.clone());
+        let arguments_hash = approval_hash(&canonical_name, &call.arguments);
+        let binding = ApprovalBinding {
+            owner_id: &context.principal,
+            session_id: &context.session_id,
+            agent_run_id: &context.agent_run_id,
+            tool_call_id: &call.call_id,
+            tool_name: &canonical_name,
+            arguments_hash: &arguments_hash,
+        };
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            if cancellation.is_cancelled() {
+                return Ok(ApprovalWaitStatus::Cancelled);
+            }
+            match storage.approval_status(binding)?.as_deref() {
+                Some("approved") => return Ok(ApprovalWaitStatus::Approved),
+                Some("denied") => return Ok(ApprovalWaitStatus::Denied),
+                Some("expired" | "consumed") | None => return Ok(ApprovalWaitStatus::Expired),
+                Some("pending") => {}
+                Some(_) => return Ok(ApprovalWaitStatus::Denied),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(ApprovalWaitStatus::TimedOut);
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(ApprovalWaitStatus::Cancelled),
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
         }
     }
 

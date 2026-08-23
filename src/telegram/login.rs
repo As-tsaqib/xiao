@@ -6,7 +6,6 @@ use std::{
 
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 use crate::presentation::{Action, Block, View};
 use crate::providers::ProviderCapabilities;
@@ -22,8 +21,8 @@ pub enum CustomLoginPhase {
     Confirm,
 }
 
-/// In-memory, expiring wizard state. The API key is zeroized on replacement
-/// or drop and is never embedded in a View/callback payload.
+/// In-memory, expiring wizard state. Secrets are persisted immediately by the
+/// credential manager; this state contains only an opaque credential ref.
 pub struct CustomLoginWizard {
     pub id: String,
     pub owner_user_id: i64,
@@ -32,7 +31,8 @@ pub struct CustomLoginWizard {
     pub expires_at: Instant,
     pub phase: CustomLoginPhase,
     pub endpoint: Option<String>,
-    pub api_key: Option<Zeroizing<String>>,
+    pub credential_ref: Option<String>,
+    pub protocol: String,
     pub alias: String,
     pub models: Vec<String>,
     pub selected_index: Option<usize>,
@@ -52,6 +52,7 @@ impl CustomLoginWizard {
 pub struct CustomLoginStore {
     ttl: Duration,
     inner: Mutex<HashMap<String, Arc<AsyncMutex<CustomLoginWizard>>>>,
+    expired_credential_refs: Mutex<Vec<String>>,
 }
 
 impl CustomLoginStore {
@@ -59,6 +60,7 @@ impl CustomLoginStore {
         Self {
             ttl,
             inner: Mutex::new(HashMap::new()),
+            expired_credential_refs: Mutex::new(Vec::new()),
         }
     }
 
@@ -78,7 +80,8 @@ impl CustomLoginStore {
             expires_at: Instant::now() + self.ttl,
             phase: CustomLoginPhase::Endpoint,
             endpoint: None,
-            api_key: None,
+            credential_ref: None,
+            protocol: "openai_chat_completions".into(),
             alias: "custom".into(),
             models: Vec::new(),
             selected_index: None,
@@ -98,14 +101,44 @@ impl CustomLoginStore {
         self.inner.lock().unwrap().remove(id);
     }
 
+    pub fn remove_uncommitted_by_menu(&self, menu_id: &str) -> Vec<String> {
+        let mut credentials = Vec::new();
+        self.inner.lock().unwrap().retain(|_, wizard| {
+            let Ok(state) = wizard.try_lock() else {
+                return true;
+            };
+            if state.menu_id != menu_id {
+                return true;
+            }
+            if let Some(reference) = state.credential_ref.clone() {
+                credentials.push(reference);
+            }
+            false
+        });
+        credentials
+    }
+
+    pub fn take_expired_credential_refs(&self) -> Vec<String> {
+        self.purge();
+        std::mem::take(&mut *self.expired_credential_refs.lock().unwrap())
+    }
+
     fn purge(&self) {
         let now = Instant::now();
+        let mut expired = Vec::new();
         self.inner.lock().unwrap().retain(|_, wizard| {
-            wizard
-                .try_lock()
-                .map(|state| state.expires_at > now)
-                .unwrap_or(true)
+            let Ok(state) = wizard.try_lock() else {
+                return true;
+            };
+            if state.expires_at > now {
+                return true;
+            }
+            if let Some(reference) = state.credential_ref.clone() {
+                expired.push(reference);
+            }
+            false
         });
+        self.expired_credential_refs.lock().unwrap().extend(expired);
     }
 }
 
@@ -115,7 +148,7 @@ pub fn endpoint_view(id: &str) -> View {
         blocks: vec![Block::Paragraph {
             text: "Send the OpenAI-compatible endpoint URL (for example https://host.example/v1). Credentials in URLs are rejected.".into(),
         }],
-        actions: vec![vec![Action::back(), Action::close()]],
+        actions: vec![vec![Action::close()]],
         side_mode: false,
     }
     .with_internal_hint(id)
@@ -212,7 +245,7 @@ pub fn confirmation_view(wizard: &CustomLoginWizard) -> View {
                 ],
                 vec![
                     "API key".into(),
-                    if wizard.api_key.is_some() {
+                    if wizard.credential_ref.is_some() {
                         "configured".into()
                     } else {
                         "none".into()
@@ -235,7 +268,34 @@ pub fn confirmation_view(wizard: &CustomLoginWizard) -> View {
                 "Confirm",
                 format!("/_custom:{}:confirm", wizard.id),
             )],
-            vec![Action::back(), Action::close()],
+            vec![
+                Action::command("Back", format!("/_custom:{}:wizard_back", wizard.id)),
+                Action::close(),
+            ],
+        ],
+        side_mode: false,
+    }
+}
+
+pub fn failure_view(id: &str, endpoint: Option<&str>, problem: &str) -> View {
+    View {
+        title: Some("CUSTOM LOGIN FAILED".into()),
+        blocks: vec![Block::Table {
+            headers: vec!["Field".into(), "Value".into()],
+            rows: vec![
+                vec!["Endpoint".into(), endpoint.unwrap_or("not set").into()],
+                vec!["Problem".into(), problem.into()],
+            ],
+        }],
+        actions: vec![
+            vec![
+                Action::command("Retry", format!("/_custom:{id}:retry")),
+                Action::command("Edit Endpoint", format!("/_custom:{id}:edit_endpoint")),
+            ],
+            vec![
+                Action::command("Back", format!("/_custom:{id}:wizard_back")),
+                Action::close(),
+            ],
         ],
         side_mode: false,
     }
@@ -300,12 +360,33 @@ mod tests {
     }
 
     #[test]
+    fn expired_or_closed_wizard_returns_uncommitted_credential_for_cleanup() {
+        let store = CustomLoginStore::new(Duration::ZERO);
+        let wizard = store.begin(TelegramScope::new(1, None), 2, "expired-menu".into());
+        wizard.blocking_lock().credential_ref = Some("expired-credential".into());
+        drop(wizard);
+        assert_eq!(
+            store.take_expired_credential_refs(),
+            vec!["expired-credential"]
+        );
+
+        let store = CustomLoginStore::new(Duration::from_secs(60));
+        let wizard = store.begin(TelegramScope::new(1, None), 2, "closed-menu".into());
+        wizard.blocking_lock().credential_ref = Some("closed-credential".into());
+        drop(wizard);
+        assert_eq!(
+            store.remove_uncommitted_by_menu("closed-menu"),
+            vec!["closed-credential"]
+        );
+    }
+
+    #[test]
     fn api_key_never_enters_visible_views_or_callback_commands() {
         let store = CustomLoginStore::new(Duration::from_secs(60));
         let wizard = store.begin(TelegramScope::new(1, Some(2)), 3, "menu".into());
         let mut wizard = wizard.blocking_lock();
         wizard.endpoint = Some("https://example.test/v1".into());
-        wizard.api_key = Some(Zeroizing::new("super-secret-api-key".into()));
+        wizard.credential_ref = Some("credential-ref-only".into());
         wizard.models = vec!["model-a".into()];
         wizard.selected_index = Some(0);
         let serialized = serde_json::to_string(&confirmation_view(&wizard)).unwrap();
@@ -316,6 +397,34 @@ mod tests {
                 .callback_command()
                 .unwrap_or_default()
                 .contains("super-secret-api-key"));
+        }
+    }
+
+    #[test]
+    fn discovery_failure_exposes_concrete_recovery_actions() {
+        let view = failure_view(
+            "wizard-safe-id",
+            Some("https://offline.example/v1"),
+            "Connection timed out. upstream did not respond within 30 seconds",
+        );
+        let serialized = serde_json::to_string(&view).unwrap();
+        assert!(serialized.contains("Connection timed out"));
+        let labels = view
+            .actions
+            .iter()
+            .flatten()
+            .map(|action| action.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["Retry", "Edit Endpoint", "Back", "Close"]);
+        for command in view
+            .actions
+            .iter()
+            .flatten()
+            .filter_map(Action::callback_command)
+            .filter(|command| command.starts_with("/_custom:"))
+        {
+            assert!(command.contains("wizard-safe-id"));
+            assert!(!command.contains("offline.example"));
         }
     }
 }

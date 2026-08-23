@@ -1,4 +1,7 @@
 mod payload;
+mod profiles;
+
+pub use profiles::ProviderProfileStore;
 
 use std::{
     collections::HashMap,
@@ -8,6 +11,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -15,6 +19,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
+    attachments::NormalizedImage,
     auth::{antigravity_user_agent, AuthManager},
     config::{AppConfig, CustomProviderConfig},
     security::redact::redact_text,
@@ -63,6 +68,10 @@ impl ToolProtocol {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderCapabilities {
+    pub text: bool,
+    pub vision: bool,
+    pub file_input: bool,
+    pub native_tools: bool,
     pub tool_protocol: ToolProtocol,
     pub model_discovery: bool,
     pub structured_output: bool,
@@ -74,6 +83,10 @@ pub struct ProviderCapabilities {
 impl ProviderCapabilities {
     pub fn native(evidence: impl Into<String>) -> Self {
         Self {
+            text: true,
+            vision: false,
+            file_input: false,
+            native_tools: true,
             tool_protocol: ToolProtocol::Native,
             model_discovery: false,
             structured_output: true,
@@ -84,6 +97,10 @@ impl ProviderCapabilities {
 
     pub fn chat_only(evidence: impl Into<String>) -> Self {
         Self {
+            text: true,
+            vision: false,
+            file_input: false,
+            native_tools: false,
             tool_protocol: ToolProtocol::ChatOnly,
             model_discovery: false,
             structured_output: false,
@@ -119,6 +136,11 @@ pub struct ProviderRequest {
     /// provider may translate these, but never discovers or executes tools.
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
+    /// Runtime-validated normalized images. Telegram wire details never enter
+    /// provider adapters, and providers may serialize these only when their
+    /// selected model explicitly declares vision capability.
+    #[serde(default)]
+    pub images: Vec<NormalizedImage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,12 +175,29 @@ pub trait Provider: Send + Sync {
     fn capabilities(&self, _model: &str) -> ProviderCapabilities {
         ProviderCapabilities::chat_only("provider did not declare an agent tool protocol")
     }
+    fn capabilities_for(
+        &self,
+        model: &str,
+        _account_or_profile_id: Option<&str>,
+    ) -> ProviderCapabilities {
+        self.capabilities(model)
+    }
+    fn models_for(&self, _account_or_profile_id: Option<&str>) -> Vec<String> {
+        self.models()
+    }
     /// Whether this adapter supports the ordinary no-tool generation path
     /// used by Xiao's internal schema evaluator. Test/fake providers opt in
     /// explicitly so semantic side calls cannot accidentally consume their
     /// scripted agent-turn queues.
     fn supports_semantic_evaluation(&self, _model: &str) -> bool {
         false
+    }
+    fn supports_semantic_evaluation_for(
+        &self,
+        model: &str,
+        _account_or_profile_id: Option<&str>,
+    ) -> bool {
+        self.supports_semantic_evaluation(model)
     }
     async fn generate_text(&self, mut req: ProviderRequest) -> Result<String> {
         req.tools.clear();
@@ -291,8 +330,19 @@ impl ProviderRegistry {
     pub fn models(&self, id: &str) -> Result<Vec<String>> {
         Ok(self.get(id)?.models())
     }
+    pub fn models_for(&self, id: &str, account_or_profile_id: Option<&str>) -> Result<Vec<String>> {
+        Ok(self.get(id)?.models_for(account_or_profile_id))
+    }
     pub fn capabilities(&self, id: &str, model: &str) -> Result<ProviderCapabilities> {
         Ok(self.get(id)?.capabilities(model))
+    }
+    pub fn capabilities_for(
+        &self,
+        id: &str,
+        model: &str,
+        account_or_profile_id: Option<&str>,
+    ) -> Result<ProviderCapabilities> {
+        Ok(self.get(id)?.capabilities_for(model, account_or_profile_id))
     }
     pub fn preferred_model(&self, id: &str) -> Result<String> {
         self.models(id)?
@@ -301,7 +351,15 @@ impl ProviderRegistry {
             .ok_or_else(|| anyhow!("provider {id} has no usable models"))
     }
     pub fn resolve_model(&self, id: &str, selected: &str) -> Result<String> {
-        let models = self.models(id)?;
+        self.resolve_model_for(id, selected, None)
+    }
+    pub fn resolve_model_for(
+        &self,
+        id: &str,
+        selected: &str,
+        account_or_profile_id: Option<&str>,
+    ) -> Result<String> {
+        let models = self.models_for(id, account_or_profile_id)?;
         if selected != "default" && models.iter().any(|model| model == selected) {
             return Ok(selected.to_owned());
         }
@@ -414,6 +472,15 @@ fn models_with_default(default_model: Option<&str>, fallback_models: Vec<String>
     models
 }
 
+fn codex_model_supports_vision(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("gpt-5")
+}
+
+fn antigravity_model_supports_vision(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("gemini-")
+}
+
 fn capabilities_from_record(
     record: crate::storage::ProviderCapabilityRecord,
 ) -> Option<ProviderCapabilities> {
@@ -424,6 +491,10 @@ fn capabilities_from_record(
         _ => return None,
     };
     Some(ProviderCapabilities {
+        text: true,
+        vision: false,
+        file_input: false,
+        native_tools: record.native_tool_calls,
         tool_protocol,
         model_discovery: true,
         structured_output: record.structured_output,
@@ -472,8 +543,13 @@ impl Provider for CodexProvider {
     fn ready(&self) -> bool {
         self.enabled
     }
-    fn capabilities(&self, _model: &str) -> ProviderCapabilities {
-        ProviderCapabilities::native("OpenAI Responses native function calls and continuation")
+    fn capabilities(&self, model: &str) -> ProviderCapabilities {
+        ProviderCapabilities {
+            vision: codex_model_supports_vision(model),
+            ..ProviderCapabilities::native(
+                "OpenAI Responses native function calls and continuation; vision is enabled only for Xiao's verified GPT-5 family",
+            )
+        }
     }
     fn supports_semantic_evaluation(&self, _model: &str) -> bool {
         true
@@ -504,6 +580,11 @@ impl Provider for CodexProvider {
         if !self.enabled {
             return Err(anyhow!("Codex provider is disabled"));
         }
+        if !req.images.is_empty() && !self.capabilities(&req.model).vision {
+            return Err(anyhow!(
+                "selected Codex model does not declare vision capability"
+            ));
+        }
         emit(
             &progress,
             AgentEvent::Status("Preparing Codex request".into()),
@@ -525,7 +606,8 @@ impl Provider for CodexProvider {
             .account_native_id
             .as_deref()
             .ok_or_else(|| anyhow!("ChatGPT account id missing"))?;
-        let payload = responses_payload(&req.messages, Some(CODEX_DEFAULT_INSTRUCTIONS));
+        let mut payload = responses_payload(&req.messages, Some(CODEX_DEFAULT_INSTRUCTIONS));
+        append_responses_images(&mut payload.input, &req.images)?;
         let mut input = continuation
             .and_then(|value| value.get("input").and_then(|item| item.as_array()).cloned())
             .unwrap_or(payload.input);
@@ -596,6 +678,76 @@ fn responses_tool_specs(specs: &[ToolSpec]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn image_data_url(image: &NormalizedImage) -> Result<String> {
+    if !matches!(
+        image.mime_type.as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    ) || image.bytes.is_empty()
+        || image.bytes.len() > 20 * 1024 * 1024
+    {
+        return Err(anyhow!("normalized image violates provider input bounds"));
+    }
+    Ok(format!(
+        "data:{};base64,{}",
+        image.mime_type,
+        STANDARD.encode(&image.bytes)
+    ))
+}
+
+fn append_responses_images(
+    input: &mut Vec<serde_json::Value>,
+    images: &[NormalizedImage],
+) -> Result<()> {
+    for image in images.iter().take(4) {
+        input.push(serde_json::json!({
+            "type":"message",
+            "role":"user",
+            "content":[
+                {"type":"input_text","text":image.caption},
+                {"type":"input_image","image_url":image_data_url(image)?,"detail":"auto"}
+            ]
+        }));
+    }
+    Ok(())
+}
+
+fn append_chat_images(messages: &mut Vec<serde_json::Value>, images: &[NormalizedImage]) {
+    for image in images.iter().take(4) {
+        if let Ok(url) = image_data_url(image) {
+            messages.push(serde_json::json!({
+                "role":"user",
+                "content":[
+                    {"type":"text","text":image.caption},
+                    {"type":"image_url","image_url":{"url":url,"detail":"auto"}}
+                ]
+            }));
+        }
+    }
+}
+
+fn append_antigravity_images(
+    body: &mut serde_json::Value,
+    images: &[NormalizedImage],
+) -> Result<()> {
+    let Some(contents) = body
+        .pointer_mut("/request/contents")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Err(anyhow!("Antigravity request has no contents array"));
+    };
+    for image in images.iter().take(4) {
+        image_data_url(image)?;
+        contents.push(serde_json::json!({
+            "role":"user",
+            "parts":[
+                {"text":image.caption},
+                {"inlineData":{"mimeType":image.mime_type,"data":STANDARD.encode(&image.bytes)}}
+            ]
+        }));
+    }
+    Ok(())
+}
+
 struct AntigravityProvider {
     enabled: bool,
     base: String,
@@ -664,10 +816,13 @@ impl Provider for AntigravityProvider {
     fn ready(&self) -> bool {
         self.enabled
     }
-    fn capabilities(&self, _model: &str) -> ProviderCapabilities {
-        ProviderCapabilities::native(
-            "Gemini functionDeclarations/functionCall/functionResponse continuation",
-        )
+    fn capabilities(&self, model: &str) -> ProviderCapabilities {
+        ProviderCapabilities {
+            vision: antigravity_model_supports_vision(model),
+            ..ProviderCapabilities::native(
+                "Cloud Code Assist functionDeclarations continuation; inlineData vision is enabled only for verified Gemini families",
+            )
+        }
     }
     fn supports_semantic_evaluation(&self, _model: &str) -> bool {
         true
@@ -699,6 +854,11 @@ impl Provider for AntigravityProvider {
         if !self.enabled {
             return Err(anyhow!("Antigravity provider is disabled"));
         }
+        if !req.images.is_empty() && !self.capabilities(&req.model).vision {
+            return Err(anyhow!(
+                "selected Antigravity model does not declare vision capability"
+            ));
+        }
         emit(
             &progress,
             AgentEvent::Status("Refreshing Antigravity session if needed".into()),
@@ -725,6 +885,7 @@ impl Provider for AntigravityProvider {
             Uuid::new_v4().simple()
         );
         let mut body = antigravity_body(project, &req.model, &req.messages, &request_id);
+        append_antigravity_images(&mut body, &req.images)?;
         let mut contents = continuation
             .as_ref()
             .and_then(|value| value.get("contents"))
@@ -804,17 +965,69 @@ struct CustomProvider {
     cfg: CustomProviderConfig,
     auth: Arc<AuthManager>,
     storage: Arc<crate::storage::Storage>,
+    profiles: ProviderProfileStore,
     client: Client,
 }
+
+struct CustomTarget {
+    base_url: String,
+    protocol: String,
+    headers: std::collections::BTreeMap<String, String>,
+    api_key: Option<String>,
+}
+
 impl CustomProvider {
     fn new(cfg: CustomProviderConfig, auth: Arc<AuthManager>) -> Self {
         let storage = auth.storage();
         Self {
             cfg,
             auth,
+            profiles: ProviderProfileStore::new(storage.clone()),
             storage,
             client: http_client(),
         }
+    }
+
+    fn target(&self, profile_id: Option<&str>) -> Result<CustomTarget> {
+        if let Some(profile_id) = profile_id {
+            let profile = self
+                .profiles
+                .get_by_id(profile_id)?
+                .ok_or_else(|| anyhow!("selected Custom profile does not exist"))?;
+            if !profile.enabled {
+                return Err(anyhow!("selected Custom profile is disabled"));
+            }
+            // Critical isolation rule: resolve only the selected profile's
+            // credential reference. Absence means no Authorization header.
+            let api_key = match profile.credential_ref.as_deref() {
+                Some(reference) => self
+                    .auth
+                    .credential(reference)?
+                    .and_then(|credential| credential.api_key)
+                    .filter(|key| !key.trim().is_empty()),
+                None => None,
+            };
+            let headers = profile.safe_headers()?;
+            return Ok(CustomTarget {
+                base_url: profile.endpoint,
+                protocol: profile.protocol,
+                headers,
+                api_key,
+            });
+        }
+        // Compatibility boundary for a config-only v0.2.5 installation
+        // before an authorized Telegram owner can be derived. It deliberately
+        // does not use a provider-wide API-key fallback.
+        Ok(CustomTarget {
+            base_url: self
+                .cfg
+                .base_url
+                .clone()
+                .ok_or_else(|| anyhow!("Custom profile is not selected"))?,
+            protocol: self.cfg.protocol.clone(),
+            headers: self.cfg.headers.clone(),
+            api_key: None,
+        })
     }
 
     fn configured_capabilities(&self) -> ProviderCapabilities {
@@ -826,6 +1039,10 @@ impl CustomProvider {
                 )
             },
             "structured_json" => ProviderCapabilities {
+                text: true,
+                vision: false,
+                file_input: false,
+                native_tools: false,
                 tool_protocol: ToolProtocol::StructuredJsonFallback,
                 model_discovery: true,
                 structured_output: true,
@@ -856,16 +1073,41 @@ impl Provider for CustomProvider {
         } else {
             self.cfg.models.clone()
         };
-        models_with_default(self.cfg.default_model.as_deref(), fallback)
+        let mut models = models_with_default(self.cfg.default_model.as_deref(), fallback);
+        if let Ok(profile_models) = self.profiles.all_models() {
+            for model in profile_models {
+                if !models.contains(&model) {
+                    models.push(model);
+                }
+            }
+        }
+        models
+    }
+    fn models_for(&self, profile_id: Option<&str>) -> Vec<String> {
+        let Some(profile_id) = profile_id else {
+            return self.models();
+        };
+        self.profiles
+            .models(profile_id)
+            .map(|models| models.into_iter().map(|model| model.model_id).collect())
+            .unwrap_or_default()
     }
     fn enabled(&self) -> bool {
         self.cfg.enabled
+            || self
+                .profiles
+                .all_models()
+                .is_ok_and(|models| !models.is_empty())
     }
     fn configured(&self) -> bool {
-        self.cfg
-            .base_url
-            .as_deref()
-            .is_some_and(|x| !x.trim().is_empty())
+        self.profiles
+            .all_models()
+            .is_ok_and(|models| !models.is_empty())
+            || self
+                .cfg
+                .base_url
+                .as_deref()
+                .is_some_and(|x| !x.trim().is_empty())
     }
     fn ready(&self) -> bool {
         self.enabled() && self.configured()
@@ -877,6 +1119,35 @@ impl Provider for CustomProvider {
             .flatten()
             .and_then(capabilities_from_record)
             .unwrap_or_else(|| self.configured_capabilities())
+    }
+    fn capabilities_for(&self, model: &str, profile_id: Option<&str>) -> ProviderCapabilities {
+        let Some(profile_id) = profile_id else {
+            return self.capabilities(model);
+        };
+        self.profiles
+            .model(profile_id, model)
+            .ok()
+            .flatten()
+            .map(|record| ProviderCapabilities {
+                text: record.text_capable,
+                vision: record.vision_capable,
+                file_input: record.file_input_capable,
+                native_tools: record.native_tools,
+                tool_protocol: match record.tool_protocol.as_str() {
+                    "native" => ToolProtocol::Native,
+                    "structured_json_fallback" => ToolProtocol::StructuredJsonFallback,
+                    _ => ToolProtocol::ChatOnly,
+                },
+                model_discovery: record.model_discovery,
+                structured_output: record.structured_output,
+                continuation: record.continuation,
+                evidence: record.evidence,
+            })
+            .unwrap_or_else(|| {
+                ProviderCapabilities::chat_only(
+                    "selected Custom profile/model has not passed capability probing",
+                )
+            })
     }
     fn supports_semantic_evaluation(&self, model: &str) -> bool {
         (self
@@ -891,37 +1162,28 @@ impl Provider for CustomProvider {
             ))
             && self.capabilities(model).structured_output
     }
+    fn supports_semantic_evaluation_for(&self, model: &str, profile_id: Option<&str>) -> bool {
+        self.capabilities_for(model, profile_id).structured_output
+    }
     async fn generate_text(&self, mut req: ProviderRequest) -> Result<String> {
         req.tools.clear();
-        if !self.cfg.enabled {
+        if req.account_id.is_none() && !self.cfg.enabled {
             return Err(anyhow!("custom provider is disabled"));
         }
-        let base = self
-            .cfg
-            .base_url
-            .clone()
-            .ok_or_else(|| anyhow!("custom provider base_url is not configured"))?;
-        let endpoint = if self.cfg.protocol == "openai_chat_completions" {
-            endpoint_with_suffix(&base, "/chat/completions")
+        let target = self.target(req.account_id.as_deref())?;
+        let endpoint = if target.protocol == "openai_chat_completions" {
+            endpoint_with_suffix(&target.base_url, "/chat/completions")
         } else {
-            endpoint_with_suffix(&base, "/responses")
+            endpoint_with_suffix(&target.base_url, "/responses")
         };
         let mut request = self.client.post(endpoint);
-        for (name, value) in &self.cfg.headers {
+        for (name, value) in &target.headers {
             request = request.header(name.as_str(), value.as_str());
         }
-        let selected_api_key = match req.account_id.as_deref() {
-            Some(account) => self
-                .auth
-                .credential(account)?
-                .and_then(|credential| credential.api_key),
-            None => None,
-        };
-        let api_key = selected_api_key.or(self.auth.provider_api_key("custom")?);
-        if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
+        if let Some(key) = target.api_key.as_deref() {
             request = request.bearer_auth(key);
         }
-        let body = if self.cfg.protocol == "openai_chat_completions" {
+        let body = if target.protocol == "openai_chat_completions" {
             custom_chat_body(&req, None, &[], ToolProtocol::ChatOnly)
         } else {
             custom_responses_body(&req, None, &[], ToolProtocol::ChatOnly)
@@ -933,7 +1195,7 @@ impl Provider for CustomProvider {
         .await?
         .json()
         .await?;
-        let text = if self.cfg.protocol == "openai_chat_completions" {
+        let text = if target.protocol == "openai_chat_completions" {
             extract_chat_content(&value)
         } else {
             extract_output_text(&value)
@@ -965,46 +1227,39 @@ impl Provider for CustomProvider {
         tool_results: Vec<ToolResult>,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<ProviderTurn> {
-        if !self.cfg.enabled {
+        if req.account_id.is_none() && !self.cfg.enabled {
             return Err(anyhow!("custom provider is disabled"));
         }
-        let base = self
-            .cfg
-            .base_url
-            .clone()
-            .ok_or_else(|| anyhow!("custom provider base_url is not configured"))?;
+        let target = self.target(req.account_id.as_deref())?;
+        let capabilities = self.capabilities_for(&req.model, req.account_id.as_deref());
+        if !req.images.is_empty() && !capabilities.vision {
+            return Err(anyhow!(
+                "selected Custom profile/model does not declare vision capability"
+            ));
+        }
         emit(
             &progress,
             AgentEvent::Status("Sending request to custom provider".into()),
         );
-        let endpoint = if self.cfg.protocol == "openai_chat_completions" {
-            endpoint_with_suffix(&base, "/chat/completions")
+        let endpoint = if target.protocol == "openai_chat_completions" {
+            endpoint_with_suffix(&target.base_url, "/chat/completions")
         } else {
-            endpoint_with_suffix(&base, "/responses")
+            endpoint_with_suffix(&target.base_url, "/responses")
         };
         let mut request = self.client.post(endpoint);
-        for (name, value) in &self.cfg.headers {
+        for (name, value) in &target.headers {
             request = request.header(name.as_str(), value.as_str());
         }
-        let selected_api_key = match req.account_id.as_deref() {
-            Some(account) => self
-                .auth
-                .credential(account)?
-                .and_then(|credential| credential.api_key),
-            None => None,
-        };
-        let api_key = match selected_api_key {
-            Some(key) if !key.trim().is_empty() => Some(key),
-            _ => self.auth.provider_api_key("custom")?,
-        };
-        if let Some(key) = api_key {
+        if let Some(key) = target.api_key.as_deref() {
             request = request.bearer_auth(key);
         }
-        let capabilities = self.capabilities(&req.model);
+        let mut structured_transcript = None;
         if capabilities.tool_protocol == ToolProtocol::StructuredJsonFallback {
-            append_structured_fallback_context(&mut req.messages, &req.tools, &tool_results);
+            let transcript = structured_fallback_transcript(continuation.as_ref(), &tool_results)?;
+            append_structured_fallback_context(&mut req.messages, &req.tools, &transcript);
+            structured_transcript = Some(transcript);
         }
-        let body = if self.cfg.protocol == "openai_chat_completions" {
+        let body = if target.protocol == "openai_chat_completions" {
             custom_chat_body(
                 &req,
                 continuation.as_ref(),
@@ -1023,21 +1278,41 @@ impl Provider for CustomProvider {
         let response = ensure_success(response, "Custom provider").await?;
         let value: serde_json::Value = response.json().await?;
         let (step, continuation) = match capabilities.tool_protocol {
-            ToolProtocol::Native if self.cfg.protocol == "openai_chat_completions" => {
+            ToolProtocol::Native if target.protocol == "openai_chat_completions" => {
                 parse_custom_chat_turn(&value, body["messages"].clone())?
             }
             ToolProtocol::Native => parse_custom_responses_turn(&value, body["input"].clone())?,
             ToolProtocol::StructuredJsonFallback => {
-                let text = if self.cfg.protocol == "openai_chat_completions" {
+                let text = if target.protocol == "openai_chat_completions" {
                     extract_chat_content(&value)
                 } else {
                     extract_output_text(&value)
                 }
                 .ok_or_else(|| anyhow!("custom structured response contained no JSON text"))?;
-                (parse_structured_agent_output(&text, &req.tools)?, None)
+                let step = parse_structured_agent_output(&text, &req.tools)?;
+                let continuation = match &step {
+                    ProviderStep::ToolCalls(calls) => {
+                        let mut transcript = structured_transcript.take().unwrap_or_default();
+                        transcript.push(serde_json::json!({
+                            "role":"assistant",
+                            "kind":"tool_calls",
+                            "calls":calls.iter().map(|call| serde_json::json!({
+                                "call_id":call.call_id,
+                                "name":call.name,
+                                "arguments":call.arguments,
+                            })).collect::<Vec<_>>()
+                        }));
+                        Some(serde_json::json!({
+                            "kind":"xiao_structured_continuation_v1",
+                            "transcript":bound_structured_transcript(transcript)?,
+                        }))
+                    }
+                    ProviderStep::Final(_) => None,
+                };
+                (step, continuation)
             }
             ToolProtocol::ChatOnly => {
-                let answer = if self.cfg.protocol == "openai_chat_completions" {
+                let answer = if target.protocol == "openai_chat_completions" {
                     extract_chat_content(&value)
                 } else {
                     extract_output_text(&value)
@@ -1066,6 +1341,9 @@ fn custom_chat_body(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_else(|| chat_messages(&req.messages));
+    if continuation.is_none() {
+        append_chat_images(&mut messages, &req.images);
+    }
     if protocol == ToolProtocol::Native {
         messages.extend(tool_results.iter().map(|result| {
             serde_json::json!({
@@ -1109,7 +1387,12 @@ fn custom_responses_body(
     tool_results: &[ToolResult],
     protocol: ToolProtocol,
 ) -> serde_json::Value {
-    let payload = responses_payload(&req.messages, None);
+    let mut payload = responses_payload(&req.messages, None);
+    if continuation.is_none() {
+        // Any image reaching this point was validated by the runtime and the
+        // selected profile/model capability gate.
+        let _ = append_responses_images(&mut payload.input, &req.images);
+    }
     let mut input = continuation
         .and_then(|value| value.get("input"))
         .and_then(serde_json::Value::as_array)
@@ -1240,7 +1523,7 @@ fn parse_custom_responses_turn(
 fn append_structured_fallback_context(
     messages: &mut Vec<MessageRecord>,
     tools: &[ToolSpec],
-    tool_results: &[ToolResult],
+    transcript: &[serde_json::Value],
 ) {
     let tools = tools
         .iter()
@@ -1253,30 +1536,81 @@ fn append_structured_fallback_context(
             })
         })
         .collect::<Vec<_>>();
-    let results = tool_results
-        .iter()
-        .take(64)
-        .map(|result| {
-            serde_json::json!({
-                "call_id": result.call_id,
-                "name": result.name,
-                "output": result.output,
-                "is_error": result.is_error,
-            })
-        })
-        .collect::<Vec<_>>();
     messages.push(MessageRecord {
         role: "system".into(),
         content: format!(
-            "<XIAO_STRUCTURED_AGENT_PROTOCOL>Return exactly one JSON object, with no markdown: {{\"kind\":\"tool_calls\",\"calls\":[{{\"call_id\":\"unique\",\"name\":\"tool\",\"arguments\":{{}}}}]}} or {{\"kind\":\"final\",\"text\":\"answer\"}}. Only request listed tools. Tool policy is enforced by Xiao. TOOLS={} TOOL_RESULTS={}</XIAO_STRUCTURED_AGENT_PROTOCOL>",
+            "<XIAO_STRUCTURED_AGENT_PROTOCOL>Return exactly one JSON object, with no markdown: {{\"kind\":\"tool_calls\",\"calls\":[{{\"call_id\":\"unique\",\"name\":\"tool\",\"arguments\":{{}}}}]}} or {{\"kind\":\"final\",\"text\":\"answer\"}}. Only request listed tools. Tool policy is enforced by Xiao. TOOLS={} NORMALIZED_TRANSCRIPT={}</XIAO_STRUCTURED_AGENT_PROTOCOL>",
             serde_json::to_string(&tools).unwrap_or_else(|_| "[]".into()),
-            serde_json::to_string(&results).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(transcript).unwrap_or_else(|_| "[]".into()),
         )
         .chars()
         .take(48_000)
         .collect(),
         created_at: chrono::Utc::now().to_rfc3339(),
     });
+}
+
+const STRUCTURED_MAX_TRANSCRIPT_ITEMS: usize = 48;
+const STRUCTURED_MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
+const STRUCTURED_MAX_RESULT_BYTES: usize = 16 * 1024;
+
+fn structured_fallback_transcript(
+    continuation: Option<&serde_json::Value>,
+    tool_results: &[ToolResult],
+) -> Result<Vec<serde_json::Value>> {
+    let mut transcript = match continuation {
+        Some(value)
+            if value.get("kind").and_then(serde_json::Value::as_str)
+                == Some("xiao_structured_continuation_v1") =>
+        {
+            value
+                .get("transcript")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        }
+        Some(_) => return Err(anyhow!("invalid Custom structured continuation state")),
+        None => Vec::new(),
+    };
+    for result in tool_results.iter().take(16) {
+        transcript.push(serde_json::json!({
+            "role":"tool",
+            "call_id":result.call_id,
+            "name":result.name,
+            "output":bound_utf8(&result.output, STRUCTURED_MAX_RESULT_BYTES),
+            "is_error":result.is_error,
+        }));
+    }
+    bound_structured_transcript(transcript)
+}
+
+fn bound_structured_transcript(
+    mut transcript: Vec<serde_json::Value>,
+) -> Result<Vec<serde_json::Value>> {
+    if transcript.len() > STRUCTURED_MAX_TRANSCRIPT_ITEMS {
+        let drain = transcript.len() - STRUCTURED_MAX_TRANSCRIPT_ITEMS;
+        transcript.drain(0..drain);
+    }
+    while serde_json::to_vec(&transcript)?.len() > STRUCTURED_MAX_TRANSCRIPT_BYTES {
+        if transcript.len() <= 1 {
+            return Err(anyhow!(
+                "Custom structured continuation exceeds bounded transcript size"
+            ));
+        }
+        transcript.remove(0);
+    }
+    Ok(transcript)
+}
+
+fn bound_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_owned() + "…"
 }
 
 #[derive(Deserialize)]
@@ -1374,6 +1708,10 @@ pub(crate) async fn probe_custom_tool_capability(
         .unwrap_or(false)
     {
         return ProviderCapabilities {
+            text: true,
+            vision: false,
+            file_input: false,
+            native_tools: false,
             tool_protocol: ToolProtocol::StructuredJsonFallback,
             model_discovery: true,
             structured_output: true,
@@ -1897,8 +2235,8 @@ fn extract_output_text(v: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Storage;
-    use axum::{http::StatusCode, routing::post, Json, Router};
+    use crate::storage::{ProviderProfileInput, ProviderProfileModelRecord, Storage};
+    use axum::{http::HeaderMap, http::StatusCode, routing::post, Json, Router};
 
     fn message(role: &str, content: &str) -> MessageRecord {
         MessageRecord {
@@ -1915,6 +2253,7 @@ mod tests {
             model: "model-a".into(),
             messages,
             tools: vec![],
+            images: vec![],
         }
     }
 
@@ -1954,6 +2293,339 @@ mod tests {
         }
     }
 
+    fn named_tool(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: format!("Run {name}"),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties":{"value":{"type":"string"}},
+                "additionalProperties":false
+            }),
+            risk: crate::tools::ToolRisk::ReadOnly,
+            origin: crate::tools::ToolOrigin::Builtin,
+            effect: crate::tools::ToolEffect::None,
+            required_capabilities: vec![],
+            timeout_ms: 5_000,
+        }
+    }
+
+    fn profile_model(
+        profile_id: &str,
+        model_id: &str,
+        tool_protocol: ToolProtocol,
+    ) -> ProviderProfileModelRecord {
+        ProviderProfileModelRecord {
+            profile_id: profile_id.into(),
+            model_id: model_id.into(),
+            text_capable: true,
+            vision_capable: false,
+            file_input_capable: false,
+            native_tools: tool_protocol == ToolProtocol::Native,
+            structured_output: tool_protocol != ToolProtocol::ChatOnly,
+            continuation: tool_protocol != ToolProtocol::ChatOnly,
+            model_discovery: true,
+            tool_protocol: tool_protocol.as_str().into(),
+            evidence: "deterministic production-path test".into(),
+            probed_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_profile_without_key_never_inherits_another_profiles_secret_or_header() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let captured_tx = captured_tx.clone();
+                    async move {
+                        captured_tx.send((headers, body)).unwrap();
+                        Json(serde_json::json!({
+                            "choices":[{"message":{"role":"assistant","content":"profile-b-ok"}}]
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (auth, _directory) = test_auth();
+        let owner = "owner:telegram:7";
+        let profiles = ProviderProfileStore::new(auth.storage());
+        let credential = auth
+            .create_api_key_credential("custom", "profile-a", "SECRET_A")
+            .unwrap();
+        let profile_a = profiles
+            .create(ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner.into(),
+                alias: "profile-a".into(),
+                endpoint: "https://a.example/v1".into(),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: Some(credential.id),
+                safe_headers_json: r#"{"X-Profile-A":"HEADER_A"}"#.into(),
+            })
+            .unwrap();
+        profiles
+            .replace_models(
+                owner,
+                &profile_a.profile_id,
+                &[profile_model(
+                    &profile_a.profile_id,
+                    "m",
+                    ToolProtocol::ChatOnly,
+                )],
+            )
+            .unwrap();
+        let profile_b = profiles
+            .create(ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner.into(),
+                alias: "profile-b".into(),
+                endpoint: format!("http://{address}/v1"),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: None,
+                safe_headers_json: "{}".into(),
+            })
+            .unwrap();
+        profiles
+            .replace_models(
+                owner,
+                &profile_b.profile_id,
+                &[profile_model(
+                    &profile_b.profile_id,
+                    "m",
+                    ToolProtocol::ChatOnly,
+                )],
+            )
+            .unwrap();
+
+        let provider = CustomProvider::new(
+            CustomProviderConfig {
+                // A selected profile is independently usable even when the
+                // singleton compatibility config is disabled.
+                enabled: false,
+                base_url: Some("https://legacy.example/v1".into()),
+                protocol: "openai_chat_completions".into(),
+                models: vec!["m".into()],
+                ..Default::default()
+            },
+            auth,
+        );
+        assert!(provider.enabled());
+        let mut req = request(vec![message("user", "hello")]);
+        req.account_id = Some(profile_b.profile_id);
+        req.model = "m".into();
+        let answer = provider.run(req, None).await.unwrap();
+        assert_eq!(answer.final_answer, "profile-b-ok");
+        let (headers, body) = captured_rx.recv().await.unwrap();
+        assert!(headers.get("authorization").is_none());
+        assert!(headers.get("x-profile-a").is_none());
+        let wire = serde_json::to_string(&body).unwrap();
+        assert!(!wire.contains("SECRET_A"));
+        assert!(!wire.contains("HEADER_A"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn production_custom_structured_fallback_retains_tool_a_and_b_results_until_final() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let calls = calls.clone();
+                move |Json(body): Json<serde_json::Value>| {
+                    let captured_tx = captured_tx.clone();
+                    let calls = calls.clone();
+                    async move {
+                        captured_tx.send(body).unwrap();
+                        let content = match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                            0 => r#"{"kind":"tool_calls","calls":[{"call_id":"a","name":"tool_a","arguments":{"value":"first"}}]}"#,
+                            1 => r#"{"kind":"tool_calls","calls":[{"call_id":"b","name":"tool_b","arguments":{"value":"second"}}]}"#,
+                            _ => r#"{"kind":"final","text":"verified final"}"#,
+                        };
+                        Json(serde_json::json!({
+                            "choices":[{"message":{"role":"assistant","content":content}}]
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (auth, _directory) = test_auth();
+        let owner = "owner:telegram:8";
+        let profiles = ProviderProfileStore::new(auth.storage());
+        let profile = profiles
+            .create(ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner.into(),
+                alias: "structured".into(),
+                endpoint: format!("http://{address}/v1"),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: None,
+                safe_headers_json: "{}".into(),
+            })
+            .unwrap();
+        profiles
+            .replace_models(
+                owner,
+                &profile.profile_id,
+                &[profile_model(
+                    &profile.profile_id,
+                    "m",
+                    ToolProtocol::StructuredJsonFallback,
+                )],
+            )
+            .unwrap();
+        let provider = CustomProvider::new(
+            CustomProviderConfig {
+                enabled: true,
+                base_url: Some("https://legacy.example/v1".into()),
+                protocol: "openai_chat_completions".into(),
+                models: vec!["m".into()],
+                ..Default::default()
+            },
+            auth,
+        );
+        let mut req = request(vec![message("user", "run two steps")]);
+        req.account_id = Some(profile.profile_id);
+        req.model = "m".into();
+        req.tools = vec![named_tool("tool_a"), named_tool("tool_b")];
+
+        let first = provider
+            .run_turn(req.clone(), None, vec![], None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(first.step, ProviderStep::ToolCalls(ref calls) if calls[0].name == "tool_a")
+        );
+        let second = provider
+            .run_turn(
+                req.clone(),
+                first.continuation,
+                vec![ToolResult {
+                    call_id: "a".into(),
+                    name: "tool_a".into(),
+                    output: "RESULT_A".into(),
+                    is_error: false,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(second.step, ProviderStep::ToolCalls(ref calls) if calls[0].name == "tool_b")
+        );
+        let third = provider
+            .run_turn(
+                req,
+                second.continuation,
+                vec![ToolResult {
+                    call_id: "b".into(),
+                    name: "tool_b".into(),
+                    output: "RESULT_B".into(),
+                    is_error: false,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(third.step, ProviderStep::Final(ref text) if text == "verified final"));
+        let _first_wire = captured_rx.recv().await.unwrap();
+        let second_wire = serde_json::to_string(&captured_rx.recv().await.unwrap()).unwrap();
+        let third_wire = serde_json::to_string(&captured_rx.recv().await.unwrap()).unwrap();
+        assert!(second_wire.contains("RESULT_A"));
+        assert!(third_wire.contains("RESULT_A"));
+        assert!(third_wire.contains("RESULT_B"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn production_custom_vision_serializes_normalized_image_and_rejects_nonvision_model() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured_tx = captured_tx.clone();
+                async move {
+                    captured_tx.send(body).unwrap();
+                    Json(serde_json::json!({
+                        "choices":[{"message":{"role":"assistant","content":"visible"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (auth, _directory) = test_auth();
+        let owner = "owner:telegram:9";
+        let profiles = ProviderProfileStore::new(auth.storage());
+        let profile = profiles
+            .create(ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner.into(),
+                alias: "vision".into(),
+                endpoint: format!("http://{address}/v1"),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: None,
+                safe_headers_json: "{}".into(),
+            })
+            .unwrap();
+        let mut vision = profile_model(&profile.profile_id, "vision-m", ToolProtocol::ChatOnly);
+        vision.vision_capable = true;
+        let no_vision = profile_model(&profile.profile_id, "text-m", ToolProtocol::ChatOnly);
+        profiles
+            .replace_models(owner, &profile.profile_id, &[vision, no_vision])
+            .unwrap();
+        let provider = CustomProvider::new(
+            CustomProviderConfig {
+                enabled: true,
+                base_url: Some("https://legacy.example/v1".into()),
+                protocol: "openai_chat_completions".into(),
+                models: vec!["vision-m".into(), "text-m".into()],
+                ..Default::default()
+            },
+            auth,
+        );
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .unwrap();
+        let image = NormalizedImage {
+            attachment_id: "image-a".into(),
+            mime_type: "image/png".into(),
+            bytes: png,
+            width: 1,
+            height: 1,
+            caption: "What is visible?".into(),
+        };
+        let mut req = request(vec![message("user", "inspect this image")]);
+        req.account_id = Some(profile.profile_id.clone());
+        req.model = "vision-m".into();
+        req.images = vec![image.clone()];
+        assert_eq!(
+            provider.run(req.clone(), None).await.unwrap().final_answer,
+            "visible"
+        );
+        let body = captured_rx.recv().await.unwrap();
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(serialized.contains("image_url"));
+        assert!(serialized.contains("data:image/png;base64,"));
+        assert!(serialized.contains("What is visible?"));
+
+        req.model = "text-m".into();
+        let error = provider.run(req, None).await.unwrap_err().to_string();
+        assert!(error.contains("does not declare vision capability"));
+        server.abort();
+    }
+
     #[test]
     fn provider_capabilities_are_explicit_and_antigravity_translates_tools() {
         let (auth, _directory) = test_auth();
@@ -1967,10 +2639,14 @@ mod tests {
             auth,
         );
         assert_eq!(codex.capabilities("m").tool_protocol, ToolProtocol::Native);
+        assert!(!codex.capabilities("m").vision);
+        assert!(codex.capabilities("gpt-5.6-sol").vision);
         assert_eq!(
             antigravity.capabilities("m").tool_protocol,
             ToolProtocol::Native
         );
+        assert!(!antigravity.capabilities("claude-sonnet-4-6").vision);
+        assert!(antigravity.capabilities("gemini-pro-agent").vision);
         let wire = antigravity_tool_specs(&[test_tool()]);
         assert_eq!(wire[0]["name"], "artifact_write");
         assert_eq!(wire[0]["parameters"]["required"][0], "path");

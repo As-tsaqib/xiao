@@ -4,14 +4,18 @@ use anyhow::Result;
 use tokio::sync::RwLock;
 
 use crate::{
+    attachments::AttachmentManager,
     auth::{AuthEvent, AuthManager},
     command::CommandCore,
     config::AppConfig,
     event::EventBus,
     identity::IdentityWorkspace,
-    providers::{ProviderRegistry, ProviderState},
+    memory::MemoryStore,
+    owner::OwnerIdentity,
+    providers::{ProviderProfileStore, ProviderRegistry, ProviderState},
     runtime::{EnvironmentProbe, RuntimeState},
     session::SessionManager,
+    skills::{FilesystemSkills, SkillStore},
     storage::Storage,
 };
 
@@ -128,6 +132,7 @@ pub struct AppState {
     pub events: Arc<EventBus>,
     pub identity: Arc<IdentityWorkspace>,
     pub runtime: Arc<RuntimeState>,
+    pub attachments: Arc<AttachmentManager>,
 }
 
 impl AppState {
@@ -161,11 +166,30 @@ impl AppState {
             &environment.probed_at,
         )?;
         let sessions = Arc::new(SessionManager::new(storage.clone()));
+        let attachments = Arc::new(AttachmentManager::new(
+            storage.clone(),
+            cfg.paths.data_dir.clone(),
+            cfg.attachments.clone(),
+        )?);
         let auth = Arc::new(AuthManager::with_config(
             storage.clone(),
             cfg.paths.secrets_dir.clone(),
             config.clone(),
         ));
+        let profiles = ProviderProfileStore::new(storage.clone());
+        for telegram_user_id in &cfg.telegram.access.allowed_user_ids {
+            let migration = storage.ensure_telegram_owner(*telegram_user_id)?;
+            let legacy_credential = auth
+                .accounts(Some("custom"))?
+                .into_iter()
+                .find(|account| account.status == "connected")
+                .map(|account| account.id);
+            let _ = profiles.migrate_singleton(
+                &migration.owner_id,
+                &cfg.providers.custom,
+                legacy_credential,
+            )?;
+        }
         let providers = Arc::new(ProviderRegistry::new(cfg.clone(), auth.clone()));
         for provider_id in providers.list() {
             // Custom capabilities are endpoint/model-specific and are stored
@@ -230,6 +254,7 @@ impl AppState {
             health.clone(),
             events.clone(),
             runtime.clone(),
+            attachments.clone(),
         ));
         Ok(Self {
             config,
@@ -243,6 +268,491 @@ impl AppState {
             events,
             identity,
             runtime,
+            attachments,
         })
+    }
+
+    /// Resolve Telegram authorization identity separately from conversation
+    /// scope and reconcile owner-global living state after any legacy rekey.
+    pub fn resolve_telegram_owner(&self, telegram_user_id: i64) -> Result<OwnerIdentity> {
+        let owner = OwnerIdentity::telegram(telegram_user_id);
+        let migration = self.storage.ensure_telegram_owner(telegram_user_id)?;
+        debug_assert_eq!(migration.owner_id, owner.owner_id);
+        MemoryStore::with_workspace(self.storage.clone(), self.identity.clone())
+            .reconcile(owner.as_str())?;
+        FilesystemSkills::new(
+            self.identity.clone(),
+            Arc::new(SkillStore::new(self.storage.clone())),
+        )
+        .reconcile(owner.as_str())?;
+        Ok(owner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        memory::{MemoryScope, MemoryStore},
+        providers::ProviderProfileStore,
+        skills::{SkillCandidate, SkillStore},
+        storage::{AttachmentChunkRecord, NewAttachmentRecord, ProviderProfileInput},
+        telegram::TelegramScope,
+    };
+
+    #[tokio::test]
+    async fn stable_owner_state_is_global_while_dm_group_and_topics_stay_isolated() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.storage.database = directory.path().join("xiao.db");
+        config.paths.data_dir = directory.path().join("data");
+        config.paths.logs_dir = directory.path().join("logs");
+        config.paths.secrets_dir = directory.path().join("secrets");
+        config.telegram.access.allowed_user_ids = vec![42];
+        let app = AppState::build(config).await.unwrap();
+        let owner = app.resolve_telegram_owner(42).unwrap();
+
+        let dm = app
+            .sessions
+            .context_for_telegram(owner.as_str(), TelegramScope::new(42, None))
+            .unwrap()
+            .main;
+        let group = app
+            .sessions
+            .context_for_telegram(owner.as_str(), TelegramScope::new(-1007, None))
+            .unwrap()
+            .main;
+        let topic_a = app
+            .sessions
+            .context_for_telegram(owner.as_str(), TelegramScope::new(-1007, Some(10)))
+            .unwrap()
+            .main;
+        let topic_b = app
+            .sessions
+            .context_for_telegram(owner.as_str(), TelegramScope::new(-1007, Some(20)))
+            .unwrap()
+            .main;
+        let ids = [dm.id, group.id, topic_a.id, topic_b.id]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            ids.len(),
+            4,
+            "every TelegramScope needs its own conversation"
+        );
+
+        let memory = MemoryStore::with_workspace(app.storage.clone(), app.identity.clone());
+        memory
+            .upsert(
+                owner.as_str(),
+                MemoryScope::User,
+                "preferences",
+                "response.detail",
+                "Prefer concise evidence-backed replies",
+                1.0,
+                "owner_explicit",
+                Some(&ids.iter().next().unwrap().clone()),
+            )
+            .unwrap();
+        for _scope in [
+            TelegramScope::new(42, None),
+            TelegramScope::new(-1007, None),
+            TelegramScope::new(-1007, Some(10)),
+            TelegramScope::new(-1007, Some(20)),
+        ] {
+            assert_eq!(memory.list(owner.as_str(), None, 10).unwrap().len(), 1);
+        }
+
+        SkillStore::new(app.storage.clone())
+            .create_or_update(
+                owner.as_str(),
+                SkillCandidate {
+                    name: "verify-release".into(),
+                    summary: "Verify a Xiao release safely".into(),
+                    when_to_use: "Before publishing a release".into(),
+                    prerequisites: "Rust toolchain".into(),
+                    procedure: "Run bounded validation commands".into(),
+                    pitfalls: "Never claim commands that were not run".into(),
+                    verification: "All required commands exit successfully".into(),
+                },
+                Some(&ids.iter().next().unwrap().clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            SkillStore::new(app.storage.clone())
+                .search(owner.as_str(), "verify release", 5)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let profile = ProviderProfileStore::new(app.storage.clone())
+            .create(ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner.owner_id.clone(),
+                alias: "owner-global".into(),
+                endpoint: "https://example.invalid/v1".into(),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: None,
+                safe_headers_json: "{}".into(),
+            })
+            .unwrap();
+        assert_eq!(profile.owner_id, owner.owner_id);
+        assert_eq!(
+            ProviderProfileStore::new(app.storage.clone())
+                .list(owner.as_str())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn webui_first_local_owner_is_transactionally_claimed_by_telegram_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.storage.database = directory.path().join("local-first.db");
+        config.paths.data_dir = directory.path().join("data");
+        config.paths.logs_dir = directory.path().join("logs");
+        config.paths.secrets_dir = directory.path().join("secrets");
+        let app = AppState::build(config).await.unwrap();
+        let local = app.storage.management_owner_id().unwrap();
+        assert_eq!(local, "owner:local");
+
+        let credential = app
+            .auth
+            .configure_api_key("custom", "local-first", "LOCAL_FIRST_SECRET")
+            .unwrap();
+        app.storage
+            .set_account_owner(&local, &credential.id)
+            .unwrap();
+        let profile = ProviderProfileStore::new(app.storage.clone())
+            .create(ProviderProfileInput {
+                profile_id: None,
+                owner_id: local.clone(),
+                alias: "local-first".into(),
+                endpoint: "https://local-first.example/v1".into(),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: Some(credential.id.clone()),
+                safe_headers_json: r#"{"x-client":"local-first"}"#.into(),
+            })
+            .unwrap();
+        let session = app
+            .storage
+            .create_session(
+                &local,
+                "WebUI first",
+                "custom",
+                Some(&profile.profile_id),
+                "local-model",
+                false,
+                None,
+            )
+            .unwrap();
+        app.storage
+            .append_message(&local, &session.id, "user", "preserve local raw history")
+            .unwrap();
+        let run = app
+            .storage
+            .create_agent_run(
+                &local,
+                &session.id,
+                "custom",
+                "local-model",
+                Some("preserve local audit"),
+            )
+            .unwrap();
+        app.storage
+            .set_agent_run_status(&local, &run, "completed", None)
+            .unwrap();
+        app.storage
+            .audit(&local, "local_first", "preserve this event")
+            .unwrap();
+
+        MemoryStore::with_workspace(app.storage.clone(), app.identity.clone())
+            .upsert(
+                &local,
+                MemoryScope::User,
+                "preferences",
+                "local.preference",
+                "Keep owner-global local state",
+                1.0,
+                "owner_explicit",
+                Some(&session.id),
+            )
+            .unwrap();
+        FilesystemSkills::new(
+            app.identity.clone(),
+            Arc::new(SkillStore::new(app.storage.clone())),
+        )
+        .learn(
+            &local,
+            SkillCandidate {
+                name: "local-owner-recovery".into(),
+                summary: "Recover owner-global installation state".into(),
+                when_to_use: "When Telegram is configured after WebUI use".into(),
+                prerequisites: "A local Xiao owner".into(),
+                procedure: "Rekey durable state in one transaction".into(),
+                pitfalls: "Do not split one owner into tenants".into(),
+                verification: "History remains visible under the Telegram owner".into(),
+            },
+            Some(&session.id),
+        )
+        .unwrap();
+        app.storage
+            .insert_attachment(NewAttachmentRecord {
+                attachment_id: "local-attachment",
+                owner_id: &local,
+                session_id: &session.id,
+                telegram_file_id: None,
+                telegram_unique_id: None,
+                original_name: "local.txt",
+                declared_mime: Some("text/plain"),
+                detected_mime: "text/plain",
+                kind: "document",
+                size_bytes: 24,
+                sha256: &"a".repeat(64),
+                local_path: "/private/local-attachment/local.txt",
+            })
+            .unwrap();
+        app.storage
+            .replace_attachment_chunks(
+                &local,
+                "local-attachment",
+                &[AttachmentChunkRecord {
+                    attachment_id: "local-attachment".into(),
+                    chunk_no: 0,
+                    page_no: None,
+                    start_offset: Some(0),
+                    end_offset: Some(24),
+                    text: "copper migration sentinel".into(),
+                }],
+            )
+            .unwrap();
+
+        let owner = app.resolve_telegram_owner(42).unwrap();
+        assert_eq!(owner.as_str(), "owner:telegram:42");
+        assert_eq!(app.storage.management_owner_id().unwrap(), owner.as_str());
+        assert!(app
+            .storage
+            .account_for_owner(owner.as_str(), &credential.id)
+            .unwrap()
+            .is_some());
+        let migrated_profile = ProviderProfileStore::new(app.storage.clone())
+            .get(owner.as_str(), &profile.profile_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated_profile.credential_ref, Some(credential.id));
+        assert_eq!(
+            app.storage
+                .session(owner.as_str(), &session.id)
+                .unwrap()
+                .unwrap()
+                .message_count,
+            1
+        );
+        assert_eq!(
+            app.storage
+                .agent_run(owner.as_str(), &run)
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+        assert_eq!(
+            app.storage.audit_events(owner.as_str(), 10).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            MemoryStore::with_workspace(app.storage.clone(), app.identity.clone())
+                .list(owner.as_str(), None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            SkillStore::new(app.storage.clone())
+                .list_all(owner.as_str(), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(app
+            .storage
+            .attachment(owner.as_str(), "local-attachment")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            app.storage
+                .search_attachment_chunks(owner.as_str(), &session.id, "copper sentinel", 5)
+                .unwrap()
+                .len(),
+            1
+        );
+        let second = app.storage.ensure_telegram_owner(42).unwrap();
+        assert_eq!(second.migrated_legacy_principals, 0);
+        assert!(!second.requires_file_reconcile);
+    }
+
+    #[tokio::test]
+    async fn representative_v025_state_migrates_transactionally_and_idempotently() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.storage.database = directory.path().join("legacy-v025.db");
+        config.paths.data_dir = directory.path().join("data");
+        config.paths.logs_dir = directory.path().join("logs");
+        config.paths.secrets_dir = directory.path().join("secrets");
+        config.providers.custom.enabled = true;
+        config.providers.custom.name = Some("legacy-custom".into());
+        config.providers.custom.base_url = Some("https://legacy.example/v1".into());
+        config.providers.custom.models = vec!["legacy-model".into()];
+        config.providers.custom.default_model = Some("legacy-model".into());
+
+        let legacy_owner = "telegram:-1007:42";
+        let (legacy_session_id, legacy_run_id, credential_id) = {
+            let app = AppState::build(config.clone()).await.unwrap();
+            let credential = app
+                .auth
+                .configure_api_key("custom", "legacy", "LEGACY_SECRET_SENTINEL")
+                .unwrap();
+            let session = app
+                .storage
+                .create_session(
+                    legacy_owner,
+                    "Legacy topic",
+                    "custom",
+                    None,
+                    "legacy-model",
+                    false,
+                    None,
+                )
+                .unwrap();
+            app.storage
+                .append_message(
+                    legacy_owner,
+                    &session.id,
+                    "user",
+                    "raw v0.2.5 history survives",
+                )
+                .unwrap();
+            let run = app
+                .storage
+                .create_agent_run(
+                    legacy_owner,
+                    &session.id,
+                    "custom",
+                    "legacy-model",
+                    Some("legacy audited task"),
+                )
+                .unwrap();
+            app.storage
+                .set_agent_run_status(legacy_owner, &run, "completed", None)
+                .unwrap();
+            MemoryStore::with_workspace(app.storage.clone(), app.identity.clone())
+                .upsert(
+                    legacy_owner,
+                    MemoryScope::User,
+                    "preferences",
+                    "migration.preference",
+                    "Preserve this canonical preference",
+                    1.0,
+                    "owner_explicit",
+                    Some(&session.id),
+                )
+                .unwrap();
+            FilesystemSkills::new(
+                app.identity.clone(),
+                Arc::new(SkillStore::new(app.storage.clone())),
+            )
+            .learn(
+                legacy_owner,
+                SkillCandidate {
+                    name: "legacy-release-check".into(),
+                    summary: "Check a migrated legacy release".into(),
+                    when_to_use: "When validating migrated state".into(),
+                    prerequisites: "Legacy database".into(),
+                    procedure: "Inspect preserved history and verify current state".into(),
+                    pitfalls: "Do not duplicate canonical skills".into(),
+                    verification: "One canonical skill remains".into(),
+                },
+                Some(&session.id),
+            )
+            .unwrap();
+            (session.id, run, credential.id)
+        };
+
+        config.telegram.access.allowed_user_ids = vec![42];
+        let migrated = AppState::build(config.clone()).await.unwrap();
+        let owner = migrated.resolve_telegram_owner(42).unwrap();
+        let session = migrated
+            .storage
+            .session(owner.as_str(), &legacy_session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.message_count, 1);
+        assert_eq!(
+            migrated
+                .storage
+                .agent_run(owner.as_str(), &legacy_run_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+        assert_eq!(
+            MemoryStore::with_workspace(migrated.storage.clone(), migrated.identity.clone())
+                .list(owner.as_str(), None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            SkillStore::new(migrated.storage.clone())
+                .list_all(owner.as_str(), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        let profiles = ProviderProfileStore::new(migrated.storage.clone())
+            .list(owner.as_str())
+            .unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].credential_ref.as_deref(),
+            Some(credential_id.as_str())
+        );
+        assert_eq!(
+            migrated
+                .auth
+                .credential(&credential_id)
+                .unwrap()
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("LEGACY_SECRET_SENTINEL")
+        );
+        assert_eq!(
+            migrated
+                .storage
+                .telegram_scope_for_session(owner.as_str(), &legacy_session_id)
+                .unwrap(),
+            Some((-1007, None))
+        );
+        drop(migrated);
+
+        let reopened = AppState::build(config).await.unwrap();
+        let owner = reopened.resolve_telegram_owner(42).unwrap();
+        assert_eq!(
+            ProviderProfileStore::new(reopened.storage.clone())
+                .list(owner.as_str())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(reopened
+            .storage
+            .session(owner.as_str(), &legacy_session_id)
+            .unwrap()
+            .is_some());
     }
 }

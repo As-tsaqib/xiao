@@ -80,6 +80,8 @@ enum TxnKind {
 #[derive(Debug, Clone)]
 struct AuthTxn {
     provider: String,
+    owner_id: Option<String>,
+    replacement_account_id: Option<String>,
     kind: TxnKind,
 }
 
@@ -165,6 +167,53 @@ impl AuthManager {
         }
     }
 
+    pub async fn begin_login_for_owner(
+        self: &Arc<Self>,
+        provider: &str,
+        owner_id: &str,
+    ) -> Result<AuthChallenge> {
+        let challenge = self.begin_login(provider).await?;
+        if let AuthChallenge::BrowserUrl { transaction_id, .. } = &challenge {
+            let mut transactions = self.txns.lock().unwrap();
+            let transaction = transactions
+                .get_mut(transaction_id)
+                .ok_or_else(|| anyhow!("auth transaction disappeared before owner binding"))?;
+            transaction.owner_id = Some(owner_id.to_owned());
+        }
+        Ok(challenge)
+    }
+
+    /// Start a fresh OAuth transaction whose successful completion replaces
+    /// one existing account in place. The old credential remains usable until
+    /// the new provider exchange succeeds.
+    pub async fn begin_reconnect_for_owner(
+        self: &Arc<Self>,
+        provider: &str,
+        owner_id: &str,
+        account_id: &str,
+    ) -> Result<AuthChallenge> {
+        if owner_id.trim().is_empty() || account_id.trim().is_empty() {
+            return Err(anyhow!("owner and replacement account are required"));
+        }
+        let account = self
+            .storage
+            .account_for_owner(owner_id, account_id)?
+            .ok_or_else(|| anyhow!("replacement account does not belong to owner"))?;
+        if account.provider != provider {
+            return Err(anyhow!("replacement account provider does not match login"));
+        }
+        let challenge = self.begin_login(provider).await?;
+        if let AuthChallenge::BrowserUrl { transaction_id, .. } = &challenge {
+            let mut transactions = self.txns.lock().unwrap();
+            let transaction = transactions
+                .get_mut(transaction_id)
+                .ok_or_else(|| anyhow!("auth transaction disappeared before reconnect binding"))?;
+            transaction.owner_id = Some(owner_id.to_owned());
+            transaction.replacement_account_id = Some(account_id.to_owned());
+        }
+        Ok(challenge)
+    }
+
     async fn begin_codex(self: &Arc<Self>) -> Result<AuthChallenge> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:1455")
             .await
@@ -178,6 +227,8 @@ impl AuthManager {
             txid.clone(),
             AuthTxn {
                 provider: "codex".into(),
+                owner_id: None,
+                replacement_account_id: None,
                 kind: TxnKind::CodexPkce {
                     verifier,
                     state,
@@ -207,6 +258,8 @@ impl AuthManager {
             txid.clone(),
             AuthTxn {
                 provider: "antigravity".into(),
+                owner_id: None,
+                replacement_account_id: None,
                 kind: TxnKind::AntigravityOAuth {
                     state,
                     redirect_uri,
@@ -330,7 +383,10 @@ impl AuthManager {
             .or_else(|| jwt_claims(body.access_token.as_str()).and_then(|v| chatgpt_account_id(&v)))
             .ok_or_else(|| anyhow!("Codex token response is missing the ChatGPT account id"))?;
         let plan_type = claims.as_ref().and_then(chatgpt_plan_type);
-        let account_id = Uuid::new_v4().to_string();
+        let account_id = txn
+            .replacement_account_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let cred = Credential {
             provider: "codex".into(),
             account_id: account_id.clone(),
@@ -347,6 +403,9 @@ impl AuthManager {
             Some(email),
             serde_json::json!({"chatgpt_account_id":native,"plan_type":plan_type}).to_string(),
         )?;
+        if let Some(owner_id) = txn.owner_id.as_deref() {
+            self.storage.set_account_owner(owner_id, &rec.id)?;
+        }
         self.txns.lock().unwrap().remove(transaction_id);
         let _ = self.events.send(AuthEvent::Completed {
             transaction_id: transaction_id.to_owned(),
@@ -434,7 +493,10 @@ impl AuthManager {
             .map(str::to_owned)
             .ok_or_else(|| anyhow!("Antigravity userinfo response is missing the account email"))?;
         let project_id = Some(self.fetch_antigravity_project(&body.access_token).await?);
-        let account_id = Uuid::new_v4().to_string();
+        let account_id = txn
+            .replacement_account_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let cred = Credential {
             provider: "antigravity".into(),
             account_id: account_id.clone(),
@@ -451,6 +513,9 @@ impl AuthManager {
             Some(email),
             serde_json::json!({"project_id":project_id}).to_string(),
         )?;
+        if let Some(owner_id) = txn.owner_id.as_deref() {
+            self.storage.set_account_owner(owner_id, &rec.id)?;
+        }
         self.txns.lock().unwrap().remove(transaction_id);
         let _ = self.events.send(AuthEvent::Completed {
             transaction_id: transaction_id.to_owned(),
@@ -599,7 +664,46 @@ impl AuthManager {
             serde_json::json!({"kind":"api_key"}).to_string(),
         )?;
         record.label = label.into();
-        self.storage.upsert_account(&record)?;
+        if let Err(error) = self.storage.upsert_account(&record) {
+            let _ = self.logout(&record.id);
+            return Err(error);
+        }
+        Ok(record)
+    }
+
+    /// Create a profile-bound API-key credential. Unlike the v0.2.5
+    /// compatibility helper this never reuses another Custom account.
+    pub fn create_api_key_credential(
+        &self,
+        provider: &str,
+        label: &str,
+        key: &str,
+    ) -> Result<AccountRecord> {
+        let key = key.trim();
+        if key.is_empty() || key.chars().count() > 16_384 {
+            return Err(anyhow!("API key is empty or too long"));
+        }
+        let cred = Credential {
+            provider: provider.into(),
+            account_id: Uuid::new_v4().to_string(),
+            access_token: None,
+            refresh_token: None,
+            id_token: None,
+            expires_at_unix: None,
+            account_native_id: None,
+            project_id: None,
+            api_key: Some(key.into()),
+        };
+        let mut record = self.persist_credential(
+            cred,
+            None,
+            serde_json::json!({"kind":"profile_api_key"}).to_string(),
+        )?;
+        record.label = label.into();
+        if let Err(error) = self.storage.upsert_account(&record) {
+            let _ = self.logout(&record.id);
+            return Err(error);
+        }
         Ok(record)
     }
 
@@ -611,10 +715,10 @@ impl AuthManager {
     ) -> Result<AccountRecord> {
         let account_id = cred.account_id.clone();
         let provider = cred.provider.clone();
-        self.secrets.put(
-            &format!("account-{account_id}"),
-            &serde_json::to_string(&cred)?,
-        )?;
+        let secret_key = format!("account-{account_id}");
+        let previous_secret = self.secrets.get(&secret_key)?;
+        self.secrets
+            .put(&secret_key, &serde_json::to_string(&cred)?)?;
         let rec = AccountRecord {
             id: account_id,
             provider: provider.clone(),
@@ -627,7 +731,14 @@ impl AuthManager {
                 .map(|d| d.to_rfc3339()),
             metadata_json,
         };
-        self.storage.upsert_account(&rec)?;
+        if let Err(error) = self.storage.upsert_account(&rec) {
+            if let Some(previous) = previous_secret {
+                let _ = self.secrets.put(&secret_key, &previous);
+            } else {
+                let _ = self.secrets.remove(&secret_key);
+            }
+            return Err(error);
+        }
         Ok(rec)
     }
 
@@ -1079,5 +1190,90 @@ mod tests {
         assert!(params["scope"].contains("cloud-platform"));
         assert!(!params.contains_key("code_challenge"));
         assert_eq!(antigravity_user_agent(&config), ANTIGRAVITY_USER_AGENT);
+    }
+
+    #[test]
+    fn reconnect_persistence_keeps_account_id_and_restores_old_credential_on_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let auth = AuthManager::new(storage.clone(), directory.path().join("secrets"));
+        let original = Credential {
+            provider: "codex".into(),
+            account_id: "stable-account".into(),
+            access_token: Some("OLD_ACCESS_SENTINEL".into()),
+            refresh_token: Some("OLD_REFRESH_SENTINEL".into()),
+            id_token: None,
+            expires_at_unix: None,
+            account_native_id: Some("native-old".into()),
+            project_id: None,
+            api_key: None,
+        };
+        auth.persist_credential(
+            original.clone(),
+            Some("old@example.test".into()),
+            "{}".into(),
+        )
+        .unwrap();
+
+        storage
+            .with_conn(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER reject_reconnect BEFORE UPDATE ON provider_accounts
+                     WHEN NEW.id='stable-account'
+                     BEGIN SELECT RAISE(FAIL,'synthetic reconnect persistence failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let replacement = Credential {
+            access_token: Some("NEW_ACCESS_SENTINEL".into()),
+            refresh_token: Some("NEW_REFRESH_SENTINEL".into()),
+            account_native_id: Some("native-new".into()),
+            ..original
+        };
+        assert!(auth
+            .persist_credential(
+                replacement.clone(),
+                Some("new@example.test".into()),
+                "{}".into(),
+            )
+            .is_err());
+        let restored = auth.credential("stable-account").unwrap().unwrap();
+        assert_eq!(
+            restored.access_token.as_deref(),
+            Some("OLD_ACCESS_SENTINEL")
+        );
+        assert_eq!(
+            restored.refresh_token.as_deref(),
+            Some("OLD_REFRESH_SENTINEL")
+        );
+        assert_eq!(
+            storage
+                .account("stable-account")
+                .unwrap()
+                .unwrap()
+                .email
+                .as_deref(),
+            Some("old@example.test")
+        );
+
+        storage
+            .with_conn(|connection| {
+                connection.execute_batch("DROP TRIGGER reject_reconnect;")?;
+                Ok(())
+            })
+            .unwrap();
+        let account = auth
+            .persist_credential(replacement, Some("new@example.test".into()), "{}".into())
+            .unwrap();
+        assert_eq!(account.id, "stable-account");
+        assert_eq!(
+            auth.credential("stable-account")
+                .unwrap()
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("NEW_ACCESS_SENTINEL")
+        );
     }
 }

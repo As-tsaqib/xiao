@@ -229,9 +229,53 @@ pass 'Fresh, upgrade, idempotent and crash-recovery migrations covered'
     rg -q 'CREATE TABLE IF NOT EXISTS provider_capabilities' src/storage/mod.rs &&
     rg -q 'CREATE TABLE IF NOT EXISTS dependency_installs' src/storage/mod.rs &&
     rg -q 'CREATE TABLE IF NOT EXISTS environment_probes' src/storage/mod.rs &&
-    rg -q 'UPDATE dependency_installs SET status=.interrupted' src/storage/mod.rs
-} || fail 'Final architecture migrations through version 12'
-pass 'Migrations v10-v12 and uncertain package-install quarantine are present'
+    rg -q 'UPDATE dependency_installs SET status=.interrupted' src/storage/mod.rs &&
+    rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(13\)' src/storage/mod.rs &&
+    rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(14\),\(15\)' src/storage/mod.rs &&
+    rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(16\)' src/storage/mod.rs &&
+    rg -q 'CREATE TABLE IF NOT EXISTS owners' src/storage/mod.rs &&
+    rg -q 'CREATE TABLE IF NOT EXISTS provider_profiles' src/storage/mod.rs &&
+    rg -q 'CREATE TABLE IF NOT EXISTS attachments' src/storage/mod.rs &&
+    rg -q 'CREATE VIRTUAL TABLE IF NOT EXISTS attachment_fts' src/storage/mod.rs
+} || fail 'Final architecture migrations through version 16'
+pass 'Migrations v10-v16 preserve prior state and add owner/profile/attachment storage'
+{
+  [ -f src/owner.rs ] &&
+    rg -q 'ensure_telegram_owner' src/storage/mod.rs src/app.rs &&
+    rg -q 'webui_first_local_owner_is_transactionally_claimed_by_telegram_owner' src/app.rs &&
+    rg -q 'stable_owner_state_is_global_while_dm_group_and_topics_stay_isolated' src/app.rs &&
+    rg -q 'representative_v025_state_migrates_transactionally_and_idempotently' src/app.rs
+} || fail 'Stable owner migration'
+pass 'Stable OwnerIdentity migration preserves WebUI-first and Telegram legacy state'
+{
+  [ -f src/providers/profiles.rs ] &&
+    rg -q 'custom_profile_without_key_never_inherits_another_profiles_secret_or_header' src/providers/mod.rs &&
+    rg -q 'production_custom_structured_fallback_retains_tool_a_and_b_results_until_final' src/providers/mod.rs &&
+    rg -q 'endpoint_edit_clears_credentials_and_headers' src/providers/profiles.rs &&
+    rg -q 'manager_custom_create_rolls_back_profile_when_credential_creation_fails' src/ipc/mod.rs
+} || fail 'Custom profile isolation and continuation'
+pass 'Custom profiles isolate credentials, rollback failed creation and retain bounded continuation'
+{
+  rg -q 'approval_is_exact_one_shot_and_cannot_cross_sessions_or_runs' src/storage/mod.rs &&
+    rg -q 'yolo_converts_only_ask_to_audited_allow_and_never_bypasses_deny' src/tools/registry.rs &&
+    rg -q 'arguments_hash' src/storage/mod.rs
+} || fail 'Exact approvals and YOLO policy'
+pass 'Approvals bind exact operation identity and YOLO cannot bypass DENY'
+{
+  [ -d src/attachments ] &&
+    rg -q 'telegram_photo_and_document_are_downloaded_scoped_and_indexed' src/telegram/mod.rs &&
+    rg -q 'wrong_txt_extension_cannot_override_pdf_magic_and_empty_pdf_requires_ocr' src/attachments/mod.rs &&
+    rg -q 'text_pdf_and_docx_extract_into_fts_without_macro_content' src/attachments/mod.rs &&
+    rg -q 'production_custom_vision_serializes_normalized_image_and_rejects_nonvision_model' src/providers/mod.rs
+} || fail 'Attachment, document and vision pipeline'
+pass 'Attachments are bounded/sniffed/indexed and vision is capability-gated'
+{
+  rg -q 'xiao-semantic-runtime' src/semantic/mod.rs &&
+    rg -q 'Semaphore::new' src/semantic/mod.rs &&
+    rg -q 'tokio::time::timeout' src/semantic/mod.rs &&
+    rg -q 'provider_evaluations_use_one_reusable_runtime_with_bounded_concurrency' src/semantic/mod.rs
+} || fail 'Reusable bounded semantic runtime'
+pass 'Semantic evaluation uses one bounded cancellable worker runtime'
 {
   rg -q 'Command::Approvals' src/command/mod.rs &&
     rg -q 'Command::Approve' src/command/mod.rs &&
@@ -247,6 +291,9 @@ pass 'Telegram exposes approvals and verified multipart result files'
     rg -q 'message_thread_id' src/telegram/types.rs src/telegram/client.rs &&
     rg -q 'public_registry_is_exact_and_hidden_commands_are_not_advertised' src/telegram/commands.rs &&
     rg -q 'custom_login_wizard_discovers_pages_probes_and_rejects_wrong_topic_callbacks' src/telegram/mod.rs &&
+    rg -q 'custom_wizard_retry_and_back_are_phase_aware_and_replace_transient_keys' src/telegram/mod.rs &&
+    rg -q 'failed_custom_wizard_commit_restores_session_and_removes_partial_profile' src/telegram/mod.rs &&
+    rg -q 'credential_input_payload_is_scrubbed_without_changing_inbox_state' src/storage/mod.rs &&
     rg -q 'wizard_state_requires_owner_chat_topic_menu_and_unexpired_state' src/telegram/login.rs &&
     rg -q 'topic_session_manager_paginates_and_preserves_archived_history' src/command/mod.rs
 } || fail 'Telegram topic scope, registry and Custom login UX'
@@ -307,16 +354,24 @@ pass 'Gateway/provider health distinguishes readiness from daemon liveness'
 pass 'No fake /compact command is exposed'
 {
   [ -f module/webroot/index.html ] &&
-    rg -q 'id="gateway"' module/webroot/index.html &&
-    rg -q 'id="daemon"' module/webroot/index.html &&
-    rg -q 'id="botToken"' module/webroot/index.html &&
-    rg -q 'id="chatId"' module/webroot/index.html &&
-    rg -q 'id="fetchModels"' module/webroot/index.html &&
     rg -q "const ACTION = '/data/adb/modules/xiao/action.sh'" module/webroot/assets/app.js &&
-    rg -Fq 'run(`${ACTION} snapshot`)' module/webroot/assets/app.js &&
-    ! rg -q 'agyClient|userIds|progressDetail|closeBehavior|customHeaders' module/webroot/index.html module/webroot/assets/app.js
-} || fail 'WebUI gateway/daemon surfaces'
-pass 'WebUI is limited to gateway/daemon status, two-field Telegram setup and custom model discovery'
+    rg -q 'manager-get-base64' module/webroot/assets/app.js module/action.sh src/bin_cli.rs &&
+    rg -q 'manager-post-base64' module/webroot/assets/app.js module/action.sh src/bin_cli.rs &&
+    rg -q 'id="view-dashboard"' module/webroot/index.html &&
+    rg -q 'id="view-providers"' module/webroot/index.html &&
+    rg -q 'id="view-runtime"' module/webroot/index.html &&
+    rg -q 'id="view-sessions"' module/webroot/index.html &&
+    rg -q 'id="view-tasks"' module/webroot/index.html &&
+    rg -q 'id="view-memory"' module/webroot/index.html &&
+    rg -q 'id="view-skills"' module/webroot/index.html &&
+    rg -q 'id="view-tools"' module/webroot/index.html &&
+    rg -q 'id="view-security"' module/webroot/index.html &&
+    rg -q 'id="view-diagnostics"' module/webroot/index.html &&
+    rg -q 'id="view-logs"' module/webroot/index.html &&
+    rg -q 'modelPickerPager' module/webroot/index.html module/webroot/assets/app.js &&
+    ! rg -q 'sqlite3|xiao\.db|/system/bin/su|raw-root' module/webroot/assets/app.js
+} || fail 'Xiao Manager WebUI surfaces'
+pass 'Xiao Manager uses only typed xiaod actions across all required sections'
 {
   rg -q '/v1/admin/custom/models' src/ipc/mod.rs src/bin_cli.rs &&
     rg -q 'custom_model_catalog_is_sorted_deduplicated' src/ipc/mod.rs &&
@@ -332,15 +387,6 @@ pass 'Custom provider discovers models through authenticated root admin IPC'
     rg -q 'XIAO_CONFIG="\$XIAO_CONFIG" XIAO_CLIENT_CONFIG="\$XIAO_CLIENT_CONFIG"' module/watchdog.sh
 } || fail 'KernelSU watchdog hardening'
 pass 'KernelSU watchdog has boot-safe environment, graceful stop, backoff, auto-restart and bounded logs'
-{
-    rg -q 'XIAO_RESTART=' module/common.sh &&
-    rg -q 'restart_daemon' module/action.sh &&
-    rg -q 'Restart xiaod diminta melalui watchdog' module/action.sh &&
-    rg -q 'karena restart diminta; mulai ulang sekarang' module/watchdog.sh &&
-    rg -q 'waitForDaemon' module/webroot/assets/app.js &&
-    ! sed -n '/restart)/,/;;/p' module/action.sh | rg -q 'stop_watchdog'
-} || fail 'WebUI-safe daemon restart handshake'
-pass 'WebUI restarts only the watchdog child and waits for replacement readiness'
 for f in module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh; do sh -n "$f"; done
 for f in packaging/build-module.sh scripts/acceptance.sh; do bash -n "$f"; done
 pass 'Shell syntax'

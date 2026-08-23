@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    attachments::AttachmentManager,
     config::AgentConfig,
     context::SessionHistoryStore,
     identity::{IdentityWorkspace, WorkspaceDocument},
@@ -63,6 +64,7 @@ pub struct ContextEngine {
     config: AgentConfig,
     workspace: Option<Arc<IdentityWorkspace>>,
     runtime: Option<Arc<RuntimeState>>,
+    attachments: Option<Arc<AttachmentManager>>,
 }
 
 impl ContextEngine {
@@ -75,6 +77,7 @@ impl ContextEngine {
             config,
             workspace: None,
             runtime: None,
+            attachments: None,
         }
     }
 
@@ -82,6 +85,15 @@ impl ContextEngine {
         storage: Arc<Storage>,
         config: AgentConfig,
         runtime: Arc<RuntimeState>,
+    ) -> Self {
+        Self::with_runtime_and_attachments(storage, config, runtime, None)
+    }
+
+    pub fn with_runtime_and_attachments(
+        storage: Arc<Storage>,
+        config: AgentConfig,
+        runtime: Arc<RuntimeState>,
+        attachments: Option<Arc<AttachmentManager>>,
     ) -> Self {
         let skill_store = Arc::new(SkillStore::new(storage.clone()));
         let skills = SkillRegistry::with_filesystem(
@@ -101,6 +113,7 @@ impl ContextEngine {
             config,
             workspace: Some(runtime.workspace()),
             runtime: Some(runtime),
+            attachments,
         }
     }
 
@@ -216,6 +229,14 @@ impl ContextEngine {
             .runtime
             .as_ref()
             .map(|runtime| runtime.concise_context());
+        let attachment_block = self
+            .attachments
+            .as_ref()
+            .map(|attachments| {
+                attachments.context_block(principal, &session.active.id, current_prompt)
+            })
+            .transpose()?
+            .flatten();
 
         let soul_cost = soul_block.as_ref().map_or(0, |block| char_count(block));
         let required_chars =
@@ -225,6 +246,7 @@ impl ContextEngine {
         let selected_user_file = take_block(user_file_block, &mut optional_budget);
         let selected_memory_file = take_block(memory_file_block, &mut optional_budget);
         let selected_agents = take_block(agents_block, &mut optional_budget);
+        let selected_attachments = take_block(attachment_block, &mut optional_budget);
         let selected_user_memory = if self.workspace.is_none() {
             take_block(user_memory_block, &mut optional_budget)
         } else {
@@ -292,6 +314,7 @@ impl ContextEngine {
             selected_user_file,
             selected_memory_file,
             selected_agents,
+            selected_attachments,
             selected_user_memory,
             selected_agent_memory,
             selected_skill,

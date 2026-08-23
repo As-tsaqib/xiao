@@ -15,7 +15,7 @@ pub struct BotCommand {
 pub struct TelegramCommandRegistry;
 
 impl TelegramCommandRegistry {
-    pub const PUBLIC: [TelegramCommandDefinition; 19] = [
+    pub const PUBLIC: [TelegramCommandDefinition; 17] = [
         TelegramCommandDefinition {
             name: "start",
             description: "Start Xiao",
@@ -27,10 +27,6 @@ impl TelegramCommandRegistry {
         TelegramCommandDefinition {
             name: "login",
             description: "Connect or configure an AI provider",
-        },
-        TelegramCommandDefinition {
-            name: "logout",
-            description: "Disconnect an AI account/provider",
         },
         TelegramCommandDefinition {
             name: "model",
@@ -85,10 +81,6 @@ impl TelegramCommandRegistry {
             description: "Diagnose Xiao runtime",
         },
         TelegramCommandDefinition {
-            name: "about",
-            description: "Show Xiao identity and environment",
-        },
-        TelegramCommandDefinition {
             name: "approvals",
             description: "Review pending approvals",
         },
@@ -100,7 +92,7 @@ impl TelegramCommandRegistry {
 
     /// Canonicalize only supported public commands and intentional hidden
     /// compatibility/internal commands. `/provider`, `/settings`, `/usage`,
-    /// and `/env` deliberately have no route.
+    /// `/env`, `/about`, and `/logout` deliberately have no route.
     pub fn canonical(name: &str) -> Option<&'static str> {
         match name {
             "session" => Some("sessions"),
@@ -157,7 +149,6 @@ mod tests {
                 "start",
                 "help",
                 "login",
-                "logout",
                 "model",
                 "new",
                 "sessions",
@@ -171,11 +162,10 @@ mod tests {
                 "skills",
                 "tools",
                 "doctor",
-                "about",
                 "approvals"
             ]
         );
-        for removed in ["provider", "settings", "usage", "env"] {
+        for removed in ["provider", "settings", "usage", "env", "about", "logout"] {
             assert!(TelegramCommandRegistry::canonical(removed).is_none());
         }
         assert_eq!(

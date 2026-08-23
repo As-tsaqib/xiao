@@ -1,6 +1,6 @@
 # First-patch validation record — 2026-08-22
 
-> Historical v0.1.0 device evidence. Xiao v0.2.5 host validation and its
+> Historical v0.1.0 device evidence. Xiao v0.2.6 host validation and its
 > still-pending device/provider checks are tracked in `docs/ACCEPTANCE.md`.
 
 This record separates checks that were actually executed on the rooted Android
@@ -103,3 +103,33 @@ Still deferred for the child-only restart correction:
 
 - a real reboot and WebUI Telegram-save restart using its new Actions artifact;
 - real Codex and Antigravity browser completion, refresh, and generation.
+
+## v0.2.6 host validation — 2026-08-23
+
+The v0.2.6 version gate was opened only after the pre-version format, check,
+test, Clippy, static acceptance, WebUI syntax, and diff checks passed. The same
+source gates were then rerun after updating package/documentation versioning:
+
+```text
+cargo fmt --all -- --check                                      PASS
+CARGO_BUILD_JOBS=1 cargo check --locked --all-targets --all-features
+                                                                 PASS
+CARGO_BUILD_JOBS=1 cargo test --locked --all-targets --all-features
+                                                                 PASS (220 tests)
+CARGO_BUILD_JOBS=1 cargo clippy --locked --all-targets --all-features -- -D warnings
+                                                                 PASS
+bash scripts/acceptance.sh --static-only                         PASS
+node --check module/webroot/assets/app.js                        PASS
+node --check module/webroot/assets/ksu-bridge.js                 PASS
+shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
+                                                                 PASS
+shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
+                                                                 PASS
+git diff --check                                                 PASS
+```
+
+These are local Termux/host checks, not evidence of an Android arm64 release
+build, flashed module, live Telegram delivery, real OAuth/provider calls, root
+broker behavior under KernelSU/Magisk, or real package installation. Those
+remain the explicit real-device/provider checks in `docs/ACCEPTANCE.md` and the
+GitHub Actions artifact remains the release-build authority.

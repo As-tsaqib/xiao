@@ -14,6 +14,44 @@ pub struct Message {
     pub chat: Chat,
     pub from: Option<User>,
     pub text: Option<String>,
+    #[serde(default)]
+    pub caption: Option<String>,
+    #[serde(default)]
+    pub photo: Vec<PhotoSize>,
+    #[serde(default)]
+    pub document: Option<Document>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PhotoSize {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Document {
+    pub file_id: String,
+    pub file_unique_id: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TelegramFile {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_unique_id: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    pub file_path: String,
 }
 
 impl Message {

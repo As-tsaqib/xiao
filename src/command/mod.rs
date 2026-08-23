@@ -7,17 +7,21 @@ use tokio::sync::{mpsc, RwLock};
 use crate::{
     agent::{AgentAnswer, AgentEngine},
     app::{GatewayStatus, HealthState},
+    attachments::AttachmentManager,
     auth::{AuthChallenge, AuthManager},
     config::AppConfig,
     event::{AppEvent, EventBus},
     memory::{MemoryScope, MemoryStore},
     presentation::{Action, Block, View},
-    providers::{AgentEvent, ProviderRegistry, ProviderState},
-    runtime::{CapabilityStatus, RuntimeState},
+    providers::{AgentEvent, ProviderProfileStore, ProviderRegistry, ProviderState},
+    runtime::{
+        AndroidBroker, AndroidOperation, CapabilityStatus, ExecutionPurpose, ProcessExecutor,
+        RuntimeState, SystemAndroidBroker, TermuxCommand, TermuxExecutor,
+    },
     session::{ChatMode, SessionManager},
-    skills::SkillStore,
+    skills::{FilesystemSkills, SkillStore},
     storage::{AccountRecord, Storage},
-    telegram::{commands::TelegramCommandRegistry, TelegramScope},
+    telegram::{commands::TelegramCommandRegistry, paginator::Paginator, TelegramScope},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,12 +36,53 @@ pub enum Command {
     CancelAuth {
         transaction: String,
     },
-    Logout {
-        account: Option<String>,
+    Accounts {
+        page: usize,
     },
-    Account,
+    AccountDetail {
+        account: String,
+    },
     UseAccount {
         account: String,
+    },
+    ConfirmDisconnectAccount {
+        account: String,
+    },
+    DisconnectAccount {
+        account: String,
+    },
+    CustomProfiles {
+        page: usize,
+    },
+    CustomProfileDetail {
+        profile: String,
+    },
+    UseCustomProfile {
+        profile: String,
+    },
+    CustomProfileModels {
+        profile: String,
+        page: usize,
+    },
+    UseCustomProfileModel {
+        profile: String,
+        model: String,
+    },
+    TestCustomProfile {
+        profile: String,
+    },
+    RequestEditCustomEndpoint {
+        profile: String,
+    },
+    EditCustomEndpoint {
+        profile: String,
+        endpoint: String,
+    },
+    ConfirmDeleteCustomProfile {
+        profile: String,
+    },
+    DeleteCustomProfile {
+        profile: String,
     },
     Model,
     ModelPicker {
@@ -110,7 +155,6 @@ pub enum Command {
         skill: String,
     },
     Tools,
-    About,
     Approvals,
     Approve {
         request: String,
@@ -195,6 +239,108 @@ pub fn parse(input: &str) -> Result<Option<Command>> {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1),
         },
+        "model" if args.first() == Some(&"accounts") => Command::Accounts {
+            page: args
+                .get(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1),
+        },
+        "model" if args.first() == Some(&"account-detail") => Command::AccountDetail {
+            account: args
+                .get(1)
+                .ok_or_else(|| anyhow!("account id required"))?
+                .to_string(),
+        },
+        "model" if args.first() == Some(&"account-use") => Command::UseAccount {
+            account: args
+                .get(1)
+                .ok_or_else(|| anyhow!("account id required"))?
+                .to_string(),
+        },
+        "model" if args.first() == Some(&"account-disconnect") => {
+            Command::ConfirmDisconnectAccount {
+                account: args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("account id required"))?
+                    .to_string(),
+            }
+        }
+        "model" if args.first() == Some(&"account-disconnect-confirm") => {
+            Command::DisconnectAccount {
+                account: args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("account id required"))?
+                    .to_string(),
+            }
+        }
+        "model" if args.first() == Some(&"custom-profiles") => Command::CustomProfiles {
+            page: args
+                .get(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1),
+        },
+        "model" if args.first() == Some(&"custom-detail") => Command::CustomProfileDetail {
+            profile: args
+                .get(1)
+                .ok_or_else(|| anyhow!("Custom profile id required"))?
+                .to_string(),
+        },
+        "model" if args.first() == Some(&"custom-use") => Command::UseCustomProfile {
+            profile: args
+                .get(1)
+                .ok_or_else(|| anyhow!("Custom profile id or alias required"))?
+                .to_string(),
+        },
+        "model" if args.first() == Some(&"custom-models") => Command::CustomProfileModels {
+            profile: args
+                .get(1)
+                .ok_or_else(|| anyhow!("Custom profile id required"))?
+                .to_string(),
+            page: args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1),
+        },
+        "model" if args.first() == Some(&"custom-model") => Command::UseCustomProfileModel {
+            profile: args
+                .get(1)
+                .ok_or_else(|| anyhow!("Custom profile id required"))?
+                .to_string(),
+            model: args.iter().skip(2).copied().collect::<Vec<_>>().join(" "),
+        },
+        "model" if args.first() == Some(&"custom-test") => Command::TestCustomProfile {
+            profile: args
+                .get(1)
+                .ok_or_else(|| anyhow!("Custom profile id required"))?
+                .to_string(),
+        },
+        "model" if args.first() == Some(&"custom-edit") && args.len() == 2 => {
+            Command::RequestEditCustomEndpoint {
+                profile: args[1].to_string(),
+            }
+        }
+        "model" if args.first() == Some(&"custom-edit") => Command::EditCustomEndpoint {
+            profile: args
+                .get(1)
+                .ok_or_else(|| anyhow!("Custom profile id required"))?
+                .to_string(),
+            endpoint: args
+                .get(2)
+                .ok_or_else(|| anyhow!("Custom endpoint required"))?
+                .to_string(),
+        },
+        "model" if args.first() == Some(&"custom-delete") => Command::ConfirmDeleteCustomProfile {
+            profile: args
+                .get(1)
+                .ok_or_else(|| anyhow!("Custom profile id required"))?
+                .to_string(),
+        },
+        "model" if args.first() == Some(&"custom-delete-confirm") => Command::DeleteCustomProfile {
+            profile: args
+                .get(1)
+                .ok_or_else(|| anyhow!("Custom profile id required"))?
+                .to_string(),
+        },
         "model" if !args.is_empty() => Command::SetModel {
             model: args.join(" "),
         },
@@ -205,10 +351,10 @@ pub fn parse(input: &str) -> Result<Option<Command>> {
                 .ok_or_else(|| anyhow!("account id required"))?
                 .to_string(),
         },
-        "account" if !args.is_empty() => Command::UseAccount {
+        "account" if !args.is_empty() => Command::AccountDetail {
             account: args[0].to_owned(),
         },
-        "account" => Command::Account,
+        "account" => Command::Accounts { page: 1 },
         "login" if args.first() == Some(&"cancel") => Command::CancelAuth {
             transaction: args
                 .get(1)
@@ -216,7 +362,6 @@ pub fn parse(input: &str) -> Result<Option<Command>> {
                 .to_string(),
         },
         "login" => Command::Login { provider: one() },
-        "logout" => Command::Logout { account: one() },
         "status" => Command::Status,
         "context" => Command::Context,
         "cancel" => Command::Stop,
@@ -299,7 +444,6 @@ pub fn parse(input: &str) -> Result<Option<Command>> {
             query: (!args.is_empty()).then(|| args.join(" ")),
         },
         "tools" => Command::Tools,
-        "about" => Command::About,
         "approvals" => Command::Approvals,
         "approve" => Command::Approve {
             request: args
@@ -329,6 +473,7 @@ pub struct CommandCore {
     events: Arc<EventBus>,
     agent: AgentEngine,
     runtime: Option<Arc<RuntimeState>>,
+    attachments: Option<Arc<AttachmentManager>>,
 }
 
 impl CommandCore {
@@ -342,7 +487,7 @@ impl CommandCore {
         events: Arc<EventBus>,
     ) -> Self {
         Self::build(
-            config, storage, sessions, providers, auth, health, events, None,
+            config, storage, sessions, providers, auth, health, events, None, None,
         )
     }
 
@@ -356,6 +501,7 @@ impl CommandCore {
         health: Arc<HealthState>,
         events: Arc<EventBus>,
         runtime: Arc<RuntimeState>,
+        attachments: Arc<AttachmentManager>,
     ) -> Self {
         Self::build(
             config,
@@ -366,6 +512,7 @@ impl CommandCore {
             health,
             events,
             Some(runtime),
+            Some(attachments),
         )
     }
 
@@ -379,6 +526,7 @@ impl CommandCore {
         health: Arc<HealthState>,
         events: Arc<EventBus>,
         runtime: Option<Arc<RuntimeState>>,
+        attachments: Option<Arc<AttachmentManager>>,
     ) -> Self {
         let agent_config = config
             .try_read()
@@ -391,6 +539,7 @@ impl CommandCore {
                 providers.clone(),
                 agent_config,
                 runtime,
+                attachments.clone(),
             )
         } else {
             AgentEngine::with_config(
@@ -410,6 +559,7 @@ impl CommandCore {
             events,
             agent,
             runtime,
+            attachments,
         }
     }
 
@@ -500,6 +650,28 @@ impl CommandCore {
 
     pub async fn execute(&self, principal: &str, command: Command) -> Result<CommandResult> {
         self.execute_in_scope(principal, None, command).await
+    }
+
+    /// Management cancellation remains session-bound. Telegram runs are
+    /// addressed through their originating topic scope; local runs use the
+    /// installation-local session namespace.
+    pub fn cancel_session_run(&self, principal: &str, session_id: &str) -> Result<bool> {
+        let session = self
+            .storage
+            .session(principal, session_id)?
+            .ok_or_else(|| anyhow!("session not found for owner"))?;
+        if session.archived {
+            return Ok(false);
+        }
+        let scope = self
+            .storage
+            .telegram_scope_for_session(principal, session_id)?
+            .map(|(chat_id, message_thread_id)| TelegramScope::new(chat_id, message_thread_id));
+        Ok(self.agent.cancel_in_scope(principal, scope))
+    }
+
+    pub async fn management_doctor(&self, principal: &str) -> View {
+        self.doctor_view(principal, None).await
     }
 
     pub async fn execute_in_scope(
@@ -642,13 +814,7 @@ impl CommandCore {
                 self.model_picker_view(principal, scope, page)?,
             )),
             SetModel { model } => {
-                let custom_configured = {
-                    let config = self.config.read().await;
-                    config.providers.custom.enabled && config.providers.custom.base_url.is_some()
-                };
-                if custom_configured
-                    && self.session_context(principal, scope)?.active.provider == "custom"
-                {
+                if self.session_context(principal, scope)?.active.provider == "custom" {
                     self.probe_custom_model(principal, scope, &model).await?;
                 }
                 self.set_model(principal, scope, &model)?;
@@ -660,8 +826,11 @@ impl CommandCore {
                     self.model_view(principal, scope)?,
                 ))
             }
-            Account => Ok(CommandResult::ManagerView(
-                self.account_view(principal, scope)?,
+            Accounts { page } => Ok(CommandResult::ManagerView(
+                self.account_view(principal, scope, page)?,
+            )),
+            AccountDetail { account } => Ok(CommandResult::ManagerView(
+                self.account_detail_view(principal, scope, &account)?,
             )),
             UseAccount { account } => {
                 let (provider, model) = self.use_account(principal, scope, &account)?;
@@ -681,6 +850,172 @@ impl CommandCore {
                     self.model_view(principal, scope)?,
                 ))
             }
+            ConfirmDisconnectAccount { account } => {
+                let record = self
+                    .storage
+                    .account_for_owner(principal, &account)?
+                    .ok_or_else(|| anyhow!("account not found"))?;
+                let mut view = View::info(
+                    "DISCONNECT ACCOUNT",
+                    format!(
+                        "Disconnect {}? Its stored credential will be removed. Other accounts and Custom profiles are unaffected.",
+                        account_label(&record)
+                    ),
+                );
+                view.actions = vec![
+                    vec![Action::command(
+                        "Disconnect",
+                        format!("/model account-disconnect-confirm {}", record.id),
+                    )],
+                    vec![Action::back(), Action::close()],
+                ];
+                Ok(CommandResult::Confirmation(view))
+            }
+            DisconnectAccount { account } => {
+                let record = self
+                    .storage
+                    .account_for_owner(principal, &account)?
+                    .ok_or_else(|| anyhow!("account not found"))?;
+                if record.provider == "custom" {
+                    return Err(anyhow!(
+                        "Custom credentials are managed through their profile detail"
+                    ));
+                }
+                self.storage.detach_account_from_sessions(&account)?;
+                self.auth.logout(&account)?;
+                self.storage.audit(
+                    principal,
+                    "provider_account_disconnected",
+                    &format!("account_id={account};provider={}", record.provider),
+                )?;
+                Ok(CommandResult::ManagerView(
+                    self.account_view(principal, scope, 1)?,
+                ))
+            }
+            CustomProfiles { page } => Ok(CommandResult::ManagerView(
+                self.custom_profiles_view(principal, scope, page)?,
+            )),
+            CustomProfileDetail { profile } => Ok(CommandResult::ManagerView(
+                self.custom_profile_detail_view(principal, scope, &profile)?,
+            )),
+            UseCustomProfile { profile } => {
+                let selected = self.resolve_custom_profile(principal, &profile)?;
+                let model = ProviderProfileStore::new(self.storage.clone())
+                    .models(&selected.profile_id)?
+                    .into_iter()
+                    .find(|model| model.text_capable)
+                    .ok_or_else(|| anyhow!("Custom profile has no usable text model"))?
+                    .model_id;
+                let context = self.session_context(principal, scope)?;
+                self.storage.set_session_provider(
+                    principal,
+                    &context.active.id,
+                    "custom",
+                    Some(&selected.profile_id),
+                    &model,
+                )?;
+                Ok(CommandResult::ManagerView(
+                    self.model_view(principal, scope)?,
+                ))
+            }
+            CustomProfileModels { profile, page } => Ok(CommandResult::ManagerView(
+                self.custom_profile_models_view(principal, scope, &profile, page)?,
+            )),
+            UseCustomProfileModel { profile, model } => {
+                if model.trim().is_empty() {
+                    return Err(anyhow!("Custom model id required"));
+                }
+                let selected = self.resolve_custom_profile(principal, &profile)?;
+                let context = self.session_context(principal, scope)?;
+                self.storage.set_session_provider(
+                    principal,
+                    &context.active.id,
+                    "custom",
+                    Some(&selected.profile_id),
+                    &model,
+                )?;
+                self.probe_custom_model(principal, scope, &model).await?;
+                Ok(CommandResult::ManagerView(
+                    self.model_view(principal, scope)?,
+                ))
+            }
+            TestCustomProfile { profile } => {
+                let profile = self.resolve_custom_profile(principal, &profile)?;
+                self.refresh_custom_profile(principal, &profile).await?;
+                Ok(CommandResult::ManagerView(
+                    self.custom_profile_detail_view(principal, scope, &profile.profile_id)?,
+                ))
+            }
+            RequestEditCustomEndpoint { profile } => {
+                let profile = self.resolve_custom_profile(principal, &profile)?;
+                Ok(CommandResult::InputRequest {
+                    view: View::info(
+                        "EDIT CUSTOM ENDPOINT",
+                        format!(
+                            "Current endpoint: {}\nSend the replacement HTTP(S) endpoint. Changing it clears the profile credential, headers, and cached models.",
+                            profile.endpoint
+                        ),
+                    ),
+                    command_prefix: format!("/model custom-edit {}", profile.profile_id),
+                })
+            }
+            EditCustomEndpoint { profile, endpoint } => {
+                let profile = self.resolve_custom_profile(principal, &profile)?;
+                let credential = profile.credential_ref.clone();
+                ProviderProfileStore::new(self.storage.clone()).change_endpoint(
+                    principal,
+                    &profile.profile_id,
+                    &endpoint,
+                )?;
+                if let Some(reference) = credential {
+                    self.auth.logout(&reference)?;
+                }
+                self.storage.audit(
+                    principal,
+                    "custom_profile_endpoint_changed",
+                    &format!(
+                        "profile_id={};credential_and_headers_cleared=true",
+                        profile.profile_id
+                    ),
+                )?;
+                Ok(CommandResult::ManagerView(
+                    self.custom_profile_detail_view(principal, scope, &profile.profile_id)?,
+                ))
+            }
+            ConfirmDeleteCustomProfile { profile } => {
+                let profile = self.resolve_custom_profile(principal, &profile)?;
+                let mut view = View::info(
+                    "DELETE CUSTOM PROFILE",
+                    format!(
+                        "Delete {} ({})? This removes its models and profile-bound credential. Active sessions must switch away first.",
+                        profile.alias, profile.endpoint
+                    ),
+                );
+                view.actions = vec![
+                    vec![Action::command(
+                        "Delete",
+                        format!("/model custom-delete-confirm {}", profile.profile_id),
+                    )],
+                    vec![Action::back(), Action::close()],
+                ];
+                Ok(CommandResult::Confirmation(view))
+            }
+            DeleteCustomProfile { profile } => {
+                let profile = self.resolve_custom_profile(principal, &profile)?;
+                let credential = ProviderProfileStore::new(self.storage.clone())
+                    .delete(principal, &profile.profile_id)?;
+                if let Some(credential) = credential {
+                    self.auth.logout(&credential)?;
+                }
+                self.storage.audit(
+                    principal,
+                    "custom_profile_deleted",
+                    &format!("profile_id={}", profile.profile_id),
+                )?;
+                Ok(CommandResult::ManagerView(
+                    self.custom_profiles_view(principal, scope, 1)?,
+                ))
+            }
             Login { provider: None } => Ok(CommandResult::ManagerView(login_picker())),
             Login {
                 provider: Some(provider),
@@ -689,7 +1024,10 @@ impl CommandCore {
                 if provider == "custom" {
                     return Ok(CommandResult::StartCustomLogin);
                 }
-                let challenge = self.auth.begin_login(&provider).await?;
+                let challenge = self
+                    .auth
+                    .begin_login_for_owner(&provider, principal)
+                    .await?;
                 let transaction_id = match &challenge {
                     AuthChallenge::BrowserUrl { transaction_id, .. } => transaction_id.clone(),
                     AuthChallenge::ApiKey { .. } => "local-api-key".into(),
@@ -705,22 +1043,6 @@ impl CommandCore {
                 let mut view = View::info("LOGIN", "Authentication cancelled");
                 view.actions = vec![vec![Action::command("Login", "/login"), Action::close()]];
                 Ok(CommandResult::Confirmation(view))
-            }
-            Logout { account } => {
-                let id = match account {
-                    Some(v) => v,
-                    None => self
-                        .sessions
-                        .context_for(principal)?
-                        .active
-                        .account_id
-                        .ok_or_else(|| anyhow!("no active account"))?,
-                };
-                self.auth.logout(&id)?;
-                Ok(CommandResult::Confirmation(View::info(
-                    "ACCOUNT",
-                    "Disconnected",
-                )))
             }
             Status => Ok(CommandResult::InfoView(
                 self.status_view(principal, scope).await?,
@@ -765,7 +1087,7 @@ impl CommandCore {
             Memory { query } if query.as_deref() == Some("search") => {
                 Ok(CommandResult::InputRequest {
                     view: View::info("MEMORY SEARCH", "Send the memory search query."),
-                    command_prefix: "/memory".into(),
+                    command_prefix: "/memory find".into(),
                 })
             }
             Memory { query } => Ok(CommandResult::ManagerView(
@@ -834,7 +1156,7 @@ impl CommandCore {
             Skills { query } if query.as_deref() == Some("search") => {
                 Ok(CommandResult::InputRequest {
                     view: View::info("SKILL SEARCH", "Send the skill search query."),
-                    command_prefix: "/skills".into(),
+                    command_prefix: "/skills find".into(),
                 })
             }
             Skills { query } => Ok(CommandResult::ManagerView(
@@ -903,9 +1225,11 @@ impl CommandCore {
                 ))
             }
             Tools => Ok(CommandResult::ManagerView(self.tools_view())),
-            About => Ok(CommandResult::InfoView(self.about_view())),
             Approvals => {
-                let approvals = self.storage.pending_approvals(principal)?;
+                let active = self.session_context(principal, scope)?.active;
+                let approvals = self
+                    .storage
+                    .pending_approvals_for_session(principal, Some(&active.id))?;
                 let body = if approvals.is_empty() {
                     "No pending sensitive or privileged operations.".into()
                 } else {
@@ -942,7 +1266,7 @@ impl CommandCore {
                 }
                 Ok(CommandResult::Confirmation(View::info(
                     "APPROVED",
-                    "One exact operation was approved. Use /retry to resume the original request; the grant is consumed once.",
+                    "One exact operation was approved. Its awaiting run may resume and the grant can be consumed only once.",
                 )))
             }
             DenyApproval { request } => {
@@ -955,7 +1279,9 @@ impl CommandCore {
                 )))
             }
             Help { .. } => Ok(CommandResult::InfoView(help_view())),
-            Doctor => Ok(CommandResult::InfoView(self.doctor_view().await)),
+            Doctor => Ok(CommandResult::InfoView(
+                self.doctor_view(principal, scope).await,
+            )),
         }
     }
 
@@ -1121,29 +1447,45 @@ impl CommandCore {
 
     fn model_view(&self, principal: &str, scope: Option<TelegramScope>) -> Result<View> {
         let c = self.session_context(principal, scope)?;
-        let account = c
-            .active
-            .account_id
-            .as_deref()
-            .and_then(|id| self.storage.account(id).ok().flatten())
-            .map(|a| account_label(&a))
-            .unwrap_or_else(|| "—".into());
+        let account = if c.active.provider == "custom" {
+            c.active
+                .account_id
+                .as_deref()
+                .and_then(|id| {
+                    ProviderProfileStore::new(self.storage.clone())
+                        .get(principal, id)
+                        .ok()
+                        .flatten()
+                })
+                .map(|profile| profile.alias)
+                .unwrap_or_else(|| "—".into())
+        } else {
+            c.active
+                .account_id
+                .as_deref()
+                .and_then(|id| self.storage.account_for_owner(principal, id).ok().flatten())
+                .map(|account| account_label(&account))
+                .unwrap_or_else(|| "—".into())
+        };
         let status = format!("{:?}", self.providers.state(&c.active.provider)).to_uppercase();
         let protocol = self
             .providers
-            .capabilities(&c.active.provider, &c.active.model)
+            .capabilities_for(
+                &c.active.provider,
+                &c.active.model,
+                c.active.account_id.as_deref(),
+            )
             .map(|capability| capability.tool_protocol.as_str().to_owned())
             .unwrap_or_else(|_| "unknown".into());
         Ok(View {
-            title: Some("MODEL".into()),
+            title: Some("AI CONFIGURATION".into()),
             blocks: vec![Block::Table {
                 headers: vec!["Field".into(), "Value".into()],
                 rows: vec![
                     vec!["PROVIDER".into(), c.active.provider.clone()],
-                    vec!["ACCOUNT".into(), account],
+                    vec!["ACCOUNT / PROFILE".into(), account],
                     vec!["MODEL".into(), c.active.model.clone()],
                     vec!["AGENT PROTOCOL".into(), protocol],
-                    vec!["REASONING".into(), "Provider default".into()],
                     vec!["SESSION".into(), c.main.name],
                     vec!["STATUS".into(), status],
                 ],
@@ -1151,9 +1493,10 @@ impl CommandCore {
             actions: vec![
                 vec![Action::command("Change Model", "/model change")],
                 vec![
-                    Action::command("Account", "/account"),
-                    Action::command("Login", "/login"),
+                    Action::command("Accounts", "/model accounts"),
+                    Action::command("Custom Providers", "/model custom-profiles"),
                 ],
+                vec![Action::command("Add Provider", "/login")],
                 vec![Action::close()],
             ],
             side_mode: c.mode == ChatMode::Side,
@@ -1167,15 +1510,11 @@ impl CommandCore {
         page: usize,
     ) -> Result<View> {
         let c = self.session_context(principal, scope)?;
-        let models = self.providers.models(&c.active.provider)?;
-        let pages = models.len().max(1).div_ceil(5);
-        let page = page.clamp(1, pages);
-        let visible = models
-            .iter()
-            .skip((page - 1) * 5)
-            .take(5)
-            .cloned()
-            .collect::<Vec<_>>();
+        let models = self
+            .providers
+            .models_for(&c.active.provider, c.active.account_id.as_deref())?;
+        let pagination = Paginator::new(models.len(), page, 5);
+        let visible = models[pagination.range()].to_vec();
         let rows = visible
             .iter()
             .enumerate()
@@ -1199,12 +1538,9 @@ impl CommandCore {
             })
             .collect::<Vec<_>>()];
         actions.push(vec![
-            Action::command(
-                "‹",
-                format!("/model change {}", page.saturating_sub(1).max(1)),
-            ),
-            Action::noop(format!("Page {page}/{pages}")),
-            Action::command("›", format!("/model change {}", (page + 1).min(pages))),
+            Action::command("‹", format!("/model change {}", pagination.previous())),
+            Action::noop(format!("Page {}/{}", pagination.page(), pagination.pages())),
+            Action::command("›", format!("/model change {}", pagination.next())),
         ]);
         actions.push(vec![Action::back(), Action::close()]);
         Ok(View {
@@ -1218,10 +1554,22 @@ impl CommandCore {
         })
     }
 
-    fn account_view(&self, principal: &str, scope: Option<TelegramScope>) -> Result<View> {
+    fn account_view(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        page: usize,
+    ) -> Result<View> {
         let c = self.session_context(principal, scope)?;
-        let accounts = self.auth.accounts(Some(&c.active.provider))?;
-        let rows = accounts
+        let accounts = self
+            .storage
+            .accounts_for_owner(principal, None)?
+            .into_iter()
+            .filter(|account| account.provider != "custom")
+            .collect::<Vec<_>>();
+        let pagination = Paginator::new(accounts.len(), page, 5);
+        let visible = &accounts[pagination.range()];
+        let rows = visible
             .iter()
             .map(|a| {
                 vec![
@@ -1230,28 +1578,40 @@ impl CommandCore {
                     } else {
                         "".into()
                     },
+                    a.provider.clone(),
                     a.label.clone(),
                     a.status.clone(),
                 ]
             })
             .collect();
-        let mut actions = accounts
-            .into_iter()
+        let mut actions = visible
+            .iter()
             .map(|a| {
                 vec![Action::command(
                     a.label.clone(),
-                    format!("/account {}", a.id),
+                    format!("/model account-detail {}", a.id),
                 )]
             })
             .collect::<Vec<_>>();
         actions.push(vec![
-            Action::command("Add / Login", format!("/login {}", c.active.provider)),
+            Action::command("‹", format!("/model accounts {}", pagination.previous())),
+            Action::noop(format!("Page {}/{}", pagination.page(), pagination.pages())),
+            Action::command("›", format!("/model accounts {}", pagination.next())),
+        ]);
+        actions.push(vec![
+            Action::command("Add Account", "/login"),
+            Action::back(),
             Action::close(),
         ]);
         Ok(View {
-            title: Some("ACCOUNT".into()),
+            title: Some("ACCOUNTS".into()),
             blocks: vec![Block::Table {
-                headers: vec!["Current".into(), "Account".into(), "Status".into()],
+                headers: vec![
+                    "Current".into(),
+                    "Provider".into(),
+                    "Account".into(),
+                    "Status".into(),
+                ],
                 rows,
             }],
             actions,
@@ -1259,11 +1619,348 @@ impl CommandCore {
         })
     }
 
+    fn account_detail_view(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        account_id: &str,
+    ) -> Result<View> {
+        let account = self
+            .storage
+            .account_for_owner(principal, account_id)?
+            .filter(|account| account.provider != "custom")
+            .ok_or_else(|| anyhow!("account not found"))?;
+        let current =
+            self.session_context(principal, scope)?.active.account_id == Some(account.id.clone());
+        Ok(View {
+            title: Some("ACCOUNT DETAIL".into()),
+            blocks: vec![Block::Table {
+                headers: vec!["Field".into(), "Value".into()],
+                rows: vec![
+                    vec!["Provider".into(), account.provider.clone()],
+                    vec!["Account".into(), account_label(&account)],
+                    vec!["Status".into(), account.status.clone()],
+                    vec!["Current session".into(), yes_no(current)],
+                    vec![
+                        "Credential".into(),
+                        if self.auth.credential(&account.id)?.is_some() {
+                            "configured (masked)".into()
+                        } else {
+                            "none".into()
+                        },
+                    ],
+                ],
+            }],
+            actions: vec![
+                vec![Action::command(
+                    "Use",
+                    format!("/model account-use {}", account.id),
+                )],
+                vec![Action::command(
+                    "Reconnect",
+                    format!("/login {}", account.provider),
+                )],
+                vec![Action::command(
+                    "Disconnect",
+                    format!("/model account-disconnect {}", account.id),
+                )],
+                vec![Action::back(), Action::close()],
+            ],
+            side_mode: false,
+        })
+    }
+
+    fn custom_profiles_view(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        page: usize,
+    ) -> Result<View> {
+        let context = self.session_context(principal, scope)?;
+        let profiles = ProviderProfileStore::new(self.storage.clone()).list(principal)?;
+        let pagination = Paginator::new(profiles.len(), page, 5);
+        let visible = &profiles[pagination.range()];
+        let rows = visible
+            .iter()
+            .map(|profile| {
+                vec![
+                    if context.active.provider == "custom"
+                        && context.active.account_id.as_deref() == Some(profile.profile_id.as_str())
+                    {
+                        "●".into()
+                    } else {
+                        String::new()
+                    },
+                    profile.alias.clone(),
+                    profile.endpoint.clone(),
+                    profile.reachability.clone(),
+                ]
+            })
+            .collect();
+        let mut actions = visible
+            .iter()
+            .map(|profile| {
+                vec![Action::command(
+                    profile.alias.clone(),
+                    format!("/model custom-detail {}", profile.profile_id),
+                )]
+            })
+            .collect::<Vec<_>>();
+        actions.push(vec![
+            Action::command(
+                "‹",
+                format!("/model custom-profiles {}", pagination.previous()),
+            ),
+            Action::noop(format!("Page {}/{}", pagination.page(), pagination.pages())),
+            Action::command("›", format!("/model custom-profiles {}", pagination.next())),
+        ]);
+        actions.push(vec![
+            Action::command("Add Provider", "/login custom"),
+            Action::back(),
+            Action::close(),
+        ]);
+        Ok(View {
+            title: Some("CUSTOM PROVIDERS".into()),
+            blocks: vec![Block::Table {
+                headers: vec![
+                    "Current".into(),
+                    "Alias".into(),
+                    "Endpoint".into(),
+                    "Reachability".into(),
+                ],
+                rows,
+            }],
+            actions,
+            side_mode: false,
+        })
+    }
+
+    fn custom_profile_detail_view(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        profile_id: &str,
+    ) -> Result<View> {
+        let profile = self.resolve_custom_profile(principal, profile_id)?;
+        let models = ProviderProfileStore::new(self.storage.clone()).models(&profile.profile_id)?;
+        let current = self.session_context(principal, scope)?.active;
+        let capability = |predicate: fn(&crate::storage::ProviderProfileModelRecord) -> bool| {
+            yes_no(models.iter().any(predicate))
+        };
+        Ok(View {
+            title: Some("CUSTOM PROVIDER".into()),
+            blocks: vec![Block::Table {
+                headers: vec!["Field".into(), "Value".into()],
+                rows: vec![
+                    vec!["Alias".into(), profile.alias.clone()],
+                    vec!["Endpoint".into(), profile.endpoint.clone()],
+                    vec![
+                        "API key".into(),
+                        if profile.credential_ref.is_some() {
+                            "configured (masked)".into()
+                        } else {
+                            "none".into()
+                        },
+                    ],
+                    vec!["Protocol".into(), profile.protocol.clone()],
+                    vec!["Models".into(), models.len().to_string()],
+                    vec!["Reachability".into(), profile.reachability.clone()],
+                    vec!["Tools".into(), capability(|model| model.native_tools)],
+                    vec!["Vision".into(), capability(|model| model.vision_capable)],
+                    vec![
+                        "File input".into(),
+                        capability(|model| model.file_input_capable),
+                    ],
+                    vec![
+                        "Current session".into(),
+                        yes_no(
+                            current.provider == "custom"
+                                && current.account_id.as_deref()
+                                    == Some(profile.profile_id.as_str()),
+                        ),
+                    ],
+                ],
+            }],
+            actions: vec![
+                vec![
+                    Action::command("Use", format!("/model custom-use {}", profile.profile_id)),
+                    Action::command(
+                        "Models",
+                        format!("/model custom-models {}", profile.profile_id),
+                    ),
+                    Action::command("Test", format!("/model custom-test {}", profile.profile_id)),
+                ],
+                vec![
+                    Action::command("Edit", format!("/model custom-edit {}", profile.profile_id)),
+                    Action::command(
+                        "Delete",
+                        format!("/model custom-delete {}", profile.profile_id),
+                    ),
+                ],
+                vec![Action::back(), Action::close()],
+            ],
+            side_mode: false,
+        })
+    }
+
+    fn custom_profile_models_view(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        profile_id: &str,
+        page: usize,
+    ) -> Result<View> {
+        let profile = self.resolve_custom_profile(principal, profile_id)?;
+        let models = ProviderProfileStore::new(self.storage.clone()).models(&profile.profile_id)?;
+        let pagination = Paginator::new(models.len(), page, 5);
+        let visible = &models[pagination.range()];
+        let current = self.session_context(principal, scope)?.active;
+        let rows = visible
+            .iter()
+            .enumerate()
+            .map(|(index, model)| {
+                vec![
+                    (index + 1).to_string(),
+                    model.model_id.clone(),
+                    model.tool_protocol.clone(),
+                    yes_no(model.vision_capable),
+                    if current.provider == "custom"
+                        && current.account_id.as_deref() == Some(profile.profile_id.as_str())
+                        && current.model == model.model_id
+                    {
+                        "●".into()
+                    } else {
+                        String::new()
+                    },
+                ]
+            })
+            .collect();
+        let mut actions = vec![visible
+            .iter()
+            .enumerate()
+            .map(|(index, model)| {
+                Action::command(
+                    (index + 1).to_string(),
+                    format!(
+                        "/model custom-model {} {}",
+                        profile.profile_id, model.model_id
+                    ),
+                )
+            })
+            .collect()];
+        actions.push(vec![
+            Action::command(
+                "‹",
+                format!(
+                    "/model custom-models {} {}",
+                    profile.profile_id,
+                    pagination.previous()
+                ),
+            ),
+            Action::noop(format!("Page {}/{}", pagination.page(), pagination.pages())),
+            Action::command(
+                "›",
+                format!(
+                    "/model custom-models {} {}",
+                    profile.profile_id,
+                    pagination.next()
+                ),
+            ),
+        ]);
+        actions.push(vec![Action::back(), Action::close()]);
+        Ok(View {
+            title: Some(format!("MODELS · {}", profile.alias)),
+            blocks: vec![Block::Table {
+                headers: vec![
+                    "No".into(),
+                    "Model".into(),
+                    "Tools".into(),
+                    "Vision".into(),
+                    "Current".into(),
+                ],
+                rows,
+            }],
+            actions,
+            side_mode: false,
+        })
+    }
+
+    fn resolve_custom_profile(
+        &self,
+        principal: &str,
+        id_or_alias: &str,
+    ) -> Result<crate::storage::ProviderProfileRecord> {
+        let profiles = ProviderProfileStore::new(self.storage.clone());
+        if let Some(profile) = profiles.get(principal, id_or_alias)? {
+            return Ok(profile);
+        }
+        profiles
+            .get_by_alias(principal, id_or_alias)?
+            .ok_or_else(|| anyhow!("Custom profile not found for owner"))
+    }
+
+    async fn refresh_custom_profile(
+        &self,
+        principal: &str,
+        profile: &crate::storage::ProviderProfileRecord,
+    ) -> Result<()> {
+        let profiles = ProviderProfileStore::new(self.storage.clone());
+        let api_key = profile
+            .credential_ref
+            .as_deref()
+            .map(|reference| self.auth.credential(reference))
+            .transpose()?
+            .flatten()
+            .and_then(|credential| credential.api_key);
+        let headers = profile.safe_headers()?;
+        let discovered =
+            match crate::ipc::fetch_custom_models(&profile.endpoint, &headers, api_key.as_deref())
+                .await
+            {
+                Ok(models) => models,
+                Err(error) => {
+                    profiles.set_reachability(principal, &profile.profile_id, "unreachable")?;
+                    return Err(anyhow!(
+                        "Custom profile test failed: {}",
+                        crate::security::redact::redact_text(&error.to_string())
+                    ));
+                }
+            };
+        let existing = profiles
+            .models(&profile.profile_id)?
+            .into_iter()
+            .map(|model| (model.model_id.clone(), model))
+            .collect::<std::collections::HashMap<_, _>>();
+        let now = chrono::Utc::now().to_rfc3339();
+        let models = discovered
+            .into_iter()
+            .map(|model_id| {
+                existing.get(&model_id).cloned().unwrap_or(
+                    crate::storage::ProviderProfileModelRecord {
+                        profile_id: profile.profile_id.clone(),
+                        model_id,
+                        text_capable: true,
+                        vision_capable: false,
+                        file_input_capable: false,
+                        native_tools: false,
+                        structured_output: false,
+                        continuation: false,
+                        model_discovery: true,
+                        tool_protocol: "chat_only".into(),
+                        evidence: "discovered; capability probe required".into(),
+                        probed_at: now.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        profiles.replace_models(principal, &profile.profile_id, &models)
+    }
+
     fn set_model(&self, principal: &str, scope: Option<TelegramScope>, model: &str) -> Result<()> {
         let c = self.session_context(principal, scope)?;
         if !self
             .providers
-            .models(&c.active.provider)?
+            .models_for(&c.active.provider, c.active.account_id.as_deref())?
             .iter()
             .any(|m| m == model)
         {
@@ -1285,50 +1982,60 @@ impl CommandCore {
         model: &str,
     ) -> Result<()> {
         let context = self.session_context(principal, scope)?;
-        if !self
-            .providers
-            .models("custom")?
-            .iter()
-            .any(|candidate| candidate == model)
-        {
-            return Err(anyhow!("model is not in the provider catalog"));
-        }
-        let custom = self.config.read().await.providers.custom.clone();
-        let endpoint = custom
-            .base_url
-            .as_deref()
-            .ok_or_else(|| anyhow!("custom endpoint is not configured"))?;
-        let selected_api_key = context
-            .active
-            .account_id
-            .as_deref()
-            .and_then(|account| self.auth.credential(account).ok().flatten())
-            .and_then(|credential| credential.api_key);
-        let fallback_api_key = if selected_api_key.is_none() {
-            self.auth.provider_api_key("custom")?
-        } else {
-            None
+        let Some(profile_id) = context.active.account_id.as_deref() else {
+            // Fresh/local compatibility sessions predate owner-scoped Custom
+            // profiles and use the inert `default` catalog entry. Selecting
+            // that placeholder must remain possible, but it is never probed
+            // or treated as agent-capable and carries no credential/header.
+            // Any configured Custom endpoint must instead be represented by
+            // an explicit owner-owned profile before it can be selected.
+            let custom = &self.config.read().await.providers.custom;
+            if custom.base_url.is_none() && model == "default" {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "select a Custom profile before selecting a Custom model"
+            ));
         };
+        let profiles = ProviderProfileStore::new(self.storage.clone());
+        let profile = profiles
+            .get(principal, profile_id)?
+            .ok_or_else(|| anyhow!("selected Custom profile does not belong to the owner"))?;
+        let mut models = profiles.models(profile_id)?;
+        let Some(selected) = models
+            .iter_mut()
+            .find(|candidate| candidate.model_id == model)
+        else {
+            return Err(anyhow!("model is not in the provider catalog"));
+        };
+        // Resolve only the selected profile's credential. An empty
+        // credential_ref intentionally means no Authorization header; never
+        // fall back to another Custom account or the legacy singleton.
+        let selected_api_key = profile
+            .credential_ref
+            .as_deref()
+            .and_then(|reference| self.auth.credential(reference).ok().flatten())
+            .and_then(|credential| credential.api_key);
+        let headers = profile.safe_headers()?;
         let capability = crate::providers::probe_custom_tool_capability(
-            endpoint,
-            &custom.headers,
-            selected_api_key.as_deref().or(fallback_api_key.as_deref()),
-            &custom.protocol,
+            &profile.endpoint,
+            &headers,
+            selected_api_key.as_deref(),
+            &profile.protocol,
             model,
         )
         .await;
-        self.storage
-            .upsert_provider_capability(&crate::storage::ProviderCapabilityRecord {
-                provider: "custom".into(),
-                model: model.into(),
-                tool_protocol: capability.tool_protocol.as_str().into(),
-                native_tool_calls: capability.tool_protocol
-                    == crate::providers::ToolProtocol::Native,
-                structured_output: capability.structured_output,
-                continuation: capability.continuation,
-                probed_at: chrono::Utc::now().to_rfc3339(),
-                evidence: capability.evidence,
-            })?;
+        selected.text_capable = capability.text;
+        selected.vision_capable = capability.vision;
+        selected.file_input_capable = capability.file_input;
+        selected.native_tools = capability.native_tools;
+        selected.structured_output = capability.structured_output;
+        selected.continuation = capability.continuation;
+        selected.model_discovery = capability.model_discovery;
+        selected.tool_protocol = capability.tool_protocol.as_str().into();
+        selected.evidence = capability.evidence;
+        selected.probed_at = chrono::Utc::now().to_rfc3339();
+        profiles.replace_models(principal, profile_id, &models)?;
         Ok(())
     }
 
@@ -1342,13 +2049,14 @@ impl CommandCore {
     ) -> Result<(String, String)> {
         let record = self
             .storage
-            .account(account)?
+            .account_for_owner(principal, account)?
             .ok_or_else(|| anyhow!("account not found"))?;
         if record.status != "connected" {
             return Err(anyhow!("account is not connected"));
         }
         let model = self.providers.preferred_model(&record.provider)?;
         let c = self.session_context(principal, scope)?;
+        self.storage.set_account_owner(principal, account)?;
         self.storage.activate_account(
             principal,
             &c.active.id,
@@ -1577,51 +2285,270 @@ impl CommandCore {
         })
     }
 
-    async fn doctor_view(&self) -> View {
+    async fn doctor_view(&self, principal: &str, scope: Option<TelegramScope>) -> View {
         let cfg = self.config.read().await.clone();
         let environment = self.runtime.as_ref().map(|runtime| runtime.environment());
-        let identity_ready = self
+        let mut checks = Vec::new();
+        let mut check = |state: &str, name: &str, evidence: String| {
+            checks.push(format!("{state} · {name} · {evidence}"));
+        };
+
+        match self.storage.diagnostic_transaction() {
+            Ok(()) => check(
+                "PASS",
+                "DB transaction",
+                "begin/read/rollback succeeded".into(),
+            ),
+            Err(error) => check("FAIL", "DB transaction", safe_diagnostic(&error)),
+        }
+        match self.storage.schema_version() {
+            Ok(16) => check("PASS", "Migrations/schema", "schema version 16".into()),
+            Ok(version) => check(
+                "FAIL",
+                "Migrations/schema",
+                format!("expected 16, found {version}"),
+            ),
+            Err(error) => check("FAIL", "Migrations/schema", safe_diagnostic(&error)),
+        }
+        match self
             .runtime
             .as_ref()
-            .is_some_and(|runtime| runtime.workspace().load().is_ok());
-        let checks = vec![
-            format!("DB: {}", if self.storage.health() { "OK" } else { "ERROR" }),
-            format!("IPC: {}", cfg.ipc.bind),
-            format!("Telegram transport: {}", cfg.telegram.transport),
-            format!("Providers registered: {}", self.providers.readiness()),
-            format!(
-                "Identity workspace: {}",
-                if identity_ready { "OK" } else { "ERROR" }
+            .map(|runtime| runtime.workspace().load())
+        {
+            Some(Ok(workspace)) if !workspace.soul.trim().is_empty() => check(
+                "PASS",
+                "Identity workspace",
+                "SOUL/USER/MEMORY/AGENTS readable".into(),
             ),
-            format!(
-                "Memory index: {}",
-                if self.storage.health() { "OK" } else { "ERROR" }
+            Some(Ok(_)) => check("FAIL", "Identity workspace", "SOUL.md is empty".into()),
+            Some(Err(error)) => check("FAIL", "Identity workspace", safe_diagnostic(&error)),
+            None => check(
+                "SKIPPED",
+                "Identity workspace",
+                "runtime not attached".into(),
             ),
-            format!(
-                "Skills index: {}",
-                if self.storage.health() { "OK" } else { "ERROR" }
+        }
+
+        let memory = self.memory_store();
+        match memory.list(principal, None, 1).and_then(|_| {
+            memory
+                .search(principal, "doctor probe nonce", 1)
+                .map(|_| ())
+        }) {
+            Ok(()) => check(
+                "PASS",
+                "Memory reconcile/search",
+                "active index and FTS query succeeded; canonical files readable in identity probe"
+                    .into(),
             ),
-            format!(
-                "Termux: {}",
-                if environment.as_ref().is_some_and(|env| env.termux.is_some()) {
-                    "OK"
-                } else {
-                    "UNAVAILABLE"
+            Err(error) => check("FAIL", "Memory reconcile/search", safe_diagnostic(&error)),
+        }
+
+        let skills = SkillStore::new(self.storage.clone());
+        let skill_result = if let Some(runtime) = &self.runtime {
+            FilesystemSkills::new(runtime.workspace(), Arc::new(skills.clone()))
+                .discover()
+                .and_then(|_| {
+                    skills
+                        .search(principal, "doctor probe nonce", 1)
+                        .map(|_| ())
+                })
+        } else {
+            skills
+                .search(principal, "doctor probe nonce", 1)
+                .map(|_| ())
+        };
+        match skill_result {
+            Ok(()) => check(
+                "PASS",
+                "Skills scan/search",
+                "filesystem/index/FTS readable".into(),
+            ),
+            Err(error) => check("FAIL", "Skills scan/search", safe_diagnostic(&error)),
+        }
+
+        match self.storage.session_fts_health() {
+            Ok(rows) => check(
+                "PASS",
+                "Session FTS",
+                format!("index readable; {rows} rows"),
+            ),
+            Err(error) => check("FAIL", "Session FTS", safe_diagnostic(&error)),
+        }
+        match &self.attachments {
+            Some(attachments) => match attachments.health() {
+                Ok(evidence) => check("PASS", "Attachment store/FTS", evidence),
+                Err(error) => check("FAIL", "Attachment store/FTS", safe_diagnostic(&error)),
+            },
+            None => check(
+                "SKIPPED",
+                "Attachment store/FTS",
+                "manager not attached".into(),
+            ),
+        }
+
+        if cfg.telegram.enabled {
+            let token = crate::security::secrets::SecretStore::new(cfg.paths.secrets_dir.clone())
+                .get("telegram-bot-token")
+                .ok()
+                .flatten();
+            match token {
+                Some(token) => match crate::telegram::client::TelegramClient::new(token) {
+                    Ok(client) => match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        client.get_me(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(bot)) => {
+                            check("PASS", "Telegram API", format!("getMe bot_id={}", bot.id))
+                        }
+                        Ok(Err(error)) => check("WARN", "Telegram API", safe_diagnostic(&error)),
+                        Err(_) => check("WARN", "Telegram API", "getMe timed out".into()),
+                    },
+                    Err(error) => check("FAIL", "Telegram API", safe_diagnostic(&error)),
+                },
+                None => check("FAIL", "Telegram API", "bot token is not configured".into()),
+            }
+        } else {
+            check("SKIPPED", "Telegram API", "Telegram is disabled".into());
+        }
+
+        if let (Some(runtime), Some(termux)) = (
+            &self.runtime,
+            environment.as_ref().and_then(|env| env.termux.clone()),
+        ) {
+            let executor = TermuxExecutor::new(termux.clone(), runtime.workspace().root());
+            let command = TermuxCommand {
+                program: "true".into(),
+                args: Vec::new(),
+                cwd: termux.home,
+                environment: Default::default(),
+                timeout_ms: 5_000,
+                max_output_chars: 256,
+                purpose: ExecutionPurpose::Verification,
+            };
+            match executor
+                .execute(command, tokio_util::sync::CancellationToken::new())
+                .await
+            {
+                Ok(outcome) if outcome.succeeded() => {
+                    check("PASS", "Termux executor", outcome.observable_summary())
                 }
-            ),
-            format!(
-                "Privileged broker: {}",
-                if environment
-                    .as_ref()
-                    .is_some_and(|env| env.effective_uid == 0)
-                {
-                    "OK"
+                Ok(outcome) => check("WARN", "Termux executor", outcome.observable_summary()),
+                Err(error) => check("WARN", "Termux executor", safe_diagnostic(&error)),
+            }
+        } else {
+            check(
+                "SKIPPED",
+                "Termux executor",
+                "Termux environment unavailable".into(),
+            );
+        }
+
+        if let Some(runtime) = &self.runtime {
+            let resolution = runtime.capabilities().resolve("xiao.tool_registry");
+            check(
+                if resolution.status == CapabilityStatus::Available {
+                    "PASS"
                 } else {
-                    "UNAVAILABLE"
+                    "WARN"
+                },
+                "CapabilityRegistry",
+                format!("{}={}", resolution.canonical, resolution.status.as_str()),
+            );
+        } else {
+            check(
+                "SKIPPED",
+                "CapabilityRegistry",
+                "runtime not attached".into(),
+            );
+        }
+
+        if environment
+            .as_ref()
+            .is_some_and(|env| env.effective_uid == 0)
+            && std::path::Path::new("/system/bin/getprop").is_file()
+        {
+            match SystemAndroidBroker::default()
+                .execute(
+                    AndroidOperation::InspectXiaoService,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+            {
+                Ok(outcome) if outcome.verified => {
+                    check("PASS", "Android broker", outcome.evidence)
                 }
+                Ok(outcome) => check("WARN", "Android broker", outcome.evidence),
+                Err(error) => check("WARN", "Android broker", safe_diagnostic(&error)),
+            }
+        } else {
+            check(
+                "SKIPPED",
+                "Android broker",
+                "safe getprop probe unavailable in this runtime".into(),
+            );
+        }
+
+        match self.session_context(principal, scope) {
+            Ok(context) => check(
+                if self.providers.state(&context.active.provider) == ProviderState::Ready {
+                    "PASS"
+                } else {
+                    "WARN"
+                },
+                "Active provider/auth/model",
+                format!(
+                    "{} / {} / {:?}",
+                    context.active.provider,
+                    context.active.model,
+                    self.providers.state(&context.active.provider)
+                ),
             ),
-            "Root AI shell: DISABLED by architecture".into(),
-        ];
+            Err(error) => check(
+                "FAIL",
+                "Active provider/auth/model",
+                safe_diagnostic(&error),
+            ),
+        }
+        match ProviderProfileStore::new(self.storage.clone()).list(principal) {
+            Ok(profiles) if profiles.is_empty() => check(
+                "SKIPPED",
+                "Custom profile reachability",
+                "no Custom profiles".into(),
+            ),
+            Ok(profiles) => {
+                let unreachable = profiles
+                    .iter()
+                    .filter(|profile| profile.reachability == "unreachable")
+                    .count();
+                check(
+                    if unreachable == 0 { "PASS" } else { "WARN" },
+                    "Custom profile reachability",
+                    format!("{} profiles; {unreachable} unreachable", profiles.len()),
+                );
+            }
+            Err(error) => check(
+                "FAIL",
+                "Custom profile reachability",
+                safe_diagnostic(&error),
+            ),
+        }
+        check(
+            if cfg.ipc.ip().is_ok_and(|ip| ip.is_loopback()) {
+                "PASS"
+            } else {
+                "FAIL"
+            },
+            "Admin API backend",
+            format!("bind={}", cfg.ipc.bind),
+        );
+        check(
+            "PASS",
+            "Root AI shell: DISABLED",
+            "enforced by architecture".into(),
+        );
         View {
             title: Some("DOCTOR".into()),
             blocks: vec![Block::List {
@@ -1657,12 +2584,53 @@ impl CommandCore {
 
     fn memory_view(&self, principal: &str, query: Option<&str>) -> Result<View> {
         let store = self.memory_store();
-        let records = match query {
-            Some("user") => store.list(principal, Some(MemoryScope::User), 5)?,
-            Some("agent") => store.list(principal, Some(MemoryScope::Agent), 5)?,
-            Some(query) if !query.trim().is_empty() => store.search(principal, query, 5)?,
+        // Owner-edited USER.md/MEMORY.md is canonical. Reconcile immediately
+        // before every owner-facing list/search rather than waiting for an
+        // unrelated learning write.
+        store.reconcile(principal)?;
+        let parts = query
+            .map(str::split_whitespace)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let (selector, requested_page, search_query) = if parts.first() == Some(&"page") {
+            (
+                parts.get(2).copied(),
+                parts.get(1).and_then(|page| page.parse().ok()).unwrap_or(1),
+                None,
+            )
+        } else if parts.first() == Some(&"find") {
+            let page = parts.get(1).and_then(|value| value.parse::<usize>().ok());
+            let start = if page.is_some() { 2 } else { 1 };
+            (
+                Some("find"),
+                page.unwrap_or(1),
+                Some(
+                    parts
+                        .iter()
+                        .skip(start)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+            )
+        } else {
+            (parts.first().copied(), 1, None)
+        };
+        let all = match selector {
+            Some("user") => store.list(principal, Some(MemoryScope::User), 500)?,
+            Some("agent") => store.list(principal, Some(MemoryScope::Agent), 500)?,
+            Some("find")
+                if search_query
+                    .as_deref()
+                    .is_some_and(|query| !query.is_empty()) =>
+            {
+                store.search(principal, search_query.as_deref().unwrap_or_default(), 500)?
+            }
             _ => Vec::new(),
         };
+        let pagination = Paginator::new(all.len(), requested_page, 5);
+        let records = all[pagination.range()].to_vec();
         let blocks = if records.is_empty() {
             vec![Block::Paragraph {
                 text: "Choose a memory source or search Xiao's current inspectable state.".into(),
@@ -1715,6 +2683,27 @@ impl CommandCore {
                         ),
                     ]);
                 }
+                if let Some(selector) = selector {
+                    let command = if selector == "find" {
+                        format!(
+                            "/memory find {{page}} {}",
+                            search_query.as_deref().unwrap_or_default()
+                        )
+                    } else {
+                        format!("/memory page {{page}} {selector}")
+                    };
+                    actions.push(vec![
+                        Action::command(
+                            "‹",
+                            command.replace("{page}", &pagination.previous().to_string()),
+                        ),
+                        Action::noop(format!("Page {}/{}", pagination.page(), pagination.pages())),
+                        Action::command(
+                            "›",
+                            command.replace("{page}", &pagination.next().to_string()),
+                        ),
+                    ]);
+                }
                 actions
             },
             side_mode: false,
@@ -1730,6 +2719,10 @@ impl CommandCore {
 
     fn skills_view(&self, principal: &str, query: Option<&str>) -> Result<View> {
         let store = SkillStore::new(self.storage.clone());
+        if let Some(runtime) = &self.runtime {
+            FilesystemSkills::new(runtime.workspace(), Arc::new(store.clone()))
+                .reconcile(principal)?;
+        }
         let query_parts = query
             .map(str::split_whitespace)
             .into_iter()
@@ -1745,6 +2738,19 @@ impl CommandCore {
             .unwrap_or(1);
         let mut pages = 1usize;
         let mut page = 1usize;
+        let search_mode = query_parts.first() == Some(&"find");
+        let search_page = query_parts
+            .get(1)
+            .and_then(|value| value.parse::<usize>().ok());
+        let search_start = if search_page.is_some() { 2 } else { 1 };
+        let search_query = search_mode.then(|| {
+            query_parts
+                .iter()
+                .skip(search_start)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
         let skills = match (source, query) {
             (Some(source), _) => {
                 let matching = store
@@ -1756,7 +2762,16 @@ impl CommandCore {
                 page = requested_page.clamp(1, pages);
                 matching.into_iter().skip((page - 1) * 5).take(5).collect()
             }
-            (None, Some(query)) if !query.trim().is_empty() => store.search(principal, query, 5)?,
+            (None, _)
+                if search_query
+                    .as_deref()
+                    .is_some_and(|query| !query.is_empty()) =>
+            {
+                let matching = store.search(principal, search_query.as_deref().unwrap(), 500)?;
+                pages = matching.len().max(1).div_ceil(5);
+                page = search_page.unwrap_or(1).clamp(1, pages);
+                matching.into_iter().skip((page - 1) * 5).take(5).collect()
+            }
             _ => Vec::new(),
         };
         let mut actions = vec![
@@ -1780,6 +2795,22 @@ impl CommandCore {
                 ),
                 Action::noop(format!("Page {page}/{pages}")),
                 Action::command("›", format!("/skills {source} {}", (page + 1).min(pages))),
+            ]);
+        } else if let Some(search_query) = search_query {
+            actions.push(vec![
+                Action::command(
+                    "‹",
+                    format!(
+                        "/skills find {} {}",
+                        page.saturating_sub(1).max(1),
+                        search_query
+                    ),
+                ),
+                Action::noop(format!("Page {page}/{pages}")),
+                Action::command(
+                    "›",
+                    format!("/skills find {} {}", (page + 1).min(pages), search_query),
+                ),
             ]);
         }
         Ok(View {
@@ -1903,55 +2934,6 @@ impl CommandCore {
             side_mode: false,
         }
     }
-
-    fn about_view(&self) -> View {
-        let environment = self.runtime.as_ref().map(|runtime| runtime.environment());
-        let rows = environment
-            .map(|environment| {
-                vec![
-                    vec!["Version".into(), crate::VERSION.into()],
-                    vec!["Core".into(), "Rust".into()],
-                    vec!["Interface".into(), "Telegram".into()],
-                    vec!["Platform".into(), environment.platform],
-                    vec!["Architecture".into(), environment.architecture],
-                    vec![
-                        "Root".into(),
-                        if environment.root_available {
-                            "available".into()
-                        } else {
-                            "unavailable".into()
-                        },
-                    ],
-                    vec!["SELinux".into(), environment.selinux.as_str().into()],
-                    vec![
-                        "Termux".into(),
-                        environment
-                            .termux
-                            .map(|termux| termux.prefix.display().to_string())
-                            .unwrap_or_else(|| "unavailable".into()),
-                    ],
-                ]
-            })
-            .unwrap_or_else(|| {
-                vec![
-                    vec!["Version".into(), crate::VERSION.into()],
-                    vec!["Runtime".into(), "unavailable".into()],
-                ]
-            });
-        View {
-            title: Some("XIAO\nPrivate Personal AI Agent".into()),
-            blocks: vec![Block::Table {
-                headers: vec!["Field".into(), "Value".into()],
-                rows,
-            }],
-            actions: vec![vec![
-                Action::command("Refresh", "/about"),
-                Action::command("Tools", "/tools"),
-                Action::close(),
-            ]],
-            side_mode: false,
-        }
-    }
 }
 
 fn normalize_provider(value: &str) -> String {
@@ -1990,6 +2972,17 @@ fn short_activity(value: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(value)
         .map(|d| d.format("%d %b %H:%M").to_string())
         .unwrap_or_else(|_| value.chars().take(16).collect())
+}
+
+fn yes_no(value: bool) -> String {
+    if value { "yes" } else { "no" }.into()
+}
+
+fn safe_diagnostic(error: &impl std::fmt::Display) -> String {
+    crate::security::redact::redact_text(&error.to_string())
+        .chars()
+        .take(600)
+        .collect()
 }
 
 pub fn account_label(account: &AccountRecord) -> String {
@@ -2127,14 +3120,21 @@ mod tests {
     #[tokio::test]
     async fn owner_can_inspect_approve_and_deny_pending_operations() {
         let (core, storage, _sessions, _temp) = core();
+        let binding_a = crate::storage::ApprovalBinding {
+            owner_id: "p",
+            session_id: "session-a",
+            agent_run_id: "run-a",
+            tool_call_id: "call-a",
+            tool_name: "android_xiao_restart",
+            arguments_hash: "hash-a",
+        };
         let pending = storage
-            .request_approval(
-                "p",
-                "android.service.restart",
-                "android_xiao_restart",
-                "hash-a",
-                "restart Xiao service",
-            )
+            .request_approval(crate::storage::ApprovalRequest {
+                binding: binding_a,
+                capability: "android.service.restart",
+                risk: "privileged",
+                summary: "restart Xiao service",
+            })
             .unwrap();
         assert!(matches!(
             core.execute_text("p", "/approvals").await.unwrap(),
@@ -2146,28 +3146,29 @@ mod tests {
                 .unwrap(),
             CommandResult::Confirmation(_)
         ));
-        assert!(storage
-            .consume_approval("p", "android_xiao_restart", "hash-a")
-            .unwrap());
-        assert!(!storage
-            .consume_approval("p", "android_xiao_restart", "hash-a")
-            .unwrap());
+        assert!(storage.consume_approval(binding_a).unwrap());
+        assert!(!storage.consume_approval(binding_a).unwrap());
 
+        let binding_b = crate::storage::ApprovalBinding {
+            owner_id: "p",
+            session_id: "session-a",
+            agent_run_id: "run-b",
+            tool_call_id: "call-b",
+            tool_name: "android_xiao_restart",
+            arguments_hash: "hash-b",
+        };
         let denied = storage
-            .request_approval(
-                "p",
-                "android.service.restart",
-                "android_xiao_restart",
-                "hash-b",
-                "restart Xiao service",
-            )
+            .request_approval(crate::storage::ApprovalRequest {
+                binding: binding_b,
+                capability: "android.service.restart",
+                risk: "privileged",
+                summary: "restart Xiao service",
+            })
             .unwrap();
         core.execute_text("p", &format!("/deny {}", denied.id))
             .await
             .unwrap();
-        assert!(!storage
-            .consume_approval("p", "android_xiao_restart", "hash-b")
-            .unwrap());
+        assert!(!storage.consume_approval(binding_b).unwrap());
         assert!(storage.pending_approvals("other-owner").unwrap().is_empty());
     }
 
@@ -2386,7 +3387,6 @@ mod tests {
             ("/context", "Context budget"),
             ("/tools", "TOOLS & CAPABILITIES"),
             ("/doctor", "Root AI shell: DISABLED"),
-            ("/about", "Private Personal AI Agent"),
             ("/approvals", "No pending"),
         ] {
             let result = core.execute_text("p", command).await.unwrap();
@@ -2396,6 +3396,104 @@ mod tests {
             })
             .unwrap();
             assert!(rendered.contains(expected), "{command} missing {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_memory_failure_independently_from_healthy_database() {
+        let (core, storage, _sessions, _temp) = core();
+        storage
+            .with_conn(|connection| {
+                connection.execute_batch("DROP TABLE memories_fts;")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(storage.health());
+        let result = core.execute_text("p", "/doctor").await.unwrap();
+        let CommandResult::InfoView(view) = result else {
+            panic!("doctor view expected")
+        };
+        let checks = view
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::List { items, .. } => Some(items),
+                _ => None,
+            })
+            .unwrap();
+        assert!(checks
+            .iter()
+            .any(|check| check.starts_with("PASS · DB transaction")));
+        assert!(checks
+            .iter()
+            .any(|check| check.starts_with("FAIL · Memory reconcile/search")));
+    }
+
+    #[tokio::test]
+    async fn skills_manager_paginates_thirteen_entries_as_five_five_three() {
+        let (core, storage, _sessions, _temp) = core();
+        let store = SkillStore::new(storage);
+        let fixtures = [
+            ("resize-images", "Resize uploaded photographs"),
+            ("audit-database", "Audit SQLite transaction integrity"),
+            ("rotate-logs", "Rotate bounded service diagnostics"),
+            ("parse-invoices", "Parse invoice line items"),
+            ("backup-workspace", "Back up identity workspace files"),
+            ("verify-checksums", "Verify downloaded artifact checksums"),
+            ("format-rust", "Format a Rust project"),
+            ("summarize-pdf", "Summarize searchable PDF content"),
+            ("clean-csv", "Normalize malformed CSV columns"),
+            ("inspect-android", "Inspect Android runtime properties"),
+            ("test-webhook", "Test a local webhook response"),
+            ("archive-session", "Archive an inactive conversation"),
+            ("compare-json", "Compare structured JSON documents"),
+        ];
+        for (index, (name, summary)) in fixtures.into_iter().enumerate() {
+            store
+                .create_or_update(
+                    "p",
+                    crate::skills::SkillCandidate {
+                        name: name.into(),
+                        summary: summary.into(),
+                        when_to_use: format!("When the distinct {name} scenario occurs"),
+                        prerequisites: "test fixture".into(),
+                        procedure: format!("Execute unique procedure {index} and record evidence"),
+                        pitfalls: "Do not select a neighboring row".into(),
+                        verification: format!("Result {index} is visible"),
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        for (page, expected) in [(1, 5), (2, 5), (3, 3)] {
+            let result = core
+                .execute_text("p", &format!("/skills imported {page}"))
+                .await
+                .unwrap();
+            let CommandResult::ManagerView(view) = result else {
+                panic!("skills manager expected")
+            };
+            let rows = view
+                .blocks
+                .iter()
+                .find_map(|block| match block {
+                    Block::Table { rows, .. } => Some(rows),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(rows.len(), expected, "wrong skill count on page {page}");
+            assert_eq!(
+                view.actions
+                    .iter()
+                    .filter(|row| {
+                        row.len() == 1
+                            && row[0]
+                                .callback_command()
+                                .is_some_and(|command| command.starts_with("/skills detail "))
+                    })
+                    .count(),
+                expected
+            );
         }
     }
 
@@ -2484,5 +3582,73 @@ mod tests {
             (after.provider, after.account_id, after.model),
             (before.provider, before.account_id, before.model)
         );
+    }
+
+    #[tokio::test]
+    async fn model_disconnect_removes_only_selected_account_and_detaches_its_sessions() {
+        let (core, storage, sessions, _temp) = core();
+        let first = sessions.ensure_default_session("p").unwrap();
+        for record in [
+            account("disconnect-me", "codex"),
+            account("keep-me", "codex"),
+        ] {
+            storage.upsert_account(&record).unwrap();
+        }
+        storage
+            .set_session_provider(
+                "p",
+                &first.id,
+                "codex",
+                Some("disconnect-me"),
+                "codex-default",
+            )
+            .unwrap();
+        let second = storage
+            .create_session(
+                "p",
+                "Unrelated account",
+                "codex",
+                Some("keep-me"),
+                "codex-alt",
+                false,
+                None,
+            )
+            .unwrap();
+        let profile = ProviderProfileStore::new(storage.clone())
+            .create(crate::storage::ProviderProfileInput {
+                profile_id: None,
+                owner_id: "p".into(),
+                alias: "unrelated-profile".into(),
+                endpoint: "https://unrelated.example/v1".into(),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: None,
+                safe_headers_json: "{}".into(),
+            })
+            .unwrap();
+
+        let result = core
+            .execute_text("p", "/model account-disconnect-confirm disconnect-me")
+            .await
+            .unwrap();
+        assert!(matches!(result, CommandResult::ManagerView(_)));
+        assert!(storage.account("disconnect-me").unwrap().is_none());
+        assert!(storage.account("keep-me").unwrap().is_some());
+        assert_eq!(
+            storage.session("p", &first.id).unwrap().unwrap().account_id,
+            None
+        );
+        assert_eq!(
+            storage
+                .session("p", &second.id)
+                .unwrap()
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some("keep-me")
+        );
+        assert!(ProviderProfileStore::new(storage)
+            .get("p", &profile.profile_id)
+            .unwrap()
+            .is_some());
     }
 }

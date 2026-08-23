@@ -367,13 +367,91 @@ async fn admin(paths: &CliPaths, args: &[String]) -> Result<()> {
             )
             .await?;
         }
+        Some("manager-get-base64") => {
+            let encoded = args
+                .get(1)
+                .ok_or_else(|| anyhow!("base64 manager request required"))?;
+            let payload = String::from_utf8(URL_SAFE_NO_PAD.decode(encoded)?)?;
+            let request: serde_json::Value = serde_json::from_str(&payload)?;
+            let resource = request
+                .get("resource")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("manager resource is required"))?;
+            let path = manager_resource_path(resource)?;
+            let mut url = reqwest::Url::parse(&format!("{endpoint}{path}"))?;
+            if let Some(query) = request.get("query").and_then(serde_json::Value::as_object) {
+                let mut pairs = url.query_pairs_mut();
+                for (key, value) in query {
+                    if !matches!(
+                        key.as_str(),
+                        "page" | "limit" | "query" | "scope" | "include_archived" | "lines"
+                    ) {
+                        bail!("unsupported manager query field: {key}");
+                    }
+                    let value = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string());
+                    if value.chars().count() > 512 {
+                        bail!("manager query value is too long");
+                    }
+                    pairs.append_pair(key, &value);
+                }
+            }
+            print_response(client.get(url).bearer_auth(&token).send().await?).await?;
+        }
+        Some("manager-post-base64") => {
+            let encoded = args
+                .get(1)
+                .ok_or_else(|| anyhow!("base64 manager request required"))?;
+            let payload = String::from_utf8(URL_SAFE_NO_PAD.decode(encoded)?)?;
+            let request: serde_json::Value = serde_json::from_str(&payload)?;
+            let resource = request
+                .get("resource")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("manager resource is required"))?;
+            let body = request
+                .get("body")
+                .cloned()
+                .ok_or_else(|| anyhow!("manager request body is required"))?;
+            let path = manager_resource_path(resource)?;
+            print_response(
+                client
+                    .post(format!("{endpoint}{path}"))
+                    .bearer_auth(&token)
+                    .json(&body)
+                    .send()
+                    .await?,
+            )
+            .await?;
+        }
         _ => bail!(concat!(
             "admin usage: snapshot | logs [N] | client-config | apply-file JSON | ",
             "apply-base64 PAYLOAD | test-token-file FILE | test-token-base64 TOKEN | ",
-            "fetch-models-base64 PAYLOAD"
+            "fetch-models-base64 PAYLOAD | manager-get-base64 PAYLOAD | ",
+            "manager-post-base64 PAYLOAD"
         )),
     }
     Ok(())
+}
+
+fn manager_resource_path(resource: &str) -> Result<&'static str> {
+    match resource {
+        "dashboard" => Ok("/v1/admin/dashboard"),
+        "providers" => Ok("/v1/admin/providers"),
+        "provider-custom" => Ok("/v1/admin/providers/custom"),
+        "provider-accounts" => Ok("/v1/admin/providers/accounts"),
+        "runtime" => Ok("/v1/admin/runtime"),
+        "sessions" => Ok("/v1/admin/sessions"),
+        "runs" => Ok("/v1/admin/runs"),
+        "memory" => Ok("/v1/admin/memory"),
+        "skills" => Ok("/v1/admin/skills"),
+        "tools" => Ok("/v1/admin/tools"),
+        "security" => Ok("/v1/admin/security"),
+        "diagnostics" => Ok("/v1/admin/diagnostics"),
+        "logs" => Ok("/v1/logs"),
+        _ => bail!("unsupported manager resource"),
+    }
 }
 
 async fn apply_admin_json(
