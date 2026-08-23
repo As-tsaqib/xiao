@@ -2,10 +2,18 @@
 
 ## Runtime ownership
 
-`xiaod` remains the only durable application owner. `AppState` wires
-configuration, SQLite storage, sessions, authentication, providers,
-`CommandCore`, health state, and the event bus. Telegram, CLI/IPC, and WebUI
-remain adapters; they do not own independent agent engines or durable state.
+`xiaod` remains the only durable application owner. Xiao is a private personal
+agent for one owner; retained principal IDs isolate compatibility/session
+state, not tenants. `AppState` wires configuration, SQLite, the living
+workspace, runtime probing/capabilities, sessions, authentication, providers,
+`CommandCore`, health, and the event bus. Telegram, CLI/IPC, and WebUI remain
+adapters; they do not own independent agent engines or durable state.
+
+Startup create-loads `SOUL.md`, `USER.md`, `MEMORY.md`, and `AGENTS.md` under
+the durable data root, then probes and atomically refreshes `ENVIRONMENT.md`.
+Existing owner-edited files are never replaced by bootstrap defaults. Ordinary
+task code has no SOUL write path; hard security rules remain compiled runtime
+policy rather than workspace prose.
 
 `CommandCore` is the semantic convergence point for frontend commands. A chat
 request enters the principal-scoped `AgentEngine`, captures its target session,
@@ -29,11 +37,13 @@ they do not discover tools, apply policy, or execute tools. Codex declares
 tool-continuation capability. Providers without that capability receive no
 advertised tools, and an unexpected tool-call response is an explicit error.
 
-Completion moves through `running → verifying → completed`. A nonempty final
-answer and resolved observable tool results are required. Failed, denied, or
-interrupted tool work must be followed by a later successful recovery of the
-same tool to verify completion. Information-only answers can complete without
-tools, but are not considered meaningful reusable procedures.
+Completion moves through `running → verifying` into `completed`, `blocked`, or
+`failed`. The verifier distinguishes `VerifiedSuccess`, `NotYetVerified`,
+`Blocked`, and `Failed`. Information-only answers can complete without a tool.
+Action tasks require an observed action and separate or typed postcondition
+evidence; a nonempty final claim is insufficient. `NotYetVerified` is fed back
+to the provider so it continues. Failed action signatures cannot be retried
+unchanged indefinitely; turn/tool/no-progress/runtime bounds terminate loops.
 
 Cancellation is checked at provider and tool boundaries. Startup changes any
 persisted in-flight agent/tool runs to `interrupted`; uncertain side effects are
@@ -41,12 +51,12 @@ never automatically replayed.
 
 ## Tool registry and policy
 
-`ToolRegistry` owns canonical identity and implementation lookup, rejects
-duplicate names, advertises only policy-allowed specs, applies per-tool
-timeouts, redacts output, and enforces a configured output bound.
-`ToolPolicy` permits read-only tools and only the explicitly approved
-`memory_set`/`memory_delete` side effects. Sensitive, destructive, privileged,
-and unapproved side-effect tools are denied.
+`ToolRegistry` owns canonical `ToolSpec` identity/implementation lookup,
+rejects duplicate names, resolves safe aliases, gates capabilities, advertises
+only policy-eligible specs, applies timeouts, redacts output, and enforces an
+output bound. Providers only translate those canonical definitions to wire
+schemas. Runtime `ToolPolicy` evaluates risk and call arguments; a skill is
+guidance and cannot grant a tool or bypass policy.
 
 The v0.2.0 built-ins are:
 
@@ -54,25 +64,38 @@ The v0.2.0 built-ins are:
 - `memory_search`, `memory_set`, `memory_delete`
 - `session_search`
 - `skill_search`, `skill_view`
+- `termux_terminal` (`terminal`/`exec` compatibility aliases)
+- `android_xiao_status`, `android_xiao_restart`
 
-There is no command/process/root-shell tool. Skills and memories are data, not
-capabilities, and cannot register tools or bypass policy.
+The terminal accepts structured program/argv only, runs as the detected Termux
+owner with a Termux-only PATH and controlled cwd/env, and bounds timeout,
+cancellation, stdout, and stderr. A root daemon clears inherited groups, drops
+UID/GID, and enables Linux/Android `no_new_privs` before exec. It rejects root escalation, model-supplied
+shell command strings, unmanaged package mutation, and unsafe installer
+pipelines. Clearly destructive, opaque shell-script, or credential-sensitive
+calls require an exact one-shot approval. There is no generic root-shell tool.
+
+When a trusted mapped binary is absent, `DependencyResolver` invokes only the
+detected Termux `pkg`/`apt` backend with a normalized package, records the
+install, re-probes the executable, and resumes the original call. Privileged
+Android work is separate: `AndroidBroker` exposes only typed Xiao-service
+inspection/restart; restart requires approval and accepts no command string.
 
 ## Long-term memory
 
-Memory is editable current state, keyed by
-`(owner_principal, scope, category, key)`. SQLite enforces that uniqueness.
-`MemoryStore::upsert` updates an existing canonical row, while
-`memory_history` records create/update/delete audit events separately. Only
-active `memories` rows enter normal context.
+`USER.md` and `MEMORY.md` are the inspectable editable active state. Managed
+entries use stable semantic keys; atomic create/update/delete/merge/rekey
+operations replace contradictions rather than accumulating append-only facts.
+Manual owner edits are hash-reconciled back into SQLite. SQLite retains the
+search index and `memory_history` audit; a one-time bridge exports legacy
+SQLite-only active memories to files.
 
-The `user` scope holds durable user preferences/facts; `agent` holds durable
-project knowledge learned for that principal. Canonical aliases collapse
-common overlapping keys such as answer style/verbosity into
-`preference.response_style`. Deterministic explicit handling recognizes stable
-preference changes and bounded `remember … X is Y` facts before the provider is
-called. Explicit forget removes matching active state. Arbitrary mutations
-remain available through typed memory tools.
+The `user` scope maps to owner profile/preferences; `agent` maps to durable
+project/environment knowledge. The evaluator extracts general explicit
+preferences/facts, compares related active entries, updates near-duplicates,
+and supports explicit forget. Response style/language aliases exist for
+compatibility but are not the evaluator's only supported subjects. Typed memory
+tools use the same file-authoritative store.
 
 Memory values and sensitive identities are bounded and credential-screened.
 Structured tool arguments are recursively redacted before audit persistence.
@@ -87,16 +110,15 @@ owned sessions for every search, so results cannot cross principal boundaries.
 `session_search` bounds both result count and content size and redacts likely
 credential material.
 
-`ContextEngine` replaces the old row-count truncation strategy. It assembles:
+`ContextEngine` replaces the old fixed last-N strategy. It assembles:
 
-1. immutable Xiao system/security instructions;
-2. active user memory;
-3. active agent/project memory;
-4. selected relevant skills;
-5. durable session summaries;
-6. retrieved prior history when the request refers to earlier work;
-7. newest conversation turns;
-8. the current user request.
+1. immutable Xiao system/security instructions and SOUL;
+2. verified `RuntimeEnvironment`/`CapabilityRegistry` state;
+3. USER and relevant MEMORY state plus AGENTS guidance;
+4. selected relevant skill metadata/body;
+5. durable session summaries and selective FTS5 prior excerpts;
+6. newest conversation turns;
+7. the current owner request.
 
 Selection uses an approximate character budget. System/security instructions
 and the current request are always retained, even when those protected fields
@@ -107,20 +129,21 @@ messages remain in SQLite.
 
 ## Skills and learning
 
-A skill is principal-scoped procedural memory containing `name`, `summary`,
-`when_to_use`, `procedure`, `pitfalls`, and `verification`. SQLite FTS indexes
-searchable fields. Context searches skill summaries from the current request
-and progressively discloses only selected full skills rather than injecting
-the entire registry.
+A skill lives at `skills/<name>/SKILL.md` with YAML frontmatter requiring
+`name` and `description`. Common optional community metadata is tolerated;
+Xiao requirements live under namespaced metadata for binaries, capabilities,
+and tools. Discovery/reconciliation indexes searchable fields in SQLite.
+Search exposes eligibility metadata, full bodies load lazily, and trusted
+missing Termux dependencies may be resolved before use. Ineligible skill
+instructions never bypass ToolPolicy.
 
-`LearningEvaluator` accepts a bounded observable trace: goal, safe tool
-observations, final observable result, and verification evidence. It has no
-hidden-reasoning field. Learning is skipped for failed, cancelled, interrupted,
-unverified, trivial, or non-reusable work. A candidate is searched against
-existing skill intent before creation. Canonical token aliases and overlap
-scoring merge near-synonyms such as `fix-xiao-service-v2` into
-`diagnose-xiao-service`; procedure, pitfalls, and verification are updated in
-one canonical row, with `skill_history` retaining the audit version.
+`LearningEvaluator` consumes the bounded observable trace after
+`VerifiedSuccess`: goal, safe tool observations (including recovered failures),
+final result, and verification evidence. It has no hidden-reasoning field.
+Failed/cancelled/interrupted/unverified/trivial work creates no positive skill.
+A reusable candidate generalizes when-to-use, prerequisites, procedure,
+pitfalls, and verification; related intent is searched and merged before an
+atomic SKILL write. `skill_history` retains the audit version.
 
 ## Storage and migrations
 
@@ -132,6 +155,8 @@ v0.1.0 table. Schema versions add:
 - version 7: `memories`, `memory_history`, `memories_fts` and triggers;
 - version 8: `messages_fts`, triggers, and `session_summaries`;
 - version 9: `skills`, `skill_history`, `skills_fts` and triggers.
+- version 10: `approvals`, `dependency_installs`, `environment_probes`,
+  `workspace_file_index`, and `skill_file_index`.
 
 Migration tests cover a fresh database, a hand-built v0.1.0 database upgrade,
 repeated `migrate()` calls, FTS backfill consistency, and restart quarantine of
@@ -152,5 +177,5 @@ elevates only fixed module binaries. KernelSU/WebUI lifecycle shell paths are
 fixed administrative code and are never reachable from model tool calls.
 
 v0.2.0 deliberately does not add MCP, remote/device nodes, subagents, vector
-databases, autonomous cron, browser automation, plugins, or generic process
-execution.
+databases, autonomous cron, browser automation, a plugin ecosystem, dynamic
+native plugins, or unrestricted root execution.

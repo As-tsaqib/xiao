@@ -1,4 +1,6 @@
-# xiao managed Termux wrapper
+# Xiao and Termux
+
+## Owner CLI wrapper
 
 There is no separate Termux package. Flashing the xiao module installs two
 managed commands directly into the existing Termux prefix:
@@ -42,3 +44,37 @@ wrapper.
 
 Codex and Antigravity login URLs should be opened on the same Android device so
 their browser redirects can reach xiao's temporary localhost callback listener.
+
+## Agent execution backend
+
+Termux is also Xiao's default general-purpose agent executor. At startup,
+`EnvironmentProbe` discovers the real prefix, home, shell, package manager,
+owner UID/GID, and selected binaries. The generated `ENVIRONMENT.md` records a
+concise snapshot; current in-memory probes remain authoritative.
+
+`termux_terminal` accepts one structured program plus argv. It does not accept
+a shell command string. On a root module deployment, the child clears inherited
+supplementary groups and drops to the detected Termux app UID/GID. Its PATH is
+limited to directories below the detected Termux prefix, and its default cwd is
+Termux home because the Xiao identity data root is intentionally root-private.
+On Linux/Android it also sets `no_new_privs` before exec. The executor captures exit status/stdout/stderr and enforces timeout,
+cancellation, output retention bounds, controlled environment keys, and secret
+redaction.
+
+Runtime policy rejects privilege-escalation/system commands, `sh -c`, direct
+package mutations, and automatic installer pipelines. Clearly destructive
+argv, an opaque shell script, or credential-sensitive paths require an exact
+owner approval (`/approvals`, `/approve <id>`, `/deny <id>`). Approval is
+argument-bound, expires, and is consumed once. This terminal is user-space
+general execution, not an unrestricted root shell.
+
+If a requested ordinary binary is missing, Xiao checks a small trusted
+binary-to-Termux-package mapping. It invokes only the detected `pkg`/`apt`
+backend with a normalized package name, records progress/audit state, re-probes
+the executable, and resumes the original command. Unknown binaries and remote
+installer scripts are not auto-installed.
+
+Result files can be declared by a terminal call. Xiao accepts only bounded
+regular files under the controlled task cwd/workspace, revalidates the path
+against its data root or Termux home at the Telegram boundary, and uploads the
+file with `sendDocument`.

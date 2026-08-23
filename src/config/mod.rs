@@ -80,6 +80,19 @@ impl AppConfig {
         if !(2..=32).contains(&self.agent.max_turns) {
             return Err(anyhow!("agent.max_turns must be between 2 and 32"));
         }
+        if !(1..=256).contains(&self.agent.max_tool_calls) {
+            return Err(anyhow!("agent.max_tool_calls must be between 1 and 256"));
+        }
+        if !(1..=8).contains(&self.agent.max_no_progress_repeats) {
+            return Err(anyhow!(
+                "agent.max_no_progress_repeats must be between 1 and 8"
+            ));
+        }
+        if !(10..=3_600).contains(&self.agent.max_runtime_seconds) {
+            return Err(anyhow!(
+                "agent.max_runtime_seconds must be between 10 and 3600"
+            ));
+        }
         if !(4_096..=1_000_000).contains(&self.agent.context_max_chars) {
             return Err(anyhow!(
                 "agent.context_max_chars must be between 4096 and 1000000"
@@ -202,6 +215,12 @@ impl AppConfig {
 pub struct AgentConfig {
     #[serde(default = "default_agent_max_turns")]
     pub max_turns: usize,
+    #[serde(default = "default_agent_max_tool_calls")]
+    pub max_tool_calls: usize,
+    #[serde(default = "default_agent_no_progress_repeats")]
+    pub max_no_progress_repeats: usize,
+    #[serde(default = "default_agent_runtime_seconds")]
+    pub max_runtime_seconds: u64,
     #[serde(default = "default_context_max_chars")]
     pub context_max_chars: usize,
     #[serde(default = "default_summary_threshold_chars")]
@@ -214,6 +233,9 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_turns: default_agent_max_turns(),
+            max_tool_calls: default_agent_max_tool_calls(),
+            max_no_progress_repeats: default_agent_no_progress_repeats(),
+            max_runtime_seconds: default_agent_runtime_seconds(),
             context_max_chars: default_context_max_chars(),
             summary_threshold_chars: default_summary_threshold_chars(),
             tool_output_max_chars: default_tool_output_max_chars(),
@@ -516,6 +538,15 @@ fn default_custom_protocol() -> String {
 }
 fn default_agent_max_turns() -> usize {
     8
+}
+fn default_agent_max_tool_calls() -> usize {
+    32
+}
+fn default_agent_no_progress_repeats() -> usize {
+    2
+}
+fn default_agent_runtime_seconds() -> u64 {
+    600
 }
 fn default_context_max_chars() -> usize {
     32_000

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::{
     memory::{MemoryScope, MemoryStore},
-    tools::{Tool, ToolContext, ToolRisk, ToolSpec},
+    tools::{Tool, ToolContext, ToolEffect, ToolOrigin, ToolRisk, ToolSpec},
 };
 
 pub struct MemorySearchTool {
@@ -44,6 +44,9 @@ impl Tool for MemorySearchTool {
                 "additionalProperties":false
             }),
             risk: ToolRisk::ReadOnly,
+            origin: ToolOrigin::Builtin,
+            effect: ToolEffect::None,
+            required_capabilities: vec!["xiao.memory".into()],
             timeout_ms: 5_000,
         }
     }
@@ -99,6 +102,9 @@ impl Tool for MemorySetTool {
                 "additionalProperties":false
             }),
             risk: ToolRisk::SideEffect,
+            origin: ToolOrigin::Builtin,
+            effect: ToolEffect::Idempotent,
+            required_capabilities: vec!["xiao.memory".into()],
             timeout_ms: 5_000,
         }
     }
@@ -158,6 +164,9 @@ impl Tool for MemoryDeleteTool {
                 "additionalProperties":false
             }),
             risk: ToolRisk::SideEffect,
+            origin: ToolOrigin::Builtin,
+            effect: ToolEffect::Idempotent,
+            required_capabilities: vec!["xiao.memory".into()],
             timeout_ms: 5_000,
         }
     }

@@ -63,6 +63,10 @@ impl SkillStore {
         Self { storage }
     }
 
+    pub(crate) fn storage(&self) -> Arc<Storage> {
+        self.storage.clone()
+    }
+
     pub fn create_or_update(
         &self,
         owner: &str,

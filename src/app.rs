@@ -8,7 +8,9 @@ use crate::{
     command::CommandCore,
     config::AppConfig,
     event::EventBus,
+    identity::IdentityWorkspace,
     providers::{ProviderRegistry, ProviderState},
+    runtime::{EnvironmentProbe, RuntimeState},
     session::SessionManager,
     storage::Storage,
 };
@@ -121,6 +123,8 @@ pub struct AppState {
     pub commands: Arc<CommandCore>,
     pub health: Arc<HealthState>,
     pub events: Arc<EventBus>,
+    pub identity: Arc<IdentityWorkspace>,
+    pub runtime: Arc<RuntimeState>,
 }
 
 impl AppState {
@@ -129,6 +133,16 @@ impl AppState {
         let config = Arc::new(RwLock::new(config));
         let cfg = config.read().await.clone();
         let storage = Arc::new(Storage::open(&cfg.storage.database)?);
+        let identity = Arc::new(IdentityWorkspace::new(cfg.paths.data_dir.clone()));
+        let runtime = Arc::new(RuntimeState::initialize(
+            identity.clone(),
+            EnvironmentProbe::real(),
+        )?);
+        let environment = runtime.environment();
+        storage.record_environment_probe(
+            &serde_json::to_string(&environment)?,
+            &environment.probed_at,
+        )?;
         let sessions = Arc::new(SessionManager::new(storage.clone()));
         let auth = Arc::new(AuthManager::with_config(
             storage.clone(),
@@ -165,7 +179,7 @@ impl AppState {
                 }
             });
         }
-        let commands = Arc::new(CommandCore::new(
+        let commands = Arc::new(CommandCore::with_runtime(
             config.clone(),
             storage.clone(),
             sessions.clone(),
@@ -173,6 +187,7 @@ impl AppState {
             auth.clone(),
             health.clone(),
             events.clone(),
+            runtime.clone(),
         ));
         Ok(Self {
             config,
@@ -183,6 +198,8 @@ impl AppState {
             commands,
             health,
             events,
+            identity,
+            runtime,
         })
     }
 }

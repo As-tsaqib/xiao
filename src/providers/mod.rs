@@ -1084,6 +1084,9 @@ mod tests {
             description: "Describe bounded context".into(),
             parameters: serde_json::json!({"type":"object"}),
             risk: crate::tools::ToolRisk::ReadOnly,
+            origin: crate::tools::ToolOrigin::Builtin,
+            effect: crate::tools::ToolEffect::None,
+            required_capabilities: vec!["xiao.tool_registry".into()],
             timeout_ms: 5_000,
         }]);
         assert_eq!(wire[0]["type"], "function");

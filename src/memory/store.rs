@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -6,7 +6,11 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{security::redact::contains_secret_material, storage::Storage};
+use crate::{
+    identity::{IdentityWorkspace, WorkspaceDocument},
+    security::redact::contains_secret_material,
+    storage::Storage,
+};
 
 const MAX_CATEGORY_CHARS: usize = 80;
 const MAX_KEY_CHARS: usize = 120;
@@ -80,11 +84,22 @@ pub enum MemoryUpsert {
 #[derive(Clone)]
 pub struct MemoryStore {
     storage: Arc<Storage>,
+    workspace: Option<Arc<IdentityWorkspace>>,
 }
 
 impl MemoryStore {
     pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            workspace: None,
+        }
+    }
+
+    pub fn with_workspace(storage: Arc<Storage>, workspace: Arc<IdentityWorkspace>) -> Self {
+        Self {
+            storage,
+            workspace: Some(workspace),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -112,6 +127,15 @@ impl MemoryStore {
         }
         if contains_secret_material(value) || sensitive_identity(&category, &key) {
             return Err(anyhow!("refusing to persist secret material as memory"));
+        }
+
+        if let Some(workspace) = &self.workspace {
+            workspace.upsert_managed(
+                document_for_scope(scope),
+                &section_for(scope, &category),
+                &key,
+                value,
+            )?;
         }
 
         let id = Uuid::new_v4().to_string();
@@ -212,6 +236,9 @@ impl MemoryStore {
     ) -> Result<bool> {
         let category = canonical_category(category);
         let key = canonical_key(&category, key);
+        if let Some(workspace) = &self.workspace {
+            workspace.delete_managed(document_for_scope(scope), &key)?;
+        }
         self.storage.with_conn(|connection| {
             let transaction = connection.transaction()?;
             let existing = transaction
@@ -301,6 +328,131 @@ impl MemoryStore {
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
     }
+
+    /// Rebuild the derived SQLite active index from owner-editable files.
+    /// History remains append-only and changes caused by manual edits are
+    /// labeled `manual_file_reconcile`.
+    pub fn reconcile(&self, owner: &str) -> Result<usize> {
+        let Some(workspace) = &self.workspace else {
+            return Ok(0);
+        };
+        validate_owner(owner)?;
+        let mut changed = 0usize;
+        for (scope, document) in [
+            (MemoryScope::User, WorkspaceDocument::User),
+            (MemoryScope::Agent, WorkspaceDocument::Memory),
+        ] {
+            let content = workspace.read(document)?;
+            let hash = content_hash(&content);
+            let path = workspace.path(document).display().to_string();
+            let indexed_hash = self.storage.workspace_file_hash(&path)?;
+            if indexed_hash.as_deref() == Some(&hash) {
+                continue;
+            }
+
+            let existing = self.list(owner, Some(scope), 200)?;
+            let mut entries = workspace.managed_entries(document)?;
+            // One-time upgrade bridge for the earlier SQLite-authoritative
+            // partial v0.2 implementation. Once indexed, an empty owner file
+            // is authoritative and correctly deletes active state.
+            if indexed_hash.is_none() && entries.is_empty() && !existing.is_empty() {
+                for record in &existing {
+                    workspace.upsert_managed(
+                        document,
+                        &section_for(scope, &record.category),
+                        &record.key,
+                        &record.value,
+                    )?;
+                }
+                entries = workspace.managed_entries(document)?;
+            }
+            let active_keys = entries
+                .iter()
+                .map(|entry| entry.key.clone())
+                .collect::<BTreeSet<_>>();
+            for entry in entries {
+                let matching = existing.iter().find(|record| record.key == entry.key);
+                if matching.is_some_and(|record| record.value == entry.value) {
+                    continue;
+                }
+                let category = matching
+                    .map(|record| record.category.clone())
+                    .unwrap_or_else(|| category_for_section(scope, &entry.section));
+                let (outcome, _) = self.upsert(
+                    owner,
+                    scope,
+                    &category,
+                    &entry.key,
+                    &entry.value,
+                    1.0,
+                    "manual_file_reconcile",
+                    None,
+                )?;
+                changed += usize::from(outcome != MemoryUpsert::Unchanged);
+            }
+            for record in existing {
+                if !active_keys.contains(&record.key)
+                    && self.delete(owner, scope, &record.category, &record.key, None)?
+                {
+                    changed += 1;
+                }
+            }
+            let final_hash = content_hash(&workspace.read(document)?);
+            self.storage
+                .set_workspace_file_hash(&path, document.filename(), &final_hash)?;
+        }
+        Ok(changed)
+    }
+}
+
+fn document_for_scope(scope: MemoryScope) -> WorkspaceDocument {
+    match scope {
+        MemoryScope::User => WorkspaceDocument::User,
+        MemoryScope::Agent => WorkspaceDocument::Memory,
+    }
+}
+
+fn section_for(scope: MemoryScope, category: &str) -> String {
+    match (scope, category) {
+        (MemoryScope::User, "preference") => "Communication Preferences".into(),
+        (MemoryScope::User, "profile") => "Identity".into(),
+        (MemoryScope::User, "constraint") => "Constraints".into(),
+        (MemoryScope::Agent, "fact") => "Durable Facts".into(),
+        (MemoryScope::Agent, "lesson") => "Lessons".into(),
+        _ => title(category),
+    }
+}
+
+fn category_for_section(scope: MemoryScope, section: &str) -> String {
+    let normalized = canonical_category(section);
+    match scope {
+        MemoryScope::User if normalized.contains("preference") => "preference".into(),
+        MemoryScope::User if normalized.contains("identity") => "profile".into(),
+        MemoryScope::User if normalized.contains("constraint") => "constraint".into(),
+        MemoryScope::Agent if normalized.contains("fact") => "fact".into(),
+        MemoryScope::Agent if normalized.contains("lesson") => "lesson".into(),
+        _ => normalized,
+    }
+}
+
+fn title(value: &str) -> String {
+    value
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut characters = word.chars();
+            characters
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + characters.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
 fn row_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {

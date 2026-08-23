@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::{
     skills::SkillRegistry,
-    tools::{Tool, ToolContext, ToolRisk, ToolSpec},
+    tools::{Tool, ToolContext, ToolEffect, ToolOrigin, ToolRisk, ToolSpec},
 };
 
 pub struct SkillSearchTool {
@@ -44,26 +44,30 @@ impl Tool for SkillSearchTool {
                 "additionalProperties":false
             }),
             risk: ToolRisk::ReadOnly,
+            origin: ToolOrigin::Builtin,
+            effect: ToolEffect::None,
+            required_capabilities: vec!["xiao.skills".into()],
             timeout_ms: 5_000,
         }
     }
 
     async fn execute(&self, context: &ToolContext, arguments: Value) -> Result<String> {
         let arguments: SearchArguments = serde_json::from_value(arguments)?;
-        let rows = self.skills.search(
+        let rows = self.skills.search_with_eligibility(
             &context.principal,
             &arguments.query,
             arguments.limit.unwrap_or(5),
         )?;
         let summaries = rows
             .into_iter()
-            .map(|skill| {
+            .map(|(skill, eligibility)| {
                 json!({
                     "id":skill.id,
                     "name":skill.name,
                     "summary":skill.summary,
                     "when_to_use":skill.when_to_use,
                     "updated_at":skill.updated_at
+                    ,"eligibility": eligibility
                 })
             })
             .collect::<Vec<_>>();
@@ -100,6 +104,9 @@ impl Tool for SkillViewTool {
                 "additionalProperties":false
             }),
             risk: ToolRisk::ReadOnly,
+            origin: ToolOrigin::Builtin,
+            effect: ToolEffect::None,
+            required_capabilities: vec!["xiao.skills".into()],
             timeout_ms: 5_000,
         }
     }
@@ -108,7 +115,14 @@ impl Tool for SkillViewTool {
         let arguments: ViewArguments = serde_json::from_value(arguments)?;
         let skill = self
             .skills
-            .view(&context.principal, &arguments.name_or_id)?
+            .view_ready(
+                &context.principal,
+                &arguments.name_or_id,
+                Some(&context.agent_run_id),
+                context.cancellation.clone(),
+                context.progress.as_ref(),
+            )
+            .await?
             .ok_or_else(|| anyhow!("skill not found for principal"))?;
         Ok(serde_json::to_string(&skill)?)
     }

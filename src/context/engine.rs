@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::AgentConfig,
     context::SessionHistoryStore,
+    identity::{IdentityWorkspace, WorkspaceDocument},
     memory::{MemoryRecord, MemoryScope, MemoryStore},
+    runtime::RuntimeState,
     security::redact::redact_text,
     session::{ChatMode, SessionContext},
-    skills::{SkillRecord, SkillRegistry, SkillStore},
+    skills::{FilesystemSkills, SkillEligibility, SkillRecord, SkillRegistry, SkillStore},
     storage::{MessageRecord, SessionSummaryRecord, Storage, StoredMessageRecord},
 };
 
@@ -55,6 +57,8 @@ pub struct ContextEngine {
     history: SessionHistoryStore,
     skills: SkillRegistry,
     config: AgentConfig,
+    workspace: Option<Arc<IdentityWorkspace>>,
+    runtime: Option<Arc<RuntimeState>>,
 }
 
 impl ContextEngine {
@@ -65,6 +69,34 @@ impl ContextEngine {
             skills: SkillRegistry::new(Arc::new(SkillStore::new(storage.clone()))),
             storage,
             config,
+            workspace: None,
+            runtime: None,
+        }
+    }
+
+    pub fn with_runtime(
+        storage: Arc<Storage>,
+        config: AgentConfig,
+        runtime: Arc<RuntimeState>,
+    ) -> Self {
+        let skill_store = Arc::new(SkillStore::new(storage.clone()));
+        let skills = SkillRegistry::with_filesystem(
+            skill_store.clone(),
+            Arc::new(FilesystemSkills::with_runtime(
+                runtime.workspace(),
+                skill_store,
+                runtime.capabilities(),
+                None,
+            )),
+        );
+        Self {
+            memories: MemoryStore::new(storage.clone()),
+            history: SessionHistoryStore::new(storage.clone()),
+            skills,
+            storage,
+            config,
+            workspace: Some(runtime.workspace()),
+            runtime: Some(runtime),
         }
     }
 
@@ -132,7 +164,7 @@ impl ContextEngine {
         });
         let relevant_skills = self
             .skills
-            .search(principal, current_prompt, 3)
+            .search_with_eligibility(principal, current_prompt, 3)
             .unwrap_or_default();
         let skill_block = skill_block(&relevant_skills);
 
@@ -145,10 +177,60 @@ impl ContextEngine {
             recent.pop();
         }
 
-        let required_chars = char_count(XIAO_SYSTEM_PROMPT) + char_count(current_prompt);
+        let workspace = self
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.load())
+            .transpose()?;
+        let soul_block = workspace.as_ref().map(|snapshot| {
+            format!(
+                "<SOUL owner_editable=true security_authority=false>\n{}\n</SOUL>",
+                bound(
+                    snapshot.soul.trim(),
+                    (self.config.context_max_chars / 4).clamp(1_024, 12_000),
+                )
+            )
+        });
+        let user_file_block = workspace.as_ref().map(|snapshot| {
+            format!(
+                "<OWNER_PROFILE source=USER.md>\n{}\n</OWNER_PROFILE>",
+                bound(snapshot.user.trim(), 12_000)
+            )
+        });
+        let memory_file_block = self.workspace.as_ref().and_then(|workspace| {
+            relevant_file_memory(workspace, current_prompt)
+                .ok()
+                .flatten()
+        });
+        let agents_block = workspace.as_ref().map(|snapshot| {
+            format!(
+                "<WORKSPACE_GUIDANCE source=AGENTS.md security_authority=false>\n{}\n</WORKSPACE_GUIDANCE>",
+                bound(snapshot.agents.trim(), 6_000)
+            )
+        });
+        let runtime_block = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.concise_context());
+
+        let soul_cost = soul_block.as_ref().map_or(0, |block| char_count(block));
+        let required_chars =
+            char_count(XIAO_SYSTEM_PROMPT) + char_count(current_prompt) + soul_cost;
         let mut optional_budget = self.config.context_max_chars.saturating_sub(required_chars);
-        let selected_user_memory = take_block(user_memory_block, &mut optional_budget);
-        let selected_agent_memory = take_block(agent_memory_block, &mut optional_budget);
+        let selected_runtime = take_block(runtime_block, &mut optional_budget);
+        let selected_user_file = take_block(user_file_block, &mut optional_budget);
+        let selected_memory_file = take_block(memory_file_block, &mut optional_budget);
+        let selected_agents = take_block(agents_block, &mut optional_budget);
+        let selected_user_memory = if self.workspace.is_none() {
+            take_block(user_memory_block, &mut optional_budget)
+        } else {
+            None
+        };
+        let selected_agent_memory = if self.workspace.is_none() {
+            take_block(agent_memory_block, &mut optional_budget)
+        } else {
+            None
+        };
 
         // Recent turns have higher trimming priority than summaries/history but
         // are selected before those blocks so the newest observable work wins.
@@ -194,7 +276,18 @@ impl ContextEngine {
             content: XIAO_SYSTEM_PROMPT.into(),
             created_at: now.clone(),
         }];
+        if let Some(soul) = soul_block {
+            messages.push(MessageRecord {
+                role: "system".into(),
+                content: soul,
+                created_at: now.clone(),
+            });
+        }
         for block in [
+            selected_runtime,
+            selected_user_file,
+            selected_memory_file,
+            selected_agents,
             selected_user_memory,
             selected_agent_memory,
             selected_skill,
@@ -307,6 +400,44 @@ impl ContextEngine {
     }
 }
 
+fn relevant_file_memory(workspace: &IdentityWorkspace, prompt: &str) -> Result<Option<String>> {
+    let entries = workspace.managed_entries(WorkspaceDocument::Memory)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let prompt_tokens = semantic_tokens(prompt);
+    let mut ranked = entries
+        .into_iter()
+        .map(|entry| {
+            let candidate =
+                semantic_tokens(&format!("{} {} {}", entry.section, entry.key, entry.value));
+            let score = prompt_tokens.intersection(&candidate).count();
+            (score, entry)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let rows = ranked
+        .into_iter()
+        .take(20)
+        .map(|(_, entry)| format!("- [{}] {}", entry.key, entry.value))
+        .collect::<Vec<_>>();
+    Ok((!rows.is_empty()).then(|| {
+        format!(
+            "<RELEVANT_MEMORY source=MEMORY.md>\n{}\n</RELEVANT_MEMORY>",
+            bound(&rows.join("\n"), 12_000)
+        )
+    }))
+}
+
+fn semantic_tokens(value: &str) -> std::collections::BTreeSet<String> {
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| token.chars().count() >= 3)
+        .collect()
+}
+
 fn memory_block(label: &str, memories: &[MemoryRecord]) -> Option<String> {
     if memories.is_empty() {
         return None;
@@ -327,22 +458,32 @@ fn memory_block(label: &str, memories: &[MemoryRecord]) -> Option<String> {
     Some(format!("<{label}>\n{rows}\n</{label}>"))
 }
 
-fn skill_block(skills: &[SkillRecord]) -> Option<String> {
+fn skill_block(skills: &[(SkillRecord, SkillEligibility)]) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
     let content = skills
         .iter()
-        .map(|skill| {
-            format!(
-                "Name: {}\nSummary: {}\nWhen to use: {}\nProcedure:\n{}\nPitfalls:\n{}\nVerification:\n{}",
-                skill.name,
-                skill.summary,
-                skill.when_to_use,
-                skill.procedure,
-                skill.pitfalls,
-                skill.verification
-            )
+        .map(|(skill, eligibility)| {
+            if matches!(eligibility, SkillEligibility::Eligible) {
+                format!(
+                    "Name: {}\nSummary: {}\nWhen to use: {}\nEligibility: eligible\nProcedure:\n{}\nPitfalls:\n{}\nVerification:\n{}",
+                    skill.name,
+                    skill.summary,
+                    skill.when_to_use,
+                    skill.procedure,
+                    skill.pitfalls,
+                    skill.verification
+                )
+            } else {
+                format!(
+                    "Name: {}\nSummary: {}\nWhen to use: {}\nEligibility: {}\nFull body not loaded until requirements are resolved.",
+                    skill.name,
+                    skill.summary,
+                    skill.when_to_use,
+                    serde_json::to_string(eligibility).unwrap_or_else(|_| "unavailable".into())
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
@@ -414,7 +555,9 @@ fn bound(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::{
+        identity::{IdentityWorkspace, WorkspaceDocument},
         memory::MemoryStore,
+        runtime::{EnvironmentProbe, RuntimeState},
         session::SessionManager,
         skills::{SkillCandidate, SkillStore},
     };
@@ -580,5 +723,54 @@ mod tests {
         assert!(all.contains("diagnose-xiao-service"));
         assert!(!all.contains("prepare-garden-soil"));
         assert_eq!(built.stats.skills, 1);
+    }
+
+    #[test]
+    fn runtime_context_contains_persistent_identity_owner_and_verified_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Arc::new(IdentityWorkspace::new(directory.path()));
+        workspace.bootstrap().unwrap();
+        workspace
+            .upsert_managed(
+                WorkspaceDocument::User,
+                "Communication Preferences",
+                "response_style",
+                "concise",
+            )
+            .unwrap();
+        workspace
+            .upsert_managed(
+                WorkspaceDocument::Memory,
+                "Durable Facts",
+                "widget_format",
+                "Widgets use the Orion format",
+            )
+            .unwrap();
+        let runtime =
+            Arc::new(RuntimeState::initialize(workspace, EnvironmentProbe::real()).unwrap());
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let sessions = SessionManager::new(storage.clone());
+        let session = sessions.ensure_default_session("owner").unwrap();
+        sessions.switch_main("owner", &session.id).unwrap();
+        let context = sessions.context_for("owner").unwrap();
+        let engine = ContextEngine::with_runtime(storage, AgentConfig::default(), runtime);
+        let built = engine
+            .build("owner", &context, "Inspect the Orion widget format")
+            .unwrap();
+        let all = built
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("You are Xiao"));
+        assert!(all.contains("[response_style] concise"));
+        assert!(all.contains("Widgets use the Orion format"));
+        assert!(all.contains("<VERIFIED_RUNTIME"));
+        assert!(all.contains("Capabilities:"));
+        assert!(
+            built.stats.total_chars
+                <= built.stats.budget_chars + "Inspect the Orion widget format".chars().count()
+        );
     }
 }

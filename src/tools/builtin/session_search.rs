@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::{
     context::SessionHistoryStore,
-    tools::{Tool, ToolContext, ToolRisk, ToolSpec},
+    tools::{Tool, ToolContext, ToolEffect, ToolOrigin, ToolRisk, ToolSpec},
 };
 
 pub struct SessionSearchTool {
@@ -44,6 +44,9 @@ impl Tool for SessionSearchTool {
                 "additionalProperties":false
             }),
             risk: ToolRisk::ReadOnly,
+            origin: ToolOrigin::Builtin,
+            effect: ToolEffect::None,
+            required_capabilities: vec!["xiao.session_search".into()],
             timeout_ms: 5_000,
         }
     }

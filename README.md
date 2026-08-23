@@ -1,16 +1,20 @@
 # xiao v0.2.0
 
-xiao is a persistent Rust AI agent for Android. `xiaod` owns configuration,
-SQLite state, principal-scoped sessions, provider authentication, provider
-transports, bounded context, long-term memory, procedural skills, and agent
-execution. The `xiao` CLI, Telegram, and KernelSU WebUI are adapters over the
-same semantic Command Core.
+xiao is a private, single-owner, persistent Rust AI agent designed primarily
+for a rooted Android device. Telegram is its primary interaction surface and
+Termux is its ordinary general-purpose execution environment. `xiaod` owns
+configuration, durable SQLite state, provider authentication, bounded context,
+living identity/memory files, filesystem skills, and the bounded agent loop.
+The `xiao` CLI and KernelSU WebUI remain administrative adapters over the same
+semantic Command Core.
 
-v0.2.0 adds a registry-driven typed tool runtime, durable agent/tool audit
-runs, editable principal-scoped memory, SQLite FTS5 session retrieval,
-character-budgeted context with durable summaries, and verified
-post-completion skill learning. Memory is current state: a changed preference
-updates its canonical key, and an explicit forget removes the active row.
+v0.2.0 implements persistent `SOUL.md`, `USER.md`, `MEMORY.md`, `AGENTS.md`,
+and generated `ENVIRONMENT.md`; typed runtime probing and capability
+resolution; provider-agnostic tools; controlled Termux execution with trusted
+dependency installation; a typed Android privileged broker; SQLite FTS5
+recall; verified completion; and trace-based learning into compatible
+`skills/<name>/SKILL.md` files. Existing principal/session identifiers remain
+as compatibility and isolation keys, not as multi-tenant product architecture.
 
 The release ships as one root-level KernelSU/Magisk-compatible module ZIP.
 Flashing that ZIP installs the daemon, watchdog, WebUI, and managed Termux
@@ -83,17 +87,25 @@ KernelSU WebUI -> admin IPC ─────┘                              │ 
   does not block `/stop`, callbacks, or another principal.
 - Inline menus are edit-first with stale-revision protection.
 - Progress drafts are ephemeral and contain bounded safe status only; final
-  answers are persistent Rich Message views.
+  answers are persistent Rich Message views, with verified result artifacts
+  uploaded through Telegram `sendDocument`.
 - Provider calls and tools use canonical typed interfaces. `ToolRegistry` and
-  `ToolPolicy` expose only bounded semantic tools (`context_stats`, memory,
-  session search, and skill retrieval); there is no unrestricted
-  model-generated string to root shell path.
-- Context is assembled from system/security rules, current user and agent
-  memory, selected relevant skills, session summaries/retrieval, recent turns,
-  and the current request under a character budget. Raw history is never
-  deleted by compression.
-- Successful tool boundaries are audited in `agent_runs`/`tool_runs`.
-  Interrupted work is quarantined rather than blindly replayed.
+  `ToolPolicy` expose bounded built-ins, the structured `termux_terminal`, and
+  two typed Xiao-service Android operations. Shell command strings and a
+  generic root shell are not exposed. Destructive/sensitive Termux calls and
+  privileged service restart use exact, durable, one-shot approval.
+- Missing ordinary binaries use a trusted Termux package mapping, validated
+  package-manager argv, durable install audit, executable re-probe, and then
+  resume the original command. There is no arbitrary remote installer path.
+- Context is assembled from hard rules, SOUL, verified runtime/capabilities,
+  USER, relevant MEMORY, AGENTS, selected skills, summaries, FTS excerpts,
+  recent turns, and the current request under a character budget. Raw history
+  is never deleted by compression.
+- Action completion distinguishes verified success, not-yet-verified, blocked,
+  and failed. A textual “done” is not evidence; the bounded loop continues for
+  a changed strategy or an observable verification.
+- Agent/tool/dependency boundaries are audited. Interrupted side effects are
+  quarantined rather than blindly replayed.
 - IPC is loopback-only with separate client/admin credentials.
 - The managed Termux wrapper invokes KernelSU `su` only for the fixed,
   shell-quoted module binary; model output never reaches this root shell path.
@@ -104,9 +116,15 @@ KernelSU WebUI -> admin IPC ─────┘                              │ 
 
 Core semantic commands are `/new`, `/btw`, `/session`, `/model`, `/provider`,
 `/account`, `/login`, `/logout`, `/status`, `/context`, `/stop`, `/retry`,
-`/settings`, `/help`, `/usage`, and `/doctor`. Termux aliases preserve all
-arguments, so `xiao session rename ID New Name` and
+`/approvals`, `/approve`, `/deny`, `/settings`, `/help`, `/usage`, and
+`/doctor`. Termux aliases preserve all arguments, so
+`xiao session rename ID New Name` and
 `xiao model MODEL_ID` reach those same variants.
+
+The living workspace is under `[paths].data_dir` (normally
+`/data/adb/xiao`). Owner edits to USER/MEMORY/SKILL files are reconciled into
+SQLite indexes/history. `SOUL.md` is never rewritten by ordinary tasks;
+`ENVIRONMENT.md` is refreshed from probes at startup.
 
 ## Provider setup
 

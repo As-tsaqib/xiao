@@ -12,6 +12,7 @@ use crate::{
     event::{AppEvent, EventBus},
     presentation::{Action, Block, View},
     providers::{AgentEvent, ProviderRegistry, ProviderState},
+    runtime::RuntimeState,
     session::{ChatMode, SessionManager},
     storage::{AccountRecord, Storage},
 };
@@ -41,6 +42,9 @@ pub enum Command {
     Context,
     Stop,
     Retry,
+    Approvals,
+    Approve { request: String },
+    DenyApproval { request: String },
     Settings,
     SetProgressDetail { detail: String },
     SetMenuCloseBehavior { behavior: String },
@@ -143,6 +147,19 @@ pub fn parse(input: &str) -> Result<Option<Command>> {
         "context" => Command::Context,
         "stop" => Command::Stop,
         "retry" => Command::Retry,
+        "approvals" => Command::Approvals,
+        "approve" => Command::Approve {
+            request: args
+                .first()
+                .ok_or_else(|| anyhow!("approval request id required"))?
+                .to_string(),
+        },
+        "deny" => Command::DenyApproval {
+            request: args
+                .first()
+                .ok_or_else(|| anyhow!("approval request id required"))?
+                .to_string(),
+        },
         "settings" if args.first() == Some(&"progress") => Command::SetProgressDetail {
             detail: args
                 .get(1)
@@ -184,16 +201,65 @@ impl CommandCore {
         health: Arc<HealthState>,
         events: Arc<EventBus>,
     ) -> Self {
+        Self::build(
+            config, storage, sessions, providers, auth, health, events, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_runtime(
+        config: Arc<RwLock<AppConfig>>,
+        storage: Arc<Storage>,
+        sessions: Arc<SessionManager>,
+        providers: Arc<ProviderRegistry>,
+        auth: Arc<AuthManager>,
+        health: Arc<HealthState>,
+        events: Arc<EventBus>,
+        runtime: Arc<RuntimeState>,
+    ) -> Self {
+        Self::build(
+            config,
+            storage,
+            sessions,
+            providers,
+            auth,
+            health,
+            events,
+            Some(runtime),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        config: Arc<RwLock<AppConfig>>,
+        storage: Arc<Storage>,
+        sessions: Arc<SessionManager>,
+        providers: Arc<ProviderRegistry>,
+        auth: Arc<AuthManager>,
+        health: Arc<HealthState>,
+        events: Arc<EventBus>,
+        runtime: Option<Arc<RuntimeState>>,
+    ) -> Self {
         let agent_config = config
             .try_read()
             .map(|guard| guard.agent.clone())
             .unwrap_or_default();
-        let agent = AgentEngine::with_config(
-            sessions.clone(),
-            storage.clone(),
-            providers.clone(),
-            agent_config,
-        );
+        let agent = if let Some(runtime) = runtime {
+            AgentEngine::with_runtime(
+                sessions.clone(),
+                storage.clone(),
+                providers.clone(),
+                agent_config,
+                runtime,
+            )
+        } else {
+            AgentEngine::with_config(
+                sessions.clone(),
+                storage.clone(),
+                providers.clone(),
+                agent_config,
+            )
+        };
         Self {
             config,
             storage,
@@ -434,6 +500,56 @@ impl CommandCore {
             Retry => Ok(CommandResult::Agent(
                 self.agent.retry_with_progress(principal, None).await?,
             )),
+            Approvals => {
+                let approvals = self.storage.pending_approvals(principal)?;
+                let body = if approvals.is_empty() {
+                    "No pending sensitive or privileged operations.".into()
+                } else {
+                    approvals
+                        .iter()
+                        .map(|approval| {
+                            format!(
+                                "{}\n{} · {}\nExpires: {}",
+                                approval.id,
+                                approval.tool_name,
+                                approval.summary,
+                                approval.expires_at
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                };
+                let mut view = View::info("APPROVALS", body);
+                view.actions = approvals
+                    .into_iter()
+                    .take(5)
+                    .map(|approval| {
+                        vec![
+                            Action::command("Approve", format!("/approve {}", approval.id)),
+                            Action::command("Deny", format!("/deny {}", approval.id)),
+                        ]
+                    })
+                    .collect();
+                Ok(CommandResult::ManagerView(view))
+            }
+            Approve { request } => {
+                if !self.storage.decide_approval(principal, &request, true)? {
+                    return Err(anyhow!("pending approval request not found or expired"));
+                }
+                Ok(CommandResult::Confirmation(View::info(
+                    "APPROVED",
+                    "One exact operation was approved. Use /retry to resume the original request; the grant is consumed once.",
+                )))
+            }
+            DenyApproval { request } => {
+                if !self.storage.decide_approval(principal, &request, false)? {
+                    return Err(anyhow!("pending approval request not found or expired"));
+                }
+                Ok(CommandResult::Confirmation(View::info(
+                    "DENIED",
+                    "The pending sensitive operation was denied.",
+                )))
+            }
             Settings => Ok(CommandResult::ManagerView(
                 self.settings_view(principal).await?,
             )),
@@ -1008,7 +1124,7 @@ fn help_view(topic: Option<&str>) -> View {
         "chat"|"session"|"btw"=>("HELP · CHAT","/new — create a main session\n/btw — enter/exit isolated side chat\n/session — manage only your sessions\n/retry — repeat your latest user request\n/stop — cancel active generation"),
         "ai"|"model"|"provider"=>("HELP · AI","/model — active provider/account/model status\n/provider — choose provider\n/context — effective context summary"),
         "accounts"|"account"|"login"=>("HELP · ACCOUNTS","/login [codex|antigravity] — authenticate\n/account — connected accounts\n/account <id> — atomically activate provider/account/model\n/logout [id] — disconnect"),
-        "advanced"|"settings"=>("HELP · ADVANCED","/status — aggregate gateway health\n/settings — Telegram progress/close behavior\n/usage — local session usage\n/doctor — diagnostic summary"),
+        "advanced"|"settings"=>("HELP · ADVANCED","/status — aggregate gateway health\n/approvals — inspect pending sensitive operations\n/approve <id> or /deny <id> — decide one exact operation\n/settings — Telegram progress/close behavior\n/usage — local session usage\n/doctor — diagnostic summary"),
         _=>("HELP","Choose a category or use /help btw, /help session, /help model, /help account, or /help settings."),
     };
     View {
@@ -1163,6 +1279,53 @@ mod tests {
         assert_eq!(after.provider, "codex");
         assert_eq!(after.account_id.as_deref(), Some("c1"));
         assert_eq!(after.model, "codex-default");
+    }
+
+    #[tokio::test]
+    async fn owner_can_inspect_approve_and_deny_pending_operations() {
+        let (core, storage, _sessions, _temp) = core();
+        let pending = storage
+            .request_approval(
+                "p",
+                "android.service.restart",
+                "android_xiao_restart",
+                "hash-a",
+                "restart Xiao service",
+            )
+            .unwrap();
+        assert!(matches!(
+            core.execute_text("p", "/approvals").await.unwrap(),
+            CommandResult::ManagerView(_)
+        ));
+        assert!(matches!(
+            core.execute_text("p", &format!("/approve {}", pending.id))
+                .await
+                .unwrap(),
+            CommandResult::Confirmation(_)
+        ));
+        assert!(storage
+            .consume_approval("p", "android_xiao_restart", "hash-a")
+            .unwrap());
+        assert!(!storage
+            .consume_approval("p", "android_xiao_restart", "hash-a")
+            .unwrap());
+
+        let denied = storage
+            .request_approval(
+                "p",
+                "android.service.restart",
+                "android_xiao_restart",
+                "hash-b",
+                "restart Xiao service",
+            )
+            .unwrap();
+        core.execute_text("p", &format!("/deny {}", denied.id))
+            .await
+            .unwrap();
+        assert!(!storage
+            .consume_approval("p", "android_xiao_restart", "hash-b")
+            .unwrap());
+        assert!(storage.pending_approvals("other-owner").unwrap().is_empty());
     }
 
     #[test]

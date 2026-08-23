@@ -7,6 +7,9 @@ log_level = "info"
 
 [agent]
 max_turns = 8
+max_tool_calls = 32
+max_no_progress_repeats = 2
+max_runtime_seconds = 600
 context_max_chars = 32000
 summary_threshold_chars = 24000
 tool_output_max_chars = 4096

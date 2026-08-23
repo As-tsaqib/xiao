@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
+use std::path::Path;
 
 use super::types::{ApiEnvelope, BotIdentity, SentMessage, Update};
 
@@ -65,7 +66,7 @@ impl TelegramClient {
                 .unwrap_or_default();
             return Err(anyhow!(
                 "Telegram {method} failed ({status}): {}{}",
-                env.description.unwrap_or_else(|| "unknown error".into()),
+                self.safe_description(&env.description.unwrap_or_else(|| "unknown error".into())),
                 suffix
             ));
         }
@@ -77,6 +78,10 @@ impl TelegramClient {
             "Telegram {stage} error: {}",
             e.to_string().replace(&self.token, "<redacted>")
         )
+    }
+
+    fn safe_description(&self, value: &str) -> String {
+        crate::security::redact::redact_text(&value.replace(&self.token, "<redacted>"))
     }
 
     pub async fn get_me(&self) -> Result<BotIdentity> {
@@ -124,6 +129,48 @@ impl TelegramClient {
             ),
         )
         .await
+    }
+    pub async fn send_document(
+        &self,
+        chat_id: i64,
+        path: &Path,
+        filename: &str,
+    ) -> Result<SentMessage> {
+        let metadata = tokio::fs::metadata(path).await?;
+        if !metadata.is_file() || metadata.len() > 50 * 1024 * 1024 {
+            return Err(anyhow!("Telegram result file is missing or exceeds 50 MiB"));
+        }
+        let bytes = tokio::fs::read(path).await?;
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.to_owned());
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("document", part);
+        let response = self
+            .client
+            .post(self.url("sendDocument"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| self.safe_error("document transport", error))?;
+        let status = response.status();
+        let envelope: ApiEnvelope<SentMessage> = response
+            .json()
+            .await
+            .map_err(|error| self.safe_error("document decode", error))?;
+        if envelope.ok {
+            envelope
+                .result
+                .ok_or_else(|| anyhow!("Telegram sendDocument returned no result"))
+        } else {
+            Err(anyhow!(
+                "Telegram sendDocument failed ({status}): {}",
+                self.safe_description(
+                    &envelope
+                        .description
+                        .unwrap_or_else(|| "unknown error".into())
+                )
+            ))
+        }
     }
     pub async fn draft_rich(&self, chat_id: i64, draft_id: i64, rich: Value) -> Result<bool> {
         self.call("sendRichMessageDraft", json!({"chat_id":chat_id,"draft_id":if draft_id==0{1}else{draft_id},"rich_message":rich})).await
@@ -263,6 +310,41 @@ impl super::menu::EditTransport for TelegramClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Bytes,
+        extract::State,
+        http::{HeaderMap, Uri},
+        routing::post,
+        Json, Router,
+    };
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    #[derive(Default)]
+    struct UploadProbe {
+        path: Mutex<String>,
+        content_type: Mutex<String>,
+        body: Mutex<Vec<u8>>,
+    }
+
+    async fn upload_stub(
+        State(probe): State<Arc<UploadProbe>>,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Json<Value> {
+        *probe.path.lock().unwrap() = uri.path().to_owned();
+        *probe.content_type.lock().unwrap() = headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        *probe.body.lock().unwrap() = body.to_vec();
+        Json(json!({
+            "ok":true,
+            "result":{"message_id":91,"chat":{"id":4242,"type":"private"}}
+        }))
+    }
 
     #[test]
     fn absent_optional_fields_are_omitted_not_serialized_as_null() {
@@ -280,5 +362,38 @@ mod tests {
             Some(markup.clone()),
         );
         assert_eq!(body.get("reply_markup"), Some(&markup));
+    }
+
+    #[tokio::test]
+    async fn result_file_is_sent_through_telegram_multipart_document_path() {
+        let probe = Arc::new(UploadProbe::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .fallback(post(upload_stub))
+            .with_state(probe.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("result.txt");
+        std::fs::write(&artifact, "observable artifact content").unwrap();
+        let client =
+            TelegramClient::with_base("test-token".into(), format!("http://{address}")).unwrap();
+        let sent = client
+            .send_document(4242, &artifact, "result.txt")
+            .await
+            .unwrap();
+        assert_eq!(sent.message_id, 91);
+        assert_eq!(&*probe.path.lock().unwrap(), "/bottest-token/sendDocument");
+        assert!(probe
+            .content_type
+            .lock()
+            .unwrap()
+            .starts_with("multipart/form-data; boundary="));
+        let body = String::from_utf8_lossy(&probe.body.lock().unwrap()).into_owned();
+        assert!(body.contains("name=\"chat_id\""));
+        assert!(body.contains("4242"));
+        assert!(body.contains("filename=\"result.txt\""));
+        assert!(body.contains("observable artifact content"));
     }
 }

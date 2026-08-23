@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -76,6 +77,12 @@ impl LearningEvaluator {
                 memory_mutations,
             });
         }
+        if trace.skill_candidate.is_none() && !reusable_trace(trace) {
+            return Ok(LearningOutcome {
+                skill: SkillLearningAction::None,
+                memory_mutations,
+            });
+        }
         let Some(candidate) = trace
             .skill_candidate
             .clone()
@@ -123,10 +130,10 @@ fn derive_candidate(trace: &LearningTrace) -> Option<SkillCandidate> {
         .iter()
         .filter(|observation| observation.status == "succeeded")
         .collect::<Vec<_>>();
-    if successful.len() < 2 {
+    if successful.len() < 2 || trace.verification_evidence.trim().is_empty() {
         return None;
     }
-    let mut name_words = trace
+    let name_words = trace
         .user_goal
         .split_whitespace()
         .filter(|word| {
@@ -141,39 +148,123 @@ fn derive_candidate(trace: &LearningTrace) -> Option<SkillCandidate> {
         return None;
     }
     let name = canonical_skill_name(&name_words.join(" "));
-    name_words.clear();
-    let procedure = successful
+    let checkpoints = successful
         .iter()
-        .enumerate()
-        .map(|(index, observation)| {
-            format!(
-                "{}. Use the typed {} operation and require a successful observable result.",
-                index + 1,
-                observation.tool
-            )
-        })
+        .map(|observation| compact(&observation.observable_summary, 220))
+        .filter(|summary| summary != "no output")
+        .take(4)
+        .map(|summary| format!("   - Expected checkpoint: {summary}"))
         .collect::<Vec<_>>()
         .join("\n");
+    let prerequisites = if trace
+        .tool_observations
+        .iter()
+        .any(|observation| observation.risk == "privileged")
+    {
+        "Confirm the typed privileged capability is available and obtain owner approval before the sensitive step."
+    } else {
+        "Confirm required runtime capabilities and inputs before changing state."
+    };
+    let procedure = format!(
+        "1. Clarify the desired observable end state and inspect the current state.\n2. {prerequisites}\n3. Perform the smallest scoped action that advances the task, then observe its bounded result before continuing.\n{checkpoints}\n4. If an attempt fails, diagnose its observable error and choose a materially different action.\n5. Run an independent verification appropriate to the artifact, service, or configuration before reporting success."
+    );
     let pitfalls = trace
         .tool_observations
         .iter()
         .filter(|observation| observation.status != "succeeded")
         .map(|observation| {
             format!(
-                "- {} did not succeed: {}",
-                observation.tool, observation.observable_summary
+                "- Avoid repeating the failed {} approach unchanged: {}",
+                observation.tool,
+                compact(&observation.observable_summary, 300)
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
     Some(SkillCandidate {
         name,
-        summary: trace.user_goal.chars().take(1_000).collect(),
-        when_to_use: format!("When a future task has this goal: {}", trace.user_goal),
+        summary: compact(&trace.user_goal, 1_000),
+        when_to_use: format!(
+            "Use for future tasks with the same intended outcome as: {}",
+            compact(&trace.user_goal, 800)
+        ),
         procedure,
-        pitfalls,
-        verification: trace.verification_evidence.clone(),
+        pitfalls: if pitfalls.is_empty() {
+            "- Do not treat a successful command exit or a model statement as sufficient proof; verify the requested outcome.".into()
+        } else {
+            pitfalls
+        },
+        verification: compact(&trace.verification_evidence, 4_000),
     })
+}
+
+fn reusable_trace(trace: &LearningTrace) -> bool {
+    if trace.final_observable_result.trim().is_empty()
+        || trace.verification_evidence.trim().is_empty()
+    {
+        return false;
+    }
+    let successful = trace
+        .tool_observations
+        .iter()
+        .filter(|observation| observation.status == "succeeded")
+        .collect::<Vec<_>>();
+    let has_observable_action = successful.iter().any(|observation| {
+        !matches!(observation.risk.as_str(), "read_only" | "unknown")
+            && !observation.observable_summary.trim().is_empty()
+            && observation.observable_summary != "no output"
+    });
+    let distinct_observations = trace
+        .tool_observations
+        .iter()
+        .filter(|observation| observation.status == "succeeded")
+        .map(|observation| format!("{}:{}", observation.tool, observation.observable_summary))
+        .collect::<BTreeSet<_>>()
+        .len();
+    // Reusability is based on a semantically non-trivial goal plus an actual
+    // action/verification trace. It is not inferred from a hard-coded action
+    // verb or from tool-call count alone.
+    let goal_concepts = trace
+        .user_goal
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| token.chars().count() >= 3 && !goal_stop_word(token))
+        .collect::<BTreeSet<_>>()
+        .len();
+    has_observable_action
+        && successful.len() >= 2
+        && distinct_observations >= 2
+        && goal_concepts >= 4
+}
+
+fn goal_stop_word(word: &str) -> bool {
+    matches!(
+        word,
+        "and"
+            | "the"
+            | "for"
+            | "from"
+            | "with"
+            | "this"
+            | "that"
+            | "please"
+            | "tolong"
+            | "untuk"
+            | "dengan"
+            | "yang"
+            | "ini"
+            | "itu"
+            | "saya"
+    )
+}
+
+fn compact(value: &str, max_chars: usize) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.chars().count() <= max_chars {
+        value
+    } else {
+        value.chars().take(max_chars).collect::<String>() + "…"
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +360,73 @@ mod tests {
             let result = evaluator.evaluate("p", &trace).unwrap();
             assert_eq!(result.skill, SkillLearningAction::None);
         }
+        assert!(store.list("p", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn observable_trace_creates_generalized_skill_with_pitfall_then_updates_same_skill() {
+        let (evaluator, store) = evaluator();
+        let mut trace = completed(candidate("ignored", ""));
+        trace.skill_candidate = None;
+        trace.tool_observations = vec![
+            SafeToolObservation {
+                tool: "first_probe".into(),
+                risk: "read_only".into(),
+                status: "failed".into(),
+                observable_summary: "service socket was stale".into(),
+            },
+            SafeToolObservation {
+                tool: "scoped_repair".into(),
+                risk: "side_effect".into(),
+                status: "succeeded".into(),
+                observable_summary: "stale socket replaced".into(),
+            },
+            SafeToolObservation {
+                tool: "health_check".into(),
+                risk: "read_only".into(),
+                status: "succeeded".into(),
+                observable_summary: "service healthy after repair".into(),
+            },
+        ];
+        let first = evaluator.evaluate("p", &trace).unwrap();
+        assert!(matches!(first.skill, SkillLearningAction::Created { .. }));
+        let skill = store.list("p", 10).unwrap().remove(0);
+        assert!(skill.pitfalls.contains("stale"));
+        assert!(skill.procedure.contains("materially different"));
+        assert!(!skill.procedure.contains("Use the typed"));
+
+        trace.user_goal = "Repair the Xiao service crash safely".into();
+        trace.tool_observations[2].observable_summary =
+            "service healthy and stable on a second probe".into();
+        let second = evaluator.evaluate("p", &trace).unwrap();
+        assert!(matches!(second.skill, SkillLearningAction::Updated { .. }));
+        assert_eq!(store.list("p", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tool_counts_without_reusable_semantics_do_not_create_a_skill() {
+        let (evaluator, store) = evaluator();
+        let mut trace = completed(candidate("ignored", ""));
+        trace.skill_candidate = None;
+        trace.user_goal = "Create file".into();
+        trace.tool_observations = vec![
+            SafeToolObservation {
+                tool: "write".into(),
+                risk: "side_effect".into(),
+                status: "succeeded".into(),
+                observable_summary: "file written".into(),
+            },
+            SafeToolObservation {
+                tool: "check".into(),
+                risk: "read_only".into(),
+                status: "succeeded".into(),
+                observable_summary: "file exists".into(),
+            },
+        ];
+        assert_eq!(
+            evaluator.evaluate("p", &trace).unwrap().skill,
+            SkillLearningAction::None
+        );
         assert!(store.list("p", 10).unwrap().is_empty());
     }
 }

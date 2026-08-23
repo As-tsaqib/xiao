@@ -101,6 +101,33 @@ pub struct ToolRunRecord {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalRecord {
+    pub id: String,
+    pub owner_principal: String,
+    pub capability: String,
+    pub tool_name: String,
+    pub arguments_hash: String,
+    pub summary: String,
+    pub status: String,
+    pub requested_at: String,
+    pub decided_at: Option<String>,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyInstallRecord {
+    pub id: String,
+    pub agent_run_id: Option<String>,
+    pub binary: String,
+    pub package: String,
+    pub package_manager: String,
+    pub status: String,
+    pub evidence: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -393,6 +420,51 @@ impl Storage {
           FROM skills s
           WHERE NOT EXISTS(SELECT 1 FROM skills_fts f WHERE f.rowid=s.rowid);
         INSERT OR IGNORE INTO schema_migrations(version) VALUES(9);
+        CREATE TABLE IF NOT EXISTS approvals(
+          id TEXT PRIMARY KEY,
+          owner_principal TEXT NOT NULL,
+          capability TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          arguments_hash TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','approved','consumed','denied','expired')),
+          requested_at TEXT NOT NULL,
+          decided_at TEXT,
+          expires_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_approvals_owner_status
+          ON approvals(owner_principal,status,requested_at DESC);
+        CREATE TABLE IF NOT EXISTS dependency_installs(
+          id TEXT PRIMARY KEY,
+          agent_run_id TEXT REFERENCES agent_runs(id) ON DELETE SET NULL,
+          binary TEXT NOT NULL,
+          package TEXT NOT NULL,
+          package_manager TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('installing','succeeded','failed','interrupted')),
+          evidence TEXT,
+          started_at TEXT NOT NULL,
+          finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_dependency_installs_run
+          ON dependency_installs(agent_run_id,started_at DESC);
+        CREATE TABLE IF NOT EXISTS environment_probes(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          snapshot_json TEXT NOT NULL,
+          probed_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workspace_file_index(
+          path TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          indexed_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS skill_file_index(
+          path TEXT PRIMARY KEY,
+          skill_name TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          indexed_at TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES(10);
         "#)?;
             Ok(())
         })
@@ -419,6 +491,213 @@ impl Storage {
         })
         .is_ok()
     }
+
+    pub fn record_environment_probe(&self, snapshot_json: &str, probed_at: &str) -> Result<()> {
+        serde_json::from_str::<serde_json::Value>(snapshot_json)
+            .map_err(|_| anyhow::anyhow!("environment probe must be valid JSON"))?;
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO environment_probes(snapshot_json,probed_at) VALUES(?,?)",
+                params![snapshot_json, probed_at],
+            )?;
+            transaction.execute(
+                "DELETE FROM environment_probes WHERE id NOT IN (SELECT id FROM environment_probes ORDER BY id DESC LIMIT 100)",
+                [],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn workspace_file_hash(&self, path: &str) -> Result<Option<String>> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT content_hash FROM workspace_file_index WHERE path=?",
+                    params![path],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn set_workspace_file_hash(&self, path: &str, kind: &str, hash: &str) -> Result<()> {
+        self.with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO workspace_file_index(path,kind,content_hash,indexed_at) VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind=excluded.kind,content_hash=excluded.content_hash,indexed_at=excluded.indexed_at",
+                params![path, kind, hash, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn skill_file_hash(&self, path: &str) -> Result<Option<String>> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT content_hash FROM skill_file_index WHERE path=?",
+                    params![path],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn set_skill_file_hash(&self, path: &str, name: &str, hash: &str) -> Result<()> {
+        self.with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO skill_file_index(path,skill_name,content_hash,indexed_at) VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET skill_name=excluded.skill_name,content_hash=excluded.content_hash,indexed_at=excluded.indexed_at",
+                params![path, name, hash, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn begin_dependency_install(
+        &self,
+        agent_run_id: Option<&str>,
+        binary: &str,
+        package: &str,
+        package_manager: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO dependency_installs(id,agent_run_id,binary,package,package_manager,status,started_at) VALUES(?,?,?,?,?,'installing',?)",
+                params![id, agent_run_id, binary, package, package_manager, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
+        Ok(id)
+    }
+
+    pub fn finish_dependency_install(&self, id: &str, status: &str, evidence: &str) -> Result<()> {
+        if !matches!(status, "succeeded" | "failed" | "interrupted") {
+            return Err(anyhow::anyhow!("invalid dependency install status"));
+        }
+        self.with_conn(|connection| {
+            let changed = connection.execute(
+                "UPDATE dependency_installs SET status=?,evidence=?,finished_at=? WHERE id=? AND status='installing'",
+                params![status, evidence, Utc::now().to_rfc3339(), id],
+            )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!("dependency install record not found or terminal"));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn dependency_installs(&self, agent_run_id: &str) -> Result<Vec<DependencyInstallRecord>> {
+        self.with_conn(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id,agent_run_id,binary,package,package_manager,status,evidence,started_at,finished_at FROM dependency_installs WHERE agent_run_id=? ORDER BY started_at",
+            )?;
+            let rows = statement.query_map(params![agent_run_id], |row| {
+                Ok(DependencyInstallRecord {
+                    id: row.get(0)?,
+                    agent_run_id: row.get(1)?,
+                    binary: row.get(2)?,
+                    package: row.get(3)?,
+                    package_manager: row.get(4)?,
+                    status: row.get(5)?,
+                    evidence: row.get(6)?,
+                    started_at: row.get(7)?,
+                    finished_at: row.get(8)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn request_approval(
+        &self,
+        owner: &str,
+        capability: &str,
+        tool_name: &str,
+        arguments_hash: &str,
+        summary: &str,
+    ) -> Result<ApprovalRecord> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let expires_at = (now + chrono::Duration::minutes(15)).to_rfc3339();
+        self.with_conn(|connection| {
+            if let Some(record) = connection
+                .query_row(
+                    "SELECT id,owner_principal,capability,tool_name,arguments_hash,summary,status,requested_at,decided_at,expires_at FROM approvals WHERE owner_principal=? AND tool_name=? AND arguments_hash=? AND status='pending' AND expires_at>? ORDER BY requested_at DESC LIMIT 1",
+                    params![owner, tool_name, arguments_hash, now_text],
+                    row_approval,
+                )
+                .optional()?
+            {
+                return Ok(record);
+            }
+            let id = Uuid::new_v4().to_string();
+            connection.execute(
+                "INSERT INTO approvals(id,owner_principal,capability,tool_name,arguments_hash,summary,status,requested_at,expires_at) VALUES(?,?,?,?,?,?,'pending',?,?)",
+                params![id, owner, capability, tool_name, arguments_hash, summary, now_text, expires_at],
+            )?;
+            connection.query_row(
+                "SELECT id,owner_principal,capability,tool_name,arguments_hash,summary,status,requested_at,decided_at,expires_at FROM approvals WHERE id=?",
+                params![id],
+                row_approval,
+            ).map_err(Into::into)
+        })
+    }
+
+    pub fn decide_approval(&self, owner: &str, id: &str, approve: bool) -> Result<bool> {
+        self.with_conn(|connection| {
+            let changed = connection.execute(
+                "UPDATE approvals SET status=?,decided_at=? WHERE id=? AND owner_principal=? AND status='pending' AND expires_at>?",
+                params![if approve { "approved" } else { "denied" }, Utc::now().to_rfc3339(), id, owner, Utc::now().to_rfc3339()],
+            )?;
+            Ok(changed == 1)
+        })
+    }
+
+    pub fn consume_approval(
+        &self,
+        owner: &str,
+        tool_name: &str,
+        arguments_hash: &str,
+    ) -> Result<bool> {
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let id = transaction
+                .query_row(
+                    "SELECT id FROM approvals WHERE owner_principal=? AND tool_name=? AND arguments_hash=? AND status='approved' AND expires_at>? ORDER BY decided_at DESC LIMIT 1",
+                    params![owner, tool_name, arguments_hash, Utc::now().to_rfc3339()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let consumed = if let Some(id) = id {
+                transaction.execute(
+                    "UPDATE approvals SET status='consumed' WHERE id=? AND status='approved'",
+                    params![id],
+                )? == 1
+            } else {
+                false
+            };
+            transaction.commit()?;
+            Ok(consumed)
+        })
+    }
+
+    pub fn pending_approvals(&self, owner: &str) -> Result<Vec<ApprovalRecord>> {
+        self.with_conn(|connection| {
+            connection.execute(
+                "UPDATE approvals SET status='expired' WHERE status IN ('pending','approved') AND expires_at<=?",
+                params![Utc::now().to_rfc3339()],
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT id,owner_principal,capability,tool_name,arguments_hash,summary,status,requested_at,decided_at,expires_at FROM approvals WHERE owner_principal=? AND status='pending' ORDER BY requested_at DESC LIMIT 20",
+            )?;
+            let rows = statement.query_map(params![owner], row_approval)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
     pub fn checkpoint(&self) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -433,11 +712,15 @@ impl Storage {
             let now = Utc::now().to_rfc3339();
             let tx = conn.transaction()?;
             tx.execute(
-                "UPDATE tool_runs SET status='interrupted',finished_at=?,error=COALESCE(error,'daemon stopped during tool execution') WHERE status IN ('requested','running')",
+                "UPDATE tool_runs SET status='interrupted',finished_at=?,error=COALESCE(error,'daemon stopped during tool execution') WHERE status IN ('requested','policy_check','installing_dependency','running')",
                 params![now],
             )?;
             tx.execute(
-                "UPDATE agent_runs SET status='interrupted',finished_at=?,error=COALESCE(error,'daemon stopped during agent run') WHERE status IN ('running','verifying')",
+                "UPDATE agent_runs SET status='interrupted',finished_at=?,error=COALESCE(error,'daemon stopped during agent run') WHERE status IN ('received','context_build','running','verifying')",
+                params![now],
+            )?;
+            tx.execute(
+                "UPDATE dependency_installs SET status='interrupted',finished_at=?,evidence=COALESCE(evidence,'daemon stopped during package installation') WHERE status='installing'",
                 params![now],
             )?;
             tx.commit()?;
@@ -482,11 +765,23 @@ impl Storage {
     ) -> Result<()> {
         if !matches!(
             status,
-            "running" | "verifying" | "completed" | "failed" | "cancelled" | "interrupted"
+            "received"
+                | "context_build"
+                | "running"
+                | "awaiting_approval"
+                | "verifying"
+                | "completed"
+                | "blocked"
+                | "failed"
+                | "cancelled"
+                | "interrupted"
         ) {
             return Err(anyhow::anyhow!("invalid agent run status"));
         }
-        let terminal = matches!(status, "completed" | "failed" | "cancelled" | "interrupted");
+        let terminal = matches!(
+            status,
+            "completed" | "blocked" | "failed" | "cancelled" | "interrupted"
+        );
         self.with_conn(|conn| {
             let changed = conn.execute(
                 "UPDATE agent_runs SET status=?,error=?,finished_at=CASE WHEN ? THEN ? ELSE NULL END WHERE id=? AND owner_principal=?",
@@ -596,7 +891,15 @@ impl Storage {
     ) -> Result<()> {
         if !matches!(
             status,
-            "requested" | "running" | "succeeded" | "failed" | "interrupted" | "denied"
+            "requested"
+                | "policy_check"
+                | "awaiting_approval"
+                | "installing_dependency"
+                | "running"
+                | "succeeded"
+                | "failed"
+                | "interrupted"
+                | "denied"
         ) {
             return Err(anyhow::anyhow!("invalid tool run status"));
         }
@@ -1151,6 +1454,21 @@ fn row_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     })
 }
 
+fn row_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRecord> {
+    Ok(ApprovalRecord {
+        id: row.get(0)?,
+        owner_principal: row.get(1)?,
+        capability: row.get(2)?,
+        tool_name: row.get(3)?,
+        arguments_hash: row.get(4)?,
+        summary: row.get(5)?,
+        status: row.get(6)?,
+        requested_at: row.get(7)?,
+        decided_at: row.get(8)?,
+        expires_at: row.get(9)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1338,7 +1656,7 @@ mod tests {
                 connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                     row.get(0)
                 })?;
-            assert_eq!(latest, 9);
+            assert_eq!(latest, 10);
             for table in [
                 "agent_runs",
                 "tool_runs",
@@ -1349,6 +1667,11 @@ mod tests {
                 "skills",
                 "skill_history",
                 "skills_fts",
+                "approvals",
+                "dependency_installs",
+                "environment_probes",
+                "workspace_file_index",
+                "skill_file_index",
             ] {
                 let exists: bool = connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)",

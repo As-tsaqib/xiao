@@ -1,101 +1,141 @@
-# Xiao v0.2.0 Acceptance Coverage
+# Xiao v0.2.0 Final-Architecture Acceptance Coverage
 
-This document maps the v0.2.0 specification to implemented automated and
-device validation. `scripts/acceptance.sh --static-only` checks source/package
-invariants without invoking Cargo. Rust gates are also runnable locally and in
-CI. Tests requiring a real Android reboot, Telegram credential, or provider
-account remain explicit device checks and are never reported as automated
-success.
+This maps the final v0.2.0 acceptance criteria to implementation and
+deterministic tests. Xiao is a private single-owner agent; `principal` remains
+only as a compatibility/session isolation key. Host tests use fake runtime and
+executor boundaries and do not claim real rooted-Android validation.
 
-## Agent and tools
+## Mandatory scenario matrix
 
-| Requirement | Coverage |
-|---|---|
-| Registry-driven tools; no provider-owned discovery | `ToolRegistry`, `ToolSpec`, provider wire-translation test, static rejection of `ToolRouter` |
-| Duplicate/unknown/malformed calls fail safely | Registry duplicate/unknown tests, strict argument deserialization, malformed `context_stats` test |
-| Basic policy boundary | Read-only allow, explicit memory side-effect allowlist, destructive policy-denial test |
-| Bounded turns, timeout, and output | `max_turn_guard_fails_run_without_persisting_assistant`; registry timeout/output test |
-| Cancellation at provider/tool boundaries | `stop_cancels_active_generation`; `cancellation_during_tool_marks_both_run_boundaries_terminal` |
-| Captured final-write target | `concurrent_session_switch_cannot_redirect_captured_final_write` |
-| Durable run/tool audit | Typed loop asserts completed `agent_runs` and succeeded `tool_runs`; unknown tool asserts durable `denied` row |
-| Crash uncertainty | `reopen_quarantines_inflight_agent_and_tool_runs_without_replay` |
-| No unrestricted shell | No shell implementation/spec; policy denies privileged/destructive tools; static acceptance grep |
+| Scenario | Automated coverage | Result required |
+|---|---|---|
+| Identity survives restart | `identity_bootstrap_survives_restart_and_never_overwrites_owner_files`; `runtime_context_contains_persistent_identity_owner_and_verified_environment` | Living files survive bootstrap and enter a new context; SOUL is not overwritten |
+| Preference replacement | `synonymous_explicit_preference_change_updates_one_canonical_memory_and_file`; `generalized_preferences_facts_and_manual_edits_reconcile` | One active semantic preference, updated USER.md, SQLite audit retained |
+| Missing Termux dependency | `trusted_missing_dependency_is_installed_reprobed_and_audited`; `missing_dependency_installs_reprobes_and_resumes_original_command` | Trusted package installs, binary is re-probed, original command resumes, progress/audit exist |
+| First approach fails | `failure_changes_strategy_and_unverified_final_continues_until_evidence` | Failure is observed, arguments change, unverified final continues, later evidence completes |
+| Action requires verification | `action_claim_without_evidence_is_not_yet_verified` | Bare “done,” action-only, and same-call verification labels remain `NotYetVerified` |
+| Successful task learns | `failure_changes_strategy_and_unverified_final_continues_until_evidence`; `observable_trace_creates_generalized_skill_with_pitfall_then_updates_same_skill` | Verified reusable trace creates a generalized skill containing recovered pitfalls |
+| Similar task updates skill | `verified_work_creates_then_updates_one_canonical_skill`; `related_skill_updates_canonical_row_instead_of_creating_duplicate` | Related intent updates one canonical skill and history, not a duplicate |
+| Privileged policy | `broker_surface_is_typed_and_restart_is_approval_classed`; `privileged_tool_requires_exact_durable_one_shot_approval` | Typed broker only; exact approval is consumed once; no root-shell tool |
+| No false capability refusal | `capability_resolution_prevents_false_cannot_when_termux_backend_is_usable`; `capability_resolution_distinguishes_available_installable_and_approval` | Termux aliases resolve available and have no blocker; missing trusted binary is installable |
+| Telegram progress/cancel/files | `long_generation_does_not_block_stop_other_principal_or_callbacks`; semantic progress tests; `result_file_is_sent_through_telegram_multipart_document_path`; command approval test | `/stop` remains responsive, progress stays semantic/redacted, document uses multipart, approval commands work |
 
-## Memory
+## Architecture coverage
 
-| Requirement | Coverage |
-|---|---|
-| Principal-scoped canonical uniqueness | SQLite `UNIQUE(owner_principal,scope,category,key)` plus cross-principal search/delete test |
-| UPSERT current state | `create_upsert_alias_and_delete_keep_one_active_state_with_history` |
-| Concise → detailed remains one active row | `synonymous_explicit_preference_change_updates_one_canonical_memory` |
-| Generic explicit fact update | `generic_explicit_fact_changes_and_forgets_same_canonical_state` |
-| Explicit forget | Dedicated response-style and generic deletion tests; deletion history retained separately |
-| FTS retrieval | Principal-scoped `MemoryStore::search` test and trigger-backed `memories_fts` |
-| Secret rejection | Sensitive value/identity tests plus structured redaction and token-pattern tests |
-| Conservative implicit memory | Evaluator only accepts a narrow durable project fact after verified completion |
+### Identity, environment, and capabilities
 
-## Session retrieval and context
+- `IdentityWorkspace` create-loads `SOUL.md`, `USER.md`, `MEMORY.md`,
+  `AGENTS.md`, and `ENVIRONMENT.md` with private permissions and atomic writes.
+- `RuntimeState` refreshes only generated `ENVIRONMENT.md`.
+- `EnvironmentProbe` is fakeable and captures platform/Android, architecture,
+  Xiao version, UID, root evidence, SELinux, Termux prefix/home/PATH/shell,
+  package manager, selected binaries, and execution backends.
+- `CapabilityRegistry` represents available, missing-installable,
+  approval-required, temporary, unsupported, forbidden, and unknown states.
+- Coverage: all `identity::tests`, `runtime::environment::tests`, and
+  `runtime::capabilities::tests`.
 
-| Requirement | Coverage |
-|---|---|
-| Principal-scoped FTS5 session search | `fts_search_is_relevant_bounded_and_principal_scoped` |
-| Result count/content bound | Search clamps limit and truncates/redacts each result; test uses oversized content |
-| Memory in context | `user_and_agent_memory_enter_delimited_context` |
-| Relevant skill progressive disclosure | `only_relevant_selected_skill_is_progressively_disclosed` |
-| Character-budget context | `current_request_and_system_prompt_survive_budget_pressure` |
-| Protected system/current request | Same pressure test asserts exact first and last protected messages |
-| Durable compaction without raw deletion | `compression_persists_summary_without_deleting_raw_history` |
-| MAIN/SIDE behavior preserved | Existing `side_never_writes_main`, no-nesting, ownership and Telegram renderer tests |
+### Provider-agnostic tools and execution
 
-## Skills, completion, and learning
+- Canonical `ToolSpec` includes origin, effect, risk, capability requirements,
+  schema, and timeout. Providers only translate specs.
+- `ToolRegistry` dispatches canonical tools/aliases, gates capabilities,
+  enforces runtime `ToolPolicy`, records approval status through the agent
+  audit path, bounds output, and redacts results.
+- `TermuxExecutor` uses structured argv, Termux-only PATH, controlled cwd/env,
+  root-daemon UID/GID/supplementary-group drop plus `no_new_privs`, timeout, cancellation, and
+  drained-but-bounded output. It rejects root escalation, `-c` shell strings,
+  unmanaged package mutation, and remote installer pipelines.
+- Argument-aware policy requires exact approval for destructive commands,
+  opaque shell scripts, and credential-sensitive access.
+- `DependencyResolver` accepts only trusted normalized package mappings,
+  records installs, re-probes, and then resumes.
+- `AndroidBroker` accepts typed Xiao-service operations only; restart requires
+  approval and no model-controlled command string.
+- Coverage: `provider_translates_canonical_tool_specs_without_owning_policy`,
+  all `tools::registry::tests`, `tools::policy::tests`,
+  `runtime::execution::tests`, `runtime::dependency::tests`, and
+  `runtime::android::tests`.
 
-| Requirement | Coverage |
-|---|---|
-| Complete skill shape and ownership | Schema/store require summary, when-to-use, procedure, pitfalls, verification; isolation test |
-| FTS search and full view | `skill_search`/`skill_view` backed by principal-filtered `SkillRegistry` |
-| `running → verifying → completed` | Agent status transitions plus `CompletionVerifier` observable evidence |
-| Recovery can resolve earlier failure | `unresolved_failure_is_not_verified_but_successful_recovery_is` |
-| Verified reusable work creates skill | `verified_work_creates_then_updates_one_canonical_skill` |
-| Near-synonym updates canonical skill | `related_skill_updates_canonical_row_instead_of_creating_duplicate` |
-| Failed/cancelled/interrupted/trivial work learns no skill | `trivial_failed_cancelled_and_unverified_work_never_creates_skill` |
-| Failed attempts can become pitfalls after success | Learning trace derives non-success observations into candidate pitfalls only after verified completion |
-| No hidden reasoning persisted | `LearningTrace` contains only goal, safe observations, final result, and verification evidence |
+### Memory, recall, context, and skills
 
-## Migrations and regression
+- USER/MEMORY files are active current state; stable managed entries support
+  none/create/update/delete/merge/rekey and reconcile manual edits. SQLite
+  remains index/history, including a legacy SQLite-to-file bridge.
+- `messages_fts` provides owner-filtered old-session recall. Context combines
+  hard rules, SOUL, verified runtime/capabilities, USER, relevant MEMORY,
+  AGENTS, selected skill bodies, summaries, FTS excerpts, recent turns, and
+  current request under a character budget.
+- Filesystem `skills/<name>/SKILL.md` accepts YAML `name`/`description`, common
+  optional metadata, namespaced Xiao requirements, discovery/reconciliation,
+  lazy view, eligibility gating, and safe dependency resolution.
+- Coverage: all `memory::evaluator::tests`, `memory::store::tests`,
+  `context::retrieval::tests`, `context::engine::tests`,
+  `skills::filesystem::tests`, and `skills::store::tests`.
 
-| Requirement | Coverage |
-|---|---|
-| Fresh v0.2.0 database | `v020_migration_is_fresh_and_idempotent_with_consistent_fts` checks all new objects/version 9 |
-| Upgrade existing v0.1.0 database | `v010_database_upgrades_additively_without_losing_history` verifies owner assignment, raw history, and FTS backfill |
-| Repeated migrate is safe | Fresh migration test calls `migrate()` twice after data insertion and asserts one FTS hit |
-| WAL/foreign keys/reopen durability | Existing storage reopen and inbox tests remain green |
-| Telegram ACL/inbox/responsiveness | Existing ACL-before-dispatch, durable inbox, and slow-generation adapter regression tests |
-| Provider/account compatibility | Existing Codex/Antigravity/custom protocol, OAuth, refresh, atomic account/model tests |
-| Loopback IPC and redaction | Existing non-loopback rejection, constant-time bearer, split privilege, snapshot/log tests |
-| Formatting/build/tests/lints | `cargo fmt --all -- --check`, `cargo check`, `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings` |
+### Agent loop, verification, learning, and Telegram
 
-## Device integration checklist
+- Configured turn/tool/no-progress/runtime limits prevent unbounded loops.
+  Cancellation is checked around provider/tool work; identical failed action
+  signatures are rejected.
+- Completion states are `VerifiedSuccess`, `NotYetVerified`, `Blocked`, and
+  `Failed`. `NotYetVerified` becomes a new provider observation and continues.
+- Learning runs only after verified success from the bounded observable trace.
+  It generalizes prerequisites/procedure/pitfalls/verification and searches for
+  related skills before creating; failed/cancelled/unverified/trivial traces do
+  not produce positive skills.
+- Telegram exposes semantic progress, trusted-install progress, `/approvals`,
+  `/approve`, `/deny`, `/stop`, blockers/finals, and bounded verified document
+  results. Hidden reasoning has no event or persistence field.
+- Coverage: `agent::completion::tests`, agent adaptive/cancel/bounds tests,
+  `learning::evaluator::tests`, `owner_can_inspect_approve_and_deny_pending_operations`,
+  Telegram progress/cancellation tests, and multipart document test.
 
-After CI produces the Android arm64 module archive:
+### Storage, migration, recovery, and exclusions
 
-1. Flash `xiao-v0.2.0-kernelsu-arm64.zip`, reboot, and verify daemon/watchdog
-   readiness plus persistence under `/data/adb/xiao`.
-2. Configure a real Telegram bot and authorized Chat ID; verify an unauthorized
-   principal creates no session/message/memory/skill/run mutation.
-3. Exercise `/session`, `/btw`, concurrent switching, `/stop`, and `/retry`;
-   inspect MAIN/SIDE rows and durable run statuses after restart.
-4. Complete Codex and Antigravity OAuth with authorized accounts and execute a
-   real Codex tool continuation (`context_stats` or memory search).
-5. Verify explicit remember, preference change, and forget across daemon
-   restart, including one canonical active memory row and separate history.
-6. Create enough history to trigger a summary; confirm raw message count is
-   unchanged and `session_search` finds old principal-owned content.
-7. Complete a meaningful verified reusable workflow twice with an improvement;
-   confirm one canonical skill is updated and failed/cancelled work creates no
-   skill.
-8. Verify managed Termux wrappers, authenticated loopback IPC, WebUI restart,
-   bounded/redacted logs, and module update/uninstall preservation.
+- Migration version 10 adds `approvals`, `dependency_installs`,
+  `environment_probes`, `workspace_file_index`, and `skill_file_index` after
+  the v6-v9 run/memory/FTS/skill migrations.
+- `v020_migration_is_fresh_and_idempotent_with_consistent_fts` expects version
+  10 and every new object; `v010_database_upgrades_additively_without_losing_history`
+  preserves legacy history; reopen tests quarantine uncertain agent/tool and
+  package-install work rather than replaying it.
+- Static acceptance rejects an unrestricted model root-shell path and checks
+  absence of MCP, subagents, vector DB, cron missions, and native plugins.
 
-Real provider credentials, Telegram delivery, Android lifecycle, and device
-packaging are not available to host unit tests and must remain reported as
-manual/device validation.
+## Quality gates
+
+Run from the repository root:
+
+```sh
+cargo fmt --all -- --check
+cargo check --locked --all-targets --all-features
+cargo test --locked --all-targets --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+./scripts/acceptance.sh --static-only
+git diff --check
+```
+
+The final implementation report must state actual outcomes rather than treating
+this checklist as evidence that a command ran.
+
+## Real-device validation still required
+
+1. Flash the arm64 module on a rooted Android device and reboot; verify private
+   data/workspace persistence, watchdog readiness, SELinux behavior, and that
+   root `xiaod` drops general commands to the real Termux app identity.
+2. Confirm detected Termux PATH/home/package manager across supported Termux
+   installations; auto-install a missing trusted package from the configured
+   Termux repository and cancel one install in progress.
+3. Configure a real Telegram bot/owner ACL; exercise semantic progress,
+   approval/retry, `/stop`, dependency progress, blocker delivery, and document
+   upload.
+4. Complete real Codex/Antigravity OAuth and tool continuation using owner
+   accounts; confirm no provider receives tools it cannot continue.
+5. Exercise the typed Xiao-service inspection/restart broker under the actual
+   KernelSU/Magisk service model and verify exact one-shot approval.
+6. Manually edit USER.md, MEMORY.md, and a community SKILL.md, restart, and
+   verify reconciliation/history without SOUL replacement.
+
+Real credentials, Telegram delivery, Android init/root/SELinux behavior, and
+device package repositories are intentionally not impersonated by host tests.

@@ -95,9 +95,56 @@ pass 'Codex and Antigravity OAuth follow CLIProxyAPI browser login contracts'
     rg -q 'typed_tool_call_continues_provider_until_final_answer' src/agent/mod.rs &&
     ! rg -q 'ToolRouter' src/agent/mod.rs src/providers/mod.rs src/tools/mod.rs
 } || fail 'Typed tool loop'
-! rg -n 'Command::new\("sh"\)|Command::new\("su"\)|/system/bin/sh|/bin/sh' src/agent src/providers src/command src/tools >/dev/null || fail 'Unrestricted model root shell found'
+! rg -n 'Command::new\("(sh|bash|su)"\)' src/agent src/providers src/command src/tools src/runtime >/dev/null || fail 'Unrestricted model root shell found'
 rg -q 'bytes_stream\(\)' src/providers/mod.rs || fail 'Incremental provider streaming'
 pass 'Typed bounded tool loop and incremental provider streaming'
+{
+  [ -f src/identity/templates/SOUL.md ] &&
+    [ -f src/identity/templates/USER.md ] &&
+    [ -f src/identity/templates/MEMORY.md ] &&
+    [ -f src/identity/templates/AGENTS.md ] &&
+    [ -f src/identity/templates/ENVIRONMENT.md ] &&
+    rg -q 'identity_bootstrap_survives_restart_and_never_overwrites_owner_files' src/identity/mod.rs &&
+    rg -q 'write_soul_owner_approved' src/identity/mod.rs &&
+    rg -q 'write_environment' src/runtime/environment.rs
+} || fail 'Persistent living identity workspace'
+pass 'Persistent identity files bootstrap without ordinary SOUL replacement'
+{
+  rg -q 'struct RuntimeEnvironment' src/runtime/environment.rs &&
+    rg -q 'trait HostProbe' src/runtime/environment.rs &&
+    rg -q 'enum CapabilityStatus' src/runtime/capabilities.rs &&
+    rg -q 'MissingInstallable' src/runtime/capabilities.rs &&
+    rg -q 'capability_resolution_prevents_false_cannot_when_termux_backend_is_usable' src/runtime/capabilities.rs
+} || fail 'Typed runtime and capability resolution'
+pass 'Runtime probing and non-boolean capability resolution are covered'
+{
+  rg -q 'name: "termux_terminal"' src/tools/builtin/terminal.rs &&
+    rg -q 'register_alias\("terminal", "termux_terminal"\)' src/agent/mod.rs &&
+    rg -q 'struct TermuxExecutor' src/runtime/execution.rs &&
+    rg -q 'setgroups' src/runtime/execution.rs &&
+    rg -q 'PR_SET_NO_NEW_PRIVS' src/runtime/execution.rs &&
+    rg -q 'model-supplied shell command strings are not accepted' src/runtime/execution.rs &&
+    rg -q 'destructive Termux command' src/tools/policy.rs &&
+    rg -q 'real_executor_enforces_termux_env_cwd_timeout_cancel_and_output_bounds' src/runtime/execution.rs
+} || fail 'Controlled Termux general executor'
+pass 'Termux structured argv, UID drop, bounds and argument-aware policy are covered'
+{
+  rg -q 'struct DependencyResolver' src/runtime/dependency.rs &&
+    rg -q 'trusted_package_for_binary' src/runtime/capabilities.rs src/runtime/dependency.rs &&
+    rg -q 'validate_package' src/runtime/dependency.rs &&
+    rg -q 'trusted_missing_dependency_is_installed_reprobed_and_audited' src/runtime/dependency.rs &&
+    rg -q 'missing_dependency_installs_reprobes_and_resumes_original_command' src/tools/builtin/terminal.rs &&
+    rg -q 'package_names_and_unknown_remote_installers_are_rejected' src/runtime/dependency.rs
+} || fail 'Trusted Termux dependency resolution'
+pass 'Trusted dependency install is normalized, audited, re-probed and resumed'
+{
+  rg -q 'trait AndroidBroker' src/runtime/android.rs &&
+    rg -q 'enum AndroidOperation' src/runtime/android.rs &&
+    rg -q 'AndroidXiaoRestartTool' src/tools/builtin/android.rs &&
+    rg -q 'privileged_tool_requires_exact_durable_one_shot_approval' src/tools/registry.rs &&
+    ! rg -q 'struct RootShell|name: "root_shell"|Command::new\("su"\)' src/runtime src/tools src/agent
+} || fail 'Typed privileged Android broker'
+pass 'Privileged Android surface is typed and exact-approval guarded'
 {
   rg -Fq 'UNIQUE(owner_principal,scope,category,key)' src/storage/mod.rs &&
     rg -q 'MemoryStore' src/memory/mod.rs src/memory/store.rs &&
@@ -105,6 +152,14 @@ pass 'Typed bounded tool loop and incremental provider streaming'
     rg -q 'explicit_forget_removes_active_memory' src/memory/evaluator.rs
 } || fail 'Editable principal-scoped memory'
 pass 'Memory UPSERT, deduplication, history and explicit forget semantics'
+{
+  rg -q 'MemoryDecisionKind' src/memory/evaluator.rs &&
+    rg -q 'Rekey' src/memory/evaluator.rs &&
+    rg -q 'with_workspace' src/memory/store.rs &&
+    rg -q 'manual_file_reconcile' src/memory/store.rs &&
+    rg -q 'generalized_preferences_facts_and_manual_edits_reconcile' src/memory/evaluator.rs
+} || fail 'File-authoritative generalized memory'
+pass 'USER/MEMORY current state supports generalized lifecycle and manual reconciliation'
 {
   rg -q 'messages_fts' src/storage/mod.rs &&
     rg -q 'ContextEngine' src/agent/mod.rs src/context/engine.rs &&
@@ -120,11 +175,44 @@ pass 'Principal-scoped FTS retrieval and bounded context compression'
 } || fail 'Verified skill learning and deduplication'
 pass 'Verified post-completion learning updates canonical principal-scoped skills'
 {
+  rg -q 'serde_yaml::from_str' src/skills/filesystem.rs &&
+    rg -q 'SKILL.md must start with YAML frontmatter' src/skills/filesystem.rs &&
+    rg -q 'resolve_dependencies' src/skills/filesystem.rs &&
+    rg -q 'community_minimum_and_optional_metadata_are_tolerated' src/skills/filesystem.rs &&
+    rg -q 'observable_trace_creates_generalized_skill_with_pitfall_then_updates_same_skill' src/learning/evaluator.rs &&
+    rg -q 'tool_counts_without_reusable_semantics_do_not_create_a_skill' src/learning/evaluator.rs
+} || fail 'Filesystem community skills and trace learning'
+pass 'Community SKILL.md discovery/gating and generalized trace learning are covered'
+{
+  rg -q 'enum VerificationState' src/agent/completion.rs &&
+    rg -q 'NotYetVerified' src/agent/completion.rs src/agent/mod.rs &&
+    rg -q 'max_no_progress_repeats' src/config/mod.rs src/agent/mod.rs &&
+    rg -q 'failure_changes_strategy_and_unverified_final_continues_until_evidence' src/agent/mod.rs &&
+    rg -q 'same_call_claim' src/agent/completion.rs
+} || fail 'Bounded adaptive loop and completion verification'
+pass 'NotYetVerified continues and no-progress bounds prevent false completion/infinite retries'
+{
   rg -q 'v010_database_upgrades_additively_without_losing_history' src/storage/mod.rs &&
     rg -q 'v020_migration_is_fresh_and_idempotent_with_consistent_fts' src/storage/mod.rs &&
     rg -q 'reopen_quarantines_inflight_agent_and_tool_runs_without_replay' src/storage/mod.rs
 } || fail 'v0.2 additive migration coverage'
 pass 'Fresh, upgrade, idempotent and crash-recovery migrations covered'
+{
+  rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(10\)' src/storage/mod.rs &&
+    rg -q 'CREATE TABLE IF NOT EXISTS approvals' src/storage/mod.rs &&
+    rg -q 'CREATE TABLE IF NOT EXISTS dependency_installs' src/storage/mod.rs &&
+    rg -q 'CREATE TABLE IF NOT EXISTS environment_probes' src/storage/mod.rs &&
+    rg -q 'UPDATE dependency_installs SET status=.interrupted' src/storage/mod.rs
+} || fail 'Final architecture migration version 10'
+pass 'Migration v10 and uncertain package-install quarantine are present'
+{
+  rg -q 'Command::Approvals' src/command/mod.rs &&
+    rg -q 'Command::Approve' src/command/mod.rs &&
+    rg -q 'Command::Deny' src/command/mod.rs &&
+    rg -q 'send_document' src/telegram/mod.rs src/telegram/client.rs &&
+    rg -q 'result_file_is_sent_through_telegram_multipart_document_path' src/telegram/client.rs
+} || fail 'Telegram approvals and file results'
+pass 'Telegram exposes approvals and verified multipart result files'
 {
   rg -q 'must be loopback-only' src/config/mod.rs &&
     rg -q 'ct_eq' src/ipc/mod.rs
@@ -231,5 +319,10 @@ for p in [
 PY
 pass 'Example TOML parses'
 
-printf 'SKIP  Rust format/check/test/build run only in GitHub Actions.\n'
+for path in src/mcp src/subagents src/vector src/cron src/plugins; do
+  [ ! -e "$path" ] || fail "Out-of-scope architecture present: $path"
+done
+pass 'No MCP, subagent, vector, cron or plugin subsystem was added'
+
+printf 'SKIP  Rust format/check/test/clippy are not run by --static-only.\n'
 printf '\nStatic acceptance checks completed successfully. Device/provider integration items remain per docs/ACCEPTANCE.md.\n'

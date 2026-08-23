@@ -355,9 +355,17 @@ impl TelegramAdapter {
     async fn send_result(&self, chat_id: i64, user_id: i64, result: CommandResult) -> Result<()> {
         match result {
             CommandResult::Agent(answer) => {
+                let artifacts = answer.artifacts.clone();
                 let view = agent_final_view(answer);
                 for page in paginate_final_view(&view, 3500) {
                     self.send_view(chat_id, &page, None).await?;
+                }
+                for artifact in artifacts {
+                    if self.safe_artifact(&artifact.path) {
+                        self.client
+                            .send_document(chat_id, &artifact.path, &artifact.name)
+                            .await?;
+                    }
                 }
                 Ok(())
             }
@@ -385,6 +393,21 @@ impl TelegramAdapter {
                 Ok(())
             }
         }
+    }
+
+    fn safe_artifact(&self, path: &std::path::Path) -> bool {
+        let Ok(path) = path.canonicalize() else {
+            return false;
+        };
+        if !path.is_file() {
+            return false;
+        }
+        let environment = self.app.runtime.environment();
+        path.starts_with(&environment.data_root)
+            || environment
+                .termux
+                .as_ref()
+                .is_some_and(|termux| path.starts_with(&termux.home))
     }
 
     async fn send_menu(
@@ -1184,6 +1207,7 @@ mod tests {
             }],
             final_answer: "clean answer".into(),
             side_mode: true,
+            artifacts: Vec::new(),
         });
         let rendered = rich::render(&view, false).to_string();
         assert!(rendered.contains("clean answer"));

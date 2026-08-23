@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::tools::{Tool, ToolContext, ToolRisk, ToolSpec};
+use crate::tools::{Tool, ToolContext, ToolEffect, ToolOrigin, ToolRisk, ToolSpec};
 
 #[derive(Debug, Default)]
 pub struct ContextStatsTool;
@@ -19,6 +19,9 @@ impl Tool for ContextStatsTool {
                 "additionalProperties":false
             }),
             risk: ToolRisk::ReadOnly,
+            origin: ToolOrigin::Builtin,
+            effect: ToolEffect::None,
+            required_capabilities: vec!["xiao.tool_registry".into()],
             timeout_ms: 5_000,
         }
     }
@@ -59,6 +62,8 @@ mod tests {
                 content: "hello".into(),
                 created_at: "now".into(),
             }],
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            progress: None,
         };
         let specs = registry.available_specs(&context);
         assert_eq!(specs.len(), 1);

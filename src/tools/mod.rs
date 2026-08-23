@@ -7,5 +7,6 @@ pub mod builtin;
 pub use policy::{PolicyDecision, ToolPolicy};
 pub use registry::ToolRegistry;
 pub use types::{
-    Tool, ToolCall, ToolContext, ToolExecution, ToolResult, ToolRisk, ToolRunStatus, ToolSpec,
+    Tool, ToolCall, ToolContext, ToolEffect, ToolExecution, ToolOrigin, ToolResult, ToolRisk,
+    ToolRunStatus, ToolSpec,
 };

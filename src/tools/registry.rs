@@ -5,10 +5,13 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 
 use crate::{
+    runtime::{CapabilityRegistry, CapabilityStatus},
     security::redact::redact_text,
+    storage::Storage,
     tools::{
         PolicyDecision, Tool, ToolCall, ToolContext, ToolExecution, ToolPolicy, ToolResult,
         ToolRunStatus, ToolSpec,
@@ -17,16 +20,53 @@ use crate::{
 
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+    aliases: RwLock<HashMap<String, String>>,
     policy: ToolPolicy,
     max_output_chars: usize,
+    capabilities: Option<Arc<CapabilityRegistry>>,
+    approvals: Option<Arc<Storage>>,
 }
 
 impl ToolRegistry {
     pub fn new(policy: ToolPolicy, max_output_chars: usize) -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
+            aliases: RwLock::new(HashMap::new()),
             policy,
             max_output_chars: max_output_chars.max(1),
+            capabilities: None,
+            approvals: None,
+        }
+    }
+
+    pub fn with_capabilities(
+        policy: ToolPolicy,
+        max_output_chars: usize,
+        capabilities: Arc<CapabilityRegistry>,
+    ) -> Self {
+        Self {
+            tools: RwLock::new(HashMap::new()),
+            aliases: RwLock::new(HashMap::new()),
+            policy,
+            max_output_chars: max_output_chars.max(1),
+            capabilities: Some(capabilities),
+            approvals: None,
+        }
+    }
+
+    pub fn with_runtime(
+        policy: ToolPolicy,
+        max_output_chars: usize,
+        capabilities: Arc<CapabilityRegistry>,
+        storage: Arc<Storage>,
+    ) -> Self {
+        Self {
+            tools: RwLock::new(HashMap::new()),
+            aliases: RwLock::new(HashMap::new()),
+            policy,
+            max_output_chars: max_output_chars.max(1),
+            capabilities: Some(capabilities),
+            approvals: Some(storage),
         }
     }
 
@@ -48,8 +88,42 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Compatibility aliases are resolved centrally and still pass through
+    /// the canonical tool's policy and capability checks.
+    pub fn register_alias(&self, alias: &str, canonical: &str) -> Result<()> {
+        validate_tool_name(alias)?;
+        validate_tool_name(canonical)?;
+        if !self
+            .tools
+            .read()
+            .map_err(|_| anyhow!("tool registry lock poisoned"))?
+            .contains_key(canonical)
+        {
+            return Err(anyhow!("alias target {canonical} is not registered"));
+        }
+        let mut aliases = self
+            .aliases
+            .write()
+            .map_err(|_| anyhow!("tool alias registry lock poisoned"))?;
+        if aliases.contains_key(alias) || alias == canonical {
+            return Err(anyhow!("tool alias {alias} is already registered"));
+        }
+        aliases.insert(alias.to_owned(), canonical.to_owned());
+        Ok(())
+    }
+
     pub fn spec(&self, name: &str) -> Option<ToolSpec> {
-        self.tools.read().ok()?.get(name).map(|tool| tool.spec())
+        let canonical = self
+            .aliases
+            .read()
+            .ok()
+            .and_then(|aliases| aliases.get(name).cloned())
+            .unwrap_or_else(|| name.to_owned());
+        self.tools
+            .read()
+            .ok()?
+            .get(&canonical)
+            .map(|tool| tool.spec())
     }
 
     /// Only policy-allowed tools are advertised to providers. Registration is
@@ -61,28 +135,95 @@ impl ToolRegistry {
         let mut specs = tools
             .values()
             .map(|tool| tool.spec())
-            .filter(|spec| matches!(self.policy.evaluate(spec, context), PolicyDecision::Allow))
+            .filter(|spec| {
+                matches!(
+                    self.policy.evaluate(spec, context),
+                    PolicyDecision::Allow | PolicyDecision::RequireApproval(_)
+                )
+            })
+            .filter(|spec| self.capabilities_satisfiable(spec))
             .collect::<Vec<_>>();
         specs.sort_by(|left, right| left.name.cmp(&right.name));
         specs
     }
 
     pub async fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolExecution {
+        let canonical_name = self
+            .aliases
+            .read()
+            .ok()
+            .and_then(|aliases| aliases.get(&call.name).cloned())
+            .unwrap_or_else(|| call.name.clone());
         let tool = self
             .tools
             .read()
             .ok()
-            .and_then(|tools| tools.get(&call.name).cloned());
+            .and_then(|tools| tools.get(&canonical_name).cloned());
         let Some(tool) = tool else {
             return self.error(call, ToolRunStatus::Denied, "unknown or unavailable tool");
         };
         let spec = tool.spec();
-        if let PolicyDecision::Deny(reason) = self.policy.evaluate(&spec, context) {
-            return self.error(call, ToolRunStatus::Denied, &reason);
+        match self.policy.evaluate_call(&spec, &call.arguments, context) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Deny(reason) => {
+                return self.error(call, ToolRunStatus::Denied, &reason);
+            }
+            PolicyDecision::RequireApproval(reason) => {
+                let reason = bound(redact_text(&reason), 1_024);
+                let Some(storage) = &self.approvals else {
+                    return self.error(call, ToolRunStatus::Denied, &reason);
+                };
+                let arguments_hash = approval_hash(&spec.name, &call.arguments);
+                match storage.consume_approval(&context.principal, &spec.name, &arguments_hash) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let capability = spec
+                            .required_capabilities
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("tool.approval");
+                        match storage.request_approval(
+                            &context.principal,
+                            capability,
+                            &spec.name,
+                            &arguments_hash,
+                            &reason,
+                        ) {
+                            Ok(approval) => {
+                                return self.error(
+                                    call,
+                                    ToolRunStatus::AwaitingApproval,
+                                    &format!(
+                                        "approval required: {}. Approve request {} then retry",
+                                        approval.summary, approval.id
+                                    ),
+                                );
+                            }
+                            Err(error) => {
+                                return self.error(
+                                    call,
+                                    ToolRunStatus::Denied,
+                                    &format!("approval could not be recorded: {error}"),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        return self.error(
+                            call,
+                            ToolRunStatus::Denied,
+                            &format!("approval lookup failed: {error}"),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(blocker) = self.capability_blocker(&spec) {
+            return self.error(call, ToolRunStatus::Denied, &blocker);
         }
 
         // Tool implementations never hold the registry lock while awaiting.
-        let timeout_ms = spec.timeout_ms.clamp(1, 120_000);
+        let timeout_ms = spec.timeout_ms.clamp(1, 600_000);
         match timeout(
             Duration::from_millis(timeout_ms),
             tool.execute(context, call.arguments.clone()),
@@ -103,6 +244,34 @@ impl ToolRegistry {
         }
     }
 
+    fn capabilities_satisfiable(&self, spec: &ToolSpec) -> bool {
+        let Some(registry) = &self.capabilities else {
+            return true;
+        };
+        spec.required_capabilities.iter().all(|requirement| {
+            matches!(
+                registry.resolve(requirement).status,
+                CapabilityStatus::Available
+                    | CapabilityStatus::MissingInstallable
+                    | CapabilityStatus::ApprovalRequired
+            )
+        })
+    }
+
+    fn capability_blocker(&self, spec: &ToolSpec) -> Option<String> {
+        let registry = self.capabilities.as_ref()?;
+        spec.required_capabilities.iter().find_map(|requirement| {
+            let resolution = registry.resolve(requirement);
+            match resolution.status {
+                CapabilityStatus::Available | CapabilityStatus::MissingInstallable => None,
+                CapabilityStatus::ApprovalRequired => None,
+                _ => Some(resolution.concrete_blocker.unwrap_or_else(|| {
+                    format!("capability {} is unavailable", resolution.canonical)
+                })),
+            }
+        })
+    }
+
     fn error(&self, call: &ToolCall, status: ToolRunStatus, message: &str) -> ToolExecution {
         ToolExecution {
             result: ToolResult {
@@ -116,17 +285,17 @@ impl ToolRegistry {
     }
 }
 
+fn approval_hash(tool_name: &str, arguments: &serde_json::Value) -> String {
+    let canonical = serde_json::to_vec(arguments).unwrap_or_default();
+    let mut digest = Sha256::new();
+    digest.update(tool_name.as_bytes());
+    digest.update([0]);
+    digest.update(canonical);
+    format!("{:x}", digest.finalize())
+}
+
 fn validate_spec(spec: &ToolSpec) -> Result<()> {
-    let valid_name = !spec.name.is_empty()
-        && spec.name.len() <= 64
-        && spec.name.chars().enumerate().all(|(index, character)| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit() && index > 0
-                || character == '_' && index > 0
-        });
-    if !valid_name {
-        return Err(anyhow!("tool name must be canonical snake_case"));
-    }
+    validate_tool_name(&spec.name)?;
     if spec.description.trim().is_empty() || spec.description.chars().count() > 1_000 {
         return Err(anyhow!("tool description is empty or too long"));
     }
@@ -136,7 +305,30 @@ fn validate_spec(spec: &ToolSpec) -> Result<()> {
     if spec.timeout_ms == 0 {
         return Err(anyhow!("tool timeout must be positive"));
     }
+    for capability in &spec.required_capabilities {
+        if capability.trim().is_empty()
+            || capability.chars().count() > 160
+            || capability.contains(['\0', '\r', '\n'])
+        {
+            return Err(anyhow!("tool capability requirement is invalid"));
+        }
+    }
     Ok(())
+}
+
+fn validate_tool_name(name: &str) -> Result<()> {
+    let valid_name = !name.is_empty()
+        && name.len() <= 64
+        && name.chars().enumerate().all(|(index, character)| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit() && index > 0
+                || character == '_' && index > 0
+        });
+    if valid_name {
+        Ok(())
+    } else {
+        Err(anyhow!("tool name must be canonical snake_case"))
+    }
 }
 
 fn bound(value: String, max_chars: usize) -> String {
@@ -152,7 +344,15 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{json, Value};
 
-    use crate::{storage::MessageRecord, tools::ToolRisk};
+    use crate::{
+        runtime::{
+            CapabilityRegistry, ExecutionBackend, RuntimeEnvironment, SelinuxState,
+            TermuxEnvironment,
+        },
+        storage::MessageRecord,
+        tools::{ToolEffect, ToolOrigin, ToolRisk},
+    };
+    use std::{collections::BTreeMap, path::PathBuf};
 
     struct FakeTool {
         name: &'static str,
@@ -169,6 +369,9 @@ mod tests {
                 description: "A bounded test tool".into(),
                 parameters: json!({"type":"object"}),
                 risk: self.risk,
+                origin: ToolOrigin::Builtin,
+                effect: ToolEffect::None,
+                required_capabilities: Vec::new(),
                 timeout_ms: 10,
             }
         }
@@ -191,6 +394,8 @@ mod tests {
                 content: "hello".into(),
                 created_at: "now".into(),
             }],
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            progress: None,
         }
     }
 
@@ -278,5 +483,67 @@ mod tests {
             .await;
         assert!(slow.result.is_error);
         assert!(slow.result.output.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn privileged_tool_requires_exact_durable_one_shot_approval() {
+        let environment = RuntimeEnvironment {
+            platform: "android".into(),
+            os_version: None,
+            android_version: Some("14".into()),
+            device_model: None,
+            architecture: "aarch64".into(),
+            xiao_version: crate::VERSION.into(),
+            effective_uid: 0,
+            root_available: true,
+            root_evidence: "test root".into(),
+            selinux: SelinuxState::Enforcing,
+            termux: Some(TermuxEnvironment {
+                prefix: PathBuf::from("/termux/usr"),
+                home: PathBuf::from("/termux/home"),
+                path: "/termux/usr/bin".into(),
+                shell: PathBuf::from("/termux/usr/bin/sh"),
+                package_manager: None,
+                uid: Some(10234),
+                gid: Some(10234),
+            }),
+            data_root: PathBuf::from("/xiao"),
+            workspace_writable: true,
+            binaries: BTreeMap::new(),
+            execution_backends: vec![ExecutionBackend::AndroidPrivileged],
+            probed_at: "now".into(),
+        };
+        let capabilities = Arc::new(CapabilityRegistry::from_environment(&environment));
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let registry =
+            ToolRegistry::with_runtime(ToolPolicy::default(), 1_024, capabilities, storage.clone());
+        registry
+            .register(FakeTool {
+                name: "android_xiao_restart",
+                risk: ToolRisk::Privileged,
+                output: "{\"verified\":true}".into(),
+                delay_ms: 0,
+            })
+            .unwrap();
+        // The test fake needs the same capability declaration as the real
+        // typed tool, so wrap its canonical spec through an adapter.
+        let call = ToolCall {
+            call_id: "approval-1".into(),
+            name: "android_xiao_restart".into(),
+            arguments: json!({}),
+        };
+        let first = registry.execute(&call, &context()).await;
+        assert_eq!(first.status, ToolRunStatus::AwaitingApproval);
+        let pending = storage.pending_approvals("p").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(storage.decide_approval("p", &pending[0].id, true).unwrap());
+        let second = registry.execute(&call, &context()).await;
+        assert_eq!(second.status, ToolRunStatus::Succeeded);
+        let third = registry.execute(&call, &context()).await;
+        assert_eq!(third.status, ToolRunStatus::AwaitingApproval);
+        assert!(registry
+            .available_specs(&context())
+            .iter()
+            .all(|spec| spec.name != "root" && spec.name != "shell"));
     }
 }
