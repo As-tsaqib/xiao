@@ -1,9 +1,16 @@
-# xiao v0.1.0
+# xiao v0.2.0
 
-xiao is a Rust AI-agent gateway for Android. `xiaod` owns configuration,
+xiao is a persistent Rust AI agent for Android. `xiaod` owns configuration,
 SQLite state, principal-scoped sessions, provider authentication, provider
-transports, and agent execution. The `xiao` CLI, Telegram, and KernelSU WebUI
-are adapters over the same semantic Command Core.
+transports, bounded context, long-term memory, procedural skills, and agent
+execution. The `xiao` CLI, Telegram, and KernelSU WebUI are adapters over the
+same semantic Command Core.
+
+v0.2.0 adds a registry-driven typed tool runtime, durable agent/tool audit
+runs, editable principal-scoped memory, SQLite FTS5 session retrieval,
+character-budgeted context with durable summaries, and verified
+post-completion skill learning. Memory is current state: a changed preference
+updates its canonical key, and an explicit forget removes the active row.
 
 The release ships as one root-level KernelSU/Magisk-compatible module ZIP.
 Flashing that ZIP installs the daemon, watchdog, WebUI, and managed Termux
@@ -11,7 +18,7 @@ wrappers together. Mutable state stays outside the replaceable module payload.
 
 ## Install
 
-1. Download `xiao-v0.1.0-kernelsu-arm64.zip`.
+1. Download `xiao-v0.2.0-kernelsu-arm64.zip`.
 2. Flash the ZIP in KernelSU Next (or a compatible module manager).
 3. Reboot Android.
 4. Open Termux and run:
@@ -77,14 +84,23 @@ KernelSU WebUI -> admin IPC ─────┘                              │ 
 - Inline menus are edit-first with stale-revision protection.
 - Progress drafts are ephemeral and contain bounded safe status only; final
   answers are persistent Rich Message views.
-- Provider calls and tools use typed interfaces. There is no unrestricted
+- Provider calls and tools use canonical typed interfaces. `ToolRegistry` and
+  `ToolPolicy` expose only bounded semantic tools (`context_stats`, memory,
+  session search, and skill retrieval); there is no unrestricted
   model-generated string to root shell path.
+- Context is assembled from system/security rules, current user and agent
+  memory, selected relevant skills, session summaries/retrieval, recent turns,
+  and the current request under a character budget. Raw history is never
+  deleted by compression.
+- Successful tool boundaries are audited in `agent_runs`/`tool_runs`.
+  Interrupted work is quarantined rather than blindly replayed.
 - IPC is loopback-only with separate client/admin credentials.
 - The managed Termux wrapper invokes KernelSU `su` only for the fixed,
   shell-quoted module binary; model output never reaches this root shell path.
 - Secrets are outside normal config, private where supported, and redacted
   from surfaced logs/errors.
-- `/compact` remains absent in v0.1.0.
+- `/compact` remains absent in v0.2.0; bounded summary creation is an internal
+  ContextEngine responsibility.
 
 Core semantic commands are `/new`, `/btw`, `/session`, `/model`, `/provider`,
 `/account`, `/login`, `/logout`, `/status`, `/context`, `/stop`, `/retry`,
@@ -126,12 +142,12 @@ requires byte-identical ZIP hashes, verifies the checksum and ZIP integrity,
 and uploads exactly these two files:
 
 ```text
-xiao-v0.1.0-kernelsu-arm64.zip
-xiao-v0.1.0-kernelsu-arm64.zip.sha256
+xiao-v0.2.0-kernelsu-arm64.zip
+xiao-v0.2.0-kernelsu-arm64.zip.sha256
 ```
 
 Run the workflow from a push/pull request or `workflow_dispatch`, then download
-the `xiao-v0.1.0-kernelsu-arm64` artifact. Do not use an older local `dist/`
+the `xiao-v0.2.0-kernelsu-arm64` artifact. Do not use an older local `dist/`
 archive after changing source. A local source-only check is available and never
 invokes Cargo:
 

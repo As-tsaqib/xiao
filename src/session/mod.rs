@@ -185,11 +185,8 @@ impl SessionManager {
         if c.mode == ChatMode::Side {
             out.extend(self.storage.messages(principal, &c.active.id)?);
         }
-        // Bound transmitted context while preserving the complete SQLite history.
-        const MAX_MESSAGES: usize = 80;
-        if out.len() > MAX_MESSAGES {
-            out = out.split_off(out.len() - MAX_MESSAGES);
-        }
+        // Compatibility accessor for views/tests. Agent transmission is now
+        // bounded by ContextEngine using a character budget, not a row count.
         Ok(out)
     }
 

@@ -9,6 +9,12 @@ auto_restart = false
 [daemon]
 log_level = "info"
 
+[agent]
+max_turns = 8
+context_max_chars = 32000
+summary_threshold_chars = 24000
+tool_output_max_chars = 4096
+
 [telegram]
 enabled = false
 transport = "long_polling"

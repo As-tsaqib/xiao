@@ -1,6 +1,6 @@
 [package]
 name = "xiao-gateway"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "xiao Telegram-first AI agent gateway for rooted Android"

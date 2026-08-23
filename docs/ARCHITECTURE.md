@@ -1,72 +1,156 @@
-# xiao v0.1.0 Architecture
+# Xiao v0.2.0 Architecture
 
-## Ownership boundaries
+## Runtime ownership
 
-`xiaod` owns all durable application state. `AppState` wires an `AppConfig`, `Storage`, `SessionManager`, `AuthManager`, `ProviderRegistry`, `CommandCore`, health state, and internal event bus. Frontends only translate transport-specific input into semantic commands and translate semantic `View`/`CommandResult` output back to their transport.
+`xiaod` remains the only durable application owner. `AppState` wires
+configuration, SQLite storage, sessions, authentication, providers,
+`CommandCore`, health state, and the event bus. Telegram, CLI/IPC, and WebUI
+remain adapters; they do not own independent agent engines or durable state.
 
-The Command Core is the convergence point. Telegram messages, inline keyboard actions, and Termux requests all call the same semantic core. WebUI is intentionally an administrative adapter: it uses authenticated local admin endpoints for configuration/status and never becomes a second session/agent engine.
+`CommandCore` is the semantic convergence point for frontend commands. A chat
+request enters the principal-scoped `AgentEngine`, captures its target session,
+and retains that target even if the frontend switches sessions concurrently.
+Only safe typed `AgentEvent` progress crosses the frontend boundary. Hidden
+provider reasoning is neither modeled nor persisted.
 
-## Telegram
+## Agent and provider loop
 
-`TelegramAdapter` uses `getUpdates` long polling with a durable SQLite inbox and reconnect backoff. Acceptance of an update and advancement of the Telegram offset happen in one transaction. Accepted-but-unclaimed rows are replayed after restart. Once a row is claimed (`processing`), a crash or handler error is an uncertainty boundary: the row is quarantined as `interrupted`/`failed` instead of being automatically replayed, preventing duplicated destructive semantic commands. ACL is checked before any pending-input capture, command parsing, agent dispatch, or provider call.
+Each generation creates an `agent_runs` row before context/provider setup. The
+runtime builds bounded context, resolves the provider/model, then performs at
+most `[agent].max_turns` provider turns. A provider may return a final answer or
+canonical `ToolCall` values. Every tool call is persisted before execution,
+marked running, and finished as `succeeded`, `failed`, `denied`, or
+`interrupted`. Tool errors become provider observations instead of daemon
+crashes.
 
-The poller never waits for long-running generation. Accepted updates are dispatched into asynchronous tasks; independent principals can make progress concurrently. Non-generation semantic commands for one Telegram principal pass through a per-principal mutation lane, while provider generation deliberately runs outside that lane. Agent generation itself is cancellable per principal, and `/stop` resolves/cancels the active `CancellationToken` without waiting for the original provider request to finish. A generation captures its immutable target session ID before provider execution, so a concurrent session switch cannot redirect the final write.
+The provider contract receives canonical `ToolSpec` values selected by the
+agent runtime. Providers only translate them to wire format and parse calls;
+they do not discover tools, apply policy, or execute tools. Codex declares
+tool-continuation capability. Providers without that capability receive no
+advertised tools, and an unexpected tool-call response is an explicit error.
 
-Interactive views are stored as short-lived in-memory `MenuSession` records containing owner, chat/message IDs, current `View`, Back history, revision, expiry, and optional next-message capture. Callback data is `m:<10-char-id>:<revision-hex>:<index-hex>`, safely below Telegram's 64-byte limit. The callback spinner is acknowledged before waiting for the per-menu lock. Owner and revision are rechecked before mutation.
+Completion moves through `running → verifying → completed`. A nonempty final
+answer and resolved observable tool results are required. Failed, denied, or
+interrupted tool work must be followed by a later successful recovery of the
+same tool to verify completion. Information-only answers can complete without
+tools, but are not considered meaningful reusable procedures.
 
-Navigation is edit-first: rich edit, plain edit, rich replacement, then plain replacement. On replacement, the previous keyboard is retired. Persistent session/provider/model/account state remains in the daemon even when the ephemeral menu expires.
+Cancellation is checked at provider and tool boundaries. Startup changes any
+persisted in-flight agent/tool runs to `interrupted`; uncertain side effects are
+never automatically replayed.
 
-Agent progress uses one `sendRichMessageDraft` draft ID per update and is throttled to roughly 750 ms. A conservative 20-second heartbeat refreshes the same draft while generation is active, below the current Telegram draft-preview lifetime, so silent provider/tool periods do not make progress disappear. Only safe status/tool summaries from the typed `AgentEvent` channel are rendered. The active semantic activity (`Thinking`, analysis, search, fetch, tool, code, media, or writing) is represented by an animated custom emoji from Telegram's official AI Actions set inside the native draft-only `thinking` block. Completed meaningful work becomes a quiet check-mark row; transient thinking/writing states are replaced instead of accumulating. The emoji itself animates client-side, so xiao does not consume the Bot API rate limit with manual animation frames. Final output is parsed into the transport-neutral Presentation AST and sent as one or more separate persistent Rich Messages; progress blocks never enter final history.
+## Tool registry and policy
 
-## Sessions and `/btw`
+`ToolRegistry` owns canonical identity and implementation lookup, rejects
+duplicate names, advertises only policy-allowed specs, applies per-tool
+timeouts, redacts output, and enforces a configured output bound.
+`ToolPolicy` permits read-only tools and only the explicitly approved
+`memory_set`/`memory_delete` side effects. Sensitive, destructive, privileged,
+and unapproved side-effect tools are denied.
 
-Main sessions are durable rows in SQLite and every row has an immutable `owner_principal`. Telegram uses the principal form `telegram:<chat_id>:<user_id>`, which intentionally isolates two users even when they share an authorized group chat. Ownership is enforced in storage queries and mutations (not merely UI filtering) for list, switch, detail/history, rename, archive, messages, context/retry, and side-session access. `/new` creates and activates another main session for the same principal without deleting older sessions. The session manager lists five rows per page. Rename's “next message” is a frontend UI capture only; the eventual rename still executes as `/session rename <id> <name>` through Command Core.
+The v0.2.0 built-ins are:
 
-SIDE mode creates a child side-session bound to one main session and inherits that main session's owner. Agent context is main history plus side history, but user/assistant writes target only the active side session. Toggling `/btw` while in SIDE returns to MAIN, so nesting is impossible. The final renderer visibly labels SIDE replies.
+- `context_stats`
+- `memory_search`, `memory_set`, `memory_delete`
+- `session_search`
+- `skill_search`, `skill_view`
 
-## Providers and authentication
+There is no command/process/root-shell tool. Skills and memories are data, not
+capabilities, and cannot register tools or bypass policy.
 
-Provider-specific HTTP/auth details live behind `Provider` and `AuthManager` boundaries. Sessions bind `provider`, `account_id`, and `model`. The semantic `UseAccount` operation resolves the target account/provider/default valid model first and then commits provider + account + model as one SQLite transaction; failure cannot leave a half-switched session.
+## Long-term memory
 
-The agent loop is typed: a provider can return `ToolCalls`, `ToolRouter` applies the v0.1.0 allowlist/policy and timeout/output limits, results are emitted as safe `AgentEvent`s and returned to the provider for continuation. v0.1.0 intentionally exposes only bounded internal tools (for example context statistics); there is no model-controlled arbitrary process or root-shell executor. Provider streaming consumes SSE incrementally rather than buffering an entire response before emitting progress.
+Memory is editable current state, keyed by
+`(owner_principal, scope, category, key)`. SQLite enforces that uniqueness.
+`MemoryStore::upsert` updates an existing canonical row, while
+`memory_history` records create/update/delete audit events separately. Only
+active `memories` rows enter normal context.
 
-Credentials are per account and stored separately in SecretStore. Refresh uses per-account async locks to avoid concurrent refresh races. Codex browser login follows CLIProxyAPI's Authorization Code + PKCE contract and binds its localhost callback only for the active transaction. Antigravity follows CLIProxyAPI's installed-app OAuth flow, userinfo lookup, and `loadCodeAssist`/`onboardUser` project bootstrap. Its localhost callback is likewise transaction-scoped. Both adapters can change endpoint/auth details without changing Telegram/Termux or Command Core.
+The `user` scope holds durable user preferences/facts; `agent` holds durable
+project knowledge learned for that principal. Canonical aliases collapse
+common overlapping keys such as answer style/verbosity into
+`preference.response_style`. Deterministic explicit handling recognizes stable
+preference changes and bounded `remember … X is Y` facts before the provider is
+called. Explicit forget removes matching active state. Arbitrary mutations
+remain available through typed memory tools.
 
-## Storage
+Memory values and sensitive identities are bounded and credential-screened.
+Structured tool arguments are recursively redacted before audit persistence.
+Implicit learning is deliberately conservative and runs only after verified
+completion.
 
-SQLite enables WAL and foreign keys. Versioned, additive migrations create/upgrade sessions (including ownership), messages, frontend state, provider accounts, settings, Telegram durable inbox/offset state, and audit-event storage without destroying existing user data. Full message history persists; effective provider context is bounded without deleting history. Synchronous `rusqlite` work is kept behind a short mutex and enters a Tokio blocking boundary on the multithread runtime so database work does not monopolize an async worker. The daemon checkpoints WAL during graceful shutdown.
+## Retrieval and context
 
-## IPC and Termux
+Raw messages remain authoritative and are never deleted by context
+compression. `messages_fts` is maintained by SQLite triggers and joined back to
+owned sessions for every search, so results cannot cross principal boundaries.
+`session_search` bounds both result count and content size and redacts likely
+credential material.
 
-IPC refuses non-loopback binds. Bearer credentials are split by privilege and compared in constant time: the limited client token reaches command/status/log routes, while a separate root-only admin token is required for snapshot/config/token-test/client-provisioning routes. Both are generated on first daemon start and stored as secrets. The module watchdog writes a root-owned client config from only the limited token; the managed Termux wrapper never prints or copies it into the Termux home.
+`ContextEngine` replaces the old row-count truncation strategy. It assembles:
 
-Normal Termux commands post to `/v1/command`, so they use the same semantic core as Telegram. `xiao logs` calls the redacted log endpoint. The flashable module installs a managed Termux wrapper that elevates only the fixed module CLI, points it at the root-owned limited client config, and quotes every forwarded argument. `admin` subcommands require the separate local admin credential; they are for the root-owned module/WebUI context, not model-generated commands.
+1. immutable Xiao system/security instructions;
+2. active user memory;
+3. active agent/project memory;
+4. selected relevant skills;
+5. durable session summaries;
+6. retrieved prior history when the request refers to earlier work;
+7. newest conversation turns;
+8. the current user request.
 
-## KernelSU lifecycle
+Selection uses an approximate character budget. System/security instructions
+and the current request are always retained, even when those protected fields
+alone exceed the nominal budget. Older raw turns are trimmed first. When the
+unsummarized middle exceeds the configured threshold, Xiao stores a bounded
+extractive `session_summaries` row and retains recent turns intact; source
+messages remain in SQLite.
 
-`post-fs-data.sh` initializes private directories and removes reboot-stale runtime PID files. `service.sh` runs during late-start, waits only a bounded time for Android boot completion, synchronizes the Termux wrappers, and detaches `watchdog.sh`. The watchdog tracks the child PID by executable identity, forwards termination, provisions the limited local client config, applies bounded exponential restart backoff, honors `auto_restart`, and bounds log growth. Mutable files live in `/data/adb/xiao`; module updates replace only `/data/adb/modules/xiao` content.
+## Skills and learning
 
-WebUI restart never tears down and respawns the supervisor from the short-lived
-KernelSU WebUI execution context. It writes an explicit restart request, sends
-TERM only to the owned `xiaod` child, and waits until the persistent watchdog
-publishes a replacement PID. Explicit restart bypasses crash backoff, while a
-full stop still shuts down both processes.
+A skill is principal-scoped procedural memory containing `name`, `summary`,
+`when_to_use`, `procedure`, `pitfalls`, and `verification`. SQLite FTS indexes
+searchable fields. Context searches skill summaries from the current request
+and progressively discloses only selected full skills rather than injecting
+the entire registry.
 
-The module WebUI is intentionally narrow: one Gateway/Daemon status rail,
-Restart/Refresh, a Telegram form containing only bot token and one Chat ID, and
-an OpenAI-compatible Custom provider form. Codex and Antigravity OAuth never
-appear as WebUI credential fields; `/login` in Telegram owns those flows. The
-Custom form discovers `/models` through authenticated root admin IPC and can
-reuse the stored API key without returning it to JavaScript. All WebUI admin
-commands pass through `action.sh`, which supplies the same explicit root paths
-as the watchdog. Telegram ACL and Custom provider changes hot reload; a new bot
-token requests a daemon restart after validation.
+`LearningEvaluator` accepts a bounded observable trace: goal, safe tool
+observations, final observable result, and verification evidence. It has no
+hidden-reasoning field. Learning is skipped for failed, cancelled, interrupted,
+unverified, trivial, or non-reusable work. A candidate is searched against
+existing skill intent before creation. Canonical token aliases and overlap
+scoring merge near-synonyms such as `fix-xiao-service-v2` into
+`diagnose-xiao-service`; procedure, pitfalls, and verification are updated in
+one canonical row, with `skill_history` retaining the audit version.
 
-## Security invariants
+## Storage and migrations
 
-There is no generic shell tool callable by the model. Root shell execution
-exists only in fixed KernelSU lifecycle/WebUI administration scripts whose
-arguments are encoded and whose binaries are fixed paths. Telegram
-authorization happens before agent execution. The IPC socket is loopback-only
-and bearer-authenticated. Snapshot APIs return only whether a token/key is
-configured, never its value. Surfaced log/error text passes through redaction.
+SQLite keeps WAL, foreign keys, a short mutex boundary, and graceful-shutdown
+checkpointing. v0.2.0 migrations are additive and idempotent and retain every
+v0.1.0 table. Schema versions add:
+
+- version 6: `agent_runs`, `tool_runs` and lookup indexes;
+- version 7: `memories`, `memory_history`, `memories_fts` and triggers;
+- version 8: `messages_fts`, triggers, and `session_summaries`;
+- version 9: `skills`, `skill_history`, `skills_fts` and triggers.
+
+Migration tests cover a fresh database, a hand-built v0.1.0 database upgrade,
+repeated `migrate()` calls, FTS backfill consistency, and restart quarantine of
+in-flight runs.
+
+## Preserved v0.1.0 invariants
+
+Telegram still uses durable long polling. Inbox acceptance and offset advance
+remain atomic; accepted-but-unclaimed updates replay, while claimed uncertain
+updates are quarantined. ACL is checked before pending-input capture, command
+parsing, agent dispatch, or provider work. Per-principal cancellation and
+MAIN/SIDE ownership/isolation remain unchanged.
+
+IPC still rejects non-loopback binds, authenticates with constant-time checks,
+and separates limited client from root-admin credentials. Credentials remain
+in `SecretStore`; snapshot surfaces presence only. The managed Termux wrapper
+elevates only fixed module binaries. KernelSU/WebUI lifecycle shell paths are
+fixed administrative code and are never reachable from model tool calls.
+
+v0.2.0 deliberately does not add MCP, remote/device nodes, subagents, vector
+databases, autonomous cron, browser automation, plugins, or generic process
+execution.

@@ -19,7 +19,7 @@ use crate::{
     config::{AppConfig, CustomProviderConfig},
     security::redact::redact_text,
     storage::MessageRecord,
-    tools::{ToolCall, ToolResult, ToolRouter},
+    tools::{ToolCall, ToolResult, ToolSpec},
 };
 
 use self::payload::{antigravity_body, chat_messages, responses_payload};
@@ -58,6 +58,10 @@ pub struct ProviderRequest {
     pub account_id: Option<String>,
     pub model: String,
     pub messages: Vec<MessageRecord>,
+    /// Canonical Xiao tool specifications selected by the agent runtime. A
+    /// provider may translate these, but never discovers or executes tools.
+    #[serde(default)]
+    pub tools: Vec<ToolSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +93,9 @@ pub trait Provider: Send + Sync {
         true
     }
     fn ready(&self) -> bool;
+    fn supports_tool_continuation(&self) -> bool {
+        false
+    }
     async fn run(
         &self,
         req: ProviderRequest,
@@ -376,6 +383,9 @@ impl Provider for CodexProvider {
     fn ready(&self) -> bool {
         self.enabled
     }
+    fn supports_tool_continuation(&self) -> bool {
+        true
+    }
     async fn run(
         &self,
         req: ProviderRequest,
@@ -430,7 +440,7 @@ impl Provider for CodexProvider {
         for result in tool_results {
             input.push(serde_json::json!({"type":"function_call_output","call_id":result.call_id,"output":result.output}));
         }
-        let tools = ToolRouter.definitions();
+        let tools = responses_tool_specs(&req.tools);
         let body = serde_json::json!({
             "model": req.model,
             "instructions": payload.instructions.unwrap_or_else(|| CODEX_DEFAULT_INSTRUCTIONS.into()),
@@ -477,6 +487,21 @@ impl Provider for CodexProvider {
             events: vec![AgentEvent::Status("Generating with Codex".into())],
         })
     }
+}
+
+fn responses_tool_specs(specs: &[ToolSpec]) -> Vec<serde_json::Value> {
+    specs
+        .iter()
+        .map(|spec| {
+            serde_json::json!({
+                "type": "function",
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+                "strict": true,
+            })
+        })
+        .collect()
 }
 
 struct AntigravityProvider {
@@ -1048,7 +1073,23 @@ mod tests {
             account_id: None,
             model: "model-a".into(),
             messages,
+            tools: vec![],
         }
+    }
+
+    #[test]
+    fn provider_translates_canonical_tool_specs_without_owning_policy() {
+        let wire = responses_tool_specs(&[ToolSpec {
+            name: "context_stats".into(),
+            description: "Describe bounded context".into(),
+            parameters: serde_json::json!({"type":"object"}),
+            risk: crate::tools::ToolRisk::ReadOnly,
+            timeout_ms: 5_000,
+        }]);
+        assert_eq!(wire[0]["type"], "function");
+        assert_eq!(wire[0]["name"], "context_stats");
+        assert!(wire[0].get("risk").is_none());
+        assert!(wire[0].get("timeout_ms").is_none());
     }
 
     fn test_auth() -> (Arc<AuthManager>, tempfile::TempDir) {

@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub paths: PathsConfig,
     #[serde(default)]
     pub providers: ProvidersConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
 }
 
 impl AppConfig {
@@ -67,13 +69,33 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         let addr: SocketAddr = self.ipc.bind.parse().context("invalid ipc.bind")?;
         if !addr.ip().is_loopback() {
-            return Err(anyhow!("ipc.bind must be loopback-only in v0.1.0"));
+            return Err(anyhow!("ipc.bind must be loopback-only in v0.2.0"));
         }
         if self.telegram.transport != "long_polling" {
-            return Err(anyhow!("telegram.transport must be long_polling in v0.1.0"));
+            return Err(anyhow!("telegram.transport must be long_polling in v0.2.0"));
         }
         if self.telegram.ui.menu_ttl_seconds == 0 {
             return Err(anyhow!("telegram.ui.menu_ttl_seconds must be > 0"));
+        }
+        if !(2..=32).contains(&self.agent.max_turns) {
+            return Err(anyhow!("agent.max_turns must be between 2 and 32"));
+        }
+        if !(4_096..=1_000_000).contains(&self.agent.context_max_chars) {
+            return Err(anyhow!(
+                "agent.context_max_chars must be between 4096 and 1000000"
+            ));
+        }
+        if self.agent.summary_threshold_chars < 1_024
+            || self.agent.summary_threshold_chars > self.agent.context_max_chars
+        {
+            return Err(anyhow!(
+                "agent.summary_threshold_chars must be at least 1024 and not exceed agent.context_max_chars"
+            ));
+        }
+        if !(1_024..=65_536).contains(&self.agent.tool_output_max_chars) {
+            return Err(anyhow!(
+                "agent.tool_output_max_chars must be between 1024 and 65536"
+            ));
         }
         if !matches!(
             self.telegram.ui.progress_detail.as_str(),
@@ -171,6 +193,31 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// Bounded runtime controls. Defaults are deliberately conservative and are
+/// applied when upgrading a v0.1 configuration that has no `[agent]` table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentConfig {
+    #[serde(default = "default_agent_max_turns")]
+    pub max_turns: usize,
+    #[serde(default = "default_context_max_chars")]
+    pub context_max_chars: usize,
+    #[serde(default = "default_summary_threshold_chars")]
+    pub summary_threshold_chars: usize,
+    #[serde(default = "default_tool_output_max_chars")]
+    pub tool_output_max_chars: usize,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            max_turns: default_agent_max_turns(),
+            context_max_chars: default_context_max_chars(),
+            summary_threshold_chars: default_summary_threshold_chars(),
+            tool_output_max_chars: default_tool_output_max_chars(),
+        }
     }
 }
 
@@ -467,6 +514,18 @@ fn default_secrets_dir() -> PathBuf {
 fn default_custom_protocol() -> String {
     "openai_chat_completions".into()
 }
+fn default_agent_max_turns() -> usize {
+    8
+}
+fn default_context_max_chars() -> usize {
+    32_000
+}
+fn default_summary_threshold_chars() -> usize {
+    24_000
+}
+fn default_tool_output_max_chars() -> usize {
+    4_096
+}
 fn default_google_auth_url() -> String {
     "https://accounts.google.com/o/oauth2/v2/auth".into()
 }
@@ -556,5 +615,22 @@ mod tests {
             PathBuf::from("/tmp/xiao-user/data/xiao.db")
         );
         assert!(!c.telegram.enabled);
+    }
+
+    #[test]
+    fn legacy_configuration_gets_bounded_agent_defaults() {
+        let config: AppConfig = toml::from_str("[ipc]\nbind='127.0.0.1:37921'\n").unwrap();
+        assert_eq!(config.agent, AgentConfig::default());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_unbounded_agent_runtime_configuration() {
+        let mut config = AppConfig::default();
+        config.agent.max_turns = 0;
+        assert!(config.validate().is_err());
+        config.agent = AgentConfig::default();
+        config.agent.summary_threshold_chars = config.agent.context_max_chars + 1;
+        assert!(config.validate().is_err());
     }
 }

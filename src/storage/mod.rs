@@ -34,6 +34,25 @@ pub struct MessageRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredMessageRecord {
+    pub id: i64,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSummaryRecord {
+    pub session_id: String,
+    pub owner_principal: String,
+    pub summary: String,
+    pub covered_through_message_id: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountRecord {
     pub id: String,
@@ -53,6 +72,35 @@ pub struct TelegramInboxRecord {
     pub attempts: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunRecord {
+    pub id: String,
+    pub owner_principal: String,
+    pub session_id: String,
+    pub provider: String,
+    pub model: String,
+    pub status: String,
+    pub goal: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolRunRecord {
+    pub id: String,
+    pub agent_run_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    pub arguments_json: String,
+    pub risk: String,
+    pub status: String,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -68,6 +116,7 @@ impl Storage {
             conn: Mutex::new(conn),
         };
         s.migrate()?;
+        s.recover_interrupted_runs()?;
         Ok(s)
     }
 
@@ -78,6 +127,7 @@ impl Storage {
             conn: Mutex::new(conn),
         };
         s.migrate()?;
+        s.recover_interrupted_runs()?;
         Ok(s)
     }
 
@@ -178,11 +228,177 @@ impl Storage {
         CREATE INDEX IF NOT EXISTS idx_sessions_owner_main ON sessions(owner_principal,is_side,archived,last_active_at);
         INSERT OR IGNORE INTO schema_migrations(version) VALUES(4),(5);
         "#)?;
+        conn.execute_batch(r#"
+        CREATE TABLE IF NOT EXISTS agent_runs(
+          id TEXT PRIMARY KEY,
+          owner_principal TEXT NOT NULL,
+          session_id TEXT NOT NULL REFERENCES sessions(id),
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          status TEXT NOT NULL,
+          goal TEXT,
+          started_at TEXT NOT NULL,
+          finished_at TEXT,
+          error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_owner_started
+          ON agent_runs(owner_principal,started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_session_started
+          ON agent_runs(session_id,started_at DESC);
+        CREATE TABLE IF NOT EXISTS tool_runs(
+          id TEXT PRIMARY KEY,
+          agent_run_id TEXT NOT NULL REFERENCES agent_runs(id),
+          call_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          arguments_json TEXT NOT NULL,
+          risk TEXT NOT NULL,
+          status TEXT NOT NULL,
+          output TEXT,
+          error TEXT,
+          started_at TEXT,
+          finished_at TEXT,
+          UNIQUE(agent_run_id,call_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tool_runs_agent
+          ON tool_runs(agent_run_id,started_at);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES(6);
+        CREATE TABLE IF NOT EXISTS memories(
+          id TEXT PRIMARY KEY,
+          owner_principal TEXT NOT NULL,
+          scope TEXT NOT NULL CHECK(scope IN ('user','agent')),
+          category TEXT NOT NULL,
+          key TEXT NOT NULL,
+          value TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 1.0,
+          source_kind TEXT NOT NULL,
+          source_session_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(owner_principal,scope,category,key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memories_owner_scope_category
+          ON memories(owner_principal,scope,category,updated_at DESC);
+        CREATE TABLE IF NOT EXISTS memory_history(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          memory_id TEXT,
+          owner_principal TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          category TEXT NOT NULL,
+          key TEXT NOT NULL,
+          action TEXT NOT NULL,
+          old_value TEXT,
+          new_value TEXT,
+          source_session_id TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_history_owner_memory
+          ON memory_history(owner_principal,memory_id,created_at DESC);
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+          owner_principal UNINDEXED,
+          scope UNINDEXED,
+          category,
+          key,
+          value
+        );
+        CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
+          INSERT INTO memories_fts(rowid,owner_principal,scope,category,key,value)
+          VALUES(new.rowid,new.owner_principal,new.scope,new.category,new.key,new.value);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE ON memories BEGIN
+          DELETE FROM memories_fts WHERE rowid=old.rowid;
+          INSERT INTO memories_fts(rowid,owner_principal,scope,category,key,value)
+          VALUES(new.rowid,new.owner_principal,new.scope,new.category,new.key,new.value);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_fts_delete AFTER DELETE ON memories BEGIN
+          DELETE FROM memories_fts WHERE rowid=old.rowid;
+        END;
+        INSERT INTO memories_fts(rowid,owner_principal,scope,category,key,value)
+          SELECT m.rowid,m.owner_principal,m.scope,m.category,m.key,m.value
+          FROM memories m
+          WHERE NOT EXISTS(SELECT 1 FROM memories_fts f WHERE f.rowid=m.rowid);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES(7);
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content);
+        CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+          INSERT INTO messages_fts(rowid,content) VALUES(new.id,new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+          DELETE FROM messages_fts WHERE rowid=old.id;
+          INSERT INTO messages_fts(rowid,content) VALUES(new.id,new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+          DELETE FROM messages_fts WHERE rowid=old.id;
+        END;
+        INSERT INTO messages_fts(rowid,content)
+          SELECT m.id,m.content FROM messages m
+          WHERE NOT EXISTS(SELECT 1 FROM messages_fts f WHERE f.rowid=m.id);
+        CREATE TABLE IF NOT EXISTS session_summaries(
+          session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+          owner_principal TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          covered_through_message_id INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_summaries_owner
+          ON session_summaries(owner_principal,updated_at DESC);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES(8);
+        CREATE TABLE IF NOT EXISTS skills(
+          id TEXT PRIMARY KEY,
+          owner_principal TEXT NOT NULL,
+          name TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          when_to_use TEXT NOT NULL,
+          procedure TEXT NOT NULL,
+          pitfalls TEXT NOT NULL DEFAULT '',
+          verification TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(owner_principal,name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_skills_owner_updated
+          ON skills(owner_principal,updated_at DESC);
+        CREATE TABLE IF NOT EXISTS skill_history(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          skill_id TEXT,
+          owner_principal TEXT NOT NULL,
+          action TEXT NOT NULL,
+          old_content_json TEXT,
+          new_content_json TEXT,
+          source_session_id TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_skill_history_owner_skill
+          ON skill_history(owner_principal,skill_id,created_at DESC);
+        CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
+          owner_principal UNINDEXED,
+          name,
+          summary,
+          when_to_use,
+          procedure
+        );
+        CREATE TRIGGER IF NOT EXISTS skills_fts_insert AFTER INSERT ON skills BEGIN
+          INSERT INTO skills_fts(rowid,owner_principal,name,summary,when_to_use,procedure)
+          VALUES(new.rowid,new.owner_principal,new.name,new.summary,new.when_to_use,new.procedure);
+        END;
+        CREATE TRIGGER IF NOT EXISTS skills_fts_update AFTER UPDATE ON skills BEGIN
+          DELETE FROM skills_fts WHERE rowid=old.rowid;
+          INSERT INTO skills_fts(rowid,owner_principal,name,summary,when_to_use,procedure)
+          VALUES(new.rowid,new.owner_principal,new.name,new.summary,new.when_to_use,new.procedure);
+        END;
+        CREATE TRIGGER IF NOT EXISTS skills_fts_delete AFTER DELETE ON skills BEGIN
+          DELETE FROM skills_fts WHERE rowid=old.rowid;
+        END;
+        INSERT INTO skills_fts(rowid,owner_principal,name,summary,when_to_use,procedure)
+          SELECT s.rowid,s.owner_principal,s.name,s.summary,s.when_to_use,s.procedure
+          FROM skills s
+          WHERE NOT EXISTS(SELECT 1 FROM skills_fts f WHERE f.rowid=s.rowid);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES(9);
+        "#)?;
             Ok(())
         })
     }
 
-    fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         let run = || {
             let mut conn = self
                 .conn
@@ -207,6 +423,227 @@ impl Storage {
         self.with_conn(|conn| {
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
             Ok(())
+        })
+    }
+
+    /// On daemon restart, an in-flight run is an uncertainty boundary. It is
+    /// made terminal instead of being replayed, especially for side effects.
+    fn recover_interrupted_runs(&self) -> Result<()> {
+        self.with_conn(|conn| {
+            let now = Utc::now().to_rfc3339();
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE tool_runs SET status='interrupted',finished_at=?,error=COALESCE(error,'daemon stopped during tool execution') WHERE status IN ('requested','running')",
+                params![now],
+            )?;
+            tx.execute(
+                "UPDATE agent_runs SET status='interrupted',finished_at=?,error=COALESCE(error,'daemon stopped during agent run') WHERE status IN ('running','verifying')",
+                params![now],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn create_agent_run(
+        &self,
+        owner: &str,
+        session_id: &str,
+        provider: &str,
+        model: &str,
+        goal: Option<&str>,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let owns_session: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=? AND owner_principal=?)",
+                params![session_id, owner],
+                |row| row.get(0),
+            )?;
+            if !owns_session {
+                return Err(anyhow::anyhow!("session not found for principal"));
+            }
+            conn.execute(
+                "INSERT INTO agent_runs(id,owner_principal,session_id,provider,model,status,goal,started_at) VALUES(?,?,?,?,?,'running',?,?)",
+                params![id, owner, session_id, provider, model, goal, now],
+            )?;
+            Ok(())
+        })?;
+        Ok(id)
+    }
+
+    pub fn set_agent_run_status(
+        &self,
+        owner: &str,
+        run_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            "running" | "verifying" | "completed" | "failed" | "cancelled" | "interrupted"
+        ) {
+            return Err(anyhow::anyhow!("invalid agent run status"));
+        }
+        let terminal = matches!(status, "completed" | "failed" | "cancelled" | "interrupted");
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE agent_runs SET status=?,error=?,finished_at=CASE WHEN ? THEN ? ELSE NULL END WHERE id=? AND owner_principal=?",
+                params![status, error, terminal, Utc::now().to_rfc3339(), run_id, owner],
+            )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!("agent run not found for principal"));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn set_agent_run_model(&self, owner: &str, run_id: &str, model: &str) -> Result<()> {
+        self.with_conn(|connection| {
+            let changed = connection.execute(
+                "UPDATE agent_runs SET model=? WHERE id=? AND owner_principal=? AND status='running'",
+                params![model, run_id, owner],
+            )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!("running agent run not found for principal"));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn agent_run(&self, owner: &str, run_id: &str) -> Result<Option<AgentRunRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id,owner_principal,session_id,provider,model,status,goal,started_at,finished_at,error FROM agent_runs WHERE id=? AND owner_principal=?",
+                params![run_id, owner],
+                |row| {
+                    Ok(AgentRunRecord {
+                        id: row.get(0)?,
+                        owner_principal: row.get(1)?,
+                        session_id: row.get(2)?,
+                        provider: row.get(3)?,
+                        model: row.get(4)?,
+                        status: row.get(5)?,
+                        goal: row.get(6)?,
+                        started_at: row.get(7)?,
+                        finished_at: row.get(8)?,
+                        error: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn agent_runs(&self, owner: &str, limit: usize) -> Result<Vec<AgentRunRecord>> {
+        self.with_conn(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id,owner_principal,session_id,provider,model,status,goal,started_at,finished_at,error FROM agent_runs WHERE owner_principal=? ORDER BY started_at DESC LIMIT ?",
+            )?;
+            let rows = statement.query_map(params![owner, limit.clamp(1, 500) as i64], |row| {
+                Ok(AgentRunRecord {
+                    id: row.get(0)?,
+                    owner_principal: row.get(1)?,
+                    session_id: row.get(2)?,
+                    provider: row.get(3)?,
+                    model: row.get(4)?,
+                    status: row.get(5)?,
+                    goal: row.get(6)?,
+                    started_at: row.get(7)?,
+                    finished_at: row.get(8)?,
+                    error: row.get(9)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn create_tool_run(
+        &self,
+        agent_run_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+        risk: &str,
+    ) -> Result<String> {
+        if call_id.trim().is_empty() || call_id.chars().count() > 256 {
+            return Err(anyhow::anyhow!("tool call id is empty or too long"));
+        }
+        if tool_name.trim().is_empty() || tool_name.chars().count() > 128 {
+            return Err(anyhow::anyhow!("tool name is empty or too long"));
+        }
+        serde_json::from_str::<serde_json::Value>(arguments_json)
+            .map_err(|_| anyhow::anyhow!("tool audit arguments must be valid JSON"))?;
+        let id = Uuid::new_v4().to_string();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tool_runs(id,agent_run_id,call_id,tool_name,arguments_json,risk,status) VALUES(?,?,?,?,?,?,'requested')",
+                params![id, agent_run_id, call_id, tool_name, arguments_json, risk],
+            )?;
+            Ok(())
+        })?;
+        Ok(id)
+    }
+
+    pub fn set_tool_run_status(
+        &self,
+        tool_run_id: &str,
+        status: &str,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            "requested" | "running" | "succeeded" | "failed" | "interrupted" | "denied"
+        ) {
+            return Err(anyhow::anyhow!("invalid tool run status"));
+        }
+        let starting = status == "running";
+        let terminal = matches!(status, "succeeded" | "failed" | "interrupted" | "denied");
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE tool_runs SET status=?,output=?,error=?,started_at=CASE WHEN ? THEN COALESCE(started_at,?) ELSE started_at END,finished_at=CASE WHEN ? THEN ? ELSE finished_at END WHERE id=?",
+                params![
+                    status,
+                    output,
+                    error,
+                    starting,
+                    Utc::now().to_rfc3339(),
+                    terminal,
+                    Utc::now().to_rfc3339(),
+                    tool_run_id
+                ],
+            )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!("tool run not found"));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn tool_runs(&self, owner: &str, agent_run_id: &str) -> Result<Vec<ToolRunRecord>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT t.id,t.agent_run_id,t.call_id,t.tool_name,t.arguments_json,t.risk,t.status,t.output,t.error,t.started_at,t.finished_at FROM tool_runs t JOIN agent_runs a ON a.id=t.agent_run_id WHERE t.agent_run_id=? AND a.owner_principal=? ORDER BY t.rowid",
+            )?;
+            let rows = statement.query_map(params![agent_run_id, owner], |row| {
+                Ok(ToolRunRecord {
+                    id: row.get(0)?,
+                    agent_run_id: row.get(1)?,
+                    call_id: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    arguments_json: row.get(4)?,
+                    risk: row.get(5)?,
+                    status: row.get(6)?,
+                    output: row.get(7)?,
+                    error: row.get(8)?,
+                    started_at: row.get(9)?,
+                    finished_at: row.get(10)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
     }
 
@@ -421,6 +858,82 @@ impl Storage {
             let mut stmt = conn.prepare("SELECT m.role,m.content,m.created_at FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.session_id=? AND s.owner_principal=? ORDER BY m.id")?;
             let rows = stmt.query_map(params![session_id,owner], |r| Ok(MessageRecord{role:r.get(0)?,content:r.get(1)?,created_at:r.get(2)?}))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn stored_messages(
+        &self,
+        owner: &str,
+        session_id: &str,
+    ) -> Result<Vec<StoredMessageRecord>> {
+        self.with_conn(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT m.id,m.session_id,m.role,m.content,m.created_at FROM messages m JOIN sessions s ON s.id=m.session_id WHERE m.session_id=? AND s.owner_principal=? ORDER BY m.id",
+            )?;
+            let rows = statement.query_map(params![session_id, owner], |row| {
+                Ok(StoredMessageRecord {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn session_summary(
+        &self,
+        owner: &str,
+        session_id: &str,
+    ) -> Result<Option<SessionSummaryRecord>> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT session_id,owner_principal,summary,covered_through_message_id,created_at,updated_at FROM session_summaries WHERE session_id=? AND owner_principal=?",
+                    params![session_id, owner],
+                    |row| {
+                        Ok(SessionSummaryRecord {
+                            session_id: row.get(0)?,
+                            owner_principal: row.get(1)?,
+                            summary: row.get(2)?,
+                            covered_through_message_id: row.get(3)?,
+                            created_at: row.get(4)?,
+                            updated_at: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn upsert_session_summary(
+        &self,
+        owner: &str,
+        session_id: &str,
+        summary: &str,
+        covered_through_message_id: i64,
+    ) -> Result<()> {
+        if summary.trim().is_empty() || summary.chars().count() > 8_192 {
+            return Err(anyhow::anyhow!("session summary is empty or too long"));
+        }
+        self.with_conn(|connection| {
+            let owns_session: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=? AND owner_principal=?)",
+                params![session_id, owner],
+                |row| row.get(0),
+            )?;
+            if !owns_session {
+                return Err(anyhow::anyhow!("session not found for principal"));
+            }
+            let now = Utc::now().to_rfc3339();
+            connection.execute(
+                "INSERT INTO session_summaries(session_id,owner_principal,summary,covered_through_message_id,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary,covered_through_message_id=excluded.covered_through_message_id,updated_at=excluded.updated_at WHERE session_summaries.owner_principal=excluded.owner_principal",
+                params![session_id, owner, summary, covered_through_message_id, now, now],
+            )?;
+            Ok(())
         })
     }
 
@@ -640,7 +1153,10 @@ fn row_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::context::SessionHistoryStore;
     #[test]
     fn persists_session_and_messages() {
         let db = Storage::open_memory().unwrap();
@@ -805,5 +1321,137 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].update_id, 11);
         assert_eq!(pending[0].attempts, 0);
+    }
+
+    #[test]
+    fn v020_migration_is_fresh_and_idempotent_with_consistent_fts() {
+        let db = Storage::open_memory().unwrap();
+        let session = db
+            .create_session("p", "fresh", "custom", None, "m", false, None)
+            .unwrap();
+        db.append_message("p", &session.id, "user", "migration sentinel")
+            .unwrap();
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+        db.with_conn(|connection| {
+            let latest: i64 =
+                connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(latest, 9);
+            for table in [
+                "agent_runs",
+                "tool_runs",
+                "memories",
+                "memory_history",
+                "messages_fts",
+                "session_summaries",
+                "skills",
+                "skill_history",
+                "skills_fts",
+            ] {
+                let exists: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)",
+                    params![table],
+                    |row| row.get(0),
+                )?;
+                assert!(exists, "missing migration object {table}");
+            }
+            let indexed: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'migration'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(indexed, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn v010_database_upgrades_additively_without_losing_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.db");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
+                    INSERT INTO schema_migrations(version) VALUES(1),(2),(3);
+                    CREATE TABLE sessions(
+                      id TEXT PRIMARY KEY,name TEXT NOT NULL,provider TEXT NOT NULL DEFAULT 'custom',
+                      account_id TEXT,model TEXT NOT NULL DEFAULT 'default',archived INTEGER NOT NULL DEFAULT 0,
+                      is_side INTEGER NOT NULL DEFAULT 0,parent_id TEXT,created_at TEXT NOT NULL,last_active_at TEXT NOT NULL
+                    );
+                    CREATE TABLE messages(
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                      role TEXT NOT NULL,content TEXT NOT NULL,created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE frontend_state(
+                      principal TEXT PRIMARY KEY,active_main_session_id TEXT NOT NULL,
+                      side_session_id TEXT,mode TEXT NOT NULL DEFAULT 'main'
+                    );
+                    INSERT INTO sessions(id,name,provider,model,created_at,last_active_at)
+                      VALUES('legacy-session','Legacy','custom','m','now','now');
+                    INSERT INTO messages(session_id,role,content,created_at)
+                      VALUES('legacy-session','user','upgrade sentinel survives','now');
+                    INSERT INTO frontend_state(principal,active_main_session_id,mode)
+                      VALUES('legacy:owner','legacy-session','main');
+                    "#,
+                )
+                .unwrap();
+        }
+        let upgraded = Arc::new(Storage::open(&path).unwrap());
+        let session = upgraded
+            .session("legacy:owner", "legacy-session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.owner_principal, "legacy:owner");
+        assert_eq!(
+            upgraded
+                .messages("legacy:owner", &session.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let hits = SessionHistoryStore::new(upgraded.clone())
+            .search("legacy:owner", "upgrade sentinel", 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(SessionHistoryStore::new(upgraded)
+            .search("other", "upgrade sentinel", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn reopen_quarantines_inflight_agent_and_tool_runs_without_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runs.db");
+        let (run_id, tool_id) = {
+            let db = Storage::open(&path).unwrap();
+            let session = db
+                .create_session("p", "run", "custom", None, "m", false, None)
+                .unwrap();
+            let run = db
+                .create_agent_run("p", &session.id, "custom", "m", Some("goal"))
+                .unwrap();
+            let tool = db
+                .create_tool_run(&run, "call", "memory_set", "{}", "side_effect")
+                .unwrap();
+            db.set_tool_run_status(&tool, "running", None, None)
+                .unwrap();
+            (run, tool)
+        };
+        let reopened = Storage::open(&path).unwrap();
+        assert_eq!(
+            reopened.agent_run("p", &run_id).unwrap().unwrap().status,
+            "interrupted"
+        );
+        let tools = reopened.tool_runs("p", &run_id).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].id, tool_id);
+        assert_eq!(tools[0].status, "interrupted");
     }
 }

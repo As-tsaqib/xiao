@@ -1,5 +1,8 @@
 # First-patch validation record — 2026-08-22
 
+> Historical v0.1.0 device evidence. Xiao v0.2.0 host validation and its
+> still-pending device/provider checks are tracked in `docs/ACCEPTANCE.md`.
+
 This record separates checks that were actually executed on the rooted Android
 device from checks deliberately deferred to GitHub Actions. Any ZIP currently
 present in local `dist/` predates the final source changes and is not a release

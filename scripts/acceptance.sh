@@ -22,7 +22,7 @@ pass 'Module packaging is guarded to GitHub Actions'
 } || fail 'Session principal ownership'
 pass 'Session principal ownership enforced in storage/service tests'
 rg -q 'get_updates\(offset, 50\)' src/telegram/mod.rs || fail 'Telegram long polling'
-! rg -q 'setWebhook|webhook' src/telegram src/main.rs || fail 'No Telegram webhook in v0.1.0'
+! rg -q 'setWebhook|webhook' src/telegram src/main.rs || fail 'No Telegram webhook in v0.2.0'
 pass 'Telegram long-polling-only transport'
 rg -q 'allowed\(message.chat.id' src/telegram/mod.rs || fail 'Telegram message ACL'
 rg -q 'allowed\(message.chat.id, Some\(callback.from.id\)' src/telegram/mod.rs || fail 'Telegram callback ACL'
@@ -89,13 +89,42 @@ pass 'Login/account activation is atomic across provider/account/model'
 } || fail 'CLIProxyAPI-compatible Codex OAuth flow'
 pass 'Codex and Antigravity OAuth follow CLIProxyAPI browser login contracts'
 {
-  rg -q 'ToolRouter' src/agent/mod.rs src/tools/mod.rs &&
+  rg -q 'ToolRegistry' src/agent/mod.rs src/tools/mod.rs &&
+    rg -q 'ToolPolicy' src/agent/mod.rs src/tools/mod.rs &&
     rg -q 'ProviderStep::ToolCalls' src/agent/mod.rs &&
-    rg -q 'typed_tool_call_continues_provider_until_final_answer' src/agent/mod.rs
+    rg -q 'typed_tool_call_continues_provider_until_final_answer' src/agent/mod.rs &&
+    ! rg -q 'ToolRouter' src/agent/mod.rs src/providers/mod.rs src/tools/mod.rs
 } || fail 'Typed tool loop'
 ! rg -n 'Command::new\("sh"\)|Command::new\("su"\)|/system/bin/sh|/bin/sh' src/agent src/providers src/command src/tools >/dev/null || fail 'Unrestricted model root shell found'
 rg -q 'bytes_stream\(\)' src/providers/mod.rs || fail 'Incremental provider streaming'
 pass 'Typed bounded tool loop and incremental provider streaming'
+{
+  rg -Fq 'UNIQUE(owner_principal,scope,category,key)' src/storage/mod.rs &&
+    rg -q 'MemoryStore' src/memory/mod.rs src/memory/store.rs &&
+    rg -q 'synonymous_explicit_preference_change_updates_one_canonical_memory' src/memory/evaluator.rs &&
+    rg -q 'explicit_forget_removes_active_memory' src/memory/evaluator.rs
+} || fail 'Editable principal-scoped memory'
+pass 'Memory UPSERT, deduplication, history and explicit forget semantics'
+{
+  rg -q 'messages_fts' src/storage/mod.rs &&
+    rg -q 'ContextEngine' src/agent/mod.rs src/context/engine.rs &&
+    rg -q 'current_request_and_system_prompt_survive_budget_pressure' src/context/engine.rs &&
+    rg -q 'compression_persists_summary_without_deleting_raw_history' src/context/engine.rs
+} || fail 'Session retrieval and bounded context'
+pass 'Principal-scoped FTS retrieval and bounded context compression'
+{
+  rg -Fq 'UNIQUE(owner_principal,name)' src/storage/mod.rs &&
+    rg -q 'LearningEvaluator' src/agent/mod.rs src/learning/evaluator.rs &&
+    rg -q 'verified_work_creates_then_updates_one_canonical_skill' src/learning/evaluator.rs &&
+    rg -q 'trivial_failed_cancelled_and_unverified_work_never_creates_skill' src/learning/evaluator.rs
+} || fail 'Verified skill learning and deduplication'
+pass 'Verified post-completion learning updates canonical principal-scoped skills'
+{
+  rg -q 'v010_database_upgrades_additively_without_losing_history' src/storage/mod.rs &&
+    rg -q 'v020_migration_is_fresh_and_idempotent_with_consistent_fts' src/storage/mod.rs &&
+    rg -q 'reopen_quarantines_inflight_agent_and_tool_runs_without_replay' src/storage/mod.rs
+} || fail 'v0.2 additive migration coverage'
+pass 'Fresh, upgrade, idempotent and crash-recovery migrations covered'
 {
   rg -q 'must be loopback-only' src/config/mod.rs &&
     rg -q 'ct_eq' src/ipc/mod.rs

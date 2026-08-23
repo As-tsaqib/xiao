@@ -184,7 +184,16 @@ impl CommandCore {
         health: Arc<HealthState>,
         events: Arc<EventBus>,
     ) -> Self {
-        let agent = AgentEngine::new(sessions.clone(), storage.clone(), providers.clone());
+        let agent_config = config
+            .try_read()
+            .map(|guard| guard.agent.clone())
+            .unwrap_or_default();
+        let agent = AgentEngine::with_config(
+            sessions.clone(),
+            storage.clone(),
+            providers.clone(),
+            agent_config,
+        );
         Self {
             config,
             storage,
@@ -900,7 +909,7 @@ impl CommandCore {
         let c = self.sessions.context_for(principal)?;
         let stored = self.storage.messages(principal, &c.active.id)?;
         let chars: usize = stored.iter().map(|m| m.content.chars().count()).sum();
-        Ok(View::info("USAGE", format!("Session messages: {}\nStored characters: {}\nProvider quota telemetry is provider-dependent and not normalized in v0.1.0.", stored.len(), chars)))
+        Ok(View::info("USAGE", format!("Session messages: {}\nStored characters: {}\nProvider quota telemetry is provider-dependent and not normalized in v0.2.0.", stored.len(), chars)))
     }
 
     async fn doctor_view(&self) -> View {
