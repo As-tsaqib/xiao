@@ -40,6 +40,63 @@ pub enum ProviderState {
     Error,
 }
 
+/// The normalized agent protocol exposed by a provider/model pair. The agent
+/// runtime uses this explicit value instead of treating a missing provider
+/// override as permission to silently remove all tools.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolProtocol {
+    Native,
+    StructuredJsonFallback,
+    ChatOnly,
+}
+
+impl ToolProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::StructuredJsonFallback => "structured_json_fallback",
+            Self::ChatOnly => "chat_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    pub tool_protocol: ToolProtocol,
+    pub model_discovery: bool,
+    pub structured_output: bool,
+    pub continuation: bool,
+    /// Concise inspectable evidence, never provider reasoning.
+    pub evidence: String,
+}
+
+impl ProviderCapabilities {
+    pub fn native(evidence: impl Into<String>) -> Self {
+        Self {
+            tool_protocol: ToolProtocol::Native,
+            model_discovery: false,
+            structured_output: true,
+            continuation: true,
+            evidence: evidence.into(),
+        }
+    }
+
+    pub fn chat_only(evidence: impl Into<String>) -> Self {
+        Self {
+            tool_protocol: ToolProtocol::ChatOnly,
+            model_discovery: false,
+            structured_output: false,
+            continuation: false,
+            evidence: evidence.into(),
+        }
+    }
+
+    pub fn is_agent_capable(&self) -> bool {
+        self.tool_protocol != ToolProtocol::ChatOnly
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -93,8 +150,19 @@ pub trait Provider: Send + Sync {
         true
     }
     fn ready(&self) -> bool;
-    fn supports_tool_continuation(&self) -> bool {
+    fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+        ProviderCapabilities::chat_only("provider did not declare an agent tool protocol")
+    }
+    /// Whether this adapter supports the ordinary no-tool generation path
+    /// used by Xiao's internal schema evaluator. Test/fake providers opt in
+    /// explicitly so semantic side calls cannot accidentally consume their
+    /// scripted agent-turn queues.
+    fn supports_semantic_evaluation(&self, _model: &str) -> bool {
         false
+    }
+    async fn generate_text(&self, mut req: ProviderRequest) -> Result<String> {
+        req.tools.clear();
+        Ok(self.run(req, None).await?.final_answer)
     }
     async fn run(
         &self,
@@ -223,6 +291,9 @@ impl ProviderRegistry {
     pub fn models(&self, id: &str) -> Result<Vec<String>> {
         Ok(self.get(id)?.models())
     }
+    pub fn capabilities(&self, id: &str, model: &str) -> Result<ProviderCapabilities> {
+        Ok(self.get(id)?.capabilities(model))
+    }
     pub fn preferred_model(&self, id: &str) -> Result<String> {
         self.models(id)?
             .into_iter()
@@ -343,6 +414,24 @@ fn models_with_default(default_model: Option<&str>, fallback_models: Vec<String>
     models
 }
 
+fn capabilities_from_record(
+    record: crate::storage::ProviderCapabilityRecord,
+) -> Option<ProviderCapabilities> {
+    let tool_protocol = match record.tool_protocol.as_str() {
+        "native" => ToolProtocol::Native,
+        "structured_json_fallback" | "structured_json" => ToolProtocol::StructuredJsonFallback,
+        "chat_only" => ToolProtocol::ChatOnly,
+        _ => return None,
+    };
+    Some(ProviderCapabilities {
+        tool_protocol,
+        model_discovery: true,
+        structured_output: record.structured_output,
+        continuation: record.continuation,
+        evidence: record.evidence,
+    })
+}
+
 struct CodexProvider {
     enabled: bool,
     base: String,
@@ -383,7 +472,10 @@ impl Provider for CodexProvider {
     fn ready(&self) -> bool {
         self.enabled
     }
-    fn supports_tool_continuation(&self) -> bool {
+    fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+        ProviderCapabilities::native("OpenAI Responses native function calls and continuation")
+    }
+    fn supports_semantic_evaluation(&self, _model: &str) -> bool {
         true
     }
     async fn run(
@@ -572,11 +664,38 @@ impl Provider for AntigravityProvider {
     fn ready(&self) -> bool {
         self.enabled
     }
+    fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+        ProviderCapabilities::native(
+            "Gemini functionDeclarations/functionCall/functionResponse continuation",
+        )
+    }
+    fn supports_semantic_evaluation(&self, _model: &str) -> bool {
+        true
+    }
     async fn run(
         &self,
         req: ProviderRequest,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<ProviderResponse> {
+        let turn = self.run_turn(req, None, Vec::new(), progress).await?;
+        match turn.step {
+            ProviderStep::Final(final_answer) => Ok(ProviderResponse {
+                events: turn.events,
+                final_answer,
+            }),
+            ProviderStep::ToolCalls(_) => Err(anyhow!(
+                "Antigravity requested a tool outside the agent loop"
+            )),
+        }
+    }
+
+    async fn run_turn(
+        &self,
+        req: ProviderRequest,
+        continuation: Option<serde_json::Value>,
+        tool_results: Vec<ToolResult>,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<ProviderTurn> {
         if !self.enabled {
             return Err(anyhow!("Antigravity provider is disabled"));
         }
@@ -605,35 +724,124 @@ impl Provider for AntigravityProvider {
             chrono::Utc::now().timestamp_millis(),
             Uuid::new_v4().simple()
         );
-        let body = antigravity_body(project, &req.model, &req.messages, &request_id);
+        let mut body = antigravity_body(project, &req.model, &req.messages, &request_id);
+        let mut contents = continuation
+            .as_ref()
+            .and_then(|value| value.get("contents"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .or_else(|| {
+                body.pointer("/request/contents")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+            })
+            .unwrap_or_default();
+        if !tool_results.is_empty() {
+            contents.push(serde_json::json!({
+                "role": "user",
+                "parts": tool_results.into_iter().map(|result| serde_json::json!({
+                    "functionResponse": {
+                        "name": result.name,
+                        "response": {
+                            "output": result.output,
+                            "is_error": result.is_error,
+                        }
+                    }
+                })).collect::<Vec<_>>()
+            }));
+        }
+        body["request"]["contents"] = serde_json::Value::Array(contents.clone());
+        if !req.tools.is_empty() {
+            body["request"]["tools"] = serde_json::json!([{
+                "functionDeclarations": antigravity_tool_specs(&req.tools)
+            }]);
+        }
         emit(
             &progress,
             AgentEvent::Status("Generating with Antigravity".into()),
         );
         let response = self.request_builder(token, &body).send().await?;
         let response = ensure_success(response, "Antigravity").await?;
-        let answer = consume_antigravity_sse(response, progress.clone()).await?;
-        if answer.is_empty() {
+        let streamed = consume_antigravity_sse(response, progress.clone()).await?;
+        if !streamed.tool_calls.is_empty() {
+            contents.push(serde_json::json!({
+                "role": "model",
+                "parts": streamed.function_parts,
+            }));
+            return Ok(ProviderTurn {
+                step: ProviderStep::ToolCalls(streamed.tool_calls),
+                continuation: Some(serde_json::json!({"contents": contents})),
+                events: vec![AgentEvent::Status(
+                    "Antigravity requested an internal tool".into(),
+                )],
+            });
+        }
+        if streamed.text.is_empty() {
             return Err(anyhow!("Antigravity stream contained no assistant text"));
         }
-        Ok(ProviderResponse {
+        Ok(ProviderTurn {
+            step: ProviderStep::Final(streamed.text),
+            continuation: None,
             events: vec![AgentEvent::Status("Generating with Antigravity".into())],
-            final_answer: answer,
         })
     }
+}
+
+fn antigravity_tool_specs(specs: &[ToolSpec]) -> Vec<serde_json::Value> {
+    specs
+        .iter()
+        .map(|spec| {
+            serde_json::json!({
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            })
+        })
+        .collect()
 }
 
 struct CustomProvider {
     cfg: CustomProviderConfig,
     auth: Arc<AuthManager>,
+    storage: Arc<crate::storage::Storage>,
     client: Client,
 }
 impl CustomProvider {
     fn new(cfg: CustomProviderConfig, auth: Arc<AuthManager>) -> Self {
+        let storage = auth.storage();
         Self {
             cfg,
             auth,
+            storage,
             client: http_client(),
+        }
+    }
+
+    fn configured_capabilities(&self) -> ProviderCapabilities {
+        match self.cfg.tool_protocol.as_str() {
+            "chat_only" => ProviderCapabilities {
+                model_discovery: true,
+                ..ProviderCapabilities::chat_only(
+                    "capability probe marked this custom model ChatOnly",
+                )
+            },
+            "structured_json" => ProviderCapabilities {
+                tool_protocol: ToolProtocol::StructuredJsonFallback,
+                model_discovery: true,
+                structured_output: true,
+                continuation: true,
+                evidence: "validated strict structured-JSON agent protocol".into(),
+            },
+            "native" => ProviderCapabilities {
+                model_discovery: true,
+                ..ProviderCapabilities::native("OpenAI-compatible native function/tool protocol")
+            },
+            _ => ProviderCapabilities {
+                model_discovery: true,
+                ..ProviderCapabilities::chat_only(
+                    "custom model capability has not been probed; select it through /login",
+                )
+            },
         }
     }
 }
@@ -662,11 +870,101 @@ impl Provider for CustomProvider {
     fn ready(&self) -> bool {
         self.enabled() && self.configured()
     }
+    fn capabilities(&self, model: &str) -> ProviderCapabilities {
+        self.storage
+            .provider_capability("custom", model)
+            .ok()
+            .flatten()
+            .and_then(capabilities_from_record)
+            .unwrap_or_else(|| self.configured_capabilities())
+    }
+    fn supports_semantic_evaluation(&self, model: &str) -> bool {
+        (self
+            .storage
+            .provider_capability("custom", model)
+            .ok()
+            .flatten()
+            .is_some()
+            || matches!(
+                self.cfg.tool_protocol.as_str(),
+                "native" | "structured_json"
+            ))
+            && self.capabilities(model).structured_output
+    }
+    async fn generate_text(&self, mut req: ProviderRequest) -> Result<String> {
+        req.tools.clear();
+        if !self.cfg.enabled {
+            return Err(anyhow!("custom provider is disabled"));
+        }
+        let base = self
+            .cfg
+            .base_url
+            .clone()
+            .ok_or_else(|| anyhow!("custom provider base_url is not configured"))?;
+        let endpoint = if self.cfg.protocol == "openai_chat_completions" {
+            endpoint_with_suffix(&base, "/chat/completions")
+        } else {
+            endpoint_with_suffix(&base, "/responses")
+        };
+        let mut request = self.client.post(endpoint);
+        for (name, value) in &self.cfg.headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let selected_api_key = match req.account_id.as_deref() {
+            Some(account) => self
+                .auth
+                .credential(account)?
+                .and_then(|credential| credential.api_key),
+            None => None,
+        };
+        let api_key = selected_api_key.or(self.auth.provider_api_key("custom")?);
+        if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
+            request = request.bearer_auth(key);
+        }
+        let body = if self.cfg.protocol == "openai_chat_completions" {
+            custom_chat_body(&req, None, &[], ToolProtocol::ChatOnly)
+        } else {
+            custom_responses_body(&req, None, &[], ToolProtocol::ChatOnly)
+        };
+        let value: serde_json::Value = ensure_success(
+            request.json(&body).send().await?,
+            "Custom semantic provider",
+        )
+        .await?
+        .json()
+        .await?;
+        let text = if self.cfg.protocol == "openai_chat_completions" {
+            extract_chat_content(&value)
+        } else {
+            extract_output_text(&value)
+        };
+        text.filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| anyhow!("custom semantic response contained no text"))
+    }
     async fn run(
         &self,
         req: ProviderRequest,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<ProviderResponse> {
+        let turn = self.run_turn(req, None, Vec::new(), progress).await?;
+        match turn.step {
+            ProviderStep::Final(final_answer) => Ok(ProviderResponse {
+                events: turn.events,
+                final_answer,
+            }),
+            ProviderStep::ToolCalls(_) => Err(anyhow!(
+                "custom provider requested a tool outside the agent loop"
+            )),
+        }
+    }
+
+    async fn run_turn(
+        &self,
+        mut req: ProviderRequest,
+        continuation: Option<serde_json::Value>,
+        tool_results: Vec<ToolResult>,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<ProviderTurn> {
         if !self.cfg.enabled {
             return Err(anyhow!("custom provider is disabled"));
         }
@@ -702,38 +1000,341 @@ impl Provider for CustomProvider {
         if let Some(key) = api_key {
             request = request.bearer_auth(key);
         }
+        let capabilities = self.capabilities(&req.model);
+        if capabilities.tool_protocol == ToolProtocol::StructuredJsonFallback {
+            append_structured_fallback_context(&mut req.messages, &req.tools, &tool_results);
+        }
         let body = if self.cfg.protocol == "openai_chat_completions" {
-            serde_json::json!({
-                "model": req.model,
-                "messages": chat_messages(&req.messages),
-                "stream": false,
-            })
+            custom_chat_body(
+                &req,
+                continuation.as_ref(),
+                &tool_results,
+                capabilities.tool_protocol,
+            )
         } else {
-            let payload = responses_payload(&req.messages, None);
-            let mut body = serde_json::json!({
-                "model": req.model,
-                "input": payload.input,
-                "stream": false,
-            });
-            if let Some(instructions) = payload.instructions {
-                body["instructions"] = serde_json::Value::String(instructions);
-            }
-            body
+            custom_responses_body(
+                &req,
+                continuation.as_ref(),
+                &tool_results,
+                capabilities.tool_protocol,
+            )
         };
         let response = request.json(&body).send().await?;
         let response = ensure_success(response, "Custom provider").await?;
         let value: serde_json::Value = response.json().await?;
-        let answer = if self.cfg.protocol == "openai_chat_completions" {
-            extract_chat_content(&value)
-        } else {
-            extract_output_text(&value)
-        }
-        .filter(|answer| !answer.trim().is_empty())
-        .ok_or_else(|| anyhow!("custom response contained no assistant text"))?;
-        Ok(ProviderResponse {
+        let (step, continuation) = match capabilities.tool_protocol {
+            ToolProtocol::Native if self.cfg.protocol == "openai_chat_completions" => {
+                parse_custom_chat_turn(&value, body["messages"].clone())?
+            }
+            ToolProtocol::Native => parse_custom_responses_turn(&value, body["input"].clone())?,
+            ToolProtocol::StructuredJsonFallback => {
+                let text = if self.cfg.protocol == "openai_chat_completions" {
+                    extract_chat_content(&value)
+                } else {
+                    extract_output_text(&value)
+                }
+                .ok_or_else(|| anyhow!("custom structured response contained no JSON text"))?;
+                (parse_structured_agent_output(&text, &req.tools)?, None)
+            }
+            ToolProtocol::ChatOnly => {
+                let answer = if self.cfg.protocol == "openai_chat_completions" {
+                    extract_chat_content(&value)
+                } else {
+                    extract_output_text(&value)
+                }
+                .filter(|answer| !answer.trim().is_empty())
+                .ok_or_else(|| anyhow!("custom response contained no assistant text"))?;
+                (ProviderStep::Final(answer), None)
+            }
+        };
+        Ok(ProviderTurn {
+            step,
+            continuation,
             events: vec![AgentEvent::Status("Custom provider completed".into())],
-            final_answer: answer,
         })
+    }
+}
+
+fn custom_chat_body(
+    req: &ProviderRequest,
+    continuation: Option<&serde_json::Value>,
+    tool_results: &[ToolResult],
+    protocol: ToolProtocol,
+) -> serde_json::Value {
+    let mut messages = continuation
+        .and_then(|value| value.get("messages"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| chat_messages(&req.messages));
+    if protocol == ToolProtocol::Native {
+        messages.extend(tool_results.iter().map(|result| {
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": result.call_id,
+                "name": result.name,
+                "content": result.output,
+            })
+        }));
+    }
+    let mut body = serde_json::json!({
+        "model": req.model,
+        "messages": messages,
+        "stream": false,
+    });
+    if protocol == ToolProtocol::Native && !req.tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(
+            req.tools
+                .iter()
+                .map(|spec| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": spec.name,
+                            "description": spec.description,
+                            "parameters": spec.parameters,
+                            "strict": true,
+                        }
+                    })
+                })
+                .collect(),
+        );
+        body["tool_choice"] = serde_json::Value::String("auto".into());
+    }
+    body
+}
+
+fn custom_responses_body(
+    req: &ProviderRequest,
+    continuation: Option<&serde_json::Value>,
+    tool_results: &[ToolResult],
+    protocol: ToolProtocol,
+) -> serde_json::Value {
+    let payload = responses_payload(&req.messages, None);
+    let mut input = continuation
+        .and_then(|value| value.get("input"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or(payload.input);
+    if protocol == ToolProtocol::Native {
+        input.extend(tool_results.iter().map(|result| {
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": result.call_id,
+                "output": result.output,
+            })
+        }));
+    }
+    let mut body = serde_json::json!({
+        "model": req.model,
+        "input": input,
+        "stream": false,
+    });
+    if let Some(instructions) = payload.instructions {
+        body["instructions"] = serde_json::Value::String(instructions);
+    }
+    if protocol == ToolProtocol::Native && !req.tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(responses_tool_specs(&req.tools));
+    }
+    body
+}
+
+fn parse_custom_chat_turn(
+    value: &serde_json::Value,
+    messages_value: serde_json::Value,
+) -> Result<(ProviderStep, Option<serde_json::Value>)> {
+    let message = value
+        .pointer("/choices/0/message")
+        .ok_or_else(|| anyhow!("custom chat response missing choices[0].message"))?;
+    let mut calls = Vec::new();
+    for item in message
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let call_id = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("custom chat tool call missing id"))?;
+        let function = item
+            .get("function")
+            .ok_or_else(|| anyhow!("custom chat tool call missing function"))?;
+        let name = function
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("custom chat tool call missing function name"))?;
+        let raw_arguments = function
+            .get("arguments")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("custom chat tool call arguments must be JSON text"))?;
+        let arguments = serde_json::from_str(raw_arguments)
+            .map_err(|_| anyhow!("custom chat tool call arguments are malformed JSON"))?;
+        calls.push(ToolCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments,
+        });
+    }
+    if !calls.is_empty() {
+        let mut messages = messages_value.as_array().cloned().unwrap_or_default();
+        messages.push(message.clone());
+        return Ok((
+            ProviderStep::ToolCalls(calls),
+            Some(serde_json::json!({"messages": messages})),
+        ));
+    }
+    let answer = extract_chat_content(value)
+        .filter(|answer| !answer.trim().is_empty())
+        .ok_or_else(|| anyhow!("custom chat response contained no assistant text or tool call"))?;
+    Ok((ProviderStep::Final(answer), None))
+}
+
+fn parse_custom_responses_turn(
+    value: &serde_json::Value,
+    input_value: serde_json::Value,
+) -> Result<(ProviderStep, Option<serde_json::Value>)> {
+    let mut calls = Vec::new();
+    let output = value
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for item in &output {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let call_id = item
+            .get("call_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("custom Responses function call missing call_id"))?;
+        let name = item
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("custom Responses function call missing name"))?;
+        let arguments = match item.get("arguments") {
+            Some(serde_json::Value::String(raw)) => serde_json::from_str(raw)
+                .map_err(|_| anyhow!("custom Responses function arguments are malformed JSON"))?,
+            Some(value @ serde_json::Value::Object(_)) => value.clone(),
+            _ => return Err(anyhow!("custom Responses function call missing arguments")),
+        };
+        calls.push(ToolCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments,
+        });
+    }
+    if !calls.is_empty() {
+        let mut input = input_value.as_array().cloned().unwrap_or_default();
+        input.extend(output);
+        return Ok((
+            ProviderStep::ToolCalls(calls),
+            Some(serde_json::json!({"input": input})),
+        ));
+    }
+    let answer = extract_output_text(value)
+        .filter(|answer| !answer.trim().is_empty())
+        .ok_or_else(|| anyhow!("custom Responses output contained no text or function call"))?;
+    Ok((ProviderStep::Final(answer), None))
+}
+
+fn append_structured_fallback_context(
+    messages: &mut Vec<MessageRecord>,
+    tools: &[ToolSpec],
+    tool_results: &[ToolResult],
+) {
+    let tools = tools
+        .iter()
+        .take(64)
+        .map(|spec| {
+            serde_json::json!({
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = tool_results
+        .iter()
+        .take(64)
+        .map(|result| {
+            serde_json::json!({
+                "call_id": result.call_id,
+                "name": result.name,
+                "output": result.output,
+                "is_error": result.is_error,
+            })
+        })
+        .collect::<Vec<_>>();
+    messages.push(MessageRecord {
+        role: "system".into(),
+        content: format!(
+            "<XIAO_STRUCTURED_AGENT_PROTOCOL>Return exactly one JSON object, with no markdown: {{\"kind\":\"tool_calls\",\"calls\":[{{\"call_id\":\"unique\",\"name\":\"tool\",\"arguments\":{{}}}}]}} or {{\"kind\":\"final\",\"text\":\"answer\"}}. Only request listed tools. Tool policy is enforced by Xiao. TOOLS={} TOOL_RESULTS={}</XIAO_STRUCTURED_AGENT_PROTOCOL>",
+            serde_json::to_string(&tools).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&results).unwrap_or_else(|_| "[]".into()),
+        )
+        .chars()
+        .take(48_000)
+        .collect(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    });
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StructuredAgentOutput {
+    ToolCalls { calls: Vec<StructuredToolCall> },
+    Final { text: String },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredToolCall {
+    call_id: String,
+    name: String,
+    arguments: serde_json::Value,
+}
+
+fn parse_structured_agent_output(text: &str, tools: &[ToolSpec]) -> Result<ProviderStep> {
+    if text.chars().count() > 64_000 {
+        return Err(anyhow!(
+            "structured agent response exceeded the 64000 character bound"
+        ));
+    }
+    let parsed: StructuredAgentOutput = serde_json::from_str(text.trim())
+        .map_err(|_| anyhow!("structured agent response failed strict schema validation"))?;
+    match parsed {
+        StructuredAgentOutput::Final { text } if !text.trim().is_empty() => {
+            Ok(ProviderStep::Final(text))
+        }
+        StructuredAgentOutput::Final { .. } => {
+            Err(anyhow!("structured agent final text was empty"))
+        }
+        StructuredAgentOutput::ToolCalls { calls } => {
+            if calls.is_empty() || calls.len() > 16 {
+                return Err(anyhow!(
+                    "structured agent tool_calls must contain between 1 and 16 calls"
+                ));
+            }
+            calls
+                .into_iter()
+                .map(|call| {
+                    if call.call_id.trim().is_empty()
+                        || !tools.iter().any(|spec| spec.name == call.name)
+                        || !call.arguments.is_object()
+                    {
+                        return Err(anyhow!(
+                            "structured agent requested an invalid or undeclared tool call"
+                        ));
+                    }
+                    Ok(ToolCall {
+                        call_id: call.call_id,
+                        name: call.name,
+                        arguments: call.arguments,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(ProviderStep::ToolCalls)
+        }
     }
 }
 
@@ -744,6 +1345,213 @@ fn endpoint_with_suffix(base: &str, suffix: &str) -> String {
     } else {
         format!("{base}{suffix}")
     }
+}
+
+/// Probe a selected Custom model without exposing Xiao's real tools. The
+/// synthetic function has no side effect, and every response is bounded and
+/// schema-checked before capability metadata is persisted.
+pub(crate) async fn probe_custom_tool_capability(
+    base: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    api_key: Option<&str>,
+    protocol: &str,
+    model: &str,
+) -> ProviderCapabilities {
+    let nonce = Uuid::new_v4().simple().to_string();
+    if custom_native_probe(base, headers, api_key, protocol, model, &nonce)
+        .await
+        .unwrap_or(false)
+    {
+        return ProviderCapabilities {
+            model_discovery: true,
+            ..ProviderCapabilities::native(
+                "validated synthetic OpenAI-compatible function call; no Xiao tool executed",
+            )
+        };
+    }
+    if custom_structured_probe(base, headers, api_key, protocol, model, &nonce)
+        .await
+        .unwrap_or(false)
+    {
+        return ProviderCapabilities {
+            tool_protocol: ToolProtocol::StructuredJsonFallback,
+            model_discovery: true,
+            structured_output: true,
+            continuation: true,
+            evidence: "validated strict bounded JSON final envelope without tools".into(),
+        };
+    }
+    ProviderCapabilities {
+        model_discovery: true,
+        ..ProviderCapabilities::chat_only(
+            "model discovery succeeded, but native tools and strict structured JSON probes failed",
+        )
+    }
+}
+
+async fn custom_native_probe(
+    base: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    api_key: Option<&str>,
+    protocol: &str,
+    model: &str,
+    nonce: &str,
+) -> Result<bool> {
+    let tool = serde_json::json!({
+        "name":"xiao_capability_probe",
+        "description":"Return the supplied nonce to prove function-call protocol support.",
+        "parameters":{
+            "type":"object",
+            "additionalProperties":false,
+            "required":["nonce"],
+            "properties":{"nonce":{"type":"string"}}
+        }
+    });
+    let (suffix, body) = if protocol == "openai_responses" {
+        (
+            "/responses",
+            serde_json::json!({
+                "model":model,
+                "input":[{"role":"user","content":[{"type":"input_text","text":format!("Call xiao_capability_probe with nonce {nonce}. Do not answer in text.")}]}],
+                "tools":[{"type":"function","name":tool["name"],"description":tool["description"],"parameters":tool["parameters"],"strict":true}],
+                "tool_choice":{"type":"function","name":"xiao_capability_probe"},
+                "stream":false,
+            }),
+        )
+    } else {
+        (
+            "/chat/completions",
+            serde_json::json!({
+                "model":model,
+                "messages":[{"role":"user","content":format!("Call xiao_capability_probe with nonce {nonce}. Do not answer in text.")}],
+                "tools":[{"type":"function","function":tool}],
+                "tool_choice":{"type":"function","function":{"name":"xiao_capability_probe"}},
+                "stream":false,
+            }),
+        )
+    };
+    let value = send_custom_probe(base, suffix, headers, api_key, body).await?;
+    let calls = if protocol == "openai_responses" {
+        value
+            .get("output")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+            })
+            .map(|item| {
+                let name = item.get("name").and_then(serde_json::Value::as_str);
+                let arguments = match item.get("arguments") {
+                    Some(serde_json::Value::String(raw)) => serde_json::from_str(raw).ok(),
+                    Some(value @ serde_json::Value::Object(_)) => Some(value.clone()),
+                    _ => None,
+                };
+                (name, arguments)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        value
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                let function = item.get("function");
+                let name = function
+                    .and_then(|value| value.get("name"))
+                    .and_then(serde_json::Value::as_str);
+                let arguments = function
+                    .and_then(|value| value.get("arguments"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|raw| serde_json::from_str(raw).ok());
+                (name, arguments)
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok(calls.into_iter().any(|(name, arguments)| {
+        name == Some("xiao_capability_probe")
+            && arguments
+                .as_ref()
+                .and_then(|value| value.get("nonce"))
+                .and_then(serde_json::Value::as_str)
+                == Some(nonce)
+    }))
+}
+
+async fn custom_structured_probe(
+    base: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    api_key: Option<&str>,
+    protocol: &str,
+    model: &str,
+    nonce: &str,
+) -> Result<bool> {
+    let expected = format!("xiao-capability-probe:{nonce}");
+    let instruction = format!(
+        "Return exactly this JSON object and nothing else: {{\"kind\":\"final\",\"text\":\"{expected}\"}}"
+    );
+    let (suffix, body) = if protocol == "openai_responses" {
+        (
+            "/responses",
+            serde_json::json!({"model":model,"input":[{"role":"user","content":[{"type":"input_text","text":instruction}]}],"stream":false}),
+        )
+    } else {
+        (
+            "/chat/completions",
+            serde_json::json!({"model":model,"messages":[{"role":"user","content":instruction}],"stream":false}),
+        )
+    };
+    let value = send_custom_probe(base, suffix, headers, api_key, body).await?;
+    let output = if protocol == "openai_responses" {
+        extract_output_text(&value)
+    } else {
+        extract_chat_content(&value)
+    }
+    .ok_or_else(|| anyhow!("structured capability probe returned no text"))?;
+    Ok(matches!(
+        serde_json::from_str::<StructuredAgentOutput>(output.trim()),
+        Ok(StructuredAgentOutput::Final { text }) if text == expected
+    ))
+}
+
+async fn send_custom_probe(
+    base: &str,
+    suffix: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    api_key: Option<&str>,
+    body: serde_json::Value,
+) -> Result<serde_json::Value> {
+    const MAX_PROBE_BYTES: usize = 512 * 1024;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let mut request = client.post(endpoint_with_suffix(base, suffix));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let response =
+        ensure_success(request.json(&body).send().await?, "Custom capability probe").await?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROBE_BYTES as u64)
+    {
+        return Err(anyhow!("custom capability response exceeded 512 KiB"));
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROBE_BYTES {
+            return Err(anyhow!("custom capability response exceeded 512 KiB"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 async fn ensure_success(response: reqwest::Response, provider: &str) -> Result<reqwest::Response> {
@@ -974,13 +1782,21 @@ async fn consume_responses_sse(
     })
 }
 
+struct AntigravityStream {
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    function_parts: Vec<serde_json::Value>,
+}
+
 async fn consume_antigravity_sse(
     response: reqwest::Response,
     progress: Option<mpsc::UnboundedSender<AgentEvent>>,
-) -> Result<String> {
+) -> Result<AntigravityStream> {
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut output = String::new();
+    let mut calls = Vec::new();
+    let mut function_parts = Vec::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -1019,12 +1835,37 @@ async fn consume_antigravity_sse(
                     if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
                         output.push_str(text);
                     }
+                    if let Some(function) = part.get("functionCall") {
+                        let Some(name) = function.get("name").and_then(serde_json::Value::as_str)
+                        else {
+                            continue;
+                        };
+                        let arguments = function
+                            .get("args")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        let call_id = function
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("agy-{name}-{}", calls.len() + 1));
+                        calls.push(ToolCall {
+                            call_id,
+                            name: name.to_owned(),
+                            arguments,
+                        });
+                        function_parts.push(part.clone());
+                    }
                 }
             }
         }
     }
 
-    Ok(output)
+    Ok(AntigravityStream {
+        text: output,
+        tool_calls: calls,
+        function_parts,
+    })
 }
 
 fn extract_output_text(v: &serde_json::Value) -> Option<String> {
@@ -1093,6 +1934,238 @@ mod tests {
         assert_eq!(wire[0]["name"], "context_stats");
         assert!(wire[0].get("risk").is_none());
         assert!(wire[0].get("timeout_ms").is_none());
+    }
+
+    fn test_tool() -> ToolSpec {
+        ToolSpec {
+            name: "artifact_write".into(),
+            description: "Create a bounded artifact".into(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties":{"path":{"type":"string"}},
+                "required":["path"],
+                "additionalProperties":false
+            }),
+            risk: crate::tools::ToolRisk::SideEffect,
+            origin: crate::tools::ToolOrigin::Builtin,
+            effect: crate::tools::ToolEffect::Idempotent,
+            required_capabilities: vec![],
+            timeout_ms: 5_000,
+        }
+    }
+
+    #[test]
+    fn provider_capabilities_are_explicit_and_antigravity_translates_tools() {
+        let (auth, _directory) = test_auth();
+        let codex = CodexProvider::new(true, None, None, auth.clone());
+        let antigravity = AntigravityProvider::new(
+            true,
+            "https://example.invalid".into(),
+            None,
+            "test".into(),
+            "test".into(),
+            auth,
+        );
+        assert_eq!(codex.capabilities("m").tool_protocol, ToolProtocol::Native);
+        assert_eq!(
+            antigravity.capabilities("m").tool_protocol,
+            ToolProtocol::Native
+        );
+        let wire = antigravity_tool_specs(&[test_tool()]);
+        assert_eq!(wire[0]["name"], "artifact_write");
+        assert_eq!(wire[0]["parameters"]["required"][0], "path");
+        assert!(wire[0].get("risk").is_none());
+    }
+
+    #[test]
+    fn unprobed_custom_model_is_explicitly_chat_only() {
+        let (auth, _directory) = test_auth();
+        let provider = CustomProvider::new(
+            crate::config::CustomProviderConfig {
+                enabled: true,
+                base_url: Some("https://custom.example/v1".into()),
+                models: vec!["unprobed".into()],
+                default_model: Some("unprobed".into()),
+                tool_protocol: "auto".into(),
+                ..crate::config::CustomProviderConfig::default()
+            },
+            auth,
+        );
+        let capability = provider.capabilities("unprobed");
+        assert_eq!(capability.tool_protocol, ToolProtocol::ChatOnly);
+        assert!(!capability.is_agent_capable());
+        assert!(capability.evidence.contains("has not been probed"));
+    }
+
+    #[tokio::test]
+    async fn custom_chat_native_tools_continue_with_normalized_results() {
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let calls = calls.clone();
+                move |Json(body): Json<serde_json::Value>| {
+                    let captured_tx = captured_tx.clone();
+                    let calls = calls.clone();
+                    async move {
+                        captured_tx.send(body).unwrap();
+                        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            Json(serde_json::json!({
+                                "choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
+                                    "id":"call-a","type":"function","function":{"name":"artifact_write","arguments":"{\"path\":\"result.txt\"}"}
+                                }]}}]
+                            }))
+                        } else {
+                            Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":"verified"}}]}))
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (auth, _directory) = test_auth();
+        let provider = CustomProvider::new(
+            CustomProviderConfig {
+                enabled: true,
+                base_url: Some(format!("http://{address}/v1")),
+                protocol: "openai_chat_completions".into(),
+                tool_protocol: "native".into(),
+                models: vec!["m".into()],
+                ..Default::default()
+            },
+            auth,
+        );
+        let mut req = request(vec![message("user", "create result")]);
+        req.model = "m".into();
+        req.tools = vec![test_tool()];
+        let first = provider
+            .run_turn(req.clone(), None, vec![], None)
+            .await
+            .unwrap();
+        let ProviderStep::ToolCalls(tool_calls) = first.step else {
+            panic!("tool call expected")
+        };
+        assert_eq!(tool_calls[0].name, "artifact_write");
+        let second = provider
+            .run_turn(
+                req,
+                first.continuation,
+                vec![ToolResult {
+                    call_id: "call-a".into(),
+                    name: "artifact_write".into(),
+                    output: "created".into(),
+                    is_error: false,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(second.step, ProviderStep::Final(ref text) if text == "verified"));
+        let first_wire = captured_rx.recv().await.unwrap();
+        let second_wire = captured_rx.recv().await.unwrap();
+        assert_eq!(first_wire["tools"][0]["function"]["name"], "artifact_write");
+        assert!(second_wire["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool" && message["tool_call_id"] == "call-a"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_capability_probe_prefers_native_then_validated_structured_fallback() {
+        let native = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                let content = body["messages"][0]["content"].as_str().unwrap();
+                let nonce = content
+                    .split("nonce ")
+                    .nth(1)
+                    .unwrap()
+                    .split('.')
+                    .next()
+                    .unwrap();
+                Json(serde_json::json!({
+                    "choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
+                        "id":"probe","type":"function","function":{
+                            "name":"xiao_capability_probe",
+                            "arguments":serde_json::json!({"nonce":nonce}).to_string()
+                        }
+                    }]}}]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, native).await.unwrap() });
+        let capability = probe_custom_tool_capability(
+            &format!("http://{address}/v1"),
+            &Default::default(),
+            None,
+            "openai_chat_completions",
+            "m",
+        )
+        .await;
+        assert_eq!(capability.tool_protocol, ToolProtocol::Native);
+        assert!(capability.continuation);
+        server.abort();
+
+        let structured = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                if body.get("tools").is_some() {
+                    return Json(serde_json::json!({
+                        "choices":[{"message":{"role":"assistant","content":"native tools unsupported"}}]
+                    }));
+                }
+                let instruction = body["messages"][0]["content"].as_str().unwrap();
+                let exact = instruction
+                    .strip_prefix("Return exactly this JSON object and nothing else: ")
+                    .unwrap();
+                Json(serde_json::json!({
+                    "choices":[{"message":{"role":"assistant","content":exact}}]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, structured).await.unwrap() });
+        let capability = probe_custom_tool_capability(
+            &format!("http://{address}/v1"),
+            &Default::default(),
+            None,
+            "openai_chat_completions",
+            "m",
+        )
+        .await;
+        assert_eq!(
+            capability.tool_protocol,
+            ToolProtocol::StructuredJsonFallback
+        );
+        assert!(capability.structured_output);
+        server.abort();
+    }
+
+    #[test]
+    fn structured_fallback_is_strict_and_cannot_call_undeclared_tools() {
+        let tools = vec![test_tool()];
+        assert!(matches!(
+            parse_structured_agent_output(
+                r#"{"kind":"tool_calls","calls":[{"call_id":"1","name":"artifact_write","arguments":{"path":"a"}}]}"#,
+                &tools
+            )
+            .unwrap(),
+            ProviderStep::ToolCalls(_)
+        ));
+        assert!(parse_structured_agent_output(
+            r#"{"kind":"tool_calls","calls":[{"call_id":"1","name":"shell","arguments":{"cmd":"id"}}]}"#,
+            &tools
+        )
+        .is_err());
+        assert!(parse_structured_agent_output("```json\n{}\n```", &tools).is_err());
     }
 
     fn test_auth() -> (Arc<AuthManager>, tempfile::TempDir) {

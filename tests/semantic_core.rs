@@ -26,10 +26,11 @@ fn required_commands_parse_to_semantic_variants() {
         parse("/session 2").unwrap(),
         Some(Command::Session { page: 2 })
     ));
-    assert!(matches!(
-        parse("/provider codex").unwrap(),
-        Some(Command::SetProvider { .. })
-    ));
+    for removed in ["/provider codex", "/settings", "/usage", "/env"] {
+        assert!(parse(removed).is_err(), "{removed} must remain removed");
+    }
+    assert!(matches!(parse("/stop").unwrap(), Some(Command::Stop)));
+    assert!(matches!(parse("/cancel").unwrap(), Some(Command::Stop)));
     assert!(matches!(
         parse("/model gpt-5.6-sol").unwrap(),
         Some(Command::SetModel { .. })
@@ -80,19 +81,22 @@ async fn command_core_keeps_session_state_shared_and_durable() {
 }
 
 #[tokio::test]
-async fn provider_and_model_selection_use_command_core() {
+async fn removed_provider_command_and_model_selection_use_command_core() {
     let dir = tempfile::tempdir().unwrap();
     let app = AppState::build(test_config(dir.path())).await.unwrap();
     let principal = "integration:provider";
-    app.commands
+    assert!(app
+        .commands
         .execute_text(principal, "/provider codex")
         .await
-        .unwrap();
+        .is_err());
+    let initial_provider = app.sessions.context_for(principal).unwrap().active.provider;
+    let model = app.providers.models(&initial_provider).unwrap()[0].clone();
     app.commands
-        .execute_text(principal, "/model gpt-5.6-sol")
+        .execute_text(principal, &format!("/model {model}"))
         .await
         .unwrap();
     let context = app.sessions.context_for(principal).unwrap();
-    assert_eq!(context.active.provider, "codex");
-    assert_eq!(context.active.model, "gpt-5.6-sol");
+    assert_eq!(context.active.provider, initial_provider);
+    assert_eq!(context.active.model, model);
 }

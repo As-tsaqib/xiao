@@ -183,6 +183,7 @@ mod tests {
             principal: "owner".into(),
             session_id: "session".into(),
             agent_run_id: "run".into(),
+            yolo_mode: false,
             messages: Vec::<MessageRecord>::new(),
             cancellation: CancellationToken::new(),
             progress: None,

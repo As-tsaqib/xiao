@@ -3,4 +3,4 @@ name=xiao
 version=v@MODULE_VERSION@
 versionCode=@VERSION_CODE@
 author=As-tsaqib
-description=Telegram-first AI gateway with watchdog, KernelSU WebUI, and managed Termux wrappers.
+description=Private Telegram-first personal AI agent with Termux execution, watchdog, and KernelSU WebUI.

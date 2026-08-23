@@ -10,45 +10,114 @@ use crate::{
     auth::{AuthChallenge, AuthManager},
     config::AppConfig,
     event::{AppEvent, EventBus},
+    memory::{MemoryScope, MemoryStore},
     presentation::{Action, Block, View},
     providers::{AgentEvent, ProviderRegistry, ProviderState},
-    runtime::RuntimeState,
+    runtime::{CapabilityStatus, RuntimeState},
     session::{ChatMode, SessionManager},
+    skills::SkillStore,
     storage::{AccountRecord, Storage},
+    telegram::{commands::TelegramCommandRegistry, TelegramScope},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Help { topic: Option<String> },
-    Login { provider: Option<String> },
-    CancelAuth { transaction: String },
-    Logout { account: Option<String> },
-    Provider,
-    SetProvider { provider: String },
+    Start,
+    Help {
+        topic: Option<String>,
+    },
+    Login {
+        provider: Option<String>,
+    },
+    CancelAuth {
+        transaction: String,
+    },
+    Logout {
+        account: Option<String>,
+    },
     Account,
-    UseAccount { account: String },
+    UseAccount {
+        account: String,
+    },
     Model,
-    ModelPicker,
-    SetModel { model: String },
+    ModelPicker {
+        page: usize,
+    },
+    SetModel {
+        model: String,
+    },
     NewSession,
-    Session { page: usize },
-    SessionDetail { session: String },
-    SwitchSession { session: String },
-    RequestRenameSession { session: String },
-    RenameSession { session: String, name: String },
-    ArchiveSession { session: String },
+    Session {
+        page: usize,
+    },
+    SessionDetail {
+        session: String,
+    },
+    SwitchSession {
+        session: String,
+    },
+    RequestRenameSession {
+        session: String,
+    },
+    RenameSession {
+        session: String,
+        name: String,
+    },
+    ArchiveSession {
+        session: String,
+    },
     ToggleSideChat,
     Status,
     Context,
     Stop,
     Retry,
+    Yolo {
+        enabled: Option<bool>,
+    },
+    Memory {
+        query: Option<String>,
+    },
+    RequestMemoryEdit {
+        scope: String,
+        category: String,
+        key: String,
+    },
+    EditMemory {
+        scope: String,
+        category: String,
+        key: String,
+        value: String,
+    },
+    ForgetMemory {
+        scope: String,
+        category: String,
+        key: String,
+    },
+    Skills {
+        query: Option<String>,
+    },
+    SkillDetail {
+        skill: String,
+    },
+    SetSkillEnabled {
+        skill: String,
+        enabled: bool,
+    },
+    ConfirmDeleteSkill {
+        skill: String,
+    },
+    DeleteSkill {
+        skill: String,
+    },
+    Tools,
+    About,
     Approvals,
-    Approve { request: String },
-    DenyApproval { request: String },
-    Settings,
-    SetProgressDetail { detail: String },
-    SetMenuCloseBehavior { behavior: String },
-    Usage,
+    Approve {
+        request: String,
+    },
+    DenyApproval {
+        request: String,
+    },
     Doctor,
 }
 
@@ -60,6 +129,7 @@ pub enum CommandResult {
     Confirmation(View),
     InputRequest { view: View, command_prefix: String },
     StartedAuth(AuthChallenge),
+    StartCustomLogin,
     Agent(AgentAnswer),
     NoContent,
 }
@@ -80,51 +150,55 @@ pub fn parse(input: &str) -> Result<Option<Command>> {
     let args = parts.collect::<Vec<_>>();
     let one = || args.first().map(|s| (*s).to_owned());
 
-    Ok(Some(match name.as_str() {
+    let canonical = TelegramCommandRegistry::canonical(&name)
+        .ok_or_else(|| anyhow!("unknown command /{name}"))?;
+    Ok(Some(match canonical {
+        "start" => Command::Start,
         "new" => Command::NewSession,
         "btw" => Command::ToggleSideChat,
-        "session" if args.first() == Some(&"detail") => Command::SessionDetail {
+        "sessions" if args.first() == Some(&"detail") => Command::SessionDetail {
             session: args
                 .get(1)
                 .ok_or_else(|| anyhow!("session id required"))?
                 .to_string(),
         },
-        "session" if args.first() == Some(&"switch") => Command::SwitchSession {
+        "sessions" if args.first() == Some(&"switch") => Command::SwitchSession {
             session: args
                 .get(1)
                 .ok_or_else(|| anyhow!("session id required"))?
                 .to_string(),
         },
-        "session" if args.first() == Some(&"archive") => Command::ArchiveSession {
+        "sessions" if args.first() == Some(&"archive") => Command::ArchiveSession {
             session: args
                 .get(1)
                 .ok_or_else(|| anyhow!("session id required"))?
                 .to_string(),
         },
-        "session" if args.first() == Some(&"rename") && args.len() == 2 => {
+        "sessions" if args.first() == Some(&"rename") && args.len() == 2 => {
             Command::RequestRenameSession {
                 session: args[1].to_string(),
             }
         }
-        "session" if args.first() == Some(&"rename") => Command::RenameSession {
+        "sessions" if args.first() == Some(&"rename") => Command::RenameSession {
             session: args
                 .get(1)
                 .ok_or_else(|| anyhow!("session id required"))?
                 .to_string(),
             name: args.iter().skip(2).copied().collect::<Vec<_>>().join(" "),
         },
-        "session" => Command::Session {
+        "sessions" => Command::Session {
             page: one().and_then(|s| s.parse().ok()).unwrap_or(1),
         },
-        "model" if args.first() == Some(&"change") => Command::ModelPicker,
+        "model" if args.first() == Some(&"change") => Command::ModelPicker {
+            page: args
+                .get(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1),
+        },
         "model" if !args.is_empty() => Command::SetModel {
             model: args.join(" "),
         },
         "model" => Command::Model,
-        "provider" if !args.is_empty() => Command::SetProvider {
-            provider: args[0].to_owned(),
-        },
-        "provider" => Command::Provider,
         "account" if args.first() == Some(&"use") => Command::UseAccount {
             account: args
                 .get(1)
@@ -145,8 +219,87 @@ pub fn parse(input: &str) -> Result<Option<Command>> {
         "logout" => Command::Logout { account: one() },
         "status" => Command::Status,
         "context" => Command::Context,
-        "stop" => Command::Stop,
+        "cancel" => Command::Stop,
         "retry" => Command::Retry,
+        "yolo" => Command::Yolo {
+            enabled: match args.first().map(|value| value.to_ascii_lowercase()) {
+                Some(value) if matches!(value.as_str(), "on" | "enable") => Some(true),
+                Some(value) if matches!(value.as_str(), "off" | "disable") => Some(false),
+                Some(_) => return Err(anyhow!("yolo expects enable or disable")),
+                None => None,
+            },
+        },
+        "memory" if args.first() == Some(&"forget") => Command::ForgetMemory {
+            scope: args
+                .get(1)
+                .ok_or_else(|| anyhow!("memory scope required"))?
+                .to_string(),
+            category: args
+                .get(2)
+                .ok_or_else(|| anyhow!("memory category required"))?
+                .to_string(),
+            key: args
+                .get(3)
+                .ok_or_else(|| anyhow!("memory key required"))?
+                .to_string(),
+        },
+        "memory" if args.first() == Some(&"edit") && args.len() == 4 => {
+            Command::RequestMemoryEdit {
+                scope: args[1].to_string(),
+                category: args[2].to_string(),
+                key: args[3].to_string(),
+            }
+        }
+        "memory" if args.first() == Some(&"edit") => Command::EditMemory {
+            scope: args
+                .get(1)
+                .ok_or_else(|| anyhow!("memory scope required"))?
+                .to_string(),
+            category: args
+                .get(2)
+                .ok_or_else(|| anyhow!("memory category required"))?
+                .to_string(),
+            key: args
+                .get(3)
+                .ok_or_else(|| anyhow!("memory key required"))?
+                .to_string(),
+            value: args.iter().skip(4).copied().collect::<Vec<_>>().join(" "),
+        },
+        "memory" => Command::Memory {
+            query: (!args.is_empty()).then(|| args.join(" ")),
+        },
+        "skills" if args.first() == Some(&"detail") => Command::SkillDetail {
+            skill: args
+                .get(1)
+                .ok_or_else(|| anyhow!("skill id required"))?
+                .to_string(),
+        },
+        "skills" if matches!(args.first(), Some(&"enable") | Some(&"disable")) => {
+            Command::SetSkillEnabled {
+                skill: args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("skill id required"))?
+                    .to_string(),
+                enabled: args[0] == "enable",
+            }
+        }
+        "skills" if args.first() == Some(&"delete-confirm") => Command::DeleteSkill {
+            skill: args
+                .get(1)
+                .ok_or_else(|| anyhow!("skill id required"))?
+                .to_string(),
+        },
+        "skills" if args.first() == Some(&"delete") => Command::ConfirmDeleteSkill {
+            skill: args
+                .get(1)
+                .ok_or_else(|| anyhow!("skill id required"))?
+                .to_string(),
+        },
+        "skills" => Command::Skills {
+            query: (!args.is_empty()).then(|| args.join(" ")),
+        },
+        "tools" => Command::Tools,
+        "about" => Command::About,
         "approvals" => Command::Approvals,
         "approve" => Command::Approve {
             request: args
@@ -160,22 +313,8 @@ pub fn parse(input: &str) -> Result<Option<Command>> {
                 .ok_or_else(|| anyhow!("approval request id required"))?
                 .to_string(),
         },
-        "settings" if args.first() == Some(&"progress") => Command::SetProgressDetail {
-            detail: args
-                .get(1)
-                .ok_or_else(|| anyhow!("progress detail required"))?
-                .to_string(),
-        },
-        "settings" if args.first() == Some(&"close") => Command::SetMenuCloseBehavior {
-            behavior: args
-                .get(1)
-                .ok_or_else(|| anyhow!("close behavior required"))?
-                .to_string(),
-        },
-        "settings" => Command::Settings,
-        "usage" => Command::Usage,
         "doctor" => Command::Doctor,
-        "help" | "start" => Command::Help { topic: one() },
+        "help" => Command::Help { topic: one() },
         _ => return Err(anyhow!("unknown command /{name}")),
     }))
 }
@@ -189,6 +328,7 @@ pub struct CommandCore {
     health: Arc<HealthState>,
     events: Arc<EventBus>,
     agent: AgentEngine,
+    runtime: Option<Arc<RuntimeState>>,
 }
 
 impl CommandCore {
@@ -244,7 +384,7 @@ impl CommandCore {
             .try_read()
             .map(|guard| guard.agent.clone())
             .unwrap_or_default();
-        let agent = if let Some(runtime) = runtime {
+        let agent = if let Some(runtime) = runtime.clone() {
             AgentEngine::with_runtime(
                 sessions.clone(),
                 storage.clone(),
@@ -269,6 +409,7 @@ impl CommandCore {
             health,
             events,
             agent,
+            runtime,
         }
     }
 
@@ -283,17 +424,47 @@ impl CommandCore {
         input: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<CommandResult> {
+        self.execute_text_with_context(principal, None, input, progress)
+            .await
+    }
+
+    pub async fn execute_text_in_telegram_scope(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        input: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<CommandResult> {
+        self.execute_text_with_context(principal, Some(scope), input, progress)
+            .await
+    }
+
+    async fn execute_text_with_context(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        input: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<CommandResult> {
         match parse(input)? {
-            Some(cmd) => self.execute(principal, cmd).await,
+            Some(cmd) => self.execute_in_scope(principal, scope, cmd).await,
             None => {
                 if !self.config.read().await.gateway.enabled {
                     return Err(anyhow!("gateway is disabled"));
                 }
-                Ok(CommandResult::Agent(
-                    self.agent
-                        .submit_with_progress(principal, input, progress)
-                        .await?,
-                ))
+                let answer = match scope {
+                    Some(scope) => {
+                        self.agent
+                            .submit_with_progress_in_scope(principal, scope, input, progress)
+                            .await?
+                    }
+                    None => {
+                        self.agent
+                            .submit_with_progress(principal, input, progress)
+                            .await?
+                    }
+                };
+                Ok(CommandResult::Agent(answer))
             }
         }
     }
@@ -311,11 +482,47 @@ impl CommandCore {
         ))
     }
 
+    pub async fn retry_with_progress_in_telegram_scope(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<CommandResult> {
+        if !self.config.read().await.gateway.enabled {
+            return Err(anyhow!("gateway is disabled"));
+        }
+        Ok(CommandResult::Agent(
+            self.agent
+                .retry_with_progress_in_scope(principal, Some(scope), progress)
+                .await?,
+        ))
+    }
+
     pub async fn execute(&self, principal: &str, command: Command) -> Result<CommandResult> {
+        self.execute_in_scope(principal, None, command).await
+    }
+
+    pub async fn execute_in_scope(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        command: Command,
+    ) -> Result<CommandResult> {
         use Command::*;
         match command {
+            Start => Ok(CommandResult::InfoView(View {
+                title: None,
+                blocks: vec![Block::Paragraph {
+                    text: "Hello! I'm Xiao. How can I help you today?".into(),
+                }],
+                actions: Vec::new(),
+                side_mode: false,
+            })),
             NewSession => {
-                let s = self.sessions.create_and_switch(principal)?;
+                let s = match scope {
+                    Some(scope) => self.sessions.create_and_switch_telegram(principal, scope)?,
+                    None => self.sessions.create_and_switch(principal)?,
+                };
                 self.events.publish(AppEvent::SessionChanged {
                     principal: principal.into(),
                     session_id: s.id.clone(),
@@ -323,13 +530,16 @@ impl CommandCore {
                 let mut view =
                     View::info("NEW SESSION", format!("Created and activated {}", s.name));
                 view.actions = vec![vec![
-                    Action::command("Session Manager", "/session"),
+                    Action::command("Session Manager", "/sessions"),
                     Action::close(),
                 ]];
                 Ok(CommandResult::Confirmation(view))
             }
             ToggleSideChat => {
-                let c = self.sessions.toggle_side(principal)?;
+                let c = match scope {
+                    Some(scope) => self.sessions.toggle_telegram_side(principal, scope)?,
+                    None => self.sessions.toggle_side(principal)?,
+                };
                 let text = if c.mode == ChatMode::Side {
                     format!("SIDE CHAT SESSION\nParent: {}", c.main.name)
                 } else {
@@ -341,24 +551,31 @@ impl CommandCore {
                 )))
             }
             Session { page } => Ok(CommandResult::ManagerView(
-                self.session_view(principal, page)?,
+                self.session_view(principal, scope, page)?,
             )),
             SessionDetail { session } => Ok(CommandResult::ManagerView(
-                self.session_detail_view(principal, &session)?,
+                self.session_detail_view(principal, scope, &session)?,
             )),
             SwitchSession { session } => {
-                let s = self.sessions.switch_main(principal, &session)?;
+                let s = match scope {
+                    Some(scope) => self
+                        .sessions
+                        .switch_telegram_main(principal, scope, &session)?,
+                    None => self.sessions.switch_main(principal, &session)?,
+                };
                 self.events.publish(AppEvent::SessionChanged {
                     principal: principal.into(),
                     session_id: s.id.clone(),
                 });
                 Ok(CommandResult::ManagerView(self.session_view_with_notice(
                     principal,
+                    scope,
                     1,
                     format!("Active: {}", s.name),
                 )?))
             }
             RequestRenameSession { session } => {
+                self.validate_session_scope(principal, scope, &session)?;
                 let target = self
                     .storage
                     .session(principal, &session)?
@@ -379,10 +596,11 @@ impl CommandCore {
                 };
                 Ok(CommandResult::InputRequest {
                     view,
-                    command_prefix: format!("/session rename {}", target.id),
+                    command_prefix: format!("/sessions rename {}", target.id),
                 })
             }
             RenameSession { session, name } => {
+                self.validate_session_scope(principal, scope, &session)?;
                 let name = name.trim();
                 if name.is_empty() {
                     return Err(anyhow!("new session name required"));
@@ -392,11 +610,16 @@ impl CommandCore {
                 }
                 self.storage.rename_session(principal, &session, name)?;
                 Ok(CommandResult::ManagerView(
-                    self.session_detail_view(principal, &session)?,
+                    self.session_detail_view(principal, scope, &session)?,
                 ))
             }
             ArchiveSession { session } => {
-                let active = self.sessions.archive_and_recover(principal, &session)?;
+                let active = match scope {
+                    Some(scope) => self
+                        .sessions
+                        .archive_and_recover_telegram(principal, scope, &session)?,
+                    None => self.sessions.archive_and_recover(principal, &session)?,
+                };
                 self.events.publish(AppEvent::SessionArchived {
                     principal: principal.into(),
                     session_id: session,
@@ -407,34 +630,41 @@ impl CommandCore {
                 });
                 Ok(CommandResult::ManagerView(self.session_view_with_notice(
                     principal,
+                    scope,
                     1,
                     format!("Archived. Active: {}", active.name),
                 )?))
             }
-            Provider => Ok(CommandResult::ManagerView(self.provider_view(principal)?)),
-            SetProvider { provider } => {
-                self.set_provider(principal, &provider)?;
-                self.events.publish(AppEvent::ProviderChanged {
-                    principal: principal.into(),
-                    provider: normalize_provider(&provider),
-                });
-                Ok(CommandResult::ManagerView(self.provider_view(principal)?))
-            }
-            Model => Ok(CommandResult::ManagerView(self.model_view(principal)?)),
-            ModelPicker => Ok(CommandResult::ManagerView(
-                self.model_picker_view(principal)?,
+            Model => Ok(CommandResult::ManagerView(
+                self.model_view(principal, scope)?,
+            )),
+            ModelPicker { page } => Ok(CommandResult::ManagerView(
+                self.model_picker_view(principal, scope, page)?,
             )),
             SetModel { model } => {
-                self.set_model(principal, &model)?;
+                let custom_configured = {
+                    let config = self.config.read().await;
+                    config.providers.custom.enabled && config.providers.custom.base_url.is_some()
+                };
+                if custom_configured
+                    && self.session_context(principal, scope)?.active.provider == "custom"
+                {
+                    self.probe_custom_model(principal, scope, &model).await?;
+                }
+                self.set_model(principal, scope, &model)?;
                 self.events.publish(AppEvent::ModelChanged {
                     principal: principal.into(),
                     model,
                 });
-                Ok(CommandResult::ManagerView(self.model_view(principal)?))
+                Ok(CommandResult::ManagerView(
+                    self.model_view(principal, scope)?,
+                ))
             }
-            Account => Ok(CommandResult::ManagerView(self.account_view(principal)?)),
+            Account => Ok(CommandResult::ManagerView(
+                self.account_view(principal, scope)?,
+            )),
             UseAccount { account } => {
-                let (provider, model) = self.use_account(principal, &account)?;
+                let (provider, model) = self.use_account(principal, scope, &account)?;
                 self.events.publish(AppEvent::ProviderChanged {
                     principal: principal.into(),
                     provider: provider.clone(),
@@ -447,13 +677,18 @@ impl CommandCore {
                     principal: principal.into(),
                     model: model.clone(),
                 });
-                Ok(CommandResult::ManagerView(self.model_view(principal)?))
+                Ok(CommandResult::ManagerView(
+                    self.model_view(principal, scope)?,
+                ))
             }
             Login { provider: None } => Ok(CommandResult::ManagerView(login_picker())),
             Login {
                 provider: Some(provider),
             } => {
                 let provider = normalize_provider(&provider);
+                if provider == "custom" {
+                    return Ok(CommandResult::StartCustomLogin);
+                }
                 let challenge = self.auth.begin_login(&provider).await?;
                 let transaction_id = match &challenge {
                     AuthChallenge::BrowserUrl { transaction_id, .. } => transaction_id.clone(),
@@ -487,19 +722,188 @@ impl CommandCore {
                     "Disconnected",
                 )))
             }
-            Status => Ok(CommandResult::InfoView(self.status_view(principal).await?)),
-            Context => Ok(CommandResult::InfoView(self.context_view(principal)?)),
+            Status => Ok(CommandResult::InfoView(
+                self.status_view(principal, scope).await?,
+            )),
+            Context => Ok(CommandResult::InfoView(
+                self.context_view(principal, scope).await?,
+            )),
             Stop => Ok(CommandResult::Confirmation(View::info(
-                "STOP",
-                if self.agent.cancel(principal) {
+                "CANCEL",
+                if self.agent.cancel_in_scope(principal, scope) {
                     "Cancellation requested"
                 } else {
                     "No active generation"
                 },
             ))),
-            Retry => Ok(CommandResult::Agent(
-                self.agent.retry_with_progress(principal, None).await?,
+            Retry => {
+                let answer = self
+                    .agent
+                    .retry_with_progress_in_scope(principal, scope, None)
+                    .await?;
+                Ok(CommandResult::Agent(answer))
+            }
+            Yolo { enabled } => {
+                let context = self.session_context(principal, scope)?;
+                if let Some(enabled) = enabled {
+                    self.storage
+                        .set_session_yolo(principal, &context.active.id, enabled)?;
+                    self.storage.audit(
+                        principal,
+                        if enabled {
+                            "yolo_enabled"
+                        } else {
+                            "yolo_disabled"
+                        },
+                        &format!("session_id={}", context.active.id),
+                    )?;
+                }
+                Ok(CommandResult::ManagerView(
+                    self.yolo_view(principal, scope)?,
+                ))
+            }
+            Memory { query } if query.as_deref() == Some("search") => {
+                Ok(CommandResult::InputRequest {
+                    view: View::info("MEMORY SEARCH", "Send the memory search query."),
+                    command_prefix: "/memory".into(),
+                })
+            }
+            Memory { query } => Ok(CommandResult::ManagerView(
+                self.memory_view(principal, query.as_deref())?,
             )),
+            RequestMemoryEdit {
+                scope: memory_scope,
+                category,
+                key,
+            } => {
+                let store = self.memory_store();
+                let scope = MemoryScope::try_from(memory_scope.as_str())?;
+                let record = store
+                    .list(principal, Some(scope), 500)?
+                    .into_iter()
+                    .find(|record| record.category == category && record.key == key)
+                    .ok_or_else(|| anyhow!("memory entry not found"))?;
+                Ok(CommandResult::InputRequest {
+                    view: View::info(
+                        "EDIT MEMORY",
+                        format!(
+                            "Current value: {}\nSend the replacement value.",
+                            record.value
+                        ),
+                    ),
+                    command_prefix: format!("/memory edit {memory_scope} {category} {key}"),
+                })
+            }
+            EditMemory {
+                scope: memory_scope,
+                category,
+                key,
+                value,
+            } => {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(anyhow!("memory value is required"));
+                }
+                let scope = MemoryScope::try_from(memory_scope.as_str())?;
+                self.memory_store().upsert(
+                    principal,
+                    scope,
+                    &category,
+                    &key,
+                    value,
+                    1.0,
+                    "owner_telegram_edit",
+                    None,
+                )?;
+                Ok(CommandResult::ManagerView(
+                    self.memory_view(principal, Some(scope.as_str()))?,
+                ))
+            }
+            ForgetMemory {
+                scope: memory_scope,
+                category,
+                key,
+            } => {
+                let memory_scope = MemoryScope::try_from(memory_scope.as_str())?;
+                self.memory_store()
+                    .delete(principal, memory_scope, &category, &key, None)?;
+                Ok(CommandResult::ManagerView(
+                    self.memory_view(principal, Some(memory_scope.as_str()))?,
+                ))
+            }
+            Skills { query } if query.as_deref() == Some("search") => {
+                Ok(CommandResult::InputRequest {
+                    view: View::info("SKILL SEARCH", "Send the skill search query."),
+                    command_prefix: "/skills".into(),
+                })
+            }
+            Skills { query } => Ok(CommandResult::ManagerView(
+                self.skills_view(principal, query.as_deref())?,
+            )),
+            SkillDetail { skill } => Ok(CommandResult::ManagerView(
+                self.skill_detail_view(principal, &skill)?,
+            )),
+            SetSkillEnabled { skill, enabled } => {
+                SkillStore::new(self.storage.clone()).set_enabled(principal, &skill, enabled)?;
+                self.storage.audit(
+                    principal,
+                    if enabled {
+                        "skill_enabled"
+                    } else {
+                        "skill_disabled"
+                    },
+                    &format!("skill_id={skill}"),
+                )?;
+                Ok(CommandResult::ManagerView(
+                    self.skill_detail_view(principal, &skill)?,
+                ))
+            }
+            ConfirmDeleteSkill { skill } => {
+                let record = SkillStore::new(self.storage.clone())
+                    .view(principal, &skill)?
+                    .ok_or_else(|| anyhow!("skill not found"))?;
+                if record.source_kind != "learned" {
+                    return Err(anyhow!("only learned owner-created skills can be deleted"));
+                }
+                let mut view = View::info(
+                    "DELETE LEARNED SKILL",
+                    format!(
+                        "Delete {}? This removes its active index and owner-created SKILL.md. Audit history remains.",
+                        record.name
+                    ),
+                );
+                view.actions = vec![
+                    vec![Action::command(
+                        "Delete",
+                        format!("/skills delete-confirm {}", record.id),
+                    )],
+                    vec![Action::back(), Action::close()],
+                ];
+                Ok(CommandResult::ManagerView(view))
+            }
+            DeleteSkill { skill } => {
+                let store = SkillStore::new(self.storage.clone());
+                let record = store
+                    .view(principal, &skill)?
+                    .ok_or_else(|| anyhow!("skill not found"))?;
+                if record.source_kind != "learned" {
+                    return Err(anyhow!("only learned owner-created skills can be deleted"));
+                }
+                if let Some(runtime) = &self.runtime {
+                    runtime.workspace().delete_learned_skill(&record.name)?;
+                }
+                store.delete_learned(principal, &record.id)?;
+                self.storage.audit(
+                    principal,
+                    "learned_skill_deleted",
+                    &format!("skill_id={};name={}", record.id, record.name),
+                )?;
+                Ok(CommandResult::ManagerView(
+                    self.skills_view(principal, Some("learned"))?,
+                ))
+            }
+            Tools => Ok(CommandResult::ManagerView(self.tools_view())),
+            About => Ok(CommandResult::InfoView(self.about_view())),
             Approvals => {
                 let approvals = self.storage.pending_approvals(principal)?;
                 let body = if approvals.is_empty() {
@@ -550,56 +954,34 @@ impl CommandCore {
                     "The pending sensitive operation was denied.",
                 )))
             }
-            Settings => Ok(CommandResult::ManagerView(
-                self.settings_view(principal).await?,
-            )),
-            SetProgressDetail { detail } => {
-                if !matches!(detail.as_str(), "minimal" | "normal" | "detailed") {
-                    return Err(anyhow!(
-                        "progress detail must be minimal, normal, or detailed"
-                    ));
-                }
-                self.storage
-                    .put_setting(&format!("telegram.progress_detail:{principal}"), &detail)?;
-                Ok(CommandResult::ManagerView(
-                    self.settings_view(principal).await?,
-                ))
-            }
-            SetMenuCloseBehavior { behavior } => {
-                if !matches!(
-                    behavior.as_str(),
-                    "keep_summary" | "remove_keyboard" | "delete_message"
-                ) {
-                    return Err(anyhow!(
-                        "close behavior must be keep_summary, remove_keyboard, or delete_message"
-                    ));
-                }
-                self.storage.put_setting(
-                    &format!("telegram.menu_close_behavior:{principal}"),
-                    &behavior,
-                )?;
-                Ok(CommandResult::ManagerView(
-                    self.settings_view(principal).await?,
-                ))
-            }
-            Help { topic } => Ok(CommandResult::ManagerView(help_view(topic.as_deref()))),
-            Usage => Ok(CommandResult::InfoView(self.usage_view(principal)?)),
+            Help { .. } => Ok(CommandResult::InfoView(help_view())),
             Doctor => Ok(CommandResult::InfoView(self.doctor_view().await)),
         }
     }
 
-    fn session_view(&self, principal: &str, page: usize) -> Result<View> {
-        self.session_view_with_notice(principal, page, String::new())
+    fn session_view(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        page: usize,
+    ) -> Result<View> {
+        self.session_view_with_notice(principal, scope, page, String::new())
     }
 
     fn session_view_with_notice(
         &self,
         principal: &str,
+        scope: Option<TelegramScope>,
         page: usize,
         notice: String,
     ) -> Result<View> {
-        let (rows, pages, page) = self.sessions.list_page(principal, page, 5)?;
-        let active = self.sessions.context_for(principal)?.main.id;
+        let (rows, pages, page) = match scope {
+            Some(scope) => self
+                .sessions
+                .list_telegram_page(principal, scope, page, 5)?,
+            None => self.sessions.list_page(principal, page, 5)?,
+        };
+        let active = self.session_context(principal, scope)?.main.id;
         let mut blocks = vec![];
         if !notice.is_empty() {
             blocks.push(Block::Paragraph { text: notice });
@@ -636,34 +1018,39 @@ impl CommandCore {
                 rows.iter()
                     .enumerate()
                     .map(|(i, s)| {
-                        Action::command((i + 1).to_string(), format!("/session switch {}", s.id))
+                        Action::command((i + 1).to_string(), format!("/sessions switch {}", s.id))
                     })
                     .collect(),
             );
         }
         actions.push(vec![
-            Action::command("‹", format!("/session {}", page.saturating_sub(1).max(1))),
+            Action::command("‹", format!("/sessions {}", page.saturating_sub(1).max(1))),
             Action::noop(format!("{page}/{pages}")),
-            Action::command("›", format!("/session {}", (page + 1).min(pages))),
+            Action::command("›", format!("/sessions {}", (page + 1).min(pages))),
         ]);
         actions.push(vec![
             Action::command("New", "/new"),
-            Action::command("Rename", format!("/session rename {active}")),
-            Action::command("Detail", format!("/session detail {active}")),
+            Action::command("Rename", format!("/sessions rename {active}")),
+            Action::command("Detail", format!("/sessions detail {active}")),
         ]);
         actions.push(vec![
-            Action::command("Archive", format!("/session archive {active}")),
+            Action::command("Archive", format!("/sessions archive {active}")),
             Action::close(),
         ]);
         Ok(View {
-            title: Some("SESSION".into()),
+            title: Some("SESSIONS".into()),
             blocks,
             actions,
             side_mode: false,
         })
     }
 
-    fn session_detail_view(&self, principal: &str, id: &str) -> Result<View> {
+    fn session_detail_view(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        id: &str,
+    ) -> Result<View> {
         let s = self
             .storage
             .session(principal, id)?
@@ -673,9 +1060,16 @@ impl CommandCore {
                 "side sessions are not exposed in the main session manager"
             ));
         }
-        let active = self.sessions.context_for(principal)?.main.id == s.id;
+        if let Some(scope) = scope {
+            let bound = self.storage.telegram_scope_for_session(principal, id)?;
+            if bound != Some((scope.chat_id, scope.message_thread_id)) {
+                return Err(anyhow!("session is not in this Telegram topic"));
+            }
+        }
+        let context = self.session_context(principal, scope)?;
+        let active = context.main.id == s.id;
         let mode = if active {
-            self.sessions.context_for(principal)?.mode.as_str()
+            context.mode.as_str()
         } else {
             "main"
         };
@@ -706,11 +1100,11 @@ impl CommandCore {
             ],
         ];
         let mut actions = vec![vec![
-            Action::command("Select", format!("/session switch {}", s.id)),
-            Action::command("Rename", format!("/session rename {}", s.id)),
+            Action::command("Select", format!("/sessions switch {}", s.id)),
+            Action::command("Rename", format!("/sessions rename {}", s.id)),
         ]];
         actions.push(vec![
-            Action::command("Archive", format!("/session archive {}", s.id)),
+            Action::command("Archive", format!("/sessions archive {}", s.id)),
             Action::back(),
             Action::close(),
         ]);
@@ -725,42 +1119,8 @@ impl CommandCore {
         })
     }
 
-    fn provider_view(&self, principal: &str) -> Result<View> {
-        let current = self.sessions.context_for(principal)?.active.provider;
-        let rows = self
-            .providers
-            .list()
-            .into_iter()
-            .map(|p| {
-                vec![
-                    if p == current {
-                        "●".into()
-                    } else {
-                        "".into()
-                    },
-                    p,
-                ]
-            })
-            .collect();
-        let actions = self
-            .providers
-            .list()
-            .into_iter()
-            .map(|p| vec![Action::command(p.clone(), format!("/provider {p}"))])
-            .collect();
-        Ok(View {
-            title: Some("PROVIDER".into()),
-            blocks: vec![Block::Table {
-                headers: vec!["Current".into(), "Provider".into()],
-                rows,
-            }],
-            actions,
-            side_mode: false,
-        })
-    }
-
-    fn model_view(&self, principal: &str) -> Result<View> {
-        let c = self.sessions.context_for(principal)?;
+    fn model_view(&self, principal: &str, scope: Option<TelegramScope>) -> Result<View> {
+        let c = self.session_context(principal, scope)?;
         let account = c
             .active
             .account_id
@@ -769,6 +1129,11 @@ impl CommandCore {
             .map(|a| account_label(&a))
             .unwrap_or_else(|| "—".into());
         let status = format!("{:?}", self.providers.state(&c.active.provider)).to_uppercase();
+        let protocol = self
+            .providers
+            .capabilities(&c.active.provider, &c.active.model)
+            .map(|capability| capability.tool_protocol.as_str().to_owned())
+            .unwrap_or_else(|_| "unknown".into());
         Ok(View {
             title: Some("MODEL".into()),
             blocks: vec![Block::Table {
@@ -777,6 +1142,7 @@ impl CommandCore {
                     vec!["PROVIDER".into(), c.active.provider.clone()],
                     vec!["ACCOUNT".into(), account],
                     vec!["MODEL".into(), c.active.model.clone()],
+                    vec!["AGENT PROTOCOL".into(), protocol],
                     vec!["REASONING".into(), "Provider default".into()],
                     vec!["SESSION".into(), c.main.name],
                     vec!["STATUS".into(), status],
@@ -786,7 +1152,7 @@ impl CommandCore {
                 vec![Action::command("Change Model", "/model change")],
                 vec![
                     Action::command("Account", "/account"),
-                    Action::command("Provider", "/provider"),
+                    Action::command("Login", "/login"),
                 ],
                 vec![Action::close()],
             ],
@@ -794,31 +1160,57 @@ impl CommandCore {
         })
     }
 
-    fn model_picker_view(&self, principal: &str) -> Result<View> {
-        let c = self.sessions.context_for(principal)?;
+    fn model_picker_view(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        page: usize,
+    ) -> Result<View> {
+        let c = self.session_context(principal, scope)?;
         let models = self.providers.models(&c.active.provider)?;
-        let rows = models
+        let pages = models.len().max(1).div_ceil(5);
+        let page = page.clamp(1, pages);
+        let visible = models
             .iter()
-            .map(|m| {
+            .skip((page - 1) * 5)
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>();
+        let rows = visible
+            .iter()
+            .enumerate()
+            .map(|(index, m)| {
                 vec![
+                    (index + 1).to_string(),
+                    m.clone(),
                     if *m == c.active.model {
                         "●".into()
                     } else {
                         "".into()
                     },
-                    m.clone(),
                 ]
             })
             .collect();
-        let mut actions = models
+        let mut actions = vec![visible
             .into_iter()
-            .map(|m| vec![Action::command(m.clone(), format!("/model {m}"))])
-            .collect::<Vec<_>>();
+            .enumerate()
+            .map(|(index, model)| {
+                Action::command((index + 1).to_string(), format!("/model {model}"))
+            })
+            .collect::<Vec<_>>()];
+        actions.push(vec![
+            Action::command(
+                "‹",
+                format!("/model change {}", page.saturating_sub(1).max(1)),
+            ),
+            Action::noop(format!("Page {page}/{pages}")),
+            Action::command("›", format!("/model change {}", (page + 1).min(pages))),
+        ]);
         actions.push(vec![Action::back(), Action::close()]);
         Ok(View {
             title: Some("MODEL".into()),
             blocks: vec![Block::Table {
-                headers: vec!["Current".into(), "Model".into()],
+                headers: vec!["No".into(), "Model".into(), "Current".into()],
                 rows,
             }],
             actions,
@@ -826,8 +1218,8 @@ impl CommandCore {
         })
     }
 
-    fn account_view(&self, principal: &str) -> Result<View> {
-        let c = self.sessions.context_for(principal)?;
+    fn account_view(&self, principal: &str, scope: Option<TelegramScope>) -> Result<View> {
+        let c = self.session_context(principal, scope)?;
         let accounts = self.auth.accounts(Some(&c.active.provider))?;
         let rows = accounts
             .iter()
@@ -867,28 +1259,8 @@ impl CommandCore {
         })
     }
 
-    fn set_provider(&self, principal: &str, provider: &str) -> Result<()> {
-        let provider = normalize_provider(provider);
-        self.providers.get(&provider)?;
-        let c = self.sessions.context_for(principal)?;
-        let account = self
-            .auth
-            .accounts(Some(&provider))?
-            .into_iter()
-            .find(|a| a.status == "connected")
-            .map(|a| a.id);
-        let default = self.providers.preferred_model(&provider)?;
-        self.storage.set_session_provider(
-            principal,
-            &c.active.id,
-            &provider,
-            account.as_deref(),
-            &default,
-        )
-    }
-
-    fn set_model(&self, principal: &str, model: &str) -> Result<()> {
-        let c = self.sessions.context_for(principal)?;
+    fn set_model(&self, principal: &str, scope: Option<TelegramScope>, model: &str) -> Result<()> {
+        let c = self.session_context(principal, scope)?;
         if !self
             .providers
             .models(&c.active.provider)?
@@ -906,9 +1278,68 @@ impl CommandCore {
         )
     }
 
+    async fn probe_custom_model(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        model: &str,
+    ) -> Result<()> {
+        let context = self.session_context(principal, scope)?;
+        if !self
+            .providers
+            .models("custom")?
+            .iter()
+            .any(|candidate| candidate == model)
+        {
+            return Err(anyhow!("model is not in the provider catalog"));
+        }
+        let custom = self.config.read().await.providers.custom.clone();
+        let endpoint = custom
+            .base_url
+            .as_deref()
+            .ok_or_else(|| anyhow!("custom endpoint is not configured"))?;
+        let selected_api_key = context
+            .active
+            .account_id
+            .as_deref()
+            .and_then(|account| self.auth.credential(account).ok().flatten())
+            .and_then(|credential| credential.api_key);
+        let fallback_api_key = if selected_api_key.is_none() {
+            self.auth.provider_api_key("custom")?
+        } else {
+            None
+        };
+        let capability = crate::providers::probe_custom_tool_capability(
+            endpoint,
+            &custom.headers,
+            selected_api_key.as_deref().or(fallback_api_key.as_deref()),
+            &custom.protocol,
+            model,
+        )
+        .await;
+        self.storage
+            .upsert_provider_capability(&crate::storage::ProviderCapabilityRecord {
+                provider: "custom".into(),
+                model: model.into(),
+                tool_protocol: capability.tool_protocol.as_str().into(),
+                native_tool_calls: capability.tool_protocol
+                    == crate::providers::ToolProtocol::Native,
+                structured_output: capability.structured_output,
+                continuation: capability.continuation,
+                probed_at: chrono::Utc::now().to_rfc3339(),
+                evidence: capability.evidence,
+            })?;
+        Ok(())
+    }
+
     /// Atomic provider/account/model activation. Provider and model are resolved before
     /// the transaction; the storage layer then updates all three fields together.
-    fn use_account(&self, principal: &str, account: &str) -> Result<(String, String)> {
+    fn use_account(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        account: &str,
+    ) -> Result<(String, String)> {
         let record = self
             .storage
             .account(account)?
@@ -917,7 +1348,7 @@ impl CommandCore {
             return Err(anyhow!("account is not connected"));
         }
         let model = self.providers.preferred_model(&record.provider)?;
-        let c = self.sessions.context_for(principal)?;
+        let c = self.session_context(principal, scope)?;
         self.storage.activate_account(
             principal,
             &c.active.id,
@@ -928,13 +1359,41 @@ impl CommandCore {
         Ok((record.provider, model))
     }
 
-    async fn status_view(&self, principal: &str) -> Result<View> {
+    fn session_context(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+    ) -> Result<crate::session::SessionContext> {
+        match scope {
+            Some(scope) => self.sessions.context_for_telegram(principal, scope),
+            None => self.sessions.context_for(principal),
+        }
+    }
+
+    fn validate_session_scope(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        session_id: &str,
+    ) -> Result<()> {
+        if let Some(scope) = scope {
+            let bound = self
+                .storage
+                .telegram_scope_for_session(principal, session_id)?;
+            if bound != Some((scope.chat_id, scope.message_thread_id)) {
+                return Err(anyhow!("session is not in this Telegram topic"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn status_view(&self, principal: &str, scope: Option<TelegramScope>) -> Result<View> {
         let cfg = self.config.read().await.clone();
         let health = self
             .health
             .snapshot(&cfg, self.storage.health(), self.providers.states())
             .await;
-        let c = self.sessions.context_for(principal)?;
+        let c = self.session_context(principal, scope)?;
         let selected_state = health
             .provider_states
             .get(&c.active.provider)
@@ -951,12 +1410,30 @@ impl CommandCore {
         } else {
             health.gateway.clone()
         };
+        let environment = self.runtime.as_ref().map(|runtime| runtime.environment());
+        let skills = SkillStore::new(self.storage.clone())
+            .list(principal, 500)?
+            .len();
+        let latest_run = self
+            .storage
+            .agent_runs(principal, 20)?
+            .into_iter()
+            .find(|run| run.session_id == c.active.id && run.status == "running");
         Ok(View {
             title: Some("STATUS".into()),
             blocks: vec![Block::Table {
                 headers: vec!["Field".into(), "Value".into()],
                 rows: vec![
-                    vec!["Gateway".into(), format!("{:?}", gateway).to_uppercase()],
+                    vec![
+                        "Agent".into(),
+                        if self.agent.is_active_in_scope(principal, scope) {
+                            "RUNNING".into()
+                        } else if matches!(gateway, GatewayStatus::Running) {
+                            "READY".into()
+                        } else {
+                            format!("{:?}", gateway).to_uppercase()
+                        },
+                    ],
                     vec![
                         "Daemon".into(),
                         if health.daemon_running {
@@ -987,7 +1464,48 @@ impl CommandCore {
                     ],
                     vec!["Model".into(), c.active.model],
                     vec!["Session".into(), c.main.name],
-                    vec!["Mode".into(), c.mode.as_str().to_uppercase()],
+                    vec![
+                        "Topic".into(),
+                        scope
+                            .and_then(|scope| scope.message_thread_id)
+                            .map(|thread| thread.to_string())
+                            .unwrap_or_else(|| "default".into()),
+                    ],
+                    vec![
+                        "YOLO".into(),
+                        if c.active.yolo_mode {
+                            "ON".into()
+                        } else {
+                            "OFF".into()
+                        },
+                    ],
+                    vec![
+                        "Termux".into(),
+                        if environment.as_ref().is_some_and(|env| env.termux.is_some()) {
+                            "READY".into()
+                        } else {
+                            "UNAVAILABLE".into()
+                        },
+                    ],
+                    vec![
+                        "Root broker".into(),
+                        if environment
+                            .as_ref()
+                            .is_some_and(|env| env.effective_uid == 0)
+                        {
+                            "READY".into()
+                        } else {
+                            "UNAVAILABLE".into()
+                        },
+                    ],
+                    vec!["Memory".into(), "READY".into()],
+                    vec!["Skills".into(), skills.to_string()],
+                    vec![
+                        "Running task".into(),
+                        latest_run
+                            .and_then(|run| run.goal)
+                            .unwrap_or_else(|| "—".into()),
+                    ],
                 ],
             }],
             actions: vec![],
@@ -995,16 +1513,54 @@ impl CommandCore {
         })
     }
 
-    fn context_view(&self, principal: &str) -> Result<View> {
-        let c = self.sessions.context_for(principal)?;
-        let effective = self.sessions.agent_context(principal)?;
+    async fn context_view(&self, principal: &str, scope: Option<TelegramScope>) -> Result<View> {
+        let c = self.session_context(principal, scope)?;
+        let main = self.storage.messages(principal, &c.main.id)?;
+        let side = if c.mode == ChatMode::Side {
+            self.storage.messages(principal, &c.active.id)?
+        } else {
+            Vec::new()
+        };
+        let effective_count = main.len() + side.len();
+        let chars = main
+            .iter()
+            .chain(side.iter())
+            .map(|message| message.content.chars().count())
+            .sum::<usize>();
+        let memories = MemoryStore::new(self.storage.clone())
+            .list(principal, None, 200)?
+            .len();
+        let skills = SkillStore::new(self.storage.clone())
+            .list(principal, 500)?
+            .len();
+        let summarized = self
+            .storage
+            .session_summary(principal, &c.main.id)?
+            .is_some();
+        let context_budget = self.config.read().await.agent.context_max_chars;
         Ok(View {
             title: Some("CONTEXT".into()),
             blocks: vec![Block::Table {
                 headers: vec!["Field".into(), "Value".into()],
                 rows: vec![
                     vec!["Main messages".into(), c.main.message_count.to_string()],
-                    vec!["Effective messages".into(), effective.len().to_string()],
+                    vec!["Effective messages".into(), effective_count.to_string()],
+                    vec!["Stored characters".into(), chars.to_string()],
+                    vec!["Context budget".into(), format!("{context_budget} chars")],
+                    vec![
+                        "Summary".into(),
+                        if summarized {
+                            "AVAILABLE".into()
+                        } else {
+                            "NOT NEEDED".into()
+                        },
+                    ],
+                    vec!["Active memory entries".into(), memories.to_string()],
+                    vec!["Skills available".into(), skills.to_string()],
+                    vec![
+                        "Provider / model".into(),
+                        format!("{} / {}", c.active.provider, c.active.model),
+                    ],
                     vec!["Mode".into(), c.mode.as_str().to_uppercase()],
                     vec![
                         "Side isolation".into(),
@@ -1021,20 +1577,49 @@ impl CommandCore {
         })
     }
 
-    fn usage_view(&self, principal: &str) -> Result<View> {
-        let c = self.sessions.context_for(principal)?;
-        let stored = self.storage.messages(principal, &c.active.id)?;
-        let chars: usize = stored.iter().map(|m| m.content.chars().count()).sum();
-        Ok(View::info("USAGE", format!("Session messages: {}\nStored characters: {}\nProvider quota telemetry is provider-dependent and not normalized in v0.2.0.", stored.len(), chars)))
-    }
-
     async fn doctor_view(&self) -> View {
         let cfg = self.config.read().await.clone();
+        let environment = self.runtime.as_ref().map(|runtime| runtime.environment());
+        let identity_ready = self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.workspace().load().is_ok());
         let checks = vec![
             format!("DB: {}", if self.storage.health() { "OK" } else { "ERROR" }),
             format!("IPC: {}", cfg.ipc.bind),
             format!("Telegram transport: {}", cfg.telegram.transport),
             format!("Providers registered: {}", self.providers.readiness()),
+            format!(
+                "Identity workspace: {}",
+                if identity_ready { "OK" } else { "ERROR" }
+            ),
+            format!(
+                "Memory index: {}",
+                if self.storage.health() { "OK" } else { "ERROR" }
+            ),
+            format!(
+                "Skills index: {}",
+                if self.storage.health() { "OK" } else { "ERROR" }
+            ),
+            format!(
+                "Termux: {}",
+                if environment.as_ref().is_some_and(|env| env.termux.is_some()) {
+                    "OK"
+                } else {
+                    "UNAVAILABLE"
+                }
+            ),
+            format!(
+                "Privileged broker: {}",
+                if environment
+                    .as_ref()
+                    .is_some_and(|env| env.effective_uid == 0)
+                {
+                    "OK"
+                } else {
+                    "UNAVAILABLE"
+                }
+            ),
             "Root AI shell: DISABLED by architecture".into(),
         ];
         View {
@@ -1048,52 +1633,324 @@ impl CommandCore {
         }
     }
 
-    async fn settings_view(&self, principal: &str) -> Result<View> {
-        let cfg = self.config.read().await;
-        let detail = self
-            .storage
-            .setting(&format!("telegram.progress_detail:{principal}"))?
-            .unwrap_or_else(|| cfg.telegram.ui.progress_detail.clone());
-        let close = self
-            .storage
-            .setting(&format!("telegram.menu_close_behavior:{principal}"))?
-            .unwrap_or_else(|| cfg.telegram.ui.menu_close_behavior.clone());
-        let mark = |x: &str| if x == detail { "●" } else { "○" };
+    fn yolo_view(&self, principal: &str, scope: Option<TelegramScope>) -> Result<View> {
+        let context = self.session_context(principal, scope)?;
+        let enabled = context.active.yolo_mode;
         Ok(View {
-            title: Some("SETTINGS".into()),
-            blocks: vec![Block::Table {
-                headers: vec!["Setting".into(), "Value".into()],
-                rows: vec![
-                    vec!["Agent Progress".into(), detail.clone()],
-                    vec!["Menu Close".into(), close.clone()],
-                ],
+            title: Some("YOLO MODE".into()),
+            blocks: vec![Block::Paragraph {
+                text: format!(
+                    "Current session: {}\n\nYOLO skips interactive approvals that Xiao policy normally marks ASK. Hard DENY rules still apply.",
+                    if enabled { "ON" } else { "OFF" }
+                ),
             }],
             actions: vec![
-                vec![
-                    Action::command(
-                        format!("{} Minimal", mark("minimal")),
-                        "/settings progress minimal",
-                    ),
-                    Action::command(
-                        format!("{} Normal", mark("normal")),
-                        "/settings progress normal",
-                    ),
-                    Action::command(
-                        format!("{} Detailed", mark("detailed")),
-                        "/settings progress detailed",
-                    ),
-                ],
-                vec![
-                    Action::command("Keep summary", "/settings close keep_summary"),
-                    Action::command("Remove keyboard", "/settings close remove_keyboard"),
-                ],
-                vec![
-                    Action::command("Delete message", "/settings close delete_message"),
-                    Action::close(),
-                ],
+                vec![Action::command(
+                    if enabled { "Disable" } else { "Enable" },
+                    if enabled { "/yolo disable" } else { "/yolo enable" },
+                )],
+                vec![Action::close()],
             ],
+            side_mode: context.mode == ChatMode::Side,
+        })
+    }
+
+    fn memory_view(&self, principal: &str, query: Option<&str>) -> Result<View> {
+        let store = self.memory_store();
+        let records = match query {
+            Some("user") => store.list(principal, Some(MemoryScope::User), 5)?,
+            Some("agent") => store.list(principal, Some(MemoryScope::Agent), 5)?,
+            Some(query) if !query.trim().is_empty() => store.search(principal, query, 5)?,
+            _ => Vec::new(),
+        };
+        let blocks = if records.is_empty() {
+            vec![Block::Paragraph {
+                text: "Choose a memory source or search Xiao's current inspectable state.".into(),
+            }]
+        } else {
+            vec![Block::Table {
+                headers: vec!["Scope".into(), "Key".into(), "Value".into()],
+                rows: records
+                    .iter()
+                    .map(|record| {
+                        vec![
+                            record.scope.as_str().into(),
+                            record.key.clone(),
+                            record.value.clone(),
+                        ]
+                    })
+                    .collect(),
+            }]
+        };
+        Ok(View {
+            title: Some("MEMORY".into()),
+            blocks,
+            actions: {
+                let mut actions = vec![
+                    vec![
+                        Action::command("User Profile", "/memory user"),
+                        Action::command("Agent Memory", "/memory agent"),
+                    ],
+                    vec![Action::command("Search", "/memory search"), Action::close()],
+                ];
+                for record in records.iter().take(5) {
+                    actions.push(vec![
+                        Action::command(
+                            format!("Edit {}", record.key),
+                            format!(
+                                "/memory edit {} {} {}",
+                                record.scope.as_str(),
+                                record.category,
+                                record.key
+                            ),
+                        ),
+                        Action::command(
+                            "Forget",
+                            format!(
+                                "/memory forget {} {} {}",
+                                record.scope.as_str(),
+                                record.category,
+                                record.key
+                            ),
+                        ),
+                    ]);
+                }
+                actions
+            },
             side_mode: false,
         })
+    }
+
+    fn memory_store(&self) -> MemoryStore {
+        match &self.runtime {
+            Some(runtime) => MemoryStore::with_workspace(self.storage.clone(), runtime.workspace()),
+            None => MemoryStore::new(self.storage.clone()),
+        }
+    }
+
+    fn skills_view(&self, principal: &str, query: Option<&str>) -> Result<View> {
+        let store = SkillStore::new(self.storage.clone());
+        let query_parts = query
+            .map(str::split_whitespace)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let source = query_parts
+            .first()
+            .copied()
+            .filter(|source| matches!(*source, "learned" | "imported"));
+        let requested_page = query_parts
+            .get(1)
+            .and_then(|page| page.parse::<usize>().ok())
+            .unwrap_or(1);
+        let mut pages = 1usize;
+        let mut page = 1usize;
+        let skills = match (source, query) {
+            (Some(source), _) => {
+                let matching = store
+                    .list_all(principal, 500)?
+                    .into_iter()
+                    .filter(|skill| skill.source_kind == source)
+                    .collect::<Vec<_>>();
+                pages = matching.len().max(1).div_ceil(5);
+                page = requested_page.clamp(1, pages);
+                matching.into_iter().skip((page - 1) * 5).take(5).collect()
+            }
+            (None, Some(query)) if !query.trim().is_empty() => store.search(principal, query, 5)?,
+            _ => Vec::new(),
+        };
+        let mut actions = vec![
+            vec![
+                Action::command("Learned", "/skills learned"),
+                Action::command("Imported", "/skills imported"),
+            ],
+            vec![Action::command("Search", "/skills search"), Action::close()],
+        ];
+        for skill in skills.iter().take(5) {
+            actions.push(vec![Action::command(
+                format!("View {}", skill.name),
+                format!("/skills detail {}", skill.id),
+            )]);
+        }
+        if let Some(source) = source {
+            actions.push(vec![
+                Action::command(
+                    "‹",
+                    format!("/skills {source} {}", page.saturating_sub(1).max(1)),
+                ),
+                Action::noop(format!("Page {page}/{pages}")),
+                Action::command("›", format!("/skills {source} {}", (page + 1).min(pages))),
+            ]);
+        }
+        Ok(View {
+            title: Some("SKILLS".into()),
+            blocks: if skills.is_empty() {
+                vec![Block::Paragraph {
+                    text: "No matching indexed skills.".into(),
+                }]
+            } else {
+                vec![Block::Table {
+                    headers: vec!["No".into(), "Skill".into(), "Description".into()],
+                    rows: skills
+                        .iter()
+                        .enumerate()
+                        .map(|(index, skill)| {
+                            vec![
+                                (index + 1).to_string(),
+                                skill.name.clone(),
+                                format!(
+                                    "{}{}",
+                                    skill.summary,
+                                    if skill.enabled { "" } else { " · DISABLED" }
+                                ),
+                            ]
+                        })
+                        .collect(),
+                }]
+            },
+            actions,
+            side_mode: false,
+        })
+    }
+
+    fn skill_detail_view(&self, principal: &str, skill: &str) -> Result<View> {
+        let record = SkillStore::new(self.storage.clone())
+            .view(principal, skill)?
+            .ok_or_else(|| anyhow!("skill not found"))?;
+        let prerequisites = if record.prerequisites.trim().is_empty() {
+            "None declared".into()
+        } else {
+            record.prerequisites.clone()
+        };
+        let mut actions = vec![vec![Action::command(
+            if record.enabled { "Disable" } else { "Enable" },
+            format!(
+                "/skills {} {}",
+                if record.enabled { "disable" } else { "enable" },
+                record.id
+            ),
+        )]];
+        if record.source_kind == "learned" {
+            actions.push(vec![Action::command(
+                "Delete",
+                format!("/skills delete {}", record.id),
+            )]);
+        }
+        actions.push(vec![Action::back(), Action::close()]);
+        Ok(View {
+            title: Some("SKILL DETAIL".into()),
+            blocks: vec![
+                Block::Table {
+                    headers: vec!["Field".into(), "Value".into()],
+                    rows: vec![
+                        vec!["Name".into(), record.name],
+                        vec!["Description".into(), record.summary],
+                        vec!["Source".into(), record.source_kind],
+                        vec![
+                            "State".into(),
+                            if record.enabled {
+                                "ENABLED".into()
+                            } else {
+                                "DISABLED".into()
+                            },
+                        ],
+                        vec!["Prerequisites".into(), prerequisites],
+                        vec!["Updated".into(), record.updated_at],
+                    ],
+                },
+                Block::Paragraph {
+                    text: format!(
+                        "When to use:\n{}\n\nProcedure:\n{}\n\nPitfalls:\n{}\n\nVerification:\n{}",
+                        record.when_to_use, record.procedure, record.pitfalls, record.verification
+                    ),
+                },
+            ],
+            actions,
+            side_mode: false,
+        })
+    }
+
+    fn tools_view(&self) -> View {
+        let capabilities = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.capabilities().list())
+            .unwrap_or_default();
+        let rows = capabilities
+            .into_iter()
+            .take(40)
+            .map(|capability| {
+                let marker = match capability.status {
+                    CapabilityStatus::Available => "✓",
+                    CapabilityStatus::MissingInstallable => "○",
+                    CapabilityStatus::ApprovalRequired => "!",
+                    _ => "×",
+                };
+                vec![
+                    marker.into(),
+                    capability.name,
+                    capability.status.as_str().into(),
+                ]
+            })
+            .collect();
+        View {
+            title: Some("TOOLS & CAPABILITIES".into()),
+            blocks: vec![Block::Table {
+                headers: vec!["".into(), "Capability".into(), "State".into()],
+                rows,
+            }],
+            actions: vec![vec![Action::command("Refresh", "/tools"), Action::close()]],
+            side_mode: false,
+        }
+    }
+
+    fn about_view(&self) -> View {
+        let environment = self.runtime.as_ref().map(|runtime| runtime.environment());
+        let rows = environment
+            .map(|environment| {
+                vec![
+                    vec!["Version".into(), crate::VERSION.into()],
+                    vec!["Core".into(), "Rust".into()],
+                    vec!["Interface".into(), "Telegram".into()],
+                    vec!["Platform".into(), environment.platform],
+                    vec!["Architecture".into(), environment.architecture],
+                    vec![
+                        "Root".into(),
+                        if environment.root_available {
+                            "available".into()
+                        } else {
+                            "unavailable".into()
+                        },
+                    ],
+                    vec!["SELinux".into(), environment.selinux.as_str().into()],
+                    vec![
+                        "Termux".into(),
+                        environment
+                            .termux
+                            .map(|termux| termux.prefix.display().to_string())
+                            .unwrap_or_else(|| "unavailable".into()),
+                    ],
+                ]
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    vec!["Version".into(), crate::VERSION.into()],
+                    vec!["Runtime".into(), "unavailable".into()],
+                ]
+            });
+        View {
+            title: Some("XIAO\nPrivate Personal AI Agent".into()),
+            blocks: vec![Block::Table {
+                headers: vec!["Field".into(), "Value".into()],
+                rows,
+            }],
+            actions: vec![vec![
+                Action::command("Refresh", "/about"),
+                Action::command("Tools", "/tools"),
+                Action::close(),
+            ]],
+            side_mode: false,
+        }
     }
 }
 
@@ -1118,29 +1975,13 @@ fn login_picker() -> View {
     }
 }
 
-fn help_view(topic: Option<&str>) -> View {
-    let topic = topic.unwrap_or("root").to_ascii_lowercase();
-    let (title,text)=match topic.as_str(){
-        "chat"|"session"|"btw"=>("HELP · CHAT","/new — create a main session\n/btw — enter/exit isolated side chat\n/session — manage only your sessions\n/retry — repeat your latest user request\n/stop — cancel active generation"),
-        "ai"|"model"|"provider"=>("HELP · AI","/model — active provider/account/model status\n/provider — choose provider\n/context — effective context summary"),
-        "accounts"|"account"|"login"=>("HELP · ACCOUNTS","/login [codex|antigravity] — authenticate\n/account — connected accounts\n/account <id> — atomically activate provider/account/model\n/logout [id] — disconnect"),
-        "advanced"|"settings"=>("HELP · ADVANCED","/status — aggregate gateway health\n/approvals — inspect pending sensitive operations\n/approve <id> or /deny <id> — decide one exact operation\n/settings — Telegram progress/close behavior\n/usage — local session usage\n/doctor — diagnostic summary"),
-        _=>("HELP","Choose a category or use /help btw, /help session, /help model, /help account, or /help settings."),
-    };
+fn help_view() -> View {
     View {
-        title: Some(title.into()),
-        blocks: vec![Block::Paragraph { text: text.into() }],
-        actions: vec![
-            vec![
-                Action::command("Chat", "/help chat"),
-                Action::command("AI", "/help ai"),
-            ],
-            vec![
-                Action::command("Accounts", "/help accounts"),
-                Action::command("Advanced", "/help advanced"),
-            ],
-            vec![Action::close()],
-        ],
+        title: Some("HELP".into()),
+        blocks: vec![Block::Paragraph {
+            text: TelegramCommandRegistry::help_text(),
+        }],
+        actions: vec![vec![Action::close()]],
         side_mode: false,
     }
 }
@@ -1223,7 +2064,9 @@ mod tests {
                     "custom",
                     Arc::new(FakeProvider {
                         id: "custom",
-                        models: vec!["custom-default".into()],
+                        models: (0..12)
+                            .map(|index| format!("custom-model-{index:02}"))
+                            .collect(),
                     }) as Arc<dyn Provider>,
                 ),
                 (
@@ -1270,7 +2113,7 @@ mod tests {
         let (core, storage, sessions, _temp) = core();
         let session = sessions.ensure_default_session("p").unwrap();
         storage.upsert_account(&account("c1", "codex")).unwrap();
-        let (provider, model) = core.use_account("p", "c1").unwrap();
+        let (provider, model) = core.use_account("p", None, "c1").unwrap();
         assert_eq!(
             (provider.as_str(), model.as_str()),
             ("codex", "codex-default")
@@ -1328,6 +2171,234 @@ mod tests {
         assert!(storage.pending_approvals("other-owner").unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn memory_and_skill_owner_managers_edit_disable_and_guard_delete() {
+        let (core, storage, _sessions, _temp) = core();
+        let memory = MemoryStore::new(storage.clone());
+        memory
+            .upsert(
+                "p",
+                MemoryScope::User,
+                "preference",
+                "diagram_style",
+                "PlantUML",
+                1.0,
+                "test",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            core.execute_text("p", "/memory user").await.unwrap(),
+            CommandResult::ManagerView(_)
+        ));
+        core.execute_text("p", "/memory edit user preference diagram_style Mermaid")
+            .await
+            .unwrap();
+        assert_eq!(
+            memory.list("p", Some(MemoryScope::User), 10).unwrap()[0].value,
+            "Mermaid"
+        );
+
+        let skill_store = SkillStore::new(storage);
+        let skill = skill_store
+            .create_or_update(
+                "p",
+                crate::skills::SkillCandidate {
+                    name: "verify-owner-workflow".into(),
+                    summary: "Verify an owner workflow".into(),
+                    when_to_use: "When the owner asks to verify a workflow".into(),
+                    prerequisites: "A read-only status capability".into(),
+                    procedure: "1. Inspect status.\n2. Verify the outcome.".into(),
+                    pitfalls: "Do not infer success from prose.".into(),
+                    verification: "A successful status observation.".into(),
+                },
+                Some("session"),
+            )
+            .unwrap()
+            .1;
+        assert!(matches!(
+            core.execute_text("p", "/skills learned").await.unwrap(),
+            CommandResult::ManagerView(_)
+        ));
+        let detail = core
+            .execute_text("p", &format!("/skills detail {}", skill.id))
+            .await
+            .unwrap();
+        let CommandResult::ManagerView(detail) = detail else {
+            panic!("skill detail manager expected")
+        };
+        assert!(serde_json::to_string(&detail)
+            .unwrap()
+            .contains("Prerequisites"));
+        core.execute_text("p", &format!("/skills disable {}", skill.id))
+            .await
+            .unwrap();
+        assert!(!skill_store.view("p", &skill.id).unwrap().unwrap().enabled);
+        assert!(matches!(
+            core.execute_text("p", &format!("/skills delete {}", skill.id))
+                .await
+                .unwrap(),
+            CommandResult::ManagerView(_)
+        ));
+        core.execute_text("p", &format!("/skills delete-confirm {}", skill.id))
+            .await
+            .unwrap();
+        assert!(skill_store.view("p", &skill.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn topic_session_manager_paginates_and_preserves_archived_history() {
+        let (core, storage, sessions, _temp) = core();
+        let owner = "telegram:100:10";
+        let scope = TelegramScope::new(100, Some(44));
+        let initial = sessions.context_for_telegram(owner, scope).unwrap().main;
+        for _ in 0..6 {
+            assert!(matches!(
+                core.execute_text_in_telegram_scope(owner, scope, "/new", None)
+                    .await
+                    .unwrap(),
+                CommandResult::Confirmation(_)
+            ));
+        }
+
+        let first_page = core
+            .execute_text_in_telegram_scope(owner, scope, "/sessions", None)
+            .await
+            .unwrap();
+        let CommandResult::ManagerView(first_page) = first_page else {
+            panic!("session manager view expected")
+        };
+        let first_rows = first_page
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Table { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(first_rows.len(), 5);
+        assert!(first_page
+            .actions
+            .iter()
+            .flatten()
+            .any(|action| action.label == "Close"));
+
+        let second_page = core
+            .execute_text_in_telegram_scope(owner, scope, "/session 2", None)
+            .await
+            .unwrap();
+        let CommandResult::ManagerView(second_page) = second_page else {
+            panic!("hidden /session alias must open the manager")
+        };
+        let second_rows = second_page
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Table { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(second_rows.len(), 2);
+
+        let active = sessions.context_for_telegram(owner, scope).unwrap().main;
+        storage
+            .append_message(owner, &active.id, "user", "archived recall sentinel")
+            .unwrap();
+        core.execute_text_in_telegram_scope(
+            owner,
+            scope,
+            &format!("/sessions rename {} Project Atlas", active.id),
+            None,
+        )
+        .await
+        .unwrap();
+        let renamed = storage.session(owner, &active.id).unwrap().unwrap();
+        assert_eq!(renamed.name, "Project Atlas");
+        assert!(matches!(
+            core.execute_text_in_telegram_scope(
+                owner,
+                scope,
+                &format!("/sessions detail {}", active.id),
+                None,
+            )
+            .await
+            .unwrap(),
+            CommandResult::ManagerView(_)
+        ));
+        core.execute_text_in_telegram_scope(
+            owner,
+            scope,
+            &format!("/sessions archive {}", active.id),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            storage
+                .session(owner, &active.id)
+                .unwrap()
+                .unwrap()
+                .archived
+        );
+        assert_eq!(
+            storage.messages(owner, &active.id).unwrap()[0].content,
+            "archived recall sentinel"
+        );
+        assert_ne!(
+            sessions.context_for_telegram(owner, scope).unwrap().main.id,
+            active.id
+        );
+        assert!(storage.session(owner, &initial.id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn model_picker_and_runtime_command_surfaces_are_bounded_and_factual() {
+        let (core, _storage, _sessions, _temp) = core();
+        let first = core.execute_text("p", "/model change 1").await.unwrap();
+        let CommandResult::ManagerView(first) = first else {
+            panic!("model picker expected")
+        };
+        let rows = first
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Table { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        let second = core.execute_text("p", "/model change 2").await.unwrap();
+        let CommandResult::ManagerView(second) = second else {
+            panic!("second model page expected")
+        };
+        let second_rows = second
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Table { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(second_rows.len(), 5);
+
+        for (command, expected) in [
+            ("/status", "YOLO"),
+            ("/context", "Context budget"),
+            ("/tools", "TOOLS & CAPABILITIES"),
+            ("/doctor", "Root AI shell: DISABLED"),
+            ("/about", "Private Personal AI Agent"),
+            ("/approvals", "No pending"),
+        ] {
+            let result = core.execute_text("p", command).await.unwrap();
+            let rendered = serde_json::to_string(&match result {
+                CommandResult::InfoView(view) | CommandResult::ManagerView(view) => view,
+                other => panic!("unexpected result for {command}: {other:?}"),
+            })
+            .unwrap();
+            assert!(rendered.contains(expected), "{command} missing {expected}");
+        }
+    }
+
     #[test]
     fn use_account_atomically_activates_agy_from_fresh_custom_session() {
         let (core, storage, sessions, _temp) = core();
@@ -1335,7 +2406,7 @@ mod tests {
         storage
             .upsert_account(&account("a1", "antigravity"))
             .unwrap();
-        core.use_account("p", "a1").unwrap();
+        core.use_account("p", None, "a1").unwrap();
         let after = storage.session("p", &session.id).unwrap().unwrap();
         assert_eq!(after.provider, "antigravity");
         assert_eq!(after.account_id.as_deref(), Some("a1"));
@@ -1353,12 +2424,12 @@ mod tests {
         ] {
             storage.upsert_account(&a).unwrap();
         }
-        core.use_account("p", "c1").unwrap();
-        core.use_account("p", "c2").unwrap();
+        core.use_account("p", None, "c1").unwrap();
+        core.use_account("p", None, "c2").unwrap();
         let codex = storage.session("p", &session.id).unwrap().unwrap();
         assert_eq!(codex.account_id.as_deref(), Some("c2"));
         assert_eq!(codex.provider, "codex");
-        core.use_account("p", "a1").unwrap();
+        core.use_account("p", None, "a1").unwrap();
         let agy = storage.session("p", &session.id).unwrap().unwrap();
         assert_eq!(agy.account_id.as_deref(), Some("a1"));
         assert_eq!(agy.provider, "antigravity");
@@ -1370,7 +2441,7 @@ mod tests {
         let (core, storage, sessions, _temp) = core();
         let session = sessions.ensure_default_session("p").unwrap();
         let before = storage.session("p", &session.id).unwrap().unwrap();
-        assert!(core.use_account("p", "missing").is_err());
+        assert!(core.use_account("p", None, "missing").is_err());
         let after = storage.session("p", &session.id).unwrap().unwrap();
         assert_eq!(
             (after.provider, after.account_id, after.model),
@@ -1378,7 +2449,7 @@ mod tests {
         );
         storage.upsert_account(&account("gone", "codex")).unwrap();
         storage.delete_account("gone").unwrap();
-        assert!(core.use_account("p", "gone").is_err());
+        assert!(core.use_account("p", None, "gone").is_err());
     }
 
     #[test]
@@ -1388,7 +2459,7 @@ mod tests {
         storage.upsert_account(&account("e1", "empty")).unwrap();
         let before = storage.session("p", &session.id).unwrap().unwrap();
         assert!(core
-            .use_account("p", "e1")
+            .use_account("p", None, "e1")
             .unwrap_err()
             .to_string()
             .contains("no usable models"));
@@ -1407,7 +2478,7 @@ mod tests {
         disconnected.status = "expired".into();
         storage.upsert_account(&disconnected).unwrap();
         let before = storage.session("p", &session.id).unwrap().unwrap();
-        assert!(core.use_account("p", "c1").is_err());
+        assert!(core.use_account("p", None, "c1").is_err());
         let after = storage.session("p", &session.id).unwrap().unwrap();
         assert_eq!(
             (after.provider, after.account_id, after.model),

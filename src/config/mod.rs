@@ -69,10 +69,10 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         let addr: SocketAddr = self.ipc.bind.parse().context("invalid ipc.bind")?;
         if !addr.ip().is_loopback() {
-            return Err(anyhow!("ipc.bind must be loopback-only in v0.2.0"));
+            return Err(anyhow!("ipc.bind must be loopback-only"));
         }
         if self.telegram.transport != "long_polling" {
-            return Err(anyhow!("telegram.transport must be long_polling in v0.2.0"));
+            return Err(anyhow!("telegram.transport must be long_polling"));
         }
         if self.telegram.ui.menu_ttl_seconds == 0 {
             return Err(anyhow!("telegram.ui.menu_ttl_seconds must be > 0"));
@@ -129,6 +129,14 @@ impl AppConfig {
             "openai_responses" | "openai_chat_completions"
         ) {
             return Err(anyhow!("unsupported custom provider protocol"));
+        }
+        if !matches!(
+            self.providers.custom.tool_protocol.as_str(),
+            "auto" | "native" | "structured_json" | "chat_only"
+        ) {
+            return Err(anyhow!(
+                "providers.custom.tool_protocol must be auto, native, structured_json, or chat_only"
+            ));
         }
         if self.providers.custom.enabled
             && self
@@ -461,6 +469,10 @@ pub struct CustomProviderConfig {
     pub base_url: Option<String>,
     #[serde(default = "default_custom_protocol")]
     pub protocol: String,
+    /// Agent protocol selected by a capability probe. `auto` prefers the
+    /// provider's native OpenAI-compatible function/tool protocol.
+    #[serde(default = "default_custom_tool_protocol")]
+    pub tool_protocol: String,
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
@@ -475,6 +487,7 @@ impl Default for CustomProviderConfig {
             name: Some("Custom".into()),
             base_url: None,
             protocol: default_custom_protocol(),
+            tool_protocol: default_custom_tool_protocol(),
             models: vec![],
             default_model: None,
             headers: std::collections::BTreeMap::new(),
@@ -535,6 +548,9 @@ fn default_secrets_dir() -> PathBuf {
 }
 fn default_custom_protocol() -> String {
     "openai_chat_completions".into()
+}
+fn default_custom_tool_protocol() -> String {
+    "auto".into()
 }
 fn default_agent_max_turns() -> usize {
     8

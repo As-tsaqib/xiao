@@ -88,11 +88,11 @@ apply_response=$($CURL -fsS --max-time 30 \
   --data "$apply_payload" "http://127.0.0.1:$TEST_PORT/v1/admin/apply") || exit 1
 printf '%s' "$apply_response" | grep -Fq '"ok":true' || { echo 'xiao rejected custom provider configuration.' >&2; exit 1; }
 
-provider_response=$($CURL -fsS --max-time 30 \
+model_response=$($CURL -fsS --max-time 30 \
   -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' \
-  --data '{"principal":"device:e2e","input":"/provider custom"}' \
+  --data "{\"principal\":\"device:e2e\",\"input\":\"/model $TEST_MODEL\"}" \
   "http://127.0.0.1:$TEST_PORT/v1/command") || exit 1
-printf '%s' "$provider_response" | grep -Fq 'custom' || { echo 'xiao could not activate custom provider.' >&2; exit 1; }
+printf '%s' "$model_response" | grep -Fq "$TEST_MODEL" || { echo 'xiao could not activate the discovered custom model.' >&2; exit 1; }
 
 chat_response=$($CURL -fsS --max-time 180 \
   -H "Authorization: Bearer $admin_token" -H 'Content-Type: application/json' \

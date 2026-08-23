@@ -64,10 +64,11 @@ impl SkillRegistry {
         self.sync(owner)?;
         let record = self.store.view(owner, name_or_id)?;
         Ok(record.filter(|record| {
-            matches!(
-                self.eligibility(&record.name),
-                Ok(SkillEligibility::Eligible)
-            )
+            record.enabled
+                && matches!(
+                    self.eligibility(&record.name),
+                    Ok(SkillEligibility::Eligible)
+                )
         }))
     }
 
@@ -83,6 +84,9 @@ impl SkillRegistry {
         let Some(record) = self.store.view(owner, name_or_id)? else {
             return Ok(None);
         };
+        if !record.enabled {
+            return Ok(None);
+        }
         let Some(filesystem) = &self.filesystem else {
             return Ok(Some(record));
         };

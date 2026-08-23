@@ -9,9 +9,17 @@ pub struct Update {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Message {
     pub message_id: i64,
+    #[serde(default)]
+    pub message_thread_id: Option<i64>,
     pub chat: Chat,
     pub from: Option<User>,
     pub text: Option<String>,
+}
+
+impl Message {
+    pub fn scope(&self) -> super::scope::TelegramScope {
+        super::scope::TelegramScope::new(self.chat.id, self.message_thread_id)
+    }
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Chat {

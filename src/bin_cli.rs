@@ -258,8 +258,28 @@ fn normalize_cli(args: &[String]) -> String {
         return args.join(" ");
     }
     const ALIASES: &[&str] = &[
-        "status", "model", "provider", "account", "login", "logout", "new", "btw", "session",
-        "context", "stop", "retry", "settings", "help", "usage", "doctor",
+        "start",
+        "help",
+        "login",
+        "logout",
+        "model",
+        "new",
+        "sessions",
+        "session",
+        "btw",
+        "status",
+        "context",
+        "cancel",
+        "stop",
+        "retry",
+        "yolo",
+        "memory",
+        "skills",
+        "tools",
+        "doctor",
+        "about",
+        "approvals",
+        "account",
     ];
     if ALIASES.contains(&args[0].as_str()) {
         return format!("/{}", args.join(" "));
@@ -479,7 +499,7 @@ Standalone Termux CLI for the xiao daemon and shared Command Core.\n\n\
 First run:\n  xiao quickstart [--no-start]\n\n\
 Daemon:\n  xiao daemon start|foreground|status|logs [N]|stop|restart\n\n\
 Configuration:\n  xiao config path|check\n\n\
-Agent and session commands:\n  xiao status\n  xiao doctor\n  xiao login [PROVIDER]\n  xiao provider [NAME]\n  xiao model [NAME]\n  xiao account [ID]\n  xiao new | session [ARGS] | btw | context | stop | retry\n  xiao chat TEXT\n  xiao /command [ARGS]\n  xiao logs [N]\n\n\
+Agent and session commands:\n  xiao status\n  xiao doctor\n  xiao login [PROVIDER]\n  xiao model [NAME]\n  xiao account [ID]\n  xiao new | sessions [ARGS] | btw | context | cancel | retry\n  xiao chat TEXT\n  xiao /command [ARGS]\n  xiao logs [N]\n\n\
 Environment overrides:\n  XIAO_CONFIG, XIAO_CLIENT_CONFIG, XIAO_HOME, XIAOD_BIN\n",
         xiao::VERSION
     );
@@ -503,7 +523,7 @@ mod cli_tests {
         assert_eq!(n(&["status"]), "/status");
         assert_eq!(n(&["login", "codex"]), "/login codex");
         assert_eq!(n(&["model", "gpt-5.6-sol"]), "/model gpt-5.6-sol");
-        assert_eq!(n(&["provider", "codex"]), "/provider codex");
+        assert_eq!(n(&["provider", "codex"]), "provider codex");
         assert_eq!(n(&["account", "abc"]), "/account abc");
         assert_eq!(n(&["help", "session"]), "/help session");
     }

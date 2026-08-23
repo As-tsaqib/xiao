@@ -6,7 +6,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::path::Path;
 
+use super::commands::BotCommand;
 use super::types::{ApiEnvelope, BotIdentity, SentMessage, Update};
+use super::TelegramScope;
 
 #[derive(Clone)]
 pub struct TelegramClient {
@@ -87,6 +89,10 @@ impl TelegramClient {
     pub async fn get_me(&self) -> Result<BotIdentity> {
         self.call("getMe", json!({})).await
     }
+    pub async fn set_my_commands(&self, commands: &[BotCommand]) -> Result<bool> {
+        self.call("setMyCommands", json!({"commands":commands}))
+            .await
+    }
     pub async fn get_updates(&self, offset: Option<i64>, timeout: u64) -> Result<Vec<Update>> {
         self.call(
             "getUpdates",
@@ -104,13 +110,23 @@ impl TelegramClient {
         rich: Value,
         markup: Option<Value>,
     ) -> Result<SentMessage> {
+        self.send_rich_scoped(TelegramScope::new(chat_id, None), rich, markup)
+            .await
+    }
+    pub async fn send_rich_scoped(
+        &self,
+        scope: TelegramScope,
+        rich: Value,
+        markup: Option<Value>,
+    ) -> Result<SentMessage> {
+        let body = with_optional(
+            json!({"chat_id":scope.chat_id,"rich_message":rich}),
+            "message_thread_id",
+            scope.message_thread_id.map(Value::from),
+        );
         self.call(
             "sendRichMessage",
-            with_optional(
-                json!({"chat_id":chat_id,"rich_message":rich}),
-                "reply_markup",
-                markup,
-            ),
+            with_optional(body, "reply_markup", markup),
         )
         .await
     }
@@ -120,19 +136,35 @@ impl TelegramClient {
         text: &str,
         markup: Option<Value>,
     ) -> Result<SentMessage> {
-        self.call(
-            "sendMessage",
-            with_optional(
-                json!({"chat_id":chat_id,"text":text}),
-                "reply_markup",
-                markup,
-            ),
-        )
-        .await
+        self.send_plain_scoped(TelegramScope::new(chat_id, None), text, markup)
+            .await
+    }
+    pub async fn send_plain_scoped(
+        &self,
+        scope: TelegramScope,
+        text: &str,
+        markup: Option<Value>,
+    ) -> Result<SentMessage> {
+        let body = with_optional(
+            json!({"chat_id":scope.chat_id,"text":text}),
+            "message_thread_id",
+            scope.message_thread_id.map(Value::from),
+        );
+        self.call("sendMessage", with_optional(body, "reply_markup", markup))
+            .await
     }
     pub async fn send_document(
         &self,
         chat_id: i64,
+        path: &Path,
+        filename: &str,
+    ) -> Result<SentMessage> {
+        self.send_document_scoped(TelegramScope::new(chat_id, None), path, filename)
+            .await
+    }
+    pub async fn send_document_scoped(
+        &self,
+        scope: TelegramScope,
         path: &Path,
         filename: &str,
     ) -> Result<SentMessage> {
@@ -142,9 +174,11 @@ impl TelegramClient {
         }
         let bytes = tokio::fs::read(path).await?;
         let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.to_owned());
-        let form = reqwest::multipart::Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("document", part);
+        let mut form = reqwest::multipart::Form::new().text("chat_id", scope.chat_id.to_string());
+        if let Some(thread) = scope.message_thread_id {
+            form = form.text("message_thread_id", thread.to_string());
+        }
+        let form = form.part("document", part);
         let response = self
             .client
             .post(self.url("sendDocument"))
@@ -173,7 +207,21 @@ impl TelegramClient {
         }
     }
     pub async fn draft_rich(&self, chat_id: i64, draft_id: i64, rich: Value) -> Result<bool> {
-        self.call("sendRichMessageDraft", json!({"chat_id":chat_id,"draft_id":if draft_id==0{1}else{draft_id},"rich_message":rich})).await
+        self.draft_rich_scoped(TelegramScope::new(chat_id, None), draft_id, rich)
+            .await
+    }
+    pub async fn draft_rich_scoped(
+        &self,
+        scope: TelegramScope,
+        draft_id: i64,
+        rich: Value,
+    ) -> Result<bool> {
+        let body = with_optional(
+            json!({"chat_id":scope.chat_id,"draft_id":if draft_id==0{1}else{draft_id},"rich_message":rich}),
+            "message_thread_id",
+            scope.message_thread_id.map(Value::from),
+        );
+        self.call("sendRichMessageDraft", body).await
     }
     pub async fn edit_rich(
         &self,
@@ -283,20 +331,25 @@ impl super::menu::EditTransport for TelegramClient {
             .await
             .map(|_| ())
     }
-    async fn send_rich_replacement(&self, chat_id: i64, rich: Value, markup: Value) -> Result<i64> {
+    async fn send_rich_replacement(
+        &self,
+        scope: TelegramScope,
+        rich: Value,
+        markup: Value,
+    ) -> Result<i64> {
         Ok(self
-            .send_rich(chat_id, rich, Some(markup))
+            .send_rich_scoped(scope, rich, Some(markup))
             .await?
             .message_id)
     }
     async fn send_plain_replacement(
         &self,
-        chat_id: i64,
+        scope: TelegramScope,
         text: String,
         markup: Value,
     ) -> Result<i64> {
         Ok(self
-            .send_plain(chat_id, &text, Some(markup))
+            .send_plain_scoped(scope, &text, Some(markup))
             .await?
             .message_id)
     }
@@ -325,6 +378,35 @@ mod tests {
         path: Mutex<String>,
         content_type: Mutex<String>,
         body: Mutex<Vec<u8>>,
+    }
+
+    #[derive(Default)]
+    struct RequestProbe {
+        requests: Mutex<Vec<(String, String, Vec<u8>)>>,
+    }
+
+    async fn request_stub(
+        State(probe): State<Arc<RequestProbe>>,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Json<Value> {
+        let method = uri.path().rsplit('/').next().unwrap_or_default();
+        probe.requests.lock().unwrap().push((
+            method.to_owned(),
+            headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned(),
+            body.to_vec(),
+        ));
+        let result = if matches!(method, "setMyCommands" | "sendRichMessageDraft") {
+            json!(true)
+        } else {
+            json!({"message_id":91,"chat":{"id":4242,"type":"private"}})
+        };
+        Json(json!({"ok":true,"result":result}))
     }
 
     async fn upload_stub(
@@ -395,5 +477,74 @@ mod tests {
         assert!(body.contains("4242"));
         assert!(body.contains("filename=\"result.txt\""));
         assert!(body.contains("observable artifact content"));
+    }
+
+    #[tokio::test]
+    async fn every_outbound_creation_path_preserves_the_topic_scope() {
+        let probe = Arc::new(RequestProbe::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .fallback(post(request_stub))
+            .with_state(probe.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            TelegramClient::with_base("test-token".into(), format!("http://{address}")).unwrap();
+        let scope = TelegramScope::new(4242, Some(73));
+        client
+            .send_rich_scoped(scope, json!({"blocks":[]}), None)
+            .await
+            .unwrap();
+        client
+            .send_plain_scoped(scope, "topic reply", None)
+            .await
+            .unwrap();
+        client
+            .draft_rich_scoped(scope, 8, json!({"blocks":[]}))
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("topic.txt");
+        std::fs::write(&artifact, "topic artifact").unwrap();
+        client
+            .send_document_scoped(scope, &artifact, "topic.txt")
+            .await
+            .unwrap();
+
+        let requests = probe.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for (method, content_type, body) in requests.iter() {
+            if method == "sendDocument" {
+                assert!(content_type.starts_with("multipart/form-data"));
+                let body = String::from_utf8_lossy(body);
+                assert!(body.contains("name=\"message_thread_id\""));
+                assert!(body.contains("73"));
+            } else {
+                let body: Value = serde_json::from_slice(body).unwrap();
+                assert_eq!(body["message_thread_id"], 73);
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn set_my_commands_payload_comes_from_the_public_registry() {
+        let probe = Arc::new(RequestProbe::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .fallback(post(request_stub))
+            .with_state(probe.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            TelegramClient::with_base("test-token".into(), format!("http://{address}")).unwrap();
+        let expected = super::super::commands::TelegramCommandRegistry::bot_commands();
+        assert!(client.set_my_commands(&expected).await.unwrap());
+        let requests = probe.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "setMyCommands");
+        let body: Value = serde_json::from_slice(&requests[0].2).unwrap();
+        assert_eq!(body["commands"], serde_json::to_value(expected).unwrap());
+        server.abort();
     }
 }

@@ -112,10 +112,10 @@ impl ClientConfig {
     pub fn validate(&self) -> Result<()> {
         let url = url::Url::parse(&self.endpoint).context("invalid client endpoint")?;
         if url.scheme() != "http" {
-            bail!("v0.2.0 client endpoint must use http over loopback");
+            bail!("client endpoint must use http over loopback");
         }
         if !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
-            bail!("v0.2.0 client refuses non-loopback endpoints");
+            bail!("client refuses non-loopback endpoints");
         }
         if self.token.trim().is_empty() {
             bail!("client token is empty");

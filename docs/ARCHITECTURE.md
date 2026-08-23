@@ -1,4 +1,4 @@
-# Xiao v0.2.0 Architecture
+# Xiao v0.2.5 Architecture
 
 ## Runtime ownership
 
@@ -33,9 +33,22 @@ crashes.
 
 The provider contract receives canonical `ToolSpec` values selected by the
 agent runtime. Providers only translate them to wire format and parse calls;
-they do not discover tools, apply policy, or execute tools. Codex declares
-tool-continuation capability. Providers without that capability receive no
-advertised tools, and an unexpected tool-call response is an explicit error.
+they do not discover tools, apply policy, or execute tools. Every provider/model
+reports an explicit `ToolProtocol`: `Native`, `StructuredJsonFallback`, or
+`ChatOnly`. Codex uses Responses function-call continuation. Antigravity maps
+canonical tools/results through Gemini `functionDeclarations`, `functionCall`,
+and `functionResponse`. Each Custom model is probed for a synthetic native
+function call, then a strict JSON envelope; an unprobed/unsupported model is
+explicitly `ChatOnly`. Xiao never silently removes tools and presents an action
+model as an equivalent agent.
+
+`SemanticEvaluator` is a separate no-tools boundary used for task intent,
+completion interpretation, memory lifecycle decisions, trace learning, skill
+synthesis, and skill equivalence. Inputs/outputs are bounded and redacted,
+require schema-conforming JSON, permit one format repair, and fail
+conservatively. Semantic output cannot grant a tool, override `ToolPolicy`, or
+turn model prose into action evidence. Provider-backed decisions run outside
+Tokio workers so Telegram cancellation and callbacks remain responsive.
 
 Completion moves through `running → verifying` into `completed`, `blocked`, or
 `failed`. The verifier distinguishes `VerifiedSuccess`, `NotYetVerified`,
@@ -44,6 +57,9 @@ Action tasks require an observed action and separate or typed postcondition
 evidence; a nonempty final claim is insufficient. `NotYetVerified` is fed back
 to the provider so it continues. Failed action signatures cannot be retried
 unchanged indefinitely; turn/tool/no-progress/runtime bounds terminate loops.
+The next turn receives a bounded runtime-owned `RUN_OBSERVATIONS` block with
+successful/failed actions, installs, artifacts, missing evidence, attempt count,
+and remaining budgets—never private chain-of-thought.
 
 Cancellation is checked at provider and tool boundaries. Startup changes any
 persisted in-flight agent/tool runs to `interrupted`; uncertain side effects are
@@ -58,7 +74,7 @@ output bound. Providers only translate those canonical definitions to wire
 schemas. Runtime `ToolPolicy` evaluates risk and call arguments; a skill is
 guidance and cannot grant a tool or bypass policy.
 
-The v0.2.0 built-ins are:
+The v0.2.5 built-ins are:
 
 - `context_stats`
 - `memory_search`, `memory_set`, `memory_delete`
@@ -75,11 +91,16 @@ shell command strings, unmanaged package mutation, and unsafe installer
 pipelines. Clearly destructive, opaque shell-script, or credential-sensitive
 calls require an exact one-shot approval. There is no generic root-shell tool.
 
-When a trusted mapped binary is absent, `DependencyResolver` invokes only the
-detected Termux `pkg`/`apt` backend with a normalized package, records the
-install, re-probes the executable, and resumes the original call. Privileged
-Android work is separate: `AndroidBroker` exposes only typed Xiao-service
-inspection/restart; restart requires approval and accepts no command string.
+When a binary is absent, `DependencyResolver` first uses the known trusted
+mapping and can then query trusted Termux repository metadata. A candidate must
+have a normalized package name, trusted source, and exact/provided-binary
+relationship before the detected `pkg`/`apt` backend can install it. Every
+install records source/validation metadata, re-probes the executable, refreshes
+capability state, and resumes the original call. Language ecosystem installers
+are not auto-approved and arbitrary remote installer scripts remain forbidden.
+Privileged Android work is separate: `AndroidBroker` exposes only typed
+Xiao-service inspection/restart; restart requires approval and accepts no
+command string.
 
 ## Long-term memory
 
@@ -91,11 +112,12 @@ search index and `memory_history` audit; a one-time bridge exports legacy
 SQLite-only active memories to files.
 
 The `user` scope maps to owner profile/preferences; `agent` maps to durable
-project/environment knowledge. The evaluator extracts general explicit
-preferences/facts, compares related active entries, updates near-duplicates,
-and supports explicit forget. Response style/language aliases exist for
-compatibility but are not the evaluator's only supported subjects. Typed memory
-tools use the same file-authoritative store.
+project/environment knowledge. The semantic evaluator retrieves related
+current state and chooses `NONE`/`CREATE`/`UPDATE`/`DELETE`/`MERGE`/`REKEY`.
+Explicit owner changes replace old semantic state, near-duplicates do not
+accumulate, and explicit forget removes/deactivates state. Deterministic
+extraction is a conservative fallback, not the primary intelligence. Typed
+memory tools use the same file-authoritative store.
 
 Memory values and sensitive identities are bounded and credential-screened.
 Structured tool arguments are recursively redacted before audit persistence.
@@ -137,18 +159,43 @@ Search exposes eligibility metadata, full bodies load lazily, and trusted
 missing Termux dependencies may be resolved before use. Ineligible skill
 instructions never bypass ToolPolicy.
 
-`LearningEvaluator` consumes the bounded observable trace after
+`LearningEvaluator` consumes the bounded sanitized observable trace after
 `VerifiedSuccess`: goal, safe tool observations (including recovered failures),
 final result, and verification evidence. It has no hidden-reasoning field.
 Failed/cancelled/interrupted/unverified/trivial work creates no positive skill.
-A reusable candidate generalizes when-to-use, prerequisites, procedure,
-pitfalls, and verification; related intent is searched and merged before an
-atomic SKILL write. `skill_history` retains the audit version.
+A reusable candidate describes concrete successful operations as when-to-use,
+prerequisites, procedure, recovered pitfalls, and observable verification.
+Deduplication performs canonical lookup, FTS/lexical retrieval, then semantic
+equivalence to create/update/merge/leave unchanged before an atomic SKILL
+write. Learned/imported source kinds are inspectable; skills may be disabled,
+and only learned owner-created skills may be deleted. `skill_history` retains
+the audit version.
+
+## Telegram topic scope and command UX
+
+`TelegramScope` is `chat_id + message_thread_id`; owner ID remains authorization,
+not a conversation namespace. Main/side activation, menus, callbacks, wizard
+input, drafts, replies, and documents preserve the scope. Legacy Telegram
+sessions migrate to the default non-topic scope. YOLO is persisted per Xiao
+session, defaults off for new/topic/side sessions, converts only `ASK` to an
+audited auto-approval, and never changes `DENY`.
+
+`TelegramCommandRegistry` is the single source for parsing aliases, `/help`,
+ordering, and Bot API `setMyCommands`. Public commands are `/start`, `/help`,
+`/login`, `/logout`, `/model`, `/new`, `/sessions`, `/btw`, `/status`,
+`/context`, `/cancel`, `/retry`, `/yolo`, `/memory`, `/skills`, `/tools`,
+`/doctor`, `/about`, and `/approvals`. `/session` and `/stop` are hidden aliases;
+`/provider`, `/settings`, `/usage`, and `/env` have no route.
+
+The Custom `/login` wizard is expiring and owner/chat/topic/menu-bound. It
+keeps endpoint/key/model blobs out of callback payloads, validates the endpoint,
+accepts an optional zeroized API key, discovers models five per page, probes the
+selected model protocol, and requires confirmation before secure persistence.
 
 ## Storage and migrations
 
 SQLite keeps WAL, foreign keys, a short mutex boundary, and graceful-shutdown
-checkpointing. v0.2.0 migrations are additive and idempotent and retain every
+checkpointing. v0.2.5 migrations are additive and idempotent and retain every
 v0.1.0 table. Schema versions add:
 
 - version 6: `agent_runs`, `tool_runs` and lookup indexes;
@@ -157,6 +204,11 @@ v0.1.0 table. Schema versions add:
 - version 9: `skills`, `skill_history`, `skills_fts` and triggers.
 - version 10: `approvals`, `dependency_installs`, `environment_probes`,
   `workspace_file_index`, and `skill_file_index`.
+- version 11: Telegram topic/session bindings and active scope state;
+  per-session YOLO/tool approval audit fields; provider capability metadata;
+  skill prerequisites; dependency source/validation metadata.
+- version 12: learned/imported `skills.source_kind` and owner-controlled
+  `skills.enabled`, including legacy source classification.
 
 Migration tests cover a fresh database, a hand-built v0.1.0 database upgrade,
 repeated `migrate()` calls, FTS backfill consistency, and restart quarantine of
@@ -176,6 +228,6 @@ in `SecretStore`; snapshot surfaces presence only. The managed Termux wrapper
 elevates only fixed module binaries. KernelSU/WebUI lifecycle shell paths are
 fixed administrative code and are never reachable from model tool calls.
 
-v0.2.0 deliberately does not add MCP, remote/device nodes, subagents, vector
+v0.2.5 deliberately does not add MCP, remote/device nodes, subagents, vector
 databases, autonomous cron, browser automation, a plugin ecosystem, dynamic
 native plugins, or unrestricted root execution.

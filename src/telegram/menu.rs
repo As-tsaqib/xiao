@@ -9,12 +9,16 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use crate::presentation::{Action, ActionTarget, View};
+use crate::{
+    presentation::{Action, ActionTarget, View},
+    telegram::TelegramScope,
+};
 
 #[derive(Debug, Clone)]
 pub struct MenuSession {
     pub id: String,
     pub chat_id: i64,
+    pub message_thread_id: Option<i64>,
     pub message_id: i64,
     pub owner_user_id: i64,
     pub current_view: View,
@@ -43,11 +47,21 @@ impl MenuStore {
         owner_user_id: i64,
         view: View,
     ) -> Arc<AsyncMutex<MenuSession>> {
+        self.prepare_scoped(TelegramScope::new(chat_id, None), owner_user_id, view)
+    }
+
+    pub fn prepare_scoped(
+        &self,
+        scope: TelegramScope,
+        owner_user_id: i64,
+        view: View,
+    ) -> Arc<AsyncMutex<MenuSession>> {
         self.purge();
         let id = Uuid::new_v4().simple().to_string()[..10].to_owned();
         Arc::new(AsyncMutex::new(MenuSession {
             id,
-            chat_id,
+            chat_id: scope.chat_id,
+            message_thread_id: scope.message_thread_id,
             message_id: 0,
             owner_user_id,
             current_view: view,
@@ -74,10 +88,19 @@ impl MenuStore {
         chat_id: i64,
         owner_user_id: i64,
     ) -> Option<Arc<AsyncMutex<MenuSession>>> {
+        self.pending_for_scope(TelegramScope::new(chat_id, None), owner_user_id)
+    }
+
+    pub fn pending_for_scope(
+        &self,
+        scope: TelegramScope,
+        owner_user_id: i64,
+    ) -> Option<Arc<AsyncMutex<MenuSession>>> {
         self.purge();
         self.inner.lock().unwrap().values().find_map(|menu| {
             let guard = menu.try_lock().ok()?;
-            if guard.chat_id == chat_id
+            if guard.chat_id == scope.chat_id
+                && guard.message_thread_id == scope.message_thread_id
                 && guard.owner_user_id == owner_user_id
                 && guard.pending_input.is_some()
             {
@@ -157,10 +180,15 @@ pub trait EditTransport: Send + Sync {
         text: String,
         markup: Value,
     ) -> Result<()>;
-    async fn send_rich_replacement(&self, chat_id: i64, rich: Value, markup: Value) -> Result<i64>;
+    async fn send_rich_replacement(
+        &self,
+        scope: TelegramScope,
+        rich: Value,
+        markup: Value,
+    ) -> Result<i64>;
     async fn send_plain_replacement(
         &self,
-        chat_id: i64,
+        scope: TelegramScope,
         text: String,
         markup: Value,
     ) -> Result<i64>;
@@ -201,13 +229,21 @@ pub async fn edit_first<T: EditTransport>(
 
     let old = menu.message_id;
     let new_id = match transport
-        .send_rich_replacement(menu.chat_id, rich, markup.clone())
+        .send_rich_replacement(
+            TelegramScope::new(menu.chat_id, menu.message_thread_id),
+            rich,
+            markup.clone(),
+        )
         .await
     {
         Ok(id) => id,
         Err(_) => {
             transport
-                .send_plain_replacement(menu.chat_id, plain, markup)
+                .send_plain_replacement(
+                    TelegramScope::new(menu.chat_id, menu.message_thread_id),
+                    plain,
+                    markup,
+                )
                 .await?
         }
     };
@@ -251,6 +287,16 @@ mod tests {
         assert_ne!(store.get(&id).unwrap().lock().await.revision, 1);
     }
 
+    #[tokio::test]
+    async fn expired_menu_state_is_not_resolved() {
+        let store = MenuStore::new(Duration::ZERO);
+        let menu = store.prepare_scoped(TelegramScope::new(100, Some(10)), 7, View::info("x", "y"));
+        let id = menu.lock().await.id.clone();
+        store.insert(menu.clone(), id.clone());
+        drop(menu);
+        assert!(store.get(&id).is_none());
+    }
+
     struct Fake {
         edits: AtomicUsize,
         sends: AtomicUsize,
@@ -266,11 +312,16 @@ mod tests {
             self.edits.fetch_add(1, Ordering::SeqCst);
             Err(anyhow!("can't edit plain"))
         }
-        async fn send_rich_replacement(&self, _: i64, _: Value, _: Value) -> Result<i64> {
+        async fn send_rich_replacement(&self, _: TelegramScope, _: Value, _: Value) -> Result<i64> {
             self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(99)
         }
-        async fn send_plain_replacement(&self, _: i64, _: String, _: Value) -> Result<i64> {
+        async fn send_plain_replacement(
+            &self,
+            _: TelegramScope,
+            _: String,
+            _: Value,
+        ) -> Result<i64> {
             self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(100)
         }
@@ -290,6 +341,7 @@ mod tests {
         let mut menu = MenuSession {
             id: "m".into(),
             chat_id: 1,
+            message_thread_id: None,
             message_id: 5,
             owner_user_id: 7,
             current_view: View::default(),

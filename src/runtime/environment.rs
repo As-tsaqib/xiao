@@ -26,7 +26,7 @@ pub enum SelinuxState {
 }
 
 impl SelinuxState {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Enforcing => "enforcing",
             Self::Permissive => "permissive",
@@ -526,7 +526,7 @@ mod tests {
         let environment = workspace
             .read(crate::identity::WorkspaceDocument::Environment)
             .unwrap();
-        assert!(environment.contains("Xiao version: 0.2.0"));
+        assert!(environment.contains(&format!("Xiao version: {}", crate::VERSION)));
         state.refresh().unwrap();
         assert_eq!(
             workspace

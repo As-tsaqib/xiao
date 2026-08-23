@@ -118,6 +118,27 @@ impl IdentityWorkspace {
         Ok(target)
     }
 
+    /// Remove one explicitly owner-selected learned skill without recursive
+    /// deletion or path expansion. Imported/community skills should normally
+    /// be disabled instead so their source remains inspectable.
+    pub fn delete_learned_skill(&self, name: &str) -> Result<bool> {
+        let target = self.skill_path(name)?;
+        if !target.exists() {
+            return Ok(false);
+        }
+        let metadata = fs::symlink_metadata(&target)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(anyhow!("learned skill target is not a regular SKILL.md"));
+        }
+        fs::remove_file(&target)?;
+        if let Some(directory) = target.parent() {
+            if fs::read_dir(directory)?.next().is_none() {
+                fs::remove_dir(directory)?;
+            }
+        }
+        Ok(true)
+    }
+
     pub fn path(&self, document: WorkspaceDocument) -> PathBuf {
         self.root.join(document.filename())
     }

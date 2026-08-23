@@ -116,6 +116,9 @@ fn process_memory_bytes() -> Option<u64> {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
+    /// Source config path when the daemon was started from a durable file.
+    /// Tests/embedded callers may intentionally leave this unset.
+    pub config_path: Option<Arc<std::path::PathBuf>>,
     pub storage: Arc<Storage>,
     pub sessions: Arc<SessionManager>,
     pub auth: Arc<AuthManager>,
@@ -129,6 +132,20 @@ pub struct AppState {
 
 impl AppState {
     pub async fn build(config: AppConfig) -> Result<Self> {
+        Self::build_inner(config, None).await
+    }
+
+    pub async fn build_from_path(
+        config: AppConfig,
+        config_path: impl Into<std::path::PathBuf>,
+    ) -> Result<Self> {
+        Self::build_inner(config, Some(Arc::new(config_path.into()))).await
+    }
+
+    async fn build_inner(
+        config: AppConfig,
+        config_path: Option<Arc<std::path::PathBuf>>,
+    ) -> Result<Self> {
         config.validate()?;
         let config = Arc::new(RwLock::new(config));
         let cfg = config.read().await.clone();
@@ -150,6 +167,31 @@ impl AppState {
             config.clone(),
         ));
         let providers = Arc::new(ProviderRegistry::new(cfg.clone(), auth.clone()));
+        for provider_id in providers.list() {
+            // Custom capabilities are endpoint/model-specific and are stored
+            // only after an actual wizard/model probe. Never stamp one global
+            // config assumption across every discovered Custom model.
+            if provider_id == "custom" {
+                continue;
+            }
+            for model in providers.models(&provider_id).unwrap_or_default() {
+                if let Ok(capabilities) = providers.capabilities(&provider_id, &model) {
+                    let _ = storage.upsert_provider_capability(
+                        &crate::storage::ProviderCapabilityRecord {
+                            provider: provider_id.clone(),
+                            model,
+                            tool_protocol: capabilities.tool_protocol.as_str().into(),
+                            native_tool_calls: capabilities.tool_protocol
+                                == crate::providers::ToolProtocol::Native,
+                            structured_output: capabilities.structured_output,
+                            continuation: capabilities.continuation,
+                            probed_at: chrono::Utc::now().to_rfc3339(),
+                            evidence: capabilities.evidence,
+                        },
+                    );
+                }
+            }
+        }
         let health = Arc::new(HealthState::new());
         let events = Arc::new(EventBus::new(128));
         {
@@ -191,6 +233,7 @@ impl AppState {
         ));
         Ok(Self {
             config,
+            config_path,
             storage,
             sessions,
             auth,

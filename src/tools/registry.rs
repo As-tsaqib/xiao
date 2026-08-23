@@ -163,57 +163,68 @@ impl ToolRegistry {
             return self.error(call, ToolRunStatus::Denied, "unknown or unavailable tool");
         };
         let spec = tool.spec();
+        let mut approval_mode = None;
+        let mut policy_original = None;
         match self.policy.evaluate_call(&spec, &call.arguments, context) {
             PolicyDecision::Allow => {}
             PolicyDecision::Deny(reason) => {
                 return self.error(call, ToolRunStatus::Denied, &reason);
             }
             PolicyDecision::RequireApproval(reason) => {
-                let reason = bound(redact_text(&reason), 1_024);
-                let Some(storage) = &self.approvals else {
-                    return self.error(call, ToolRunStatus::Denied, &reason);
-                };
-                let arguments_hash = approval_hash(&spec.name, &call.arguments);
-                match storage.consume_approval(&context.principal, &spec.name, &arguments_hash) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let capability = spec
-                            .required_capabilities
-                            .first()
-                            .map(String::as_str)
-                            .unwrap_or("tool.approval");
-                        match storage.request_approval(
-                            &context.principal,
-                            capability,
-                            &spec.name,
-                            &arguments_hash,
-                            &reason,
-                        ) {
-                            Ok(approval) => {
-                                return self.error(
-                                    call,
-                                    ToolRunStatus::AwaitingApproval,
-                                    &format!(
-                                        "approval required: {}. Approve request {} then retry",
-                                        approval.summary, approval.id
-                                    ),
-                                );
-                            }
-                            Err(error) => {
-                                return self.error(
-                                    call,
-                                    ToolRunStatus::Denied,
-                                    &format!("approval could not be recorded: {error}"),
-                                );
+                if context.yolo_mode {
+                    approval_mode = Some("yolo_auto_approved".into());
+                    policy_original = Some("ask".into());
+                } else {
+                    let reason = bound(redact_text(&reason), 1_024);
+                    let Some(storage) = &self.approvals else {
+                        return self.error(call, ToolRunStatus::Denied, &reason);
+                    };
+                    let arguments_hash = approval_hash(&spec.name, &call.arguments);
+                    match storage.consume_approval(&context.principal, &spec.name, &arguments_hash)
+                    {
+                        Ok(true) => {
+                            approval_mode = Some("explicit_owner_approval".into());
+                            policy_original = Some("ask".into());
+                        }
+                        Ok(false) => {
+                            let capability = spec
+                                .required_capabilities
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or("tool.approval");
+                            match storage.request_approval(
+                                &context.principal,
+                                capability,
+                                &spec.name,
+                                &arguments_hash,
+                                &reason,
+                            ) {
+                                Ok(approval) => {
+                                    return self.error(
+                                        call,
+                                        ToolRunStatus::AwaitingApproval,
+                                        &format!(
+                                            "approval required: {}. Approve request {} then retry",
+                                            approval.summary, approval.id
+                                        ),
+                                    );
+                                }
+                                Err(error) => {
+                                    return self.error(
+                                        call,
+                                        ToolRunStatus::Denied,
+                                        &format!("approval could not be recorded: {error}"),
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(error) => {
-                        return self.error(
-                            call,
-                            ToolRunStatus::Denied,
-                            &format!("approval lookup failed: {error}"),
-                        );
+                        Err(error) => {
+                            return self.error(
+                                call,
+                                ToolRunStatus::Denied,
+                                &format!("approval lookup failed: {error}"),
+                            );
+                        }
                     }
                 }
             }
@@ -238,6 +249,8 @@ impl ToolRegistry {
                     is_error: false,
                 },
                 status: ToolRunStatus::Succeeded,
+                approval_mode,
+                policy_original,
             },
             Ok(Err(error)) => self.error(call, ToolRunStatus::Failed, &error.to_string()),
             Err(_) => self.error(call, ToolRunStatus::Failed, "tool timed out"),
@@ -281,6 +294,8 @@ impl ToolRegistry {
                 is_error: true,
             },
             status,
+            approval_mode: None,
+            policy_original: None,
         }
     }
 }
@@ -389,6 +404,7 @@ mod tests {
             principal: "p".into(),
             session_id: "s".into(),
             agent_run_id: "r".into(),
+            yolo_mode: false,
             messages: vec![MessageRecord {
                 role: "user".into(),
                 content: "hello".into(),
@@ -545,5 +561,74 @@ mod tests {
             .available_specs(&context())
             .iter()
             .all(|spec| spec.name != "root" && spec.name != "shell"));
+    }
+
+    #[tokio::test]
+    async fn yolo_converts_only_ask_to_audited_allow_and_never_bypasses_deny() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let environment = RuntimeEnvironment {
+            platform: "android".into(),
+            os_version: None,
+            android_version: Some("14".into()),
+            device_model: None,
+            architecture: "aarch64".into(),
+            xiao_version: crate::VERSION.into(),
+            effective_uid: 0,
+            root_available: true,
+            root_evidence: "test".into(),
+            selinux: SelinuxState::Enforcing,
+            termux: None,
+            data_root: "/xiao".into(),
+            workspace_writable: true,
+            binaries: BTreeMap::new(),
+            execution_backends: vec![ExecutionBackend::AndroidPrivileged],
+            probed_at: "now".into(),
+        };
+        let registry = ToolRegistry::with_runtime(
+            ToolPolicy::default(),
+            1_024,
+            Arc::new(CapabilityRegistry::from_environment(&environment)),
+            storage,
+        );
+        for (name, risk) in [
+            ("privileged_op", ToolRisk::Privileged),
+            ("destructive_op", ToolRisk::Destructive),
+        ] {
+            registry
+                .register(FakeTool {
+                    name,
+                    risk,
+                    output: "ok".into(),
+                    delay_ms: 0,
+                })
+                .unwrap();
+        }
+        let mut yolo = context();
+        yolo.yolo_mode = true;
+        let allowed = registry
+            .execute(
+                &ToolCall {
+                    call_id: "ask".into(),
+                    name: "privileged_op".into(),
+                    arguments: json!({}),
+                },
+                &yolo,
+            )
+            .await;
+        assert_eq!(allowed.status, ToolRunStatus::Succeeded);
+        assert_eq!(allowed.approval_mode.as_deref(), Some("yolo_auto_approved"));
+        assert_eq!(allowed.policy_original.as_deref(), Some("ask"));
+        let denied = registry
+            .execute(
+                &ToolCall {
+                    call_id: "deny".into(),
+                    name: "destructive_op".into(),
+                    arguments: json!({}),
+                },
+                &yolo,
+            )
+            .await;
+        assert_eq!(denied.status, ToolRunStatus::Denied);
+        assert!(denied.result.is_error);
     }
 }

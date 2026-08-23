@@ -169,10 +169,10 @@ mod tests {
     use super::*;
     use crate::{
         runtime::{
-            CapabilityRegistry, CommandOutcome, ExecutionBackend, PackageBackend,
-            RuntimeEnvironment, SelinuxState, TermuxEnvironment,
+            CapabilityRegistry, CommandOutcome, ExecutionBackend, PackageBackend, PackageCandidate,
+            RuntimeEnvironment, SelinuxState, TermuxEnvironment, TrustedPackageRepository,
         },
-        storage::MessageRecord,
+        storage::{MessageRecord, Storage},
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -203,6 +203,19 @@ mod tests {
 
     struct FakeExecutor {
         commands: Mutex<Vec<TermuxCommand>>,
+    }
+
+    struct FakeRepository;
+
+    #[async_trait]
+    impl TrustedPackageRepository for FakeRepository {
+        async fn search(&self, binary: &str) -> Result<Vec<PackageCandidate>> {
+            Ok(vec![PackageCandidate {
+                package: binary.into(),
+                source: "termux_repository_fake_index".into(),
+                provided_binaries: vec![binary.into()],
+            }])
+        }
     }
 
     #[async_trait]
@@ -283,6 +296,7 @@ mod tests {
                     principal: "owner".into(),
                     session_id: "session".into(),
                     agent_run_id: "run".into(),
+                    yolo_mode: false,
                     messages: vec![MessageRecord {
                         role: "user".into(),
                         content: "Extract audio".into(),
@@ -304,6 +318,58 @@ mod tests {
         let statuses = std::iter::from_fn(|| progress_rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(statuses.iter().any(|status| status.contains("installing")));
         assert!(statuses.iter().any(|status| status.contains("resuming")));
+    }
+
+    #[tokio::test]
+    async fn unknown_binary_uses_validated_trusted_repository_then_resumes() {
+        let packages = Arc::new(FakePackages {
+            available: Mutex::new(BTreeSet::new()),
+            installs: Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(FakeExecutor {
+            commands: Mutex::new(Vec::new()),
+        });
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let session = storage
+            .create_session("owner", "task", "custom", None, "m", false, None)
+            .unwrap();
+        let run = storage
+            .create_agent_run("owner", &session.id, "custom", "m", Some("inspect media"))
+            .unwrap();
+        let resolver = Arc::new(DependencyResolver::with_trusted_repository(
+            capabilities(),
+            packages.clone(),
+            Some(storage.clone()),
+            Arc::new(FakeRepository),
+        ));
+        let tool = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let result = tool
+            .execute(
+                &ToolContext {
+                    principal: "owner".into(),
+                    session_id: session.id,
+                    agent_run_id: run.clone(),
+                    yolo_mode: false,
+                    messages: Vec::new(),
+                    cancellation: CancellationToken::new(),
+                    progress: None,
+                },
+                json!({"program":"xiao-media-probe","args":["clip.mp4"]}),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("audio.mp3"));
+        assert_eq!(&*packages.installs.lock().unwrap(), &["xiao-media-probe"]);
+        assert_eq!(executor.commands.lock().unwrap().len(), 1);
+        let audit = storage.dependency_installs(&run).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert!(audit[0].validated);
+        assert_eq!(audit[0].source, "termux_repository_fake_index");
+        assert_eq!(
+            audit[0].requested_capability.as_deref(),
+            Some("binary.xiao-media-probe")
+        );
+        assert_eq!(audit[0].status, "succeeded");
     }
 
     #[test]

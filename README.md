@@ -1,4 +1,4 @@
-# xiao v0.2.0
+# xiao v0.2.5
 
 xiao is a private, single-owner, persistent Rust AI agent designed primarily
 for a rooted Android device. Telegram is its primary interaction surface and
@@ -8,13 +8,14 @@ living identity/memory files, filesystem skills, and the bounded agent loop.
 The `xiao` CLI and KernelSU WebUI remain administrative adapters over the same
 semantic Command Core.
 
-v0.2.0 implements persistent `SOUL.md`, `USER.md`, `MEMORY.md`, `AGENTS.md`,
-and generated `ENVIRONMENT.md`; typed runtime probing and capability
-resolution; provider-agnostic tools; controlled Termux execution with trusted
-dependency installation; a typed Android privileged broker; SQLite FTS5
-recall; verified completion; and trace-based learning into compatible
-`skills/<name>/SKILL.md` files. Existing principal/session identifiers remain
-as compatibility and isolation keys, not as multi-tenant product architecture.
+v0.2.5 preserves the v0.2.0 living workspace and hardens it with explicit
+provider agent protocols, a schema-validated `SemanticEvaluator`, semantic
+memory/skill reconciliation, evidence-driven retries, trusted Termux package
+discovery, and topic-scoped Telegram sessions. Codex and Antigravity use native
+tool continuation; Custom models are probed per model for native tools or a
+strict structured-JSON fallback and are explicitly `ChatOnly` otherwise.
+Existing principal identifiers remain compatibility/authorization keys, not
+multi-tenant product architecture.
 
 The release ships as one root-level KernelSU/Magisk-compatible module ZIP.
 Flashing that ZIP installs the daemon, watchdog, WebUI, and managed Termux
@@ -22,7 +23,7 @@ wrappers together. Mutable state stays outside the replaceable module payload.
 
 ## Install
 
-1. Download `xiao-v0.2.0-kernelsu-arm64.zip`.
+1. Download `xiao-v0.2.5-kernelsu-arm64.zip`.
 2. Flash the ZIP in KernelSU Next (or a compatible module manager).
 3. Reboot Android.
 4. Open Termux and run:
@@ -55,8 +56,7 @@ xiao daemon logs 100
 xiao-ctl status
 xiao status
 xiao doctor
-xiao session
-xiao provider
+xiao sessions
 xiao model
 xiao login codex
 xiao login antigravity
@@ -81,10 +81,13 @@ KernelSU WebUI -> admin IPC ─────┘                              │ 
 - Telegram ACL is checked before business/provider work.
 - SQLite enforces principal ownership for list, switch, rename, archive, and
   read operations.
-- `/btw` uses an isolated principal-owned side session and never writes into
-  its parent main session.
+- Telegram conversations are scoped by chat plus `message_thread_id`; topic
+  sessions, side chat, menus, callbacks, replies, and per-session YOLO state do
+  not leak across topics. `/btw` never writes into its parent main session and
+  starts with YOLO off.
 - Telegram intake is durable and dispatched asynchronously; slow generation
-  does not block `/stop`, callbacks, or another principal.
+  or semantic evaluation does not block `/cancel`, callbacks, or another owner
+  scope.
 - Inline menus are edit-first with stale-revision protection.
 - Progress drafts are ephemeral and contain bounded safe status only; final
   answers are persistent Rich Message views, with verified result artifacts
@@ -94,6 +97,9 @@ KernelSU WebUI -> admin IPC ─────┘                              │ 
   two typed Xiao-service Android operations. Shell command strings and a
   generic root shell are not exposed. Destructive/sensitive Termux calls and
   privileged service restart use exact, durable, one-shot approval.
+- `ToolProtocol` explicitly distinguishes native continuation, strict
+  structured JSON fallback, and `ChatOnly`; the runtime never silently removes
+  tools and presents an action model as an equivalent agent.
 - Missing ordinary binaries use a trusted Termux package mapping, validated
   package-manager argv, durable install audit, executable re-probe, and then
   resume the original command. There is no arbitrary remote installer path.
@@ -103,7 +109,12 @@ KernelSU WebUI -> admin IPC ─────┘                              │ 
   is never deleted by compression.
 - Action completion distinguishes verified success, not-yet-verified, blocked,
   and failed. A textual “done” is not evidence; the bounded loop continues for
-  a changed strategy or an observable verification.
+  a changed strategy or observable verification. Each retry receives bounded
+  runtime-owned `RUN_OBSERVATIONS`, without private reasoning.
+- Semantic decisions for intent, completion interpretation, memory, reusable
+  learning, skill synthesis, and equivalence are strict bounded JSON with one
+  repair attempt and conservative fallback. They never receive tools or
+  override deterministic security/evidence rules.
 - Agent/tool/dependency boundaries are audited. Interrupted side effects are
   quarantined rather than blindly replayed.
 - IPC is loopback-only with separate client/admin credentials.
@@ -111,15 +122,18 @@ KernelSU WebUI -> admin IPC ─────┘                              │ 
   shell-quoted module binary; model output never reaches this root shell path.
 - Secrets are outside normal config, private where supported, and redacted
   from surfaced logs/errors.
-- `/compact` remains absent in v0.2.0; bounded summary creation is an internal
+- `/compact` remains absent in v0.2.5; bounded summary creation is an internal
   ContextEngine responsibility.
 
-Core semantic commands are `/new`, `/btw`, `/session`, `/model`, `/provider`,
-`/account`, `/login`, `/logout`, `/status`, `/context`, `/stop`, `/retry`,
-`/approvals`, `/approve`, `/deny`, `/settings`, `/help`, `/usage`, and
-`/doctor`. Termux aliases preserve all arguments, so
-`xiao session rename ID New Name` and
-`xiao model MODEL_ID` reach those same variants.
+The public Telegram command registry is exactly `/start`, `/help`, `/login`,
+`/logout`, `/model`, `/new`, `/sessions`, `/btw`, `/status`, `/context`,
+`/cancel`, `/retry`, `/yolo`, `/memory`, `/skills`, `/tools`, `/doctor`,
+`/about`, and `/approvals`. `/session` and `/stop` remain hidden compatibility
+aliases; account selection and exact `/approve`/`/deny` actions remain internal
+menu syntax. `/provider`, `/settings`, `/usage`, and `/env` are intentionally
+removed. Termux aliases preserve all arguments, so
+`xiao sessions rename ID New Name` and `xiao model MODEL_ID` reach the same
+Command Core variants.
 
 The living workspace is under `[paths].data_dir` (normally
 `/data/adb/xiao`). Owner edits to USER/MEMORY/SKILL files are reconciled into
@@ -135,9 +149,11 @@ SQLite indexes/history. `SOUL.md` is never rewritten by ordinary tasks;
   `localhost:51121/oauth-callback`. It then resolves the account email and runs
   `loadCodeAssist`/`onboardUser`. An operator-owned Desktop OAuth client remains
   an advanced config/admin override, not a WebUI form.
-- Custom: configure the base URL, protocol, models, and non-secret headers in
-  config/admin input. API keys belong only in SecretStore through the dedicated
-  admin field.
+- Custom: use `/login` → Custom in Telegram. The expiring wizard validates the
+  endpoint, optionally captures and best-effort deletes the API-key message,
+  stores credentials only in SecretStore, discovers/paginates models, probes
+  the selected model's agent protocol, and requires confirmation. Callback
+  state is bound to owner, chat, topic, menu, and expiry.
 
 Termux administrators can apply a JSON request without putting secrets in the
 process list:
@@ -160,12 +176,12 @@ requires byte-identical ZIP hashes, verifies the checksum and ZIP integrity,
 and uploads exactly these two files:
 
 ```text
-xiao-v0.2.0-kernelsu-arm64.zip
-xiao-v0.2.0-kernelsu-arm64.zip.sha256
+xiao-v0.2.5-kernelsu-arm64.zip
+xiao-v0.2.5-kernelsu-arm64.zip.sha256
 ```
 
 Run the workflow from a push/pull request or `workflow_dispatch`, then download
-the `xiao-v0.2.0-kernelsu-arm64` artifact. Do not use an older local `dist/`
+the `xiao-v0.2.5-kernelsu-arm64` artifact. Do not use an older local `dist/`
 archive after changing source. A local source-only check is available and never
 invokes Cargo:
 

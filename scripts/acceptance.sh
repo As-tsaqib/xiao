@@ -22,7 +22,7 @@ pass 'Module packaging is guarded to GitHub Actions'
 } || fail 'Session principal ownership'
 pass 'Session principal ownership enforced in storage/service tests'
 rg -q 'get_updates\(offset, 50\)' src/telegram/mod.rs || fail 'Telegram long polling'
-! rg -q 'setWebhook|webhook' src/telegram src/main.rs || fail 'No Telegram webhook in v0.2.0'
+! rg -q 'setWebhook|webhook' src/telegram src/main.rs || fail 'No Telegram webhook'
 pass 'Telegram long-polling-only transport'
 rg -q 'allowed\(message.chat.id' src/telegram/mod.rs || fail 'Telegram message ACL'
 rg -q 'allowed\(message.chat.id, Some\(callback.from.id\)' src/telegram/mod.rs || fail 'Telegram callback ACL'
@@ -98,6 +98,23 @@ pass 'Codex and Antigravity OAuth follow CLIProxyAPI browser login contracts'
 ! rg -n 'Command::new\("(sh|bash|su)"\)' src/agent src/providers src/command src/tools src/runtime >/dev/null || fail 'Unrestricted model root shell found'
 rg -q 'bytes_stream\(\)' src/providers/mod.rs || fail 'Incremental provider streaming'
 pass 'Typed bounded tool loop and incremental provider streaming'
+{
+  rg -q 'enum ToolProtocol' src/providers/mod.rs &&
+    rg -q 'StructuredJsonFallback' src/providers/mod.rs &&
+    rg -q 'antigravity_tool_specs' src/providers/mod.rs &&
+    rg -q 'probe_custom_tool_capability' src/providers/mod.rs &&
+    rg -q 'codex_antigravity_and_custom_protocols_keep_the_same_agent_tool_workflow' src/agent/mod.rs &&
+    rg -q 'chat_only_model_rejects_action_explicitly_but_serves_information' src/agent/mod.rs
+} || fail 'Provider-independent agent protocol parity'
+pass 'Codex, Antigravity and probed Custom protocols retain an explicit agent capability'
+{
+  [ -f src/semantic/mod.rs ] &&
+    rg -q 'struct SemanticEvaluator' src/semantic/mod.rs &&
+    rg -q 'tools: Vec::new\(\)' src/semantic/mod.rs &&
+    rg -q 'malformed_after_repair_is_conservative' src/semantic/mod.rs &&
+    rg -q 'semantic_intent_handles_action_wording_outside_deterministic_markers' src/agent/completion.rs
+} || fail 'Bounded no-tools semantic evaluator'
+pass 'Semantic decisions are schema-validated, bounded, no-tools and conservative'
 {
   [ -f src/identity/templates/SOUL.md ] &&
     [ -f src/identity/templates/USER.md ] &&
@@ -192,6 +209,12 @@ pass 'Community SKILL.md discovery/gating and generalized trace learning are cov
 } || fail 'Bounded adaptive loop and completion verification'
 pass 'NotYetVerified continues and no-progress bounds prevent false completion/infinite retries'
 {
+  rg -q 'RUN_OBSERVATIONS' src/agent/mod.rs &&
+    rg -q 'remaining_budgets' src/agent/mod.rs &&
+    rg -q 'repeated_identical_failed_action_terminates_as_bounded_blocker' src/agent/mod.rs
+} || fail 'Runtime observations and bounded no-progress blocker'
+pass 'Retries receive observable runtime state and repeated failure terminates Blocked'
+{
   rg -q 'v010_database_upgrades_additively_without_losing_history' src/storage/mod.rs &&
     rg -q 'v020_migration_is_fresh_and_idempotent_with_consistent_fts' src/storage/mod.rs &&
     rg -q 'reopen_quarantines_inflight_agent_and_tool_runs_without_replay' src/storage/mod.rs
@@ -199,12 +222,16 @@ pass 'NotYetVerified continues and no-progress bounds prevent false completion/i
 pass 'Fresh, upgrade, idempotent and crash-recovery migrations covered'
 {
   rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(10\)' src/storage/mod.rs &&
+    rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(11\)' src/storage/mod.rs &&
+    rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(12\)' src/storage/mod.rs &&
     rg -q 'CREATE TABLE IF NOT EXISTS approvals' src/storage/mod.rs &&
+    rg -q 'CREATE TABLE IF NOT EXISTS telegram_session_scopes' src/storage/mod.rs &&
+    rg -q 'CREATE TABLE IF NOT EXISTS provider_capabilities' src/storage/mod.rs &&
     rg -q 'CREATE TABLE IF NOT EXISTS dependency_installs' src/storage/mod.rs &&
     rg -q 'CREATE TABLE IF NOT EXISTS environment_probes' src/storage/mod.rs &&
     rg -q 'UPDATE dependency_installs SET status=.interrupted' src/storage/mod.rs
-} || fail 'Final architecture migration version 10'
-pass 'Migration v10 and uncertain package-install quarantine are present'
+} || fail 'Final architecture migrations through version 12'
+pass 'Migrations v10-v12 and uncertain package-install quarantine are present'
 {
   rg -q 'Command::Approvals' src/command/mod.rs &&
     rg -q 'Command::Approve' src/command/mod.rs &&
@@ -213,6 +240,18 @@ pass 'Migration v10 and uncertain package-install quarantine are present'
     rg -q 'result_file_is_sent_through_telegram_multipart_document_path' src/telegram/client.rs
 } || fail 'Telegram approvals and file results'
 pass 'Telegram exposes approvals and verified multipart result files'
+{
+  [ -f src/telegram/scope.rs ] &&
+    [ -f src/telegram/commands.rs ] &&
+    [ -f src/telegram/login.rs ] &&
+    rg -q 'message_thread_id' src/telegram/types.rs src/telegram/client.rs &&
+    rg -q 'public_registry_is_exact_and_hidden_commands_are_not_advertised' src/telegram/commands.rs &&
+    rg -q 'custom_login_wizard_discovers_pages_probes_and_rejects_wrong_topic_callbacks' src/telegram/mod.rs &&
+    rg -q 'wizard_state_requires_owner_chat_topic_menu_and_unexpired_state' src/telegram/login.rs &&
+    rg -q 'topic_session_manager_paginates_and_preserves_archived_history' src/command/mod.rs
+} || fail 'Telegram topic scope, registry and Custom login UX'
+! rg -q '"provider"[[:space:]]*=>' src/command/mod.rs || fail 'Removed /provider route remains'
+pass 'Telegram topics, exact command registry, removed commands and scoped Custom wizard are covered'
 {
   rg -q 'must be loopback-only' src/config/mod.rs &&
     rg -q 'ct_eq' src/ipc/mod.rs

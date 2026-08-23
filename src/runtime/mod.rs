@@ -9,7 +9,7 @@ pub use capabilities::trusted_package_for_binary;
 pub use capabilities::{Capability, CapabilityRegistry, CapabilityResolution, CapabilityStatus};
 pub use dependency::{
     validate_binary, validate_package, DependencyResolution, DependencyResolver, PackageBackend,
-    TermuxPackageBackend,
+    PackageCandidate, TermuxPackageBackend, TermuxRepositoryBackend, TrustedPackageRepository,
 };
 pub use environment::{
     EnvironmentProbe, ExecutionBackend, HostProbe, RealHostProbe, RuntimeEnvironment, RuntimeState,

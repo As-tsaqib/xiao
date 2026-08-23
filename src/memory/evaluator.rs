@@ -2,10 +2,12 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     memory::{MemoryRecord, MemoryScope, MemoryStore, MemoryUpsert},
     security::redact::contains_secret_material,
+    semantic::{SemanticEvaluator, SemanticResult},
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,11 +53,19 @@ pub enum AppliedMemoryMutation {
 #[derive(Clone)]
 pub struct MemoryEvaluator {
     store: Arc<MemoryStore>,
+    semantic: Arc<SemanticEvaluator>,
 }
 
 impl MemoryEvaluator {
     pub fn new(store: Arc<MemoryStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            semantic: Arc::new(SemanticEvaluator::deterministic()),
+        }
+    }
+
+    pub fn with_semantic(store: Arc<MemoryStore>, semantic: Arc<SemanticEvaluator>) -> Self {
+        Self { store, semantic }
     }
 
     /// Evaluate explicit owner intent against related current entries. The
@@ -66,8 +76,48 @@ impl MemoryEvaluator {
             return Ok(Vec::new());
         }
         self.store.reconcile(owner)?;
-        let normalized = normalize(prompt);
         let existing = self.store.list(owner, None, 200)?;
+        match self.semantic.evaluate::<SemanticMemoryOutput>(
+            "memory_decision",
+            memory_decision_schema(),
+            serde_json::json!({
+                "owner_statement": prompt,
+                "current_memory": existing.iter().take(100).map(memory_input).collect::<Vec<_>>(),
+                "rules": [
+                    "Choose NONE, CREATE, UPDATE, DELETE, MERGE, or REKEY.",
+                    "Explicit owner changes replace related prior active state.",
+                    "Do not create near-duplicates or store secrets/transient task details."
+                ]
+            }),
+        ) {
+            SemanticResult::Valid(output) => {
+                return Ok(validate_semantic_decisions(output.decisions, &existing));
+            }
+            SemanticResult::Malformed => return Ok(Vec::new()),
+            SemanticResult::Unavailable => {}
+        }
+        if let Some(mut candidate) = preferred_address_candidate(prompt) {
+            let related = existing
+                .iter()
+                .filter(|memory| {
+                    memory.scope == MemoryScope::User
+                        && memory.category == "preference"
+                        && memory.key == "preferred_address"
+                })
+                .collect::<Vec<_>>();
+            if let Some(current) = related.first() {
+                candidate.kind = if semantically_equal(
+                    candidate.value.as_deref().unwrap_or_default(),
+                    &current.value,
+                ) {
+                    MemoryDecisionKind::None
+                } else {
+                    MemoryDecisionKind::Update
+                };
+            }
+            return Ok(vec![candidate]);
+        }
+        let normalized = normalize(prompt);
         if is_forget(&normalized) {
             return Ok(delete_decisions(&normalized, &existing));
         }
@@ -107,6 +157,33 @@ impl MemoryEvaluator {
     ) -> Result<Vec<AppliedMemoryMutation>> {
         let decisions = self.evaluate_explicit(owner, prompt)?;
         self.apply_decisions(owner, Some(session_id), "explicit_user", decisions)
+    }
+
+    /// Agent-loop entry point that keeps provider-backed semantic evaluation
+    /// off Tokio's async worker threads.
+    pub async fn apply_explicit_async(
+        &self,
+        owner: &str,
+        session_id: &str,
+        prompt: &str,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<AppliedMemoryMutation>> {
+        let evaluator = self.clone();
+        let owner = owner.to_owned();
+        let session_id = session_id.to_owned();
+        let prompt = prompt.to_owned();
+        tokio::task::spawn_blocking(move || {
+            if cancellation.is_cancelled() {
+                return Err(anyhow::anyhow!("memory evaluation cancelled"));
+            }
+            let decisions = evaluator.evaluate_explicit(&owner, &prompt)?;
+            if cancellation.is_cancelled() {
+                return Err(anyhow::anyhow!("memory evaluation cancelled"));
+            }
+            evaluator.apply_decisions(&owner, Some(&session_id), "explicit_user", decisions)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("memory evaluator worker failed: {error}"))?
     }
 
     /// Implicit learning is restricted to declarative project/repository/
@@ -151,6 +228,50 @@ impl MemoryEvaluator {
             "implicit_evaluator",
             vec![candidate],
         )
+    }
+
+    /// Evaluate the complete sanitized successful task trace. Only observable
+    /// data is accepted; there is no hidden reasoning field. A malformed
+    /// semantic response makes no memory mutation.
+    pub fn apply_implicit_trace(
+        &self,
+        owner: &str,
+        session_id: &str,
+        trace: &serde_json::Value,
+    ) -> Result<Vec<AppliedMemoryMutation>> {
+        if contains_secret_material(&trace.to_string()) {
+            return Ok(Vec::new());
+        }
+        self.store.reconcile(owner)?;
+        let existing = self.store.list(owner, None, 200)?;
+        match self.semantic.evaluate::<SemanticMemoryOutput>(
+            "durable_trace_memory",
+            memory_decision_schema(),
+            serde_json::json!({
+                "successful_sanitized_trace": trace,
+                "current_memory": existing.iter().take(100).map(memory_input).collect::<Vec<_>>(),
+                "rules": [
+                    "Only durable owner/project/workspace/device facts from successful observations may be remembered.",
+                    "Ignore transient errors, failed attempts, secrets, and one-off outputs.",
+                    "Update or merge related current state instead of duplicating it."
+                ]
+            }),
+        ) {
+            SemanticResult::Valid(output) => self.apply_decisions(
+                owner,
+                Some(session_id),
+                "implicit_trace_evaluator",
+                validate_semantic_decisions(output.decisions, &existing),
+            ),
+            SemanticResult::Malformed => Ok(Vec::new()),
+            SemanticResult::Unavailable => {
+                let mut mutations = Vec::new();
+                for statement in successful_trace_strings(trace).into_iter().take(32) {
+                    mutations.extend(self.apply_implicit(owner, session_id, &statement)?);
+                }
+                Ok(mutations)
+            }
+        }
     }
 
     fn apply_decisions(
@@ -221,6 +342,155 @@ impl MemoryEvaluator {
         }
         Ok(mutations)
     }
+}
+
+fn preferred_address_candidate(prompt: &str) -> Option<MemoryDecision> {
+    let lower = prompt.to_ascii_lowercase();
+    let markers = [
+        "call me ",
+        "address me as ",
+        "refer to me as ",
+        "panggil saya ",
+        "panggil aku ",
+    ];
+    let (index, marker) = markers
+        .iter()
+        .filter_map(|marker| lower.find(marker).map(|index| (index, *marker)))
+        .min_by_key(|(index, _)| *index)?;
+    let start = index + marker.len();
+    let value = prompt
+        .get(start..)?
+        .trim()
+        .trim_end_matches(['.', '!', '?']);
+    let value = [" from now on", " instead", " mulai sekarang"]
+        .iter()
+        .find_map(|suffix| {
+            value
+                .to_ascii_lowercase()
+                .strip_suffix(suffix)
+                .map(|stripped| value[..stripped.len()].trim())
+        })
+        .unwrap_or(value)
+        .trim_matches(['\'', '"'])
+        .trim();
+    (!value.is_empty() && value.chars().count() <= 120).then(|| MemoryDecision {
+        kind: MemoryDecisionKind::Create,
+        scope: MemoryScope::User,
+        category: "preference".into(),
+        key: "preferred_address".into(),
+        value: Some(value.to_owned()),
+        related_keys: Vec::new(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticMemoryOutput {
+    decisions: Vec<MemoryDecision>,
+}
+
+fn memory_decision_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["decisions"],
+        "properties":{
+            "decisions":{
+                "type":"array","maxItems":8,
+                "items":{
+                    "type":"object","additionalProperties":false,
+                    "required":["kind","scope","category","key","value","related_keys"],
+                    "properties":{
+                        "kind":{"enum":["none","create","update","delete","merge","rekey"]},
+                        "scope":{"enum":["user","agent"]},
+                        "category":{"type":"string","maxLength":120},
+                        "key":{"type":"string","maxLength":160},
+                        "value":{"type":["string","null"],"maxLength":8192},
+                        "related_keys":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":160}}
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn memory_input(memory: &MemoryRecord) -> serde_json::Value {
+    serde_json::json!({
+        "scope":memory.scope,
+        "category":memory.category,
+        "key":memory.key,
+        "value":memory.value,
+    })
+}
+
+fn validate_semantic_decisions(
+    decisions: Vec<MemoryDecision>,
+    existing: &[MemoryRecord],
+) -> Vec<MemoryDecision> {
+    decisions
+        .into_iter()
+        .take(8)
+        .filter_map(|mut decision| {
+            decision.category = crate::memory::canonical_category(&decision.category);
+            decision.key = crate::memory::canonical_key(&decision.category, &decision.key);
+            decision.related_keys = decision
+                .related_keys
+                .into_iter()
+                .filter(|key| {
+                    existing
+                        .iter()
+                        .any(|memory| memory.scope == decision.scope && memory.key == *key)
+                })
+                .take(8)
+                .collect();
+            let target_exists = existing.iter().any(|memory| {
+                memory.scope == decision.scope
+                    && memory.category == decision.category
+                    && memory.key == decision.key
+            });
+            let value_ok = decision.value.as_ref().is_none_or(|value| {
+                !value.trim().is_empty()
+                    && value.chars().count() <= 8_192
+                    && !contains_secret_material(value)
+            });
+            let shape_ok = match decision.kind {
+                MemoryDecisionKind::None => true,
+                MemoryDecisionKind::Delete => target_exists && decision.value.is_none(),
+                MemoryDecisionKind::Create => decision.value.is_some(),
+                MemoryDecisionKind::Update => target_exists && decision.value.is_some(),
+                MemoryDecisionKind::Merge | MemoryDecisionKind::Rekey => {
+                    decision.value.is_some() && !decision.related_keys.is_empty()
+                }
+            };
+            (shape_ok && value_ok).then_some(decision)
+        })
+        .collect()
+}
+
+fn successful_trace_strings(value: &serde_json::Value) -> Vec<String> {
+    fn visit(value: &serde_json::Value, output: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(value) if value.chars().count() <= 8_192 => {
+                output.push(value.clone());
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    visit(value, output);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    if !matches!(key.as_str(), "failed_actions" | "errors") {
+                        visit(value, output);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut output = Vec::new();
+    visit(value, &mut output);
+    output
 }
 
 fn extract_candidate(normalized: &str, require_explicit: bool) -> Option<MemoryDecision> {
@@ -685,7 +955,12 @@ fn normalize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{identity::IdentityWorkspace, storage::Storage};
+    use crate::{
+        identity::IdentityWorkspace,
+        semantic::{SemanticBackend, SemanticRequest},
+        storage::Storage,
+    };
+    use std::sync::Mutex;
 
     fn evaluator() -> (MemoryEvaluator, Arc<MemoryStore>, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
@@ -778,5 +1053,99 @@ mod tests {
             MemoryDecisionKind::Rekey,
         ];
         assert_eq!(variants.len(), 6);
+    }
+
+    #[test]
+    fn preferred_address_replacement_keeps_one_active_entry_and_history() {
+        let (evaluator, store, _directory) = evaluator();
+        evaluator
+            .apply_explicit("p", "s", "Please call me Bos from now on.")
+            .unwrap();
+        evaluator
+            .apply_explicit("p", "s", "Call me Tuan instead.")
+            .unwrap();
+        let active = store.list("p", Some(MemoryScope::User), 10).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].key, "preferred_address");
+        assert_eq!(active[0].value, "Tuan");
+        assert_eq!(store.history("p", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn successful_full_trace_can_learn_durable_fact_but_ignores_failed_branch() {
+        let (evaluator, store, _directory) = evaluator();
+        evaluator
+            .apply_implicit_trace(
+                "p",
+                "s",
+                &serde_json::json!({
+                    "successful_actions":[{
+                        "tool":"termux_terminal",
+                        "observation":"project orion is located at /data/projects/orion"
+                    }],
+                    "failed_actions":[{
+                        "observation":"project orion is temporarily unavailable at /wrong/path"
+                    }],
+                    "final_observable_result":"project orion uses the workspace /data/projects/orion"
+                }),
+            )
+            .unwrap();
+        let active = store.list("p", Some(MemoryScope::Agent), 10).unwrap();
+        assert!(!active.is_empty());
+        assert!(active
+            .iter()
+            .any(|memory| memory.value.contains("/data/projects/orion")));
+        assert!(active
+            .iter()
+            .all(|memory| !memory.value.contains("/wrong/path")));
+    }
+
+    struct QueueSemantic(Mutex<Vec<String>>);
+    impl SemanticBackend for QueueSemantic {
+        fn evaluate(&self, _: &SemanticRequest) -> Result<String> {
+            Ok(self.0.lock().unwrap().remove(0))
+        }
+    }
+
+    #[test]
+    fn semantic_memory_handles_arbitrary_domain_and_malformed_output_is_conservative() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Arc::new(IdentityWorkspace::new(directory.path()));
+        workspace.bootstrap().unwrap();
+        let store = Arc::new(MemoryStore::with_workspace(
+            Arc::new(Storage::open_memory().unwrap()),
+            workspace,
+        ));
+        let semantic = Arc::new(SemanticEvaluator::with_backend(Arc::new(QueueSemantic(
+            Mutex::new(vec![
+                r#"{"decisions":[{"kind":"create","scope":"user","category":"preference","key":"diagram_notation","value":"PlantUML","related_keys":[]}]}"#.into(),
+                "malformed".into(),
+                "still malformed".into(),
+            ]),
+        ))));
+        let evaluator = MemoryEvaluator::with_semantic(store.clone(), semantic);
+        evaluator
+            .apply_explicit("p", "s", "Use PlantUML whenever a diagram would help.")
+            .unwrap();
+        assert_eq!(
+            store.list("p", None, 10).unwrap()[0].key,
+            "diagram_notation"
+        );
+        evaluator
+            .apply_explicit("p", "s", "Remember that my editor is Neovim")
+            .unwrap();
+        assert_eq!(store.list("p", None, 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_async_evaluation_cannot_mutate_memory_after_cancel() {
+        let (evaluator, store, _directory) = evaluator();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(evaluator
+            .apply_explicit_async("p", "s", "Please call me Bos from now on", cancellation,)
+            .await
+            .is_err());
+        assert!(store.list("p", None, 10).unwrap().is_empty());
     }
 }

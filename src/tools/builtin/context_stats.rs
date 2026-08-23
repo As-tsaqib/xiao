@@ -57,6 +57,7 @@ mod tests {
             principal: "p".into(),
             session_id: "s".into(),
             agent_run_id: "r".into(),
+            yolo_mode: false,
             messages: vec![MessageRecord {
                 role: "user".into(),
                 content: "hello".into(),

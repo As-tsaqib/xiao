@@ -515,7 +515,7 @@ fn stored_provider_api_key(app: &AppState, provider: &str) -> Result<Option<Stri
     app.auth.provider_api_key(provider)
 }
 
-async fn fetch_custom_models(
+pub(crate) async fn fetch_custom_models(
     base_url: &str,
     headers: &BTreeMap<String, String>,
     api_key: Option<&str>,

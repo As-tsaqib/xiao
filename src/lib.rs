@@ -12,6 +12,7 @@ pub mod memory;
 pub mod providers;
 pub mod runtime;
 pub mod security;
+pub mod semantic;
 pub mod session;
 pub mod skills;
 pub mod standalone;

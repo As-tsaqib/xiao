@@ -1,6 +1,6 @@
-# Xiao v0.2.0 Final-Architecture Acceptance Coverage
+# Xiao v0.2.5 Agent-Hardening Acceptance Coverage
 
-This maps the final v0.2.0 acceptance criteria to implementation and
+This maps the final v0.2.5 acceptance criteria to implementation and
 deterministic tests. Xiao is a private single-owner agent; `principal` remains
 only as a compatibility/session isolation key. Host tests use fake runtime and
 executor boundaries and do not claim real rooted-Android validation.
@@ -18,7 +18,15 @@ executor boundaries and do not claim real rooted-Android validation.
 | Similar task updates skill | `verified_work_creates_then_updates_one_canonical_skill`; `related_skill_updates_canonical_row_instead_of_creating_duplicate` | Related intent updates one canonical skill and history, not a duplicate |
 | Privileged policy | `broker_surface_is_typed_and_restart_is_approval_classed`; `privileged_tool_requires_exact_durable_one_shot_approval` | Typed broker only; exact approval is consumed once; no root-shell tool |
 | No false capability refusal | `capability_resolution_prevents_false_cannot_when_termux_backend_is_usable`; `capability_resolution_distinguishes_available_installable_and_approval` | Termux aliases resolve available and have no blocker; missing trusted binary is installable |
-| Telegram progress/cancel/files | `long_generation_does_not_block_stop_other_principal_or_callbacks`; semantic progress tests; `result_file_is_sent_through_telegram_multipart_document_path`; command approval test | `/stop` remains responsive, progress stays semantic/redacted, document uses multipart, approval commands work |
+| Provider parity | `codex_antigravity_and_custom_protocols_keep_the_same_agent_tool_workflow`; Custom native/structured wire tests | Codex, Antigravity, Custom native, and Custom structured protocols retain tools/results/continuation |
+| Semantic full-trace memory | `successful_full_trace_can_learn_durable_fact_but_ignores_failed_branch`; semantic arbitrary-memory tests | Durable successful observation enters MEMORY.md; transient failed branch does not |
+| Concrete skill synthesis/dedup | `media_dependency_workflow_synthesizes_concrete_verified_skill`; `semantic_equivalence_merges_differently_named_workflow_into_existing_skill`; learned-skill recall context test | Actual install/action/verification/pitfall is captured and related later workflows reuse one skill |
+| Retry observations/no progress | adaptive retry and `repeated_identical_failed_action_terminates_as_bounded_blocker` | Runtime observations enter the next turn; materially changed action can succeed; repetition becomes Blocked |
+| Trusted repository discovery | `unknown_binary_uses_validated_trusted_repository_then_resumes`; dependency audit test | Unknown mapping is validated against a trusted source, installed, re-probed, and resumed |
+| Telegram topics/YOLO | topic session/scope tests; all outbound-path scope test; YOLO registry/agent audit tests | Topic sessions/replies are isolated and YOLO affects only ASK in one active session |
+| Custom login wizard | full Telegram wizard E2E; wizard owner/topic/menu/expiry and secret-view tests | Endpoint/key/alias/models/pagination/probe/confirm work with bounded scoped state and no key leakage |
+| Command registry/removals | registry/help/setMyCommands tests; removed-command integration test | Exact 19 public commands share one source; hidden aliases work; removed commands have no route |
+| Telegram progress/cancel/files | `long_generation_does_not_block_stop_other_principal_or_callbacks`; semantic progress tests; `result_file_is_sent_through_telegram_multipart_document_path`; command approval test | `/cancel` and hidden `/stop` remain responsive, progress stays semantic/redacted, document uses multipart, approvals work |
 
 ## Architecture coverage
 
@@ -49,7 +57,8 @@ executor boundaries and do not claim real rooted-Android validation.
 - Argument-aware policy requires exact approval for destructive commands,
   opaque shell scripts, and credential-sensitive access.
 - `DependencyResolver` accepts only trusted normalized package mappings,
-  records installs, re-probes, and then resumes.
+  or validated trusted Termux repository candidates, records source/validation,
+  re-probes, refreshes capability state, and then resumes.
 - `AndroidBroker` accepts typed Xiao-service operations only; restart requires
   approval and no model-controlled command string.
 - Coverage: `provider_translates_canonical_tool_specs_without_owning_policy`,
@@ -75,6 +84,12 @@ executor boundaries and do not claim real rooted-Android validation.
 
 ### Agent loop, verification, learning, and Telegram
 
+- Provider capability is explicit (`Native`, `StructuredJsonFallback`, or
+  `ChatOnly`). Agent-capable adapters receive canonical tools; ChatOnly action
+  requests fail explicitly instead of silently becoming chat.
+- `SemanticEvaluator` sends bounded redacted schema-constrained JSON requests
+  with no tools, validates output, permits one bounded repair, and conservatively
+  falls back without overriding deterministic policy/evidence.
 - Configured turn/tool/no-progress/runtime limits prevent unbounded loops.
   Cancellation is checked around provider/tool work; identical failed action
   signatures are rejected.
@@ -85,8 +100,9 @@ executor boundaries and do not claim real rooted-Android validation.
   related skills before creating; failed/cancelled/unverified/trivial traces do
   not produce positive skills.
 - Telegram exposes semantic progress, trusted-install progress, `/approvals`,
-  `/approve`, `/deny`, `/stop`, blockers/finals, and bounded verified document
-  results. Hidden reasoning has no event or persistence field.
+  `/approve`, `/deny`, `/cancel`, blockers/finals, and bounded verified document
+  results. `TelegramScope` retains topic IDs across sessions, menus, callbacks,
+  drafts, replies, and files. Hidden reasoning has no event or persistence field.
 - Coverage: `agent::completion::tests`, agent adaptive/cancel/bounds tests,
   `learning::evaluator::tests`, `owner_can_inspect_approve_and_deny_pending_operations`,
   Telegram progress/cancellation tests, and multipart document test.
@@ -95,9 +111,12 @@ executor boundaries and do not claim real rooted-Android validation.
 
 - Migration version 10 adds `approvals`, `dependency_installs`,
   `environment_probes`, `workspace_file_index`, and `skill_file_index` after
-  the v6-v9 run/memory/FTS/skill migrations.
+  the v6-v9 run/memory/FTS/skill migrations. Version 11 adds Telegram scope and
+  active-session state, per-session YOLO, provider capability metadata, tool
+  approval audit, skill prerequisites, and dependency source validation.
+  Version 12 adds learned/imported source and enabled state for skills.
 - `v020_migration_is_fresh_and_idempotent_with_consistent_fts` expects version
-  10 and every new object; `v010_database_upgrades_additively_without_losing_history`
+  12 and every new object/column; `v010_database_upgrades_additively_without_losing_history`
   preserves legacy history; reopen tests quarantine uncertain agent/tool and
   package-install work rather than replaying it.
 - Static acceptance rejects an unrestricted model root-shell path and checks
@@ -127,9 +146,9 @@ this checklist as evidence that a command ran.
 2. Confirm detected Termux PATH/home/package manager across supported Termux
    installations; auto-install a missing trusted package from the configured
    Termux repository and cancel one install in progress.
-3. Configure a real Telegram bot/owner ACL; exercise semantic progress,
-   approval/retry, `/stop`, dependency progress, blocker delivery, and document
-   upload.
+3. Configure a real Telegram bot/owner ACL; exercise topics, semantic progress,
+   Custom login, approval/retry, `/cancel`, YOLO, memory/skills menus, dependency
+   progress, blocker delivery, and document upload.
 4. Complete real Codex/Antigravity OAuth and tool continuation using owner
    accounts; confirm no provider receives tools it cannot continue.
 5. Exercise the typed Xiao-service inspection/restart broker under the actual

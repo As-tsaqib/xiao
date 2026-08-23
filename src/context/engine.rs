@@ -15,7 +15,10 @@ use crate::{
     storage::{MessageRecord, SessionSummaryRecord, Storage, StoredMessageRecord},
 };
 
-pub const XIAO_SYSTEM_PROMPT: &str = r#"You are Xiao v0.2.0, a persistent personal AI agent.
+pub const XIAO_SYSTEM_PROMPT: &str = concat!(
+    "You are Xiao v",
+    env!("CARGO_PKG_VERSION"),
+    r#", a persistent personal AI agent.
 
 Security and runtime rules:
 - Use only the typed tools actually provided. Never claim a tool succeeded without a successful result.
@@ -28,7 +31,8 @@ Memory and retrieval rules:
 - Explicit remember/change/forget requests must use canonical current-state memory; update overlapping keys instead of creating contradictions.
 - Search old sessions when prior work is referenced and the supplied context is insufficient.
 - Use a relevant skill as guidance only; ToolPolicy still controls every action.
-- Learn reusable procedures only from meaningful completed and verified work, and update related skills instead of duplicating them."#;
+- Learn reusable procedures only from meaningful completed and verified work, and update related skills instead of duplicating them."#
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextStats {
@@ -678,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn only_relevant_selected_skill_is_progressively_disclosed() {
+    fn later_related_task_automatically_recalls_only_relevant_learned_skill() {
         let (storage, context, engine) = setup(AgentConfig::default());
         let skills = SkillStore::new(storage.clone());
         skills
@@ -688,11 +692,12 @@ mod tests {
                     name: "diagnose-xiao-service".into(),
                     summary: "Diagnose an unhealthy Xiao daemon".into(),
                     when_to_use: "When xiaod fails to start".into(),
+                    prerequisites: "Service inspection capability.".into(),
                     procedure: "Inspect status, then bounded logs.".into(),
                     pitfalls: "Do not expose secrets.".into(),
                     verification: "Service remains healthy.".into(),
                 },
-                None,
+                Some("verified-success-session"),
             )
             .unwrap();
         skills
@@ -702,6 +707,7 @@ mod tests {
                     name: "prepare-garden-soil".into(),
                     summary: "Prepare garden soil for tomatoes".into(),
                     when_to_use: "Before planting tomatoes".into(),
+                    prerequisites: "Compost and garden access.".into(),
                     procedure: "Add compost.".into(),
                     pitfalls: "Avoid overwatering.".into(),
                     verification: "Soil drains correctly.".into(),

@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
         ))
         .init();
 
-    let app = AppState::build(cfg.clone()).await?;
+    let app = AppState::build_from_path(cfg.clone(), config_path.clone()).await?;
 
     let ipc_app = app.clone();
     let ipc_path = config_path.clone();

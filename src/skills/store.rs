@@ -13,6 +13,8 @@ pub struct SkillCandidate {
     pub name: String,
     pub summary: String,
     pub when_to_use: String,
+    #[serde(default)]
+    pub prerequisites: String,
     pub procedure: String,
     #[serde(default)]
     pub pitfalls: String,
@@ -27,9 +29,12 @@ pub struct SkillRecord {
     pub name: String,
     pub summary: String,
     pub when_to_use: String,
+    pub prerequisites: String,
     pub procedure: String,
     pub pitfalls: String,
     pub verification: String,
+    pub source_kind: String,
+    pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -81,12 +86,15 @@ impl SkillStore {
             candidate.summary = merge_sentence(&existing.summary, &candidate.summary, 2_000);
             candidate.when_to_use =
                 merge_sentence(&existing.when_to_use, &candidate.when_to_use, 3_000);
+            candidate.prerequisites =
+                merge_lines(&existing.prerequisites, &candidate.prerequisites, 6_000);
             candidate.procedure = merge_lines(&existing.procedure, &candidate.procedure, 12_000);
             candidate.pitfalls = merge_lines(&existing.pitfalls, &candidate.pitfalls, 6_000);
             candidate.verification =
                 merge_lines(&existing.verification, &candidate.verification, 6_000);
             if existing.summary == candidate.summary
                 && existing.when_to_use == candidate.when_to_use
+                && existing.prerequisites == candidate.prerequisites
                 && existing.procedure == candidate.procedure
                 && existing.pitfalls == candidate.pitfalls
                 && existing.verification == candidate.verification
@@ -98,8 +106,8 @@ impl SkillStore {
             self.storage.with_conn(|connection| {
                 let transaction = connection.transaction()?;
                 let changed = transaction.execute(
-                    "UPDATE skills SET summary=?,when_to_use=?,procedure=?,pitfalls=?,verification=?,updated_at=? WHERE id=? AND owner_principal=?",
-                    params![candidate.summary, candidate.when_to_use, candidate.procedure, candidate.pitfalls, candidate.verification, now, existing.id, owner],
+                    "UPDATE skills SET summary=?,when_to_use=?,prerequisites=?,procedure=?,pitfalls=?,verification=?,updated_at=? WHERE id=? AND owner_principal=?",
+                    params![candidate.summary, candidate.when_to_use, candidate.prerequisites, candidate.procedure, candidate.pitfalls, candidate.verification, now, existing.id, owner],
                 )?;
                 if changed != 1 {
                     return Err(anyhow!("skill not found for principal"));
@@ -110,9 +118,12 @@ impl SkillStore {
                     name: existing.name.clone(),
                     summary: candidate.summary.clone(),
                     when_to_use: candidate.when_to_use.clone(),
+                    prerequisites: candidate.prerequisites.clone(),
                     procedure: candidate.procedure.clone(),
                     pitfalls: candidate.pitfalls.clone(),
                     verification: candidate.verification.clone(),
+                    source_kind: existing.source_kind.clone(),
+                    enabled: existing.enabled,
                     created_at: existing.created_at.clone(),
                     updated_at: now.clone(),
                 };
@@ -137,17 +148,24 @@ impl SkillStore {
             name: candidate.name,
             summary: candidate.summary,
             when_to_use: candidate.when_to_use,
+            prerequisites: candidate.prerequisites,
             procedure: candidate.procedure,
             pitfalls: candidate.pitfalls,
             verification: candidate.verification,
+            source_kind: if source_session_id.is_some() {
+                "learned".into()
+            } else {
+                "imported".into()
+            },
+            enabled: true,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
         self.storage.with_conn(|connection| {
             let transaction = connection.transaction()?;
             transaction.execute(
-                "INSERT INTO skills(id,owner_principal,name,summary,when_to_use,procedure,pitfalls,verification,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                params![record.id, record.owner_principal, record.name, record.summary, record.when_to_use, record.procedure, record.pitfalls, record.verification, record.created_at, record.updated_at],
+                "INSERT INTO skills(id,owner_principal,name,summary,when_to_use,prerequisites,procedure,pitfalls,verification,source_kind,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                params![record.id, record.owner_principal, record.name, record.summary, record.when_to_use, record.prerequisites, record.procedure, record.pitfalls, record.verification, record.source_kind, record.enabled as i32, record.created_at, record.updated_at],
             )?;
             transaction.execute(
                 "INSERT INTO skill_history(skill_id,owner_principal,action,old_content_json,new_content_json,source_session_id,created_at) VALUES(?,?,'create',NULL,?,?,?)",
@@ -164,7 +182,7 @@ impl SkillStore {
         self.storage.with_conn(|connection| {
             connection
                 .query_row(
-                    "SELECT id,owner_principal,name,summary,when_to_use,procedure,pitfalls,verification,created_at,updated_at FROM skills WHERE owner_principal=? AND (id=? OR name=?)",
+                    "SELECT id,owner_principal,name,summary,when_to_use,prerequisites,procedure,pitfalls,verification,source_kind,enabled,created_at,updated_at FROM skills WHERE owner_principal=? AND (id=? OR name=?)",
                     params![owner, name_or_id, canonical],
                     row_skill,
                 )
@@ -176,7 +194,7 @@ impl SkillStore {
     pub fn list(&self, owner: &str, limit: usize) -> Result<Vec<SkillRecord>> {
         self.storage.with_conn(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id,owner_principal,name,summary,when_to_use,procedure,pitfalls,verification,created_at,updated_at FROM skills WHERE owner_principal=? ORDER BY updated_at DESC,name LIMIT ?",
+                "SELECT id,owner_principal,name,summary,when_to_use,prerequisites,procedure,pitfalls,verification,source_kind,enabled,created_at,updated_at FROM skills WHERE owner_principal=? AND enabled=1 ORDER BY updated_at DESC,name LIMIT ?",
             )?;
             let rows = statement.query_map(params![owner, limit.clamp(1, 500) as i64], row_skill)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -189,7 +207,7 @@ impl SkillStore {
         };
         self.storage.with_conn(|connection| {
             let mut statement = connection.prepare(
-                "SELECT s.id,s.owner_principal,s.name,s.summary,s.when_to_use,s.procedure,s.pitfalls,s.verification,s.created_at,s.updated_at FROM skills_fts JOIN skills s ON s.rowid=skills_fts.rowid WHERE skills_fts MATCH ? AND s.owner_principal=? ORDER BY bm25(skills_fts),s.updated_at DESC LIMIT ?",
+                "SELECT s.id,s.owner_principal,s.name,s.summary,s.when_to_use,s.prerequisites,s.procedure,s.pitfalls,s.verification,s.source_kind,s.enabled,s.created_at,s.updated_at FROM skills_fts JOIN skills s ON s.rowid=skills_fts.rowid WHERE skills_fts MATCH ? AND s.owner_principal=? AND s.enabled=1 ORDER BY bm25(skills_fts),s.updated_at DESC LIMIT ?",
             )?;
             let rows = statement.query_map(
                 params![query, owner, limit.clamp(1, 20) as i64],
@@ -219,10 +237,61 @@ impl SkillStore {
         })
     }
 
+    pub fn list_all(&self, owner: &str, limit: usize) -> Result<Vec<SkillRecord>> {
+        self.storage.with_conn(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id,owner_principal,name,summary,when_to_use,prerequisites,procedure,pitfalls,verification,source_kind,enabled,created_at,updated_at FROM skills WHERE owner_principal=? ORDER BY updated_at DESC,name LIMIT ?",
+            )?;
+            let rows = statement.query_map(params![owner, limit.clamp(1, 500) as i64], row_skill)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn set_enabled(&self, owner: &str, id: &str, enabled: bool) -> Result<SkillRecord> {
+        let changed = self.storage.with_conn(|connection| {
+            Ok(connection.execute(
+                "UPDATE skills SET enabled=?,updated_at=? WHERE id=? AND owner_principal=?",
+                params![enabled as i32, Utc::now().to_rfc3339(), id, owner],
+            )?)
+        })?;
+        if changed != 1 {
+            return Err(anyhow!("skill not found for principal"));
+        }
+        self.view(owner, id)?
+            .ok_or_else(|| anyhow!("updated skill is missing"))
+    }
+
+    pub fn delete_learned(&self, owner: &str, id: &str) -> Result<SkillRecord> {
+        let record = self
+            .view(owner, id)?
+            .ok_or_else(|| anyhow!("skill not found"))?;
+        if record.source_kind != "learned" {
+            return Err(anyhow!("only learned owner-created skills can be deleted"));
+        }
+        let now = Utc::now().to_rfc3339();
+        self.storage.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let deleted = transaction.execute(
+                "DELETE FROM skills WHERE id=? AND owner_principal=?",
+                params![id, owner],
+            )?;
+            if deleted != 1 {
+                return Err(anyhow!("skill not found for principal"));
+            }
+            transaction.execute(
+                "INSERT INTO skill_history(skill_id,owner_principal,action,old_content_json,new_content_json,source_session_id,created_at) VALUES(?,?,'delete',?,NULL,NULL,?)",
+                params![id, owner, serde_json::to_string(&record)?, now],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })?;
+        Ok(record)
+    }
+
     fn find_related(&self, owner: &str, candidate: &SkillCandidate) -> Result<Option<SkillRecord>> {
         let candidate_intent = intent_tokens(&format!("{} {}", candidate.name, candidate.summary));
         let mut best: Option<(f64, SkillRecord)> = None;
-        for skill in self.list(owner, 500)? {
+        for skill in self.list_all(owner, 500)? {
             if skill.name == candidate.name {
                 return Ok(Some(skill));
             }
@@ -246,11 +315,14 @@ fn row_skill(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillRecord> {
         name: row.get(2)?,
         summary: row.get(3)?,
         when_to_use: row.get(4)?,
-        procedure: row.get(5)?,
-        pitfalls: row.get(6)?,
-        verification: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        prerequisites: row.get(5)?,
+        procedure: row.get(6)?,
+        pitfalls: row.get(7)?,
+        verification: row.get(8)?,
+        source_kind: row.get(9)?,
+        enabled: row.get::<_, i64>(10)? != 0,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -259,6 +331,7 @@ fn normalize_candidate(candidate: SkillCandidate) -> Result<SkillCandidate> {
         name: canonical_skill_name(&candidate.name),
         summary: candidate.summary.trim().to_owned(),
         when_to_use: candidate.when_to_use.trim().to_owned(),
+        prerequisites: candidate.prerequisites.trim().to_owned(),
         procedure: candidate.procedure.trim().to_owned(),
         pitfalls: candidate.pitfalls.trim().to_owned(),
         verification: candidate.verification.trim().to_owned(),
@@ -267,6 +340,7 @@ fn normalize_candidate(candidate: SkillCandidate) -> Result<SkillCandidate> {
         ("name", candidate.name.as_str(), 120),
         ("summary", candidate.summary.as_str(), 2_000),
         ("when_to_use", candidate.when_to_use.as_str(), 3_000),
+        ("prerequisites", candidate.prerequisites.as_str(), 6_000),
         ("procedure", candidate.procedure.as_str(), 12_000),
         ("pitfalls", candidate.pitfalls.as_str(), 6_000),
         ("verification", candidate.verification.as_str(), 6_000),
@@ -405,6 +479,7 @@ mod tests {
             name: name.into(),
             summary: "Diagnose Xiao service failures safely".into(),
             when_to_use: "When xiaod fails to start or becomes unhealthy".into(),
+            prerequisites: "Access to service status and bounded logs.".into(),
             procedure: "1. Check process status.\n2. Inspect bounded recent logs.".into(),
             pitfalls: "Do not restart repeatedly without diagnosis.".into(),
             verification: "Service is healthy and the error does not recur.".into(),
@@ -461,5 +536,35 @@ mod tests {
         secret.procedure = "API key=abc".into();
         assert!(store.create_or_update("p", secret, None).is_err());
         assert!(store.list("p", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn learned_and_imported_sources_support_disable_and_guarded_delete() {
+        let store = SkillStore::new(Arc::new(Storage::open_memory().unwrap()));
+        let learned = store
+            .create_or_update("p", candidate("learned-workflow"), Some("session"))
+            .unwrap()
+            .1;
+        let mut community = candidate("community-image-transform");
+        community.summary = "Transform image colors with a community workflow".into();
+        community.when_to_use = "When an imported image needs color conversion".into();
+        let imported = store.create_or_update("p", community, None).unwrap().1;
+        assert_eq!(learned.source_kind, "learned");
+        assert_eq!(imported.source_kind, "imported");
+        let disabled = store.set_enabled("p", &learned.id, false).unwrap();
+        assert!(!disabled.enabled);
+        assert!(store
+            .list("p", 10)
+            .unwrap()
+            .iter()
+            .all(|skill| skill.id != learned.id));
+        assert!(store.delete_learned("p", &imported.id).is_err());
+        store.delete_learned("p", &learned.id).unwrap();
+        assert!(store.view("p", &learned.id).unwrap().is_none());
+        assert!(store
+            .history("p", 10)
+            .unwrap()
+            .iter()
+            .any(|history| history.action == "delete"));
     }
 }

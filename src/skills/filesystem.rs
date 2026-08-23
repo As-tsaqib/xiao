@@ -106,7 +106,9 @@ impl FilesystemSkills {
             let raw = fs::read_to_string(&document.path)?;
             let hash = hash(&raw);
             let path = document.path.display().to_string();
-            if storage.skill_file_hash(&path)?.as_deref() == Some(&hash) {
+            if storage.skill_file_hash(&path)?.as_deref() == Some(&hash)
+                && self.store.view(owner, &document.name)?.is_some()
+            {
                 continue;
             }
             let (mutation, record) =
@@ -239,6 +241,7 @@ impl SkillDocument {
             summary: self.description.clone(),
             when_to_use: section(&self.body, "When to Use")
                 .unwrap_or_else(|| self.description.clone()),
+            prerequisites: section(&self.body, "Prerequisites").unwrap_or_default(),
             procedure: section(&self.body, "Procedure")
                 .unwrap_or_else(|| body_fallback(&self.body, &self.description)),
             pitfalls: section(&self.body, "Pitfalls").unwrap_or_default(),
@@ -368,11 +371,12 @@ fn body_fallback(body: &str, description: &str) -> String {
 fn render_skill(record: &SkillRecord) -> String {
     let description = serde_json::to_string(&record.summary).unwrap_or_else(|_| "\"Skill\"".into());
     format!(
-        "---\nname: {}\ndescription: {}\nmetadata:\n  xiao:\n    requires:\n      bins: []\n      capabilities: []\n---\n\n# {}\n\n## When to Use\n\n{}\n\n## Prerequisites\n\n- Use only runtime capabilities allowed by Xiao ToolPolicy.\n\n## Procedure\n\n{}\n\n## Pitfalls\n\n{}\n\n## Verification\n\n{}\n",
+        "---\nname: {}\ndescription: {}\nmetadata:\n  xiao:\n    requires:\n      bins: []\n      capabilities: []\n---\n\n# {}\n\n## When to Use\n\n{}\n\n## Prerequisites\n\n{}\n\n## Procedure\n\n{}\n\n## Pitfalls\n\n{}\n\n## Verification\n\n{}\n",
         record.name,
         description,
         title(&record.name),
         record.when_to_use,
+        if record.prerequisites.trim().is_empty() { "- Use only runtime capabilities allowed by Xiao ToolPolicy." } else { &record.prerequisites },
         record.procedure,
         if record.pitfalls.trim().is_empty() { "- Observe failures and change strategy; do not repeat an identical failed action." } else { &record.pitfalls },
         if record.verification.trim().is_empty() { "Confirm an observable result appropriate to the task before reporting success." } else { &record.verification },
@@ -460,6 +464,7 @@ metadata:
                     name: "repair-widget".into(),
                     summary: "Repair a widget safely".into(),
                     when_to_use: "When a widget fails".into(),
+                    prerequisites: "Widget inspection access.".into(),
                     procedure: "1. Inspect.\n2. Repair.".into(),
                     pitfalls: "Do not guess.".into(),
                     verification: "Widget check passes.".into(),
@@ -471,6 +476,19 @@ metadata:
         let raw =
             fs::read_to_string(directory.path().join("skills/repair-widget/SKILL.md")).unwrap();
         assert!(raw.contains("## Verification"));
+
+        store.set_enabled("p", &learned.1.id, false).unwrap();
+        assert_eq!(files.reconcile("p").unwrap(), 0);
+        assert!(
+            !store.view("p", &learned.1.id).unwrap().unwrap().enabled,
+            "filesystem reconciliation must preserve an owner disable"
+        );
+
+        // A stale file-hash row must not hide an on-disk skill when its
+        // active database row is absent (for example after recovery/import).
+        store.delete_learned("p", &learned.1.id).unwrap();
+        assert_eq!(files.reconcile("p").unwrap(), 1);
+        assert!(store.view("p", "repair-widget").unwrap().is_some());
     }
 
     #[test]

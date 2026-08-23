@@ -17,7 +17,7 @@ use crate::{
         CommandOutcome, ExecutionPurpose, ProcessExecutor, TermuxCommand, TermuxEnvironment,
     },
     security::redact::redact_text,
-    storage::Storage,
+    storage::{DependencyInstallStart, Storage},
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -27,6 +27,20 @@ pub struct DependencyResolution {
     pub installed: bool,
     pub verified: bool,
     pub evidence: String,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PackageCandidate {
+    pub package: String,
+    pub source: String,
+    #[serde(default)]
+    pub provided_binaries: Vec<String>,
+}
+
+#[async_trait]
+pub trait TrustedPackageRepository: Send + Sync {
+    async fn search(&self, binary: &str) -> Result<Vec<PackageCandidate>>;
 }
 
 #[async_trait]
@@ -116,11 +130,98 @@ impl PackageBackend for TermuxPackageBackend {
     }
 }
 
+/// Read-only trusted repository discovery. Results remain candidates until
+/// DependencyResolver validates their normalized package/source/provided
+/// binary relationship; this never invokes an ecosystem installer or remote
+/// script.
+#[derive(Clone)]
+pub struct TermuxRepositoryBackend {
+    executor: Arc<dyn ProcessExecutor>,
+    manager_name: String,
+    cwd: PathBuf,
+}
+
+impl TermuxRepositoryBackend {
+    pub fn new(
+        executor: Arc<dyn ProcessExecutor>,
+        environment: &TermuxEnvironment,
+        cwd: impl Into<PathBuf>,
+    ) -> Self {
+        let manager_name = environment
+            .package_manager
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("pkg")
+            .to_owned();
+        Self {
+            executor,
+            manager_name,
+            cwd: cwd.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl TrustedPackageRepository for TermuxRepositoryBackend {
+    async fn search(&self, binary: &str) -> Result<Vec<PackageCandidate>> {
+        validate_binary(binary)?;
+        let (program, args) = if self.manager_name == "pkg" {
+            ("pkg".to_owned(), vec!["search".into(), binary.into()])
+        } else {
+            (
+                "apt-cache".to_owned(),
+                vec!["search".into(), "--names-only".into(), binary.into()],
+            )
+        };
+        let outcome = self
+            .executor
+            .execute(
+                TermuxCommand {
+                    program,
+                    args,
+                    cwd: self.cwd.clone(),
+                    environment: Default::default(),
+                    timeout_ms: 30_000,
+                    max_output_chars: 64_000,
+                    purpose: ExecutionPurpose::Verification,
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+        if !outcome.succeeded() {
+            return Err(anyhow!(
+                "trusted Termux repository search failed: {}",
+                outcome.observable_summary()
+            ));
+        }
+        let mut candidates = outcome
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .map(|token| token.split('/').next().unwrap_or(token))
+            .filter(|package| validate_package(package).is_ok())
+            // Repository search alone proves exact package-name candidates.
+            // Non-exact mappings require a stronger trusted index/fake source.
+            .filter(|package| *package == binary)
+            .map(|package| PackageCandidate {
+                package: package.into(),
+                source: "termux_repository_search".into(),
+                provided_binaries: vec![binary.into()],
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.package.cmp(&right.package));
+        candidates.dedup_by(|left, right| left.package == right.package);
+        Ok(candidates)
+    }
+}
+
 #[derive(Clone)]
 pub struct DependencyResolver {
     capabilities: Arc<CapabilityRegistry>,
     backend: Arc<dyn PackageBackend>,
     storage: Option<Arc<Storage>>,
+    repository: Option<Arc<dyn TrustedPackageRepository>>,
 }
 
 impl DependencyResolver {
@@ -133,6 +234,21 @@ impl DependencyResolver {
             capabilities,
             backend,
             storage,
+            repository: None,
+        }
+    }
+
+    pub fn with_trusted_repository(
+        capabilities: Arc<CapabilityRegistry>,
+        backend: Arc<dyn PackageBackend>,
+        storage: Option<Arc<Storage>>,
+        repository: Arc<dyn TrustedPackageRepository>,
+    ) -> Self {
+        Self {
+            capabilities,
+            backend,
+            storage,
+            repository: Some(repository),
         }
     }
 
@@ -152,13 +268,23 @@ impl DependencyResolver {
                 installed: false,
                 verified: true,
                 evidence: "executable verified in Termux PATH".into(),
+                source: None,
             });
         }
 
-        let package = trusted_package_for_binary(binary).ok_or_else(|| {
-            anyhow!("binary {binary} is missing and no trusted Termux package mapping is known")
-        })?;
-        validate_package(package)?;
+        let (package, source) = if let Some(package) = trusted_package_for_binary(binary) {
+            (package.to_owned(), "known_mapping".to_owned())
+        } else {
+            let repository = self.repository.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "binary {binary} is missing and no trusted Termux repository discovery source is configured"
+                )
+            })?;
+            let candidates = repository.search(binary).await?;
+            let candidate = validated_candidate(binary, candidates)?;
+            (candidate.package, candidate.source)
+        };
+        validate_package(&package)?;
         let resolution = self.capabilities.resolve(&format!("binary.{binary}"));
         if !matches!(
             resolution.status,
@@ -198,15 +324,19 @@ impl DependencyResolver {
             .storage
             .as_ref()
             .map(|storage| {
-                storage.begin_dependency_install(
+                let requested_capability = format!("binary.{binary}");
+                storage.begin_dependency_install(DependencyInstallStart {
                     agent_run_id,
                     binary,
-                    package,
-                    self.backend.package_manager_name(),
-                )
+                    package: &package,
+                    package_manager: self.backend.package_manager_name(),
+                    source: &source,
+                    validated: true,
+                    requested_capability: &requested_capability,
+                })
             })
             .transpose()?;
-        let outcome = self.backend.install(package, cancellation.clone()).await;
+        let outcome = self.backend.install(&package, cancellation.clone()).await;
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -268,10 +398,11 @@ impl DependencyResolver {
         }
         Ok(DependencyResolution {
             binary: binary.into(),
-            package: Some(package.into()),
+            package: Some(package),
             installed: true,
             verified: true,
             evidence,
+            source: Some(source),
         })
     }
 
@@ -288,6 +419,30 @@ impl DependencyResolver {
             evidence: evidence.into(),
         });
     }
+}
+
+fn validated_candidate(
+    binary: &str,
+    candidates: Vec<PackageCandidate>,
+) -> Result<PackageCandidate> {
+    let mut valid = candidates
+        .into_iter()
+        .filter(|candidate| {
+            validate_package(&candidate.package).is_ok()
+                && candidate.source.starts_with("termux_repository")
+                && (candidate.package == binary
+                    || candidate
+                        .provided_binaries
+                        .iter()
+                        .any(|provided| provided == binary))
+        })
+        .collect::<Vec<_>>();
+    valid.sort_by(|left, right| {
+        (left.package != binary, &left.package).cmp(&(right.package != binary, &right.package))
+    });
+    valid.into_iter().next().ok_or_else(|| {
+        anyhow!("trusted Termux repository returned no validated package providing {binary}")
+    })
 }
 
 pub fn validate_package(package: &str) -> Result<()> {

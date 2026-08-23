@@ -68,6 +68,9 @@ pub struct ToolContext {
     pub principal: String,
     pub session_id: String,
     pub agent_run_id: String,
+    /// Session-local owner opt-in. It can convert only ASK to an audited
+    /// allow; hard DENY decisions remain denied.
+    pub yolo_mode: bool,
     /// Already-bounded context, supplied only for semantic context statistics.
     pub messages: Vec<MessageRecord>,
     /// Cancellation is owned by the run and is safe to clone into executors.
@@ -123,4 +126,6 @@ impl ToolRunStatus {
 pub struct ToolExecution {
     pub result: ToolResult,
     pub status: ToolRunStatus,
+    pub approval_mode: Option<String>,
+    pub policy_original: Option<String>,
 }

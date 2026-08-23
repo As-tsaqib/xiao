@@ -1,12 +1,28 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use crate::storage::ToolRunRecord;
+use crate::{
+    semantic::{SemanticEvaluator, SemanticResult},
+    storage::ToolRunRecord,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     Informational,
     Action,
+    Inspection,
+    Modification,
+    Installation,
+    Verification,
+    Mixed,
+}
+
+impl TaskKind {
+    pub fn is_action_like(self) -> bool {
+        self != Self::Informational
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,53 +47,197 @@ pub struct CompletionEvidence {
     pub observable_evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CompletionVerifier;
+#[derive(Clone)]
+pub struct CompletionVerifier {
+    semantic: Arc<SemanticEvaluator>,
+}
 
-impl CompletionVerifier {
-    pub fn classify(&self, goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind {
-        let normalized = goal.to_ascii_lowercase();
-        let action_marker = [
-            "implement",
-            "build",
-            "create",
-            "write",
-            "edit",
-            "change",
-            "update",
-            "delete",
-            "remove",
-            "install",
-            "configure",
-            "restart",
-            "run ",
-            "execute",
-            "extract",
-            "convert",
-            "download",
-            "upload",
-            "send ",
-            "fix ",
-            "repair",
-            "buat",
-            "ubah",
-            "hapus",
-            "pasang",
-            "jalankan",
-            "perbaiki",
-        ]
-        .iter()
-        .any(|marker| normalized.contains(marker));
-        let observed_side_effect = tool_runs
-            .iter()
-            .any(|run| run.risk != "read_only" && run.risk != "unknown");
-        if action_marker || observed_side_effect {
-            TaskKind::Action
-        } else {
-            TaskKind::Informational
+impl Default for CompletionVerifier {
+    fn default() -> Self {
+        Self {
+            semantic: Arc::new(SemanticEvaluator::deterministic()),
         }
     }
+}
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskIntentDecision {
+    task_kind: TaskKind,
+    #[serde(default)]
+    required_evidence: Vec<String>,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticCompletionDecision {
+    satisfied: bool,
+    #[serde(default)]
+    missing_evidence: Vec<String>,
+    #[serde(default)]
+    reason: String,
+}
+
+impl CompletionVerifier {
+    pub fn with_semantic(semantic: Arc<SemanticEvaluator>) -> Self {
+        Self { semantic }
+    }
+
+    pub fn classify(&self, goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind {
+        match self.semantic.evaluate::<TaskIntentDecision>(
+            "task_intent",
+            serde_json::json!({
+                "type":"object",
+                "additionalProperties":false,
+                "required":["task_kind","required_evidence","reason"],
+                "properties":{
+                    "task_kind":{"enum":["informational","inspection","action","modification","installation","verification","mixed"]},
+                    "required_evidence":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":300}},
+                    "reason":{"type":"string","maxLength":500}
+                }
+            }),
+            serde_json::json!({
+                "goal": goal,
+                "observed_tools": tool_runs.iter().take(64).map(|run| serde_json::json!({
+                    "tool":run.tool_name,"risk":run.risk,"status":run.status
+                })).collect::<Vec<_>>()
+            }),
+        ) {
+            SemanticResult::Valid(decision)
+                if decision.required_evidence.len() <= 8
+                    && decision.reason.chars().count() <= 500 =>
+            {
+                return decision.task_kind;
+            }
+            SemanticResult::Malformed | SemanticResult::Unavailable | SemanticResult::Valid(_) => {}
+        }
+        deterministic_task_kind(goal, tool_runs)
+    }
+
+    /// Provider-backed semantic evaluation bridges an async provider through
+    /// a synchronous, schema-validating boundary. Keep that work off Tokio's
+    /// async workers so a slow evaluator cannot stall Telegram cancellation,
+    /// callbacks, or another owner's request.
+    pub async fn classify_async(&self, goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind {
+        let evaluator = self.clone();
+        let goal = goal.to_owned();
+        let tool_runs = tool_runs.to_vec();
+        tokio::task::spawn_blocking(move || evaluator.classify(&goal, &tool_runs))
+            .await
+            .unwrap_or(TaskKind::Action)
+    }
+
+    fn semantic_completion(
+        &self,
+        goal: &str,
+        task_kind: TaskKind,
+        final_answer: &str,
+        evidence: &[String],
+    ) -> SemanticResult<SemanticCompletionDecision> {
+        self.semantic.evaluate(
+            "completion_interpretation",
+            serde_json::json!({
+                "type":"object",
+                "additionalProperties":false,
+                "required":["satisfied","missing_evidence","reason"],
+                "properties":{
+                    "satisfied":{"type":"boolean"},
+                    "missing_evidence":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":400}},
+                    "reason":{"type":"string","maxLength":800}
+                }
+            }),
+            serde_json::json!({
+                "goal":goal,
+                "task_kind":task_kind,
+                "candidate_final_answer":final_answer,
+                "hard_validated_observations":evidence,
+                "hard_rule":"Action-like tasks cannot succeed from model text alone. Treat supplied observations as facts; do not invent evidence."
+            }),
+        )
+    }
+
+    /// Deterministic fallback remains security conservative. Semantic output
+    /// may refine intent and missing evidence, but can never manufacture tool
+    /// evidence or override approval/policy failures.
+    pub fn deterministic_classify(&self, goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind {
+        deterministic_task_kind(goal, tool_runs)
+    }
+}
+
+fn deterministic_task_kind(goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind {
+    let normalized = goal.to_ascii_lowercase();
+    let installation = ["install", "package", "dependency", "pasang"]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let modification = [
+        "implement",
+        "build",
+        "create",
+        "write",
+        "edit",
+        "change",
+        "update",
+        "delete",
+        "remove",
+        "configure",
+        "restart",
+        "run ",
+        "execute",
+        "extract",
+        "convert",
+        "download",
+        "upload",
+        "send ",
+        "fix ",
+        "repair",
+        "buat",
+        "ubah",
+        "hapus",
+        "pasang",
+        "jalankan",
+        "perbaiki",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let inspection = [
+        "inspect",
+        "diagnose",
+        "investigate",
+        "check",
+        "status",
+        "periksa",
+        "telusuri",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let verification = ["verify", "validate", "prove", "pastikan", "verifikasi"]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let observed_side_effect = tool_runs
+        .iter()
+        .any(|run| run.risk != "read_only" && run.risk != "unknown");
+    let kinds = usize::from(installation)
+        + usize::from(modification || observed_side_effect)
+        + usize::from(inspection)
+        + usize::from(verification);
+    if kinds > 1 {
+        TaskKind::Mixed
+    } else if installation {
+        TaskKind::Installation
+    } else if modification || observed_side_effect {
+        TaskKind::Modification
+    } else if verification {
+        TaskKind::Verification
+    } else if inspection {
+        TaskKind::Inspection
+    } else {
+        TaskKind::Informational
+    }
+}
+
+impl CompletionVerifier {
     /// Compatibility entry point. With no explicit goal, side-effect audit
     /// records still classify a task as an action.
     pub fn verify(&self, final_answer: &str, tool_runs: &[ToolRunRecord]) -> CompletionEvidence {
@@ -165,7 +325,7 @@ impl CompletionVerifier {
                 Vec::new(),
             );
         }
-        if task_kind == TaskKind::Informational {
+        if !task_kind.is_action_like() {
             return evidence(
                 VerificationState::VerifiedSuccess,
                 task_kind,
@@ -181,6 +341,52 @@ impl CompletionVerifier {
                     .filter(|run| run.status == "succeeded")
                     .map(observation)
                     .collect(),
+            );
+        }
+
+        if matches!(task_kind, TaskKind::Inspection | TaskKind::Verification) {
+            let observations = tool_runs
+                .iter()
+                .filter(|run| run.status == "succeeded" && run.risk == "read_only")
+                .map(observation)
+                .collect::<Vec<_>>();
+            if observations.is_empty() {
+                return evidence(
+                    VerificationState::NotYetVerified,
+                    task_kind,
+                    "inspection/verification task has no successful observable probe".into(),
+                    succeeded_tools,
+                    0,
+                    Vec::new(),
+                );
+            }
+            if let SemanticResult::Valid(semantic) =
+                self.semantic_completion(goal, task_kind, final_answer, &observations)
+            {
+                if !semantic.satisfied {
+                    return evidence(
+                        VerificationState::NotYetVerified,
+                        task_kind,
+                        format!(
+                            "inspection evidence is incomplete: {}",
+                            semantic.missing_evidence.join("; ")
+                        ),
+                        succeeded_tools,
+                        0,
+                        observations,
+                    );
+                }
+            }
+            return evidence(
+                VerificationState::VerifiedSuccess,
+                task_kind,
+                format!(
+                    "inspection completed with {} observation(s)",
+                    observations.len()
+                ),
+                succeeded_tools,
+                0,
+                observations,
             );
         }
 
@@ -227,6 +433,37 @@ impl CompletionVerifier {
                     .collect(),
             );
         }
+        let observations = verification_runs
+            .iter()
+            .map(|run| observation(run))
+            .collect::<Vec<_>>();
+        if let SemanticResult::Valid(semantic) =
+            self.semantic_completion(goal, task_kind, final_answer, &observations)
+        {
+            if !semantic.satisfied {
+                let missing = semantic
+                    .missing_evidence
+                    .into_iter()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return evidence(
+                    VerificationState::NotYetVerified,
+                    task_kind,
+                    if missing.is_empty() {
+                        format!(
+                            "semantic completion check needs more evidence: {}",
+                            semantic.reason
+                        )
+                    } else {
+                        format!("missing semantic completion evidence: {missing}")
+                    },
+                    succeeded_tools,
+                    0,
+                    observations,
+                );
+            }
+        }
         evidence(
             VerificationState::VerifiedSuccess,
             task_kind,
@@ -237,8 +474,31 @@ impl CompletionVerifier {
             ),
             succeeded_tools,
             0,
-            verification_runs.into_iter().map(observation).collect(),
+            observations,
         )
+    }
+
+    /// Async agent-loop entry point. A failed blocking worker is treated
+    /// conservatively using the deterministic verifier rather than promoting
+    /// an unobserved action to success.
+    pub async fn verify_for_task_async(
+        &self,
+        goal: &str,
+        final_answer: &str,
+        tool_runs: &[ToolRunRecord],
+    ) -> CompletionEvidence {
+        let evaluator = self.clone();
+        let owned_goal = goal.to_owned();
+        let owned_answer = final_answer.to_owned();
+        let owned_runs = tool_runs.to_vec();
+        match tokio::task::spawn_blocking(move || {
+            evaluator.verify_for_task(&owned_goal, &owned_answer, &owned_runs)
+        })
+        .await
+        {
+            Ok(evidence) => evidence,
+            Err(_) => CompletionVerifier::default().verify_for_task(goal, final_answer, tool_runs),
+        }
     }
 }
 
@@ -313,6 +573,15 @@ fn observation(run: &ToolRunRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::{SemanticBackend, SemanticRequest};
+
+    struct FixedSemantic(&'static str);
+
+    impl SemanticBackend for FixedSemantic {
+        fn evaluate(&self, _: &SemanticRequest) -> anyhow::Result<String> {
+            Ok(self.0.into())
+        }
+    }
 
     fn run(name: &str, risk: &str, status: &str, output: Option<&str>) -> ToolRunRecord {
         ToolRunRecord {
@@ -322,6 +591,8 @@ mod tests {
             tool_name: name.into(),
             arguments_json: "{}".into(),
             risk: risk.into(),
+            approval_mode: None,
+            policy_original: None,
             status: status.into(),
             output: output.map(str::to_owned),
             error: None,
@@ -332,7 +603,7 @@ mod tests {
 
     #[test]
     fn unresolved_failure_is_not_yet_verified_and_changed_strategy_recovers() {
-        let verifier = CompletionVerifier;
+        let verifier = CompletionVerifier::default();
         assert_eq!(
             verifier
                 .verify("done", &[run("search", "read_only", "failed", None)])
@@ -351,24 +622,28 @@ mod tests {
 
     #[test]
     fn information_answer_can_complete_without_action_evidence() {
-        let evidence =
-            CompletionVerifier.verify_for_task("Explain Rust", "Here is the answer", &[]);
+        let evidence = CompletionVerifier::default().verify_for_task(
+            "Explain Rust",
+            "Here is the answer",
+            &[],
+        );
         assert_eq!(evidence.state, VerificationState::VerifiedSuccess);
         assert_eq!(evidence.task_kind, TaskKind::Informational);
     }
 
     #[test]
     fn action_claim_without_evidence_is_not_yet_verified() {
-        let evidence = CompletionVerifier.verify_for_task("Create the file", "Done", &[]);
+        let evidence =
+            CompletionVerifier::default().verify_for_task("Create the file", "Done", &[]);
         assert_eq!(evidence.state, VerificationState::NotYetVerified);
         assert!(!evidence.verified);
-        let action_only = CompletionVerifier.verify_for_task(
+        let action_only = CompletionVerifier::default().verify_for_task(
             "Create the file",
             "Done",
             &[run("write_file", "side_effect", "succeeded", Some("ok"))],
         );
         assert_eq!(action_only.state, VerificationState::NotYetVerified);
-        let same_call_claim = CompletionVerifier.verify_for_task(
+        let same_call_claim = CompletionVerifier::default().verify_for_task(
             "Create the file",
             "Done",
             &[run(
@@ -379,7 +654,7 @@ mod tests {
             )],
         );
         assert_eq!(same_call_claim.state, VerificationState::NotYetVerified);
-        let verified = CompletionVerifier.verify_for_task(
+        let verified = CompletionVerifier::default().verify_for_task(
             "Create the file",
             "Done",
             &[
@@ -396,10 +671,27 @@ mod tests {
     }
 
     #[test]
+    fn semantic_intent_handles_action_wording_outside_deterministic_markers() {
+        let goal = "I want a fresh manifest to materialize beside the release artifact";
+        assert_eq!(
+            CompletionVerifier::default().deterministic_classify(goal, &[]),
+            TaskKind::Informational
+        );
+        let semantic = Arc::new(SemanticEvaluator::with_backend(Arc::new(FixedSemantic(
+            r#"{"task_kind":"modification","required_evidence":["manifest exists"],"reason":"the owner requests a new artifact state"}"#,
+        ))));
+        assert_eq!(
+            CompletionVerifier::with_semantic(semantic).classify(goal, &[]),
+            TaskKind::Modification
+        );
+    }
+
+    #[test]
     fn approval_is_a_blocker_not_success_or_generic_failure() {
         let mut approval = run("android_restart", "privileged", "awaiting_approval", None);
         approval.error = Some("approval request 123".into());
-        let evidence = CompletionVerifier.verify_for_task("Restart Xiao", "Waiting", &[approval]);
+        let evidence =
+            CompletionVerifier::default().verify_for_task("Restart Xiao", "Waiting", &[approval]);
         assert_eq!(evidence.state, VerificationState::Blocked);
     }
 }

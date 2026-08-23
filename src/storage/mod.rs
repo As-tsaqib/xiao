@@ -6,6 +6,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::telegram::TelegramScope;
+
 #[derive(Debug)]
 pub struct Storage {
     conn: Mutex<Connection>,
@@ -23,6 +25,7 @@ pub struct SessionRecord {
     pub archived: bool,
     pub is_side: bool,
     pub parent_id: Option<String>,
+    pub yolo_mode: bool,
     pub created_at: String,
     pub last_active_at: String,
 }
@@ -94,6 +97,8 @@ pub struct ToolRunRecord {
     pub tool_name: String,
     pub arguments_json: String,
     pub risk: String,
+    pub approval_mode: Option<String>,
+    pub policy_original: Option<String>,
     pub status: String,
     pub output: Option<String>,
     pub error: Option<String>,
@@ -122,10 +127,36 @@ pub struct DependencyInstallRecord {
     pub binary: String,
     pub package: String,
     pub package_manager: String,
+    pub source: String,
+    pub validated: bool,
+    pub requested_capability: Option<String>,
     pub status: String,
     pub evidence: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DependencyInstallStart<'a> {
+    pub agent_run_id: Option<&'a str>,
+    pub binary: &'a str,
+    pub package: &'a str,
+    pub package_manager: &'a str,
+    pub source: &'a str,
+    pub validated: bool,
+    pub requested_capability: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCapabilityRecord {
+    pub provider: String,
+    pub model: String,
+    pub tool_protocol: String,
+    pub native_tool_calls: bool,
+    pub structured_output: bool,
+    pub continuation: bool,
+    pub probed_at: String,
+    pub evidence: String,
 }
 
 impl Storage {
@@ -466,6 +497,98 @@ impl Storage {
         );
         INSERT OR IGNORE INTO schema_migrations(version) VALUES(10);
         "#)?;
+            ensure_column(
+                conn,
+                "sessions",
+                "yolo_mode",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(conn, "tool_runs", "approval_mode", "TEXT")?;
+            ensure_column(conn, "tool_runs", "policy_original", "TEXT")?;
+            ensure_column(conn, "skills", "prerequisites", "TEXT NOT NULL DEFAULT ''")?;
+            ensure_column(conn, "dependency_installs", "source", "TEXT NOT NULL DEFAULT 'known_mapping'")?;
+            ensure_column(conn, "dependency_installs", "validated", "INTEGER NOT NULL DEFAULT 1")?;
+            ensure_column(conn, "dependency_installs", "requested_capability", "TEXT")?;
+            ensure_column(
+                conn,
+                "skills",
+                "source_kind",
+                "TEXT NOT NULL DEFAULT 'learned'",
+            )?;
+            ensure_column(conn, "skills", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS telegram_session_scopes(
+                  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                  owner_principal TEXT NOT NULL,
+                  chat_id INTEGER NOT NULL,
+                  thread_id_key INTEGER NOT NULL DEFAULT 0,
+                  is_side INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_telegram_session_scope
+                  ON telegram_session_scopes(owner_principal,chat_id,thread_id_key,is_side);
+                CREATE TABLE IF NOT EXISTS telegram_active_sessions(
+                  owner_principal TEXT NOT NULL,
+                  chat_id INTEGER NOT NULL,
+                  thread_id_key INTEGER NOT NULL DEFAULT 0,
+                  active_main_session_id TEXT NOT NULL REFERENCES sessions(id),
+                  side_session_id TEXT REFERENCES sessions(id),
+                  mode TEXT NOT NULL DEFAULT 'main' CHECK(mode IN ('main','side')),
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY(owner_principal,chat_id,thread_id_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_telegram_active_session
+                  ON telegram_active_sessions(active_main_session_id);
+                CREATE TABLE IF NOT EXISTS provider_capabilities(
+                  provider TEXT NOT NULL,
+                  model TEXT NOT NULL,
+                  tool_protocol TEXT NOT NULL,
+                  native_tool_calls INTEGER NOT NULL DEFAULT 0,
+                  structured_output INTEGER NOT NULL DEFAULT 0,
+                  continuation INTEGER NOT NULL DEFAULT 0,
+                  probed_at TEXT NOT NULL,
+                  evidence TEXT NOT NULL DEFAULT '',
+                  PRIMARY KEY(provider,model)
+                );
+
+                -- Pre-topic Telegram principals embed their chat before the owner id.
+                -- Bind those sessions to the non-topic scope without rewriting any
+                -- session/message/memory/skill ownership rows.
+                INSERT OR IGNORE INTO telegram_session_scopes(
+                  session_id,owner_principal,chat_id,thread_id_key,is_side,created_at
+                )
+                SELECT id,owner_principal,
+                       CAST(substr(substr(owner_principal,10),1,instr(substr(owner_principal,10),':')-1) AS INTEGER),
+                       0,is_side,created_at
+                  FROM sessions
+                 WHERE owner_principal LIKE 'telegram:%:%'
+                   AND instr(substr(owner_principal,10),':') > 1;
+                INSERT OR IGNORE INTO telegram_active_sessions(
+                  owner_principal,chat_id,thread_id_key,active_main_session_id,side_session_id,mode,updated_at
+                )
+                SELECT f.principal,
+                       CAST(substr(substr(f.principal,10),1,instr(substr(f.principal,10),':')-1) AS INTEGER),
+                       0,f.active_main_session_id,f.side_session_id,f.mode,
+                       strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                  FROM frontend_state f
+                 WHERE f.principal LIKE 'telegram:%:%'
+                   AND instr(substr(f.principal,10),':') > 1;
+                INSERT OR IGNORE INTO schema_migrations(version) VALUES(11);
+                "#,
+            )?;
+            conn.execute_batch(
+                r#"
+                UPDATE skills
+                   SET source_kind='imported'
+                 WHERE source_kind='learned'
+                   AND id IN (
+                     SELECT skill_id FROM skill_history
+                      WHERE action='create' AND source_session_id IS NULL
+                   );
+                INSERT OR IGNORE INTO schema_migrations(version) VALUES(12);
+                "#,
+            )?;
             Ok(())
         })
     }
@@ -507,6 +630,50 @@ impl Storage {
             )?;
             transaction.commit()?;
             Ok(())
+        })
+    }
+
+    pub fn upsert_provider_capability(&self, record: &ProviderCapabilityRecord) -> Result<()> {
+        if !matches!(
+            record.tool_protocol.as_str(),
+            "native" | "structured_json_fallback" | "chat_only"
+        ) {
+            return Err(anyhow::anyhow!("invalid provider tool protocol"));
+        }
+        self.with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO provider_capabilities(provider,model,tool_protocol,native_tool_calls,structured_output,continuation,probed_at,evidence) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(provider,model) DO UPDATE SET tool_protocol=excluded.tool_protocol,native_tool_calls=excluded.native_tool_calls,structured_output=excluded.structured_output,continuation=excluded.continuation,probed_at=excluded.probed_at,evidence=excluded.evidence",
+                params![record.provider, record.model, record.tool_protocol, record.native_tool_calls as i32, record.structured_output as i32, record.continuation as i32, record.probed_at, record.evidence],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn provider_capability(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<Option<ProviderCapabilityRecord>> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT provider,model,tool_protocol,native_tool_calls,structured_output,continuation,probed_at,evidence FROM provider_capabilities WHERE provider=? AND model=?",
+                    params![provider, model],
+                    |row| {
+                        Ok(ProviderCapabilityRecord {
+                            provider: row.get(0)?,
+                            model: row.get(1)?,
+                            tool_protocol: row.get(2)?,
+                            native_tool_calls: row.get::<_, i64>(3)? != 0,
+                            structured_output: row.get::<_, i64>(4)? != 0,
+                            continuation: row.get::<_, i64>(5)? != 0,
+                            probed_at: row.get(6)?,
+                            evidence: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(Into::into)
         })
     }
 
@@ -556,18 +723,12 @@ impl Storage {
         })
     }
 
-    pub fn begin_dependency_install(
-        &self,
-        agent_run_id: Option<&str>,
-        binary: &str,
-        package: &str,
-        package_manager: &str,
-    ) -> Result<String> {
+    pub fn begin_dependency_install(&self, start: DependencyInstallStart<'_>) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         self.with_conn(|connection| {
             connection.execute(
-                "INSERT INTO dependency_installs(id,agent_run_id,binary,package,package_manager,status,started_at) VALUES(?,?,?,?,?,'installing',?)",
-                params![id, agent_run_id, binary, package, package_manager, Utc::now().to_rfc3339()],
+                "INSERT INTO dependency_installs(id,agent_run_id,binary,package,package_manager,source,validated,requested_capability,status,started_at) VALUES(?,?,?,?,?,?,?,?,'installing',?)",
+                params![id, start.agent_run_id, start.binary, start.package, start.package_manager, start.source, start.validated as i32, start.requested_capability, Utc::now().to_rfc3339()],
             )?;
             Ok(())
         })?;
@@ -593,7 +754,7 @@ impl Storage {
     pub fn dependency_installs(&self, agent_run_id: &str) -> Result<Vec<DependencyInstallRecord>> {
         self.with_conn(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id,agent_run_id,binary,package,package_manager,status,evidence,started_at,finished_at FROM dependency_installs WHERE agent_run_id=? ORDER BY started_at",
+                "SELECT id,agent_run_id,binary,package,package_manager,source,validated,requested_capability,status,evidence,started_at,finished_at FROM dependency_installs WHERE agent_run_id=? ORDER BY started_at",
             )?;
             let rows = statement.query_map(params![agent_run_id], |row| {
                 Ok(DependencyInstallRecord {
@@ -602,10 +763,13 @@ impl Storage {
                     binary: row.get(2)?,
                     package: row.get(3)?,
                     package_manager: row.get(4)?,
-                    status: row.get(5)?,
-                    evidence: row.get(6)?,
-                    started_at: row.get(7)?,
-                    finished_at: row.get(8)?,
+                    source: row.get(5)?,
+                    validated: row.get::<_, i64>(6)? != 0,
+                    requested_capability: row.get(7)?,
+                    status: row.get(8)?,
+                    evidence: row.get(9)?,
+                    started_at: row.get(10)?,
+                    finished_at: row.get(11)?,
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -926,10 +1090,28 @@ impl Storage {
         })
     }
 
+    pub fn set_tool_run_approval_audit(
+        &self,
+        tool_run_id: &str,
+        approval_mode: Option<&str>,
+        policy_original: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn(|connection| {
+            let changed = connection.execute(
+                "UPDATE tool_runs SET approval_mode=?,policy_original=? WHERE id=?",
+                params![approval_mode, policy_original, tool_run_id],
+            )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!("tool run not found"));
+            }
+            Ok(())
+        })
+    }
+
     pub fn tool_runs(&self, owner: &str, agent_run_id: &str) -> Result<Vec<ToolRunRecord>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT t.id,t.agent_run_id,t.call_id,t.tool_name,t.arguments_json,t.risk,t.status,t.output,t.error,t.started_at,t.finished_at FROM tool_runs t JOIN agent_runs a ON a.id=t.agent_run_id WHERE t.agent_run_id=? AND a.owner_principal=? ORDER BY t.rowid",
+                "SELECT t.id,t.agent_run_id,t.call_id,t.tool_name,t.arguments_json,t.risk,t.approval_mode,t.policy_original,t.status,t.output,t.error,t.started_at,t.finished_at FROM tool_runs t JOIN agent_runs a ON a.id=t.agent_run_id WHERE t.agent_run_id=? AND a.owner_principal=? ORDER BY t.rowid",
             )?;
             let rows = statement.query_map(params![agent_run_id, owner], |row| {
                 Ok(ToolRunRecord {
@@ -939,11 +1121,13 @@ impl Storage {
                     tool_name: row.get(3)?,
                     arguments_json: row.get(4)?,
                     risk: row.get(5)?,
-                    status: row.get(6)?,
-                    output: row.get(7)?,
-                    error: row.get(8)?,
-                    started_at: row.get(9)?,
-                    finished_at: row.get(10)?,
+                    approval_mode: row.get(6)?,
+                    policy_original: row.get(7)?,
+                    status: row.get(8)?,
+                    output: row.get(9)?,
+                    error: row.get(10)?,
+                    started_at: row.get(11)?,
+                    finished_at: row.get(12)?,
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -985,7 +1169,7 @@ impl Storage {
 
     pub fn session(&self, owner: &str, id: &str) -> Result<Option<SessionRecord>> {
         self.with_conn(|conn| conn.query_row(
-            "SELECT s.id,s.owner_principal,s.name,s.provider,s.account_id,s.model,(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id),s.archived,s.is_side,s.parent_id,s.created_at,s.last_active_at FROM sessions s WHERE s.id=? AND s.owner_principal=?",
+            "SELECT s.id,s.owner_principal,s.name,s.provider,s.account_id,s.model,(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id),s.archived,s.is_side,s.parent_id,s.yolo_mode,s.created_at,s.last_active_at FROM sessions s WHERE s.id=? AND s.owner_principal=?",
             params![id,owner], row_session,
         ).optional().map_err(Into::into))
     }
@@ -999,9 +1183,9 @@ impl Storage {
     ) -> Result<Vec<SessionRecord>> {
         self.with_conn(|conn| {
             let sql = if include_archived {
-                "SELECT s.id,s.owner_principal,s.name,s.provider,s.account_id,s.model,(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id),s.archived,s.is_side,s.parent_id,s.created_at,s.last_active_at FROM sessions s WHERE owner_principal=? AND is_side=0 ORDER BY last_active_at DESC LIMIT ? OFFSET ?"
+                "SELECT s.id,s.owner_principal,s.name,s.provider,s.account_id,s.model,(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id),s.archived,s.is_side,s.parent_id,s.yolo_mode,s.created_at,s.last_active_at FROM sessions s WHERE owner_principal=? AND is_side=0 ORDER BY last_active_at DESC LIMIT ? OFFSET ?"
             } else {
-                "SELECT s.id,s.owner_principal,s.name,s.provider,s.account_id,s.model,(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id),s.archived,s.is_side,s.parent_id,s.created_at,s.last_active_at FROM sessions s WHERE owner_principal=? AND is_side=0 AND archived=0 ORDER BY last_active_at DESC LIMIT ? OFFSET ?"
+                "SELECT s.id,s.owner_principal,s.name,s.provider,s.account_id,s.model,(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id),s.archived,s.is_side,s.parent_id,s.yolo_mode,s.created_at,s.last_active_at FROM sessions s WHERE owner_principal=? AND is_side=0 AND archived=0 ORDER BY last_active_at DESC LIMIT ? OFFSET ?"
             };
             let mut stmt = conn.prepare(sql)?;
             let rows = stmt.query_map(params![owner, limit as i64, offset as i64], row_session)?;
@@ -1049,6 +1233,180 @@ impl Storage {
             let n=conn.execute("UPDATE sessions SET provider=?,account_id=?,model=?,last_active_at=? WHERE id=? AND owner_principal=?", params![provider,account,model,Utc::now().to_rfc3339(),id,owner])?;
             if n != 1 { return Err(anyhow::anyhow!("session not found for principal")); }
             Ok(())
+        })
+    }
+
+    pub fn set_session_yolo(&self, owner: &str, id: &str, enabled: bool) -> Result<()> {
+        self.with_conn(|connection| {
+            let changed = connection.execute(
+                "UPDATE sessions SET yolo_mode=?,last_active_at=? WHERE id=? AND owner_principal=? AND archived=0",
+                params![enabled as i32, Utc::now().to_rfc3339(), id, owner],
+            )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!("active session not found for principal"));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn telegram_scope_for_session(
+        &self,
+        owner: &str,
+        session_id: &str,
+    ) -> Result<Option<(i64, Option<i64>)>> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT chat_id,thread_id_key FROM telegram_session_scopes WHERE owner_principal=? AND session_id=?",
+                    params![owner, session_id],
+                    |row| {
+                        let chat_id = row.get(0)?;
+                        let thread_key: i64 = row.get(1)?;
+                        Ok((chat_id, (thread_key != 0).then_some(thread_key)))
+                    },
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn bind_session_to_telegram_scope(
+        &self,
+        owner: &str,
+        session_id: &str,
+        scope: TelegramScope,
+    ) -> Result<()> {
+        self.with_conn(|connection| {
+            let row = connection
+                .query_row(
+                    "SELECT is_side FROM sessions WHERE id=? AND owner_principal=?",
+                    params![session_id, owner],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            let Some(is_side) = row else {
+                return Err(anyhow::anyhow!("session not found for principal"));
+            };
+            let existing = connection
+                .query_row(
+                    "SELECT chat_id,thread_id_key FROM telegram_session_scopes WHERE session_id=?",
+                    params![session_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing != (scope.chat_id, scope.thread_key()) {
+                    return Err(anyhow::anyhow!(
+                        "session is already bound to another Telegram scope"
+                    ));
+                }
+                return Ok(());
+            }
+            connection.execute(
+                "INSERT INTO telegram_session_scopes(session_id,owner_principal,chat_id,thread_id_key,is_side,created_at) VALUES(?,?,?,?,?,?)",
+                params![session_id, owner, scope.chat_id, scope.thread_key(), is_side, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_main_sessions_in_telegram_scope(
+        &self,
+        owner: &str,
+        scope: TelegramScope,
+        limit: usize,
+        offset: usize,
+        include_archived: bool,
+    ) -> Result<Vec<SessionRecord>> {
+        self.with_conn(|connection| {
+            let archived = if include_archived { "" } else { " AND s.archived=0" };
+            let sql = format!(
+                "SELECT s.id,s.owner_principal,s.name,s.provider,s.account_id,s.model,(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id),s.archived,s.is_side,s.parent_id,s.yolo_mode,s.created_at,s.last_active_at FROM sessions s JOIN telegram_session_scopes ts ON ts.session_id=s.id WHERE s.owner_principal=? AND ts.owner_principal=? AND ts.chat_id=? AND ts.thread_id_key=? AND s.is_side=0{archived} ORDER BY s.last_active_at DESC LIMIT ? OFFSET ?"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(
+                params![
+                    owner,
+                    owner,
+                    scope.chat_id,
+                    scope.thread_key(),
+                    limit as i64,
+                    offset as i64
+                ],
+                row_session,
+            )?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn count_main_sessions_in_telegram_scope(
+        &self,
+        owner: &str,
+        scope: TelegramScope,
+    ) -> Result<usize> {
+        self.with_conn(|connection| {
+            Ok(connection.query_row(
+                "SELECT COUNT(*) FROM sessions s JOIN telegram_session_scopes ts ON ts.session_id=s.id WHERE s.owner_principal=? AND ts.owner_principal=? AND ts.chat_id=? AND ts.thread_id_key=? AND s.is_side=0 AND s.archived=0",
+                params![owner, owner, scope.chat_id, scope.thread_key()],
+                |row| row.get::<_, i64>(0),
+            )? as usize)
+        })
+    }
+
+    pub fn set_telegram_frontend_state(
+        &self,
+        owner: &str,
+        scope: TelegramScope,
+        main: &str,
+        side: Option<&str>,
+        mode: &str,
+    ) -> Result<()> {
+        if !matches!(mode, "main" | "side") {
+            return Err(anyhow::anyhow!("invalid Telegram session mode"));
+        }
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let main_ok: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions s JOIN telegram_session_scopes ts ON ts.session_id=s.id WHERE s.id=? AND s.owner_principal=? AND ts.owner_principal=? AND ts.chat_id=? AND ts.thread_id_key=? AND s.is_side=0 AND s.archived=0)",
+                params![main, owner, owner, scope.chat_id, scope.thread_key()],
+                |row| row.get(0),
+            )?;
+            if !main_ok {
+                return Err(anyhow::anyhow!("main session is not owned by Telegram scope"));
+            }
+            if let Some(side_id) = side {
+                let side_ok: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions s JOIN telegram_session_scopes ts ON ts.session_id=s.id WHERE s.id=? AND s.owner_principal=? AND ts.owner_principal=? AND ts.chat_id=? AND ts.thread_id_key=? AND s.is_side=1 AND s.parent_id=?)",
+                    params![side_id, owner, owner, scope.chat_id, scope.thread_key(), main],
+                    |row| row.get(0),
+                )?;
+                if !side_ok {
+                    return Err(anyhow::anyhow!("side session is not owned by Telegram scope/main"));
+                }
+            }
+            transaction.execute(
+                "INSERT INTO telegram_active_sessions(owner_principal,chat_id,thread_id_key,active_main_session_id,side_session_id,mode,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(owner_principal,chat_id,thread_id_key) DO UPDATE SET active_main_session_id=excluded.active_main_session_id,side_session_id=excluded.side_session_id,mode=excluded.mode,updated_at=excluded.updated_at",
+                params![owner, scope.chat_id, scope.thread_key(), main, side, mode, Utc::now().to_rfc3339()],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn telegram_frontend_state(
+        &self,
+        owner: &str,
+        scope: TelegramScope,
+    ) -> Result<Option<(String, Option<String>, String)>> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT active_main_session_id,side_session_id,mode FROM telegram_active_sessions WHERE owner_principal=? AND chat_id=? AND thread_id_key=?",
+                    params![owner, scope.chat_id, scope.thread_key()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(Into::into)
         })
     }
 
@@ -1248,22 +1606,30 @@ impl Storage {
         mode: &str,
     ) -> Result<()> {
         self.with_conn(|conn| {
-            let main_ok: bool = conn.query_row(
+            let transaction = conn.transaction()?;
+            let main_ok: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=? AND owner_principal=? AND is_side=0 AND archived=0)",
                 params![main,principal], |r| r.get(0)
             )?;
             if !main_ok { return Err(anyhow::anyhow!("main session is not owned by principal")); }
             if let Some(side_id) = side {
-                let side_ok: bool = conn.query_row(
+                let side_ok: bool = transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=? AND owner_principal=? AND is_side=1 AND parent_id=?)",
                     params![side_id,principal,main], |r| r.get(0)
                 )?;
                 if !side_ok { return Err(anyhow::anyhow!("side session is not owned by principal/main")); }
             }
-            conn.execute(
+            transaction.execute(
                 "INSERT INTO frontend_state(principal,active_main_session_id,side_session_id,mode) VALUES(?,?,?,?) ON CONFLICT(principal) DO UPDATE SET active_main_session_id=excluded.active_main_session_id,side_session_id=excluded.side_session_id,mode=excluded.mode",
                 params![principal,main,side,mode],
             )?;
+            if let Some((chat_id, thread_id_key)) = telegram_scope_from_principal(principal) {
+                transaction.execute(
+                    "INSERT INTO telegram_active_sessions(owner_principal,chat_id,thread_id_key,active_main_session_id,side_session_id,mode,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(owner_principal,chat_id,thread_id_key) DO UPDATE SET active_main_session_id=excluded.active_main_session_id,side_session_id=excluded.side_session_id,mode=excluded.mode,updated_at=excluded.updated_at",
+                    params![principal, chat_id, thread_id_key, main, side, mode, Utc::now().to_rfc3339()],
+                )?;
+            }
+            transaction.commit()?;
             Ok(())
         })
     }
@@ -1449,9 +1815,39 @@ fn row_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         archived: r.get::<_, i64>(7)? != 0,
         is_side: r.get::<_, i64>(8)? != 0,
         parent_id: r.get(9)?,
-        created_at: r.get(10)?,
-        last_active_at: r.get(11)?,
+        yolo_mode: r.get::<_, i64>(10)? != 0,
+        created_at: r.get(11)?,
+        last_active_at: r.get(12)?,
     })
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {declaration};"
+        ))?;
+    }
+    Ok(())
+}
+
+fn telegram_scope_from_principal(principal: &str) -> Option<(i64, i64)> {
+    let parts = principal.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["telegram", chat, _owner] => Some((chat.parse().ok()?, 0)),
+        ["telegram", chat, "topic", thread, _owner] => {
+            Some((chat.parse().ok()?, thread.parse().ok()?))
+        }
+        _ => None,
+    }
 }
 
 fn row_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRecord> {
@@ -1656,7 +2052,7 @@ mod tests {
                 connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                     row.get(0)
                 })?;
-            assert_eq!(latest, 10);
+            assert_eq!(latest, 12);
             for table in [
                 "agent_runs",
                 "tool_runs",
@@ -1672,6 +2068,9 @@ mod tests {
                 "environment_probes",
                 "workspace_file_index",
                 "skill_file_index",
+                "telegram_session_scopes",
+                "telegram_active_sessions",
+                "provider_capabilities",
             ] {
                 let exists: bool = connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)",
@@ -1686,6 +2085,25 @@ mod tests {
                 |row| row.get(0),
             )?;
             assert_eq!(indexed, 1);
+            for (table, column) in [
+                ("sessions", "yolo_mode"),
+                ("skills", "prerequisites"),
+                ("skills", "source_kind"),
+                ("skills", "enabled"),
+                ("tool_runs", "approval_mode"),
+                ("tool_runs", "policy_original"),
+                ("dependency_installs", "source"),
+                ("dependency_installs", "validated"),
+            ] {
+                let present: bool = connection.query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name=?)"
+                    ),
+                    params![column],
+                    |row| row.get(0),
+                )?;
+                assert!(present, "missing {table}.{column}");
+            }
             Ok(())
         })
         .unwrap();

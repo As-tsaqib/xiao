@@ -123,6 +123,9 @@ struct CallbackQuery {
 }
 
 impl AuthManager {
+    pub(crate) fn storage(&self) -> Arc<Storage> {
+        self.storage.clone()
+    }
     pub fn new(storage: Arc<Storage>, secrets_dir: std::path::PathBuf) -> Self {
         Self::with_config(
             storage,

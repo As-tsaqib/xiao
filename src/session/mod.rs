@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use chrono::Local;
 
 use crate::storage::{MessageRecord, SessionRecord, Storage};
+use crate::telegram::TelegramScope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatMode {
@@ -207,6 +208,249 @@ impl SessionManager {
             p,
         ))
     }
+
+    pub fn ensure_telegram_session(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+    ) -> Result<SessionRecord> {
+        if let Some(session) = self
+            .storage
+            .list_main_sessions_in_telegram_scope(principal, scope, 1, 0, false)?
+            .into_iter()
+            .next()
+        {
+            return Ok(session);
+        }
+        self.new_telegram_main(principal, scope)
+    }
+
+    pub fn new_telegram_main(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+    ) -> Result<SessionRecord> {
+        let name = format!("Session {}", Local::now().format("%d %b %H:%M"));
+        let session = self
+            .storage
+            .create_session(principal, &name, "custom", None, "default", false, None)?;
+        self.storage
+            .bind_session_to_telegram_scope(principal, &session.id, scope)?;
+        Ok(session)
+    }
+
+    pub fn context_for_telegram(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+    ) -> Result<SessionContext> {
+        let default = self.ensure_telegram_session(principal, scope)?;
+        let (main_id, side_id, mode) =
+            match self.storage.telegram_frontend_state(principal, scope)? {
+                Some(value) => value,
+                None => {
+                    self.storage.set_telegram_frontend_state(
+                        principal,
+                        scope,
+                        &default.id,
+                        None,
+                        "main",
+                    )?;
+                    (default.id, None, "main".into())
+                }
+            };
+        let main = match self.storage.session(principal, &main_id)? {
+            Some(session)
+                if !session.archived
+                    && !session.is_side
+                    && self.session_in_scope(principal, &session.id, scope)? =>
+            {
+                session
+            }
+            _ => {
+                let fallback = self.ensure_telegram_session(principal, scope)?;
+                self.storage.set_telegram_frontend_state(
+                    principal,
+                    scope,
+                    &fallback.id,
+                    None,
+                    "main",
+                )?;
+                fallback
+            }
+        };
+        if mode == "side" {
+            if let Some(side_id) = side_id {
+                if let Some(active) = self.storage.session(principal, &side_id)? {
+                    if active.is_side
+                        && !active.archived
+                        && active.parent_id.as_deref() == Some(main.id.as_str())
+                        && self.session_in_scope(principal, &active.id, scope)?
+                    {
+                        return Ok(SessionContext {
+                            main,
+                            active,
+                            mode: ChatMode::Side,
+                        });
+                    }
+                }
+            }
+            self.storage
+                .set_telegram_frontend_state(principal, scope, &main.id, None, "main")?;
+        }
+        Ok(SessionContext {
+            main: main.clone(),
+            active: main,
+            mode: ChatMode::Main,
+        })
+    }
+
+    pub fn append_user_telegram(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        text: &str,
+    ) -> Result<SessionContext> {
+        let context = self.context_for_telegram(principal, scope)?;
+        self.storage
+            .append_message(principal, &context.active.id, "user", text)?;
+        Ok(context)
+    }
+
+    pub fn create_and_switch_telegram(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+    ) -> Result<SessionRecord> {
+        let session = self.new_telegram_main(principal, scope)?;
+        self.storage
+            .set_telegram_frontend_state(principal, scope, &session.id, None, "main")?;
+        Ok(session)
+    }
+
+    pub fn switch_telegram_main(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        id: &str,
+    ) -> Result<SessionRecord> {
+        let session = self
+            .storage
+            .session(principal, id)?
+            .ok_or_else(|| anyhow!("session not found"))?;
+        if session.is_side || session.archived || !self.session_in_scope(principal, id, scope)? {
+            return Err(anyhow!("session is not selectable in this Telegram topic"));
+        }
+        self.storage
+            .set_telegram_frontend_state(principal, scope, id, None, "main")?;
+        Ok(session)
+    }
+
+    pub fn toggle_telegram_side(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+    ) -> Result<SessionContext> {
+        let context = self.context_for_telegram(principal, scope)?;
+        match context.mode {
+            ChatMode::Main => {
+                let side = self.storage.create_session(
+                    principal,
+                    &format!("Side · {}", context.main.name),
+                    &context.main.provider,
+                    context.main.account_id.as_deref(),
+                    &context.main.model,
+                    true,
+                    Some(&context.main.id),
+                )?;
+                self.storage
+                    .bind_session_to_telegram_scope(principal, &side.id, scope)?;
+                self.storage.set_telegram_frontend_state(
+                    principal,
+                    scope,
+                    &context.main.id,
+                    Some(&side.id),
+                    "side",
+                )?;
+            }
+            ChatMode::Side => self.storage.set_telegram_frontend_state(
+                principal,
+                scope,
+                &context.main.id,
+                None,
+                "main",
+            )?,
+        }
+        self.context_for_telegram(principal, scope)
+    }
+
+    pub fn archive_and_recover_telegram(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        id: &str,
+    ) -> Result<SessionRecord> {
+        if !self.session_in_scope(principal, id, scope)? {
+            return Err(anyhow!("session is not in this Telegram topic"));
+        }
+        let target = self
+            .storage
+            .session(principal, id)?
+            .ok_or_else(|| anyhow!("session not found"))?;
+        if target.is_side {
+            return Err(anyhow!("side sessions are not managed by /sessions"));
+        }
+        self.storage.archive_session(principal, id)?;
+        let fallback = self
+            .storage
+            .list_main_sessions_in_telegram_scope(principal, scope, 1, 0, false)?
+            .into_iter()
+            .next()
+            .unwrap_or(self.new_telegram_main(principal, scope)?);
+        self.storage
+            .set_telegram_frontend_state(principal, scope, &fallback.id, None, "main")?;
+        Ok(fallback)
+    }
+
+    pub fn list_telegram_page(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        page: usize,
+        page_size: usize,
+    ) -> Result<(Vec<SessionRecord>, usize, usize)> {
+        let page_size = page_size.max(1);
+        let total = self
+            .storage
+            .count_main_sessions_in_telegram_scope(principal, scope)?;
+        let pages = total.max(1).div_ceil(page_size).max(1);
+        let current = page.clamp(1, pages);
+        Ok((
+            self.storage.list_main_sessions_in_telegram_scope(
+                principal,
+                scope,
+                page_size,
+                (current - 1) * page_size,
+                false,
+            )?,
+            pages,
+            current,
+        ))
+    }
+
+    fn session_in_scope(
+        &self,
+        principal: &str,
+        session_id: &str,
+        scope: TelegramScope,
+    ) -> Result<bool> {
+        Ok(self
+            .storage
+            .telegram_scope_for_session(principal, session_id)?
+            .is_some_and(|(chat, thread)| {
+                chat == scope.chat_id && thread == scope.message_thread_id
+            }))
+    }
 }
 
 #[cfg(test)]
@@ -279,5 +523,47 @@ mod tests {
             .append_message("b", &side.id, "user", "steal side chat")
             .is_err());
         assert!(db.messages("b", &side.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn telegram_topics_have_independent_sessions_lists_and_yolo_state() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let manager = SessionManager::new(storage.clone());
+        let owner = "telegram:100:7";
+        let topic_a = TelegramScope::new(100, Some(10));
+        let topic_b = TelegramScope::new(100, Some(20));
+        let first_a = manager.context_for_telegram(owner, topic_a).unwrap().main;
+        let first_b = manager.context_for_telegram(owner, topic_b).unwrap().main;
+        assert_ne!(first_a.id, first_b.id);
+        let second_a = manager.create_and_switch_telegram(owner, topic_a).unwrap();
+        storage.set_session_yolo(owner, &second_a.id, true).unwrap();
+        assert!(
+            manager
+                .context_for_telegram(owner, topic_a)
+                .unwrap()
+                .active
+                .yolo_mode
+        );
+        assert!(
+            !manager
+                .context_for_telegram(owner, topic_b)
+                .unwrap()
+                .active
+                .yolo_mode
+        );
+        let rows_a = manager.list_telegram_page(owner, topic_a, 1, 5).unwrap().0;
+        let rows_b = manager.list_telegram_page(owner, topic_b, 1, 5).unwrap().0;
+        assert_eq!(rows_a.len(), 2);
+        assert_eq!(rows_b.len(), 1);
+        assert!(rows_a.iter().all(|row| row.id != first_b.id));
+        assert!(rows_b.iter().all(|row| row.id != first_a.id));
+
+        let side = manager.toggle_telegram_side(owner, topic_a).unwrap().active;
+        assert!(side.is_side);
+        assert!(!side.yolo_mode, "side chat must default YOLO OFF");
+        assert_eq!(
+            storage.telegram_scope_for_session(owner, &side.id).unwrap(),
+            Some((100, Some(10)))
+        );
     }
 }

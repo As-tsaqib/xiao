@@ -16,15 +16,17 @@ use crate::{
     context::{ContextEngine, SessionHistoryStore},
     learning::{LearningEvaluator, LearningTrace, SafeToolObservation},
     memory::{MemoryEvaluator, MemoryStore},
-    providers::{AgentEvent, ProviderRegistry, ProviderRequest, ProviderStep},
+    providers::{AgentEvent, ProviderRegistry, ProviderRequest, ProviderStep, ToolProtocol},
     runtime::{
         DependencyResolver, ProcessExecutor, RuntimeState, SystemAndroidBroker, TermuxExecutor,
-        TermuxPackageBackend,
+        TermuxPackageBackend, TermuxRepositoryBackend,
     },
     security::redact::{redact_json, redact_text},
+    semantic::SemanticEvaluator,
     session::{ChatMode, SessionManager},
     skills::{FilesystemSkills, SkillRegistry, SkillStore},
     storage::Storage,
+    telegram::TelegramScope,
     tools::{
         builtin::{
             AndroidXiaoRestartTool, AndroidXiaoStatusTool, ContextStatsTool, MemoryDeleteTool,
@@ -64,10 +66,9 @@ pub struct AgentEngine {
     active: Mutex<HashMap<String, CancellationToken>>,
     tools: Arc<ToolRegistry>,
     config: AgentConfig,
-    memory_evaluator: MemoryEvaluator,
+    memory_store: Arc<MemoryStore>,
+    skill_registry: Arc<SkillRegistry>,
     context_engine: ContextEngine,
-    completion: CompletionVerifier,
-    learning: LearningEvaluator,
 }
 
 impl AgentEngine {
@@ -168,13 +169,19 @@ impl AgentEngine {
             ));
             let package_backend = Arc::new(TermuxPackageBackend::new(
                 executor.clone(),
-                termux,
+                termux.clone(),
                 termux_home.clone(),
             ));
-            let resolver = Arc::new(DependencyResolver::new(
+            let repository = Arc::new(TermuxRepositoryBackend::new(
+                executor.clone(),
+                &termux,
+                termux_home.clone(),
+            ));
+            let resolver = Arc::new(DependencyResolver::with_trusted_repository(
                 runtime.capabilities(),
                 package_backend,
                 Some(storage.clone()),
+                repository,
             ));
             skill_dependency_resolver = Some(resolver.clone());
             tools
@@ -244,7 +251,6 @@ impl AgentEngine {
         } else {
             ContextEngine::new(storage.clone(), config.clone())
         };
-        let memory_evaluator = Arc::new(MemoryEvaluator::new(memory));
         let skill_store = Arc::new(SkillStore::new(storage.clone()));
         let skill_registry = Arc::new(if let Some(runtime) = &runtime {
             SkillRegistry::with_filesystem(
@@ -259,7 +265,6 @@ impl AgentEngine {
         } else {
             SkillRegistry::new(skill_store)
         });
-        let learning = LearningEvaluator::new(skill_registry, memory_evaluator.clone());
         Self {
             sessions,
             storage,
@@ -267,22 +272,32 @@ impl AgentEngine {
             active: Mutex::new(HashMap::new()),
             tools,
             config,
-            memory_evaluator: (*memory_evaluator).clone(),
+            memory_store: memory,
+            skill_registry,
             context_engine,
-            completion: CompletionVerifier,
-            learning,
         }
     }
 
     pub fn cancel(&self, principal: &str) -> bool {
+        self.cancel_in_scope(principal, None)
+    }
+
+    pub fn cancel_in_scope(&self, principal: &str, scope: Option<TelegramScope>) -> bool {
         self.active
             .lock()
             .unwrap()
-            .get(principal)
+            .get(&run_key(principal, scope))
             .map(|t| {
                 t.cancel();
                 true
             })
+            .unwrap_or(false)
+    }
+
+    pub fn is_active_in_scope(&self, principal: &str, scope: Option<TelegramScope>) -> bool {
+        self.active
+            .lock()
+            .map(|active| active.contains_key(&run_key(principal, scope)))
             .unwrap_or(false)
     }
 
@@ -292,7 +307,18 @@ impl AgentEngine {
         prompt: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        self.run(principal, prompt, true, progress).await
+        self.run(principal, None, prompt, true, progress).await
+    }
+
+    pub async fn submit_with_progress_in_scope(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        prompt: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<AgentAnswer> {
+        self.run(principal, Some(scope), prompt, true, progress)
+            .await
     }
 
     pub async fn retry_with_progress(
@@ -300,44 +326,105 @@ impl AgentEngine {
         principal: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        let ctx = self.sessions.context_for(principal)?;
+        self.retry_with_progress_in_scope(principal, None, progress)
+            .await
+    }
+
+    pub async fn retry_with_progress_in_scope(
+        &self,
+        principal: &str,
+        scope: Option<TelegramScope>,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<AgentAnswer> {
+        let ctx = match scope {
+            Some(scope) => self.sessions.context_for_telegram(principal, scope)?,
+            None => self.sessions.context_for(principal)?,
+        };
         let prompt = self
             .storage
             .latest_user_message(principal, &ctx.active.id)?
             .ok_or_else(|| anyhow!("no user request available to retry"))?;
-        self.run(principal, &prompt, false, progress).await
+        self.run(principal, scope, &prompt, false, progress).await
     }
 
     async fn run(
         &self,
         principal: &str,
+        scope: Option<TelegramScope>,
         prompt: &str,
         append_user: bool,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
         let token = CancellationToken::new();
+        let active_key = run_key(principal, scope);
         {
             let mut active = self.active.lock().unwrap();
-            if active.contains_key(principal) {
+            if active.contains_key(&active_key) {
                 return Err(anyhow!("a generation is already active for this frontend"));
             }
-            active.insert(principal.to_owned(), token.clone());
+            active.insert(active_key.clone(), token.clone());
         }
 
         if append_user {
-            if let Err(error) = self.sessions.append_user(principal, prompt) {
-                self.active.lock().unwrap().remove(principal);
+            let appended = match scope {
+                Some(scope) => self.sessions.append_user_telegram(principal, scope, prompt),
+                None => self.sessions.append_user(principal, prompt),
+            };
+            if let Err(error) = appended {
+                self.active.lock().unwrap().remove(&active_key);
                 return Err(error);
             }
         }
 
-        let ctx = match self.sessions.context_for(principal) {
+        let ctx = match scope {
+            Some(scope) => self.sessions.context_for_telegram(principal, scope),
+            None => self.sessions.context_for(principal),
+        };
+        let ctx = match ctx {
             Ok(ctx) => ctx,
             Err(error) => {
-                self.active.lock().unwrap().remove(principal);
+                self.active.lock().unwrap().remove(&active_key);
                 return Err(error);
             }
         };
+
+        let provider = match self.providers.get(&ctx.active.provider) {
+            Ok(provider) => provider,
+            Err(error) => {
+                self.active.lock().unwrap().remove(&active_key);
+                return Err(error);
+            }
+        };
+        let resolved_model = match self
+            .providers
+            .resolve_model(&ctx.active.provider, &ctx.active.model)
+        {
+            Ok(model) => model,
+            Err(error) => {
+                self.active.lock().unwrap().remove(&active_key);
+                return Err(error);
+            }
+        };
+        let semantic = Arc::new(if provider.supports_semantic_evaluation(&resolved_model) {
+            SemanticEvaluator::with_provider(
+                provider.clone(),
+                ctx.active.id.clone(),
+                ctx.active.account_id.clone(),
+                resolved_model.clone(),
+            )
+        } else {
+            SemanticEvaluator::deterministic()
+        });
+        let memory_evaluator = Arc::new(MemoryEvaluator::with_semantic(
+            self.memory_store.clone(),
+            semantic.clone(),
+        ));
+        let completion = CompletionVerifier::with_semantic(semantic.clone());
+        let learning = LearningEvaluator::with_semantic(
+            self.skill_registry.clone(),
+            memory_evaluator.clone(),
+            semantic,
+        );
 
         let goal = bound_text(redact_text(prompt), 4_096);
         let agent_run_id = match self.storage.create_agent_run(
@@ -349,24 +436,34 @@ impl AgentEngine {
         ) {
             Ok(run_id) => run_id,
             Err(error) => {
-                self.active.lock().unwrap().remove(principal);
+                self.active.lock().unwrap().remove(&active_key);
                 return Err(error);
             }
         };
 
         if append_user {
-            if let Err(error) =
-                self.memory_evaluator
-                    .apply_explicit(principal, &ctx.active.id, prompt)
-            {
+            let memory_result = tokio::select! {
+                _ = token.cancelled() => Err(anyhow!("generation cancelled during memory evaluation")),
+                result = memory_evaluator.apply_explicit_async(
+                    principal,
+                    &ctx.active.id,
+                    prompt,
+                    token.clone(),
+                ) => result,
+            };
+            if let Err(error) = memory_result {
                 let safe_error = bound_text(redact_text(&error.to_string()), 4_096);
                 let _ = self.storage.set_agent_run_status(
                     principal,
                     &agent_run_id,
-                    "failed",
+                    if token.is_cancelled() {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    },
                     Some(&safe_error),
                 );
-                self.active.lock().unwrap().remove(principal);
+                self.active.lock().unwrap().remove(&active_key);
                 return Err(error);
             }
         }
@@ -376,10 +473,6 @@ impl AgentEngine {
                 .context_engine
                 .build(principal, &ctx, prompt)?
                 .messages;
-            let provider = self.providers.get(&ctx.active.provider)?;
-            let resolved_model = self
-                .providers
-                .resolve_model(&ctx.active.provider, &ctx.active.model)?;
             if resolved_model != ctx.active.model {
                 self.storage.set_session_provider(
                     principal,
@@ -404,11 +497,24 @@ impl AgentEngine {
                 principal: principal.to_owned(),
                 session_id: ctx.active.id.clone(),
                 agent_run_id: agent_run_id.clone(),
+                yolo_mode: ctx.active.yolo_mode,
                 messages: context.clone(),
                 cancellation: token.clone(),
                 progress: Some(tool_progress_tx),
             };
-            let available_tools = if provider.supports_tool_continuation() {
+            let provider_capabilities = provider.capabilities(&resolved_model);
+            if provider_capabilities.tool_protocol == ToolProtocol::ChatOnly
+                && tokio::select! {
+                    _ = token.cancelled() => return Err(anyhow!("generation cancelled during task classification")),
+                    kind = completion.classify_async(prompt, &[]) => kind,
+                } != TaskKind::Informational
+            {
+                return Err(anyhow!(
+                    "selected provider/model is explicitly ChatOnly and cannot safely execute this action task: {}",
+                    provider_capabilities.evidence
+                ));
+            }
+            let available_tools = if provider_capabilities.is_agent_capable() {
                 self.tools.available_specs(&tool_context)
             } else {
                 Vec::new()
@@ -485,7 +591,10 @@ impl AgentEngine {
                             None,
                         )?;
                         let audit = self.storage.tool_runs(principal, &agent_run_id)?;
-                        let verification = self.completion.verify_for_task(prompt, &answer, &audit);
+                        let verification = tokio::select! {
+                            _ = token.cancelled() => return Err(anyhow!("generation cancelled during completion verification")),
+                            evidence = completion.verify_for_task_async(prompt, &answer, &audit) => evidence,
+                        };
                         match verification.state {
                             VerificationState::VerifiedSuccess => {
                                 break Ok(LoopOutcome {
@@ -508,11 +617,16 @@ impl AgentEngine {
                             VerificationState::NotYetVerified => {
                                 last_unverified_evidence = Some(verification.clone());
                                 let signature = format!(
-                                    "{:?}:{}:{}",
+                                    "{:?}:{}",
                                     verification.state,
-                                    answer.trim(),
                                     audit.iter()
-                                        .map(|run| format!("{}:{}:{}", run.tool_name, run.arguments_json, run.status))
+                                        .map(|run| format!(
+                                            "{}:{}:{}:{}",
+                                            run.tool_name,
+                                            run.arguments_json,
+                                            run.status,
+                                            run.output.as_deref().or(run.error.as_deref()).unwrap_or_default()
+                                        ))
                                         .collect::<Vec<_>>()
                                         .join("|")
                                 );
@@ -541,16 +655,24 @@ impl AgentEngine {
                                 ));
                                 if let Some(tx) = &progress { let _ = tx.send(status.clone()); }
                                 provider_events.push(status);
+                                let installs = self
+                                    .storage
+                                    .dependency_installs(&agent_run_id)
+                                    .unwrap_or_default();
+                                let observations = run_observations_block(
+                                    prompt,
+                                    &verification,
+                                    &audit,
+                                    &installs,
+                                    artifacts.values(),
+                                    turns,
+                                    self.config.max_turns.saturating_sub(turns),
+                                    self.config.max_tool_calls.saturating_sub(tool_calls),
+                                    remaining.as_secs(),
+                                );
                                 request.messages.push(crate::storage::MessageRecord {
                                     role: "system".into(),
-                                    content: format!(
-                                        "<COMPLETION_VERIFICATION state=\"{}\">The candidate final answer was not accepted: {}. Continue the task. Observe actual results, choose a materially different action after a failure, and gather independent verification evidence. Do not merely restate that the task is done.</COMPLETION_VERIFICATION>",
-                                        match verification.state {
-                                            VerificationState::NotYetVerified => "not_yet_verified",
-                                            _ => "unknown",
-                                        },
-                                        verification.summary,
-                                    ),
+                                    content: observations,
                                     created_at: chrono::Utc::now().to_rfc3339(),
                                 });
                                 continuation = None;
@@ -565,8 +687,8 @@ impl AgentEngine {
                         }
                     },
                     ProviderStep::ToolCalls(calls)=>{
-                        if !provider.supports_tool_continuation() {
-                            return Err(anyhow!("provider returned tool calls without declaring tool-continuation capability"));
+                        if provider_capabilities.tool_protocol == ToolProtocol::ChatOnly {
+                            return Err(anyhow!("ChatOnly provider returned tool calls in violation of its declared capability"));
                         }
                         if calls.is_empty(){return Err(anyhow!("provider returned an empty tool-call turn"));}
                         continuation=turn.continuation;
@@ -575,11 +697,13 @@ impl AgentEngine {
                             tool_calls += 1;
                             if tool_calls > self.config.max_tool_calls {
                                 let audit = self.storage.tool_runs(principal, &agent_run_id)?;
-                                let mut blocked = self.completion.verify_for_task(
-                                    prompt,
-                                    "tool-call budget exhausted",
-                                    &audit,
-                                );
+                                let mut blocked = completion
+                                    .verify_for_task_async(
+                                        prompt,
+                                        "tool-call budget exhausted",
+                                        &audit,
+                                    )
+                                    .await;
                                 blocked.state = VerificationState::Blocked;
                                 blocked.verified = false;
                                 blocked.summary = format!(
@@ -651,11 +775,9 @@ impl AgentEngine {
                                     >= self.config.max_no_progress_repeats
                                 {
                                     let audit = self.storage.tool_runs(principal, &agent_run_id)?;
-                                    let mut blocked = self.completion.verify_for_task(
-                                        prompt,
-                                        "no progress",
-                                        &audit,
-                                    );
+                                    let mut blocked = completion
+                                        .verify_for_task_async(prompt, "no progress", &audit)
+                                        .await;
                                     blocked.state = VerificationState::Blocked;
                                     blocked.verified = false;
                                     blocked.summary = "bounded no-progress limit reached after repeated identical failed actions".into();
@@ -690,6 +812,15 @@ impl AgentEngine {
                                 },
                                 result=self.tools.execute(&call,&tool_context)=>result
                             };
+                            if execution.approval_mode.is_some()
+                                || execution.policy_original.is_some()
+                            {
+                                self.storage.set_tool_run_approval_audit(
+                                    &tool_run_id,
+                                    execution.approval_mode.as_deref(),
+                                    execution.policy_original.as_deref(),
+                                )?;
+                            }
                             let result = execution.result;
                             let (output,error) = if result.is_error {
                                 (None, Some(result.output.as_str()))
@@ -774,8 +905,12 @@ impl AgentEngine {
                 // Feed the complete observable trace to LearningEvaluator.
                 // Whether it is reusable is decided from the trace there,
                 // rather than from a small verb list in the agent loop.
-                let meaningful = verification.task_kind == TaskKind::Action;
+                let meaningful = verification.task_kind.is_action_like();
                 let reusable = meaningful;
+                let dependency_installs = self
+                    .storage
+                    .dependency_installs(&agent_run_id)
+                    .unwrap_or_default();
                 let trace = LearningTrace {
                     run_status: "completed".into(),
                     verified: true,
@@ -790,6 +925,7 @@ impl AgentEngine {
                             tool: tool.tool_name.clone(),
                             risk: tool.risk.clone(),
                             status: tool.status.clone(),
+                            operation: bound_text(tool.arguments_json.clone(), 1_000),
                             observable_summary: bound_text(
                                 redact_text(
                                     tool.output
@@ -799,7 +935,24 @@ impl AgentEngine {
                                 ),
                                 500,
                             ),
+                            verification: tool
+                                .output
+                                .as_deref()
+                                .is_some_and(|output| {
+                                    output.contains("\"verification_evidence\":true")
+                                        || output.contains("\"verified\":true")
+                                        || output.contains("\"exists\":true")
+                                }),
                         })
+                        .collect(),
+                    installed_dependencies: dependency_installs
+                        .into_iter()
+                        .filter(|install| install.status == "succeeded")
+                        .map(|install| format!("{} ({})", install.binary, install.package))
+                        .collect(),
+                    artifacts: artifacts
+                        .values()
+                        .map(|artifact| artifact.path.display().to_string())
                         .collect(),
                     final_observable_result: bound_text(
                         redact_text(&final_answer),
@@ -810,7 +963,7 @@ impl AgentEngine {
                 };
                 // Learning is post-completion and best-effort; failure cannot
                 // rewrite a successfully delivered task into a failed one.
-                let _ = self.learning.evaluate(principal, &trace);
+                let _ = learning.evaluate_async(principal, &trace).await;
             } else {
                 let status = match verification.state {
                     VerificationState::Blocked => "blocked",
@@ -837,7 +990,7 @@ impl AgentEngine {
             })
         }.await;
 
-        self.active.lock().unwrap().remove(principal);
+        self.active.lock().unwrap().remove(&active_key);
         if let Err(error) = &result {
             let status = if token.is_cancelled() || error.to_string().contains("cancelled") {
                 "cancelled"
@@ -859,6 +1012,18 @@ impl AgentEngine {
     }
 }
 
+fn run_key(principal: &str, scope: Option<TelegramScope>) -> String {
+    scope
+        .map(|scope| {
+            format!(
+                "{principal}:telegram:{}:{}",
+                scope.chat_id,
+                scope.thread_key()
+            )
+        })
+        .unwrap_or_else(|| principal.to_owned())
+}
+
 fn bound_text(value: String, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         value
@@ -877,6 +1042,89 @@ fn bounded_json(value: &serde_json::Value, max_chars: usize) -> String {
         "preview": serialized.chars().take(max_chars.saturating_sub(100)).collect::<String>()
     })
     .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_observations_block<'a>(
+    goal: &str,
+    verification: &CompletionEvidence,
+    tool_runs: &[crate::storage::ToolRunRecord],
+    installs: &[crate::storage::DependencyInstallRecord],
+    artifacts: impl Iterator<Item = &'a AgentArtifact>,
+    attempt_count: usize,
+    remaining_turns: usize,
+    remaining_tool_calls: usize,
+    remaining_runtime_seconds: u64,
+) -> String {
+    let summarize = |run: &crate::storage::ToolRunRecord| {
+        serde_json::json!({
+            "tool": bound_text(redact_text(&run.tool_name), 128),
+            "operation": bounded_json(
+                &serde_json::from_str(&run.arguments_json).unwrap_or_else(|_| serde_json::json!({"summary":run.arguments_json})),
+                1_500,
+            ),
+            "status": run.status,
+            "observation": bound_text(
+                redact_text(run.output.as_deref().or(run.error.as_deref()).unwrap_or("no bounded output")),
+                1_000,
+            ),
+        })
+    };
+    let successful = tool_runs
+        .iter()
+        .filter(|run| run.status == "succeeded")
+        .take(32)
+        .map(summarize)
+        .collect::<Vec<_>>();
+    let failed = tool_runs
+        .iter()
+        .filter(|run| matches!(run.status.as_str(), "failed" | "denied" | "interrupted"))
+        .take(24)
+        .map(summarize)
+        .collect::<Vec<_>>();
+    let installed = installs
+        .iter()
+        .filter(|install| install.status == "succeeded")
+        .take(24)
+        .map(|install| {
+            serde_json::json!({
+                "binary":install.binary,
+                "package":install.package,
+                "evidence":install.evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    let artifacts = artifacts
+        .take(32)
+        .map(|artifact| {
+            serde_json::json!({
+                "path":artifact.path,
+                "name":artifact.name,
+                "size_bytes":artifact.size_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({
+        "goal":bound_text(redact_text(goal), 2_000),
+        "task_kind":verification.task_kind,
+        "successful_actions":successful,
+        "failed_actions":failed,
+        "installed_dependencies":installed,
+        "current_artifacts_state":artifacts,
+        "verification_evidence":verification.observable_evidence,
+        "missing_evidence":verification.summary,
+        "attempt_count":attempt_count,
+        "remaining_budgets":{
+            "turns":remaining_turns,
+            "tool_calls":remaining_tool_calls,
+            "runtime_seconds":remaining_runtime_seconds,
+        },
+        "runtime_instruction":"Continue from these observable facts. Add new evidence or choose a materially different action after failure. Do not merely claim completion."
+    });
+    format!(
+        "<RUN_OBSERVATIONS>{}</RUN_OBSERVATIONS>",
+        bounded_json(&payload, 24_000)
+    )
 }
 
 fn artifacts_from_tool_output(output: &str) -> Vec<AgentArtifact> {
@@ -908,7 +1156,7 @@ mod tests {
     use super::*;
     use crate::{
         auth::AuthManager,
-        providers::{Provider, ProviderResponse, ProviderStep, ProviderTurn},
+        providers::{Provider, ProviderCapabilities, ProviderResponse, ProviderStep, ProviderTurn},
         tools::{Tool, ToolCall, ToolRisk, ToolSpec},
     };
     use async_trait::async_trait;
@@ -990,8 +1238,8 @@ mod tests {
         fn ready(&self) -> bool {
             true
         }
-        fn supports_tool_continuation(&self) -> bool {
-            true
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities::native("test native protocol")
         }
         async fn run(
             &self,
@@ -1048,6 +1296,82 @@ mod tests {
         turns: AtomicUsize,
     }
 
+    struct ChatOnlyProbeProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for ChatOnlyProbeProvider {
+        fn id(&self) -> &'static str {
+            "chat-only"
+        }
+        fn models(&self) -> Vec<String> {
+            vec!["m".into()]
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities::chat_only("deterministic fixture has no agent protocol")
+        }
+        async fn run(
+            &self,
+            _: ProviderRequest,
+            _: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ProviderResponse {
+                events: Vec::new(),
+                final_answer: "informational response".into(),
+            })
+        }
+    }
+
+    struct RepeatedFailureProvider {
+        turns: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for RepeatedFailureProvider {
+        fn id(&self) -> &'static str {
+            "repeat-failure"
+        }
+        fn models(&self) -> Vec<String> {
+            vec!["m".into()]
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities::native("deterministic native fixture")
+        }
+        async fn run(
+            &self,
+            _: ProviderRequest,
+            _: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderResponse> {
+            Err(anyhow!("run_turn must be used"))
+        }
+        async fn run_turn(
+            &self,
+            _: ProviderRequest,
+            _: Option<serde_json::Value>,
+            _: Vec<ToolResult>,
+            _: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderTurn> {
+            let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+            Ok(ProviderTurn {
+                step: ProviderStep::ToolCalls(vec![ToolCall {
+                    call_id: format!("repeat-{turn}"),
+                    name: "adaptive_action".into(),
+                    arguments: serde_json::json!({"strategy":"bad"}),
+                }]),
+                continuation: None,
+                events: Vec::new(),
+            })
+        }
+    }
+
     #[async_trait]
     impl Provider for LoopProvider {
         fn id(&self) -> &'static str {
@@ -1059,8 +1383,8 @@ mod tests {
         fn ready(&self) -> bool {
             true
         }
-        fn supports_tool_continuation(&self) -> bool {
-            true
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities::native("test native protocol")
         }
         async fn run(
             &self,
@@ -1104,8 +1428,8 @@ mod tests {
         fn ready(&self) -> bool {
             true
         }
-        fn supports_tool_continuation(&self) -> bool {
-            true
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities::native("test native protocol")
         }
         async fn run(
             &self,
@@ -1181,6 +1505,115 @@ mod tests {
         turns: AtomicUsize,
     }
 
+    struct ParityProvider {
+        id: &'static str,
+        protocol: ToolProtocol,
+        turns: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for ParityProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn models(&self) -> Vec<String> {
+            vec!["m".into()]
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                tool_protocol: self.protocol,
+                model_discovery: self.id.starts_with("custom"),
+                structured_output: true,
+                continuation: true,
+                evidence: format!("deterministic {} parity adapter", self.id),
+            }
+        }
+        async fn run(
+            &self,
+            _: ProviderRequest,
+            _: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderResponse> {
+            Err(anyhow!("agent parity test requires normalized turns"))
+        }
+        async fn run_turn(
+            &self,
+            request: ProviderRequest,
+            _: Option<serde_json::Value>,
+            results: Vec<ToolResult>,
+            _: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderTurn> {
+            assert!(request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "parity_action"));
+            assert!(request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "parity_verify"));
+            let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+            let call = |call_id: &str, name: &str| ProviderTurn {
+                step: ProviderStep::ToolCalls(vec![ToolCall {
+                    call_id: call_id.into(),
+                    name: name.into(),
+                    arguments: serde_json::json!({}),
+                }]),
+                continuation: Some(serde_json::json!({"turn":turn})),
+                events: Vec::new(),
+            };
+            Ok(match turn {
+                0 => {
+                    assert!(results.is_empty());
+                    call("action", "parity_action")
+                }
+                1 => {
+                    assert_eq!(results.len(), 1);
+                    assert!(!results[0].is_error);
+                    call("verify", "parity_verify")
+                }
+                _ => {
+                    assert_eq!(results.len(), 1);
+                    assert!(results[0].output.contains("verification_evidence"));
+                    ProviderTurn {
+                        step: ProviderStep::Final("verified parity workflow".into()),
+                        continuation: None,
+                        events: Vec::new(),
+                    }
+                }
+            })
+        }
+    }
+
+    struct ParityTool {
+        name: &'static str,
+        risk: ToolRisk,
+        output: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for ParityTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "Execute one deterministic provider-parity observation".into(),
+                parameters: serde_json::json!({
+                    "type":"object","properties":{},"additionalProperties":false
+                }),
+                risk: self.risk,
+                origin: crate::tools::ToolOrigin::Builtin,
+                effect: crate::tools::ToolEffect::Idempotent,
+                required_capabilities: Vec::new(),
+                timeout_ms: 5_000,
+            }
+        }
+
+        async fn execute(&self, _: &ToolContext, _: serde_json::Value) -> Result<String> {
+            Ok(self.output.into())
+        }
+    }
+
     #[async_trait]
     impl Provider for AdaptiveProvider {
         fn id(&self) -> &'static str {
@@ -1192,8 +1625,8 @@ mod tests {
         fn ready(&self) -> bool {
             true
         }
-        fn supports_tool_continuation(&self) -> bool {
-            true
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities::native("test native protocol")
         }
         async fn run(
             &self,
@@ -1237,10 +1670,11 @@ mod tests {
                 }
                 3 => {
                     assert!(results.is_empty());
-                    assert!(request
-                        .messages
-                        .iter()
-                        .any(|message| { message.content.contains("COMPLETION_VERIFICATION") }));
+                    assert!(request.messages.iter().any(|message| {
+                        message.content.contains("RUN_OBSERVATIONS")
+                            && message.content.contains("missing_evidence")
+                            && message.content.contains("remaining_budgets")
+                    }));
                     call("verify", "verify-1")
                 }
                 _ => {
@@ -1293,8 +1727,8 @@ mod tests {
         fn ready(&self) -> bool {
             true
         }
-        fn supports_tool_continuation(&self) -> bool {
-            true
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities::native("test native protocol")
         }
         async fn run(
             &self,
@@ -1393,6 +1827,29 @@ mod tests {
         assert!(error.contains("cancelled"));
         assert_eq!(db.messages("u", &session).unwrap().len(), 1);
         assert_eq!(db.agent_runs("u", 10).unwrap()[0].status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn chat_only_model_rejects_action_explicitly_but_serves_information() {
+        let provider = Arc::new(ChatOnlyProbeProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (engine, db, _, _tmp) = engine("chat-only", provider.clone());
+        let error = engine
+            .submit_with_progress("u", "Create the requested artifact", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicitly ChatOnly"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(db.agent_runs("u", 10).unwrap()[0].status, "failed");
+
+        let answer = engine
+            .submit_with_progress("u", "What is an artifact?", None)
+            .await
+            .unwrap();
+        assert_eq!(answer.final_answer, "informational response");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1581,8 +2038,145 @@ mod tests {
         assert_ne!(tools[0].arguments_json, tools[1].arguments_json);
         let learned = crate::skills::SkillStore::new(db).list("u", 10).unwrap();
         assert_eq!(learned.len(), 1);
-        assert!(learned[0].procedure.contains("materially different"));
+        assert!(learned[0].procedure.contains("adaptive_action"));
+        assert!(learned[0].procedure.contains("verify"));
         assert!(learned[0].pitfalls.contains("first strategy failed"));
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_failed_action_terminates_as_bounded_blocker() {
+        let provider = Arc::new(RepeatedFailureProvider {
+            turns: AtomicUsize::new(0),
+        });
+        let (base, db, _, _tmp) = engine("repeat-failure", provider.clone());
+        let registry = Arc::new(ToolRegistry::new(
+            ToolPolicy::default().allow_side_effect("adaptive_action"),
+            4_096,
+        ));
+        registry.register(AdaptiveActionTool).unwrap();
+        let engine = AgentEngine::with_registry(
+            base.sessions.clone(),
+            db.clone(),
+            base.providers.clone(),
+            AgentConfig {
+                max_turns: 6,
+                max_no_progress_repeats: 2,
+                ..AgentConfig::default()
+            },
+            registry,
+        );
+        let answer = engine
+            .submit_with_progress("u", "Fix the widget workflow", None)
+            .await
+            .unwrap();
+        assert!(answer.final_answer.contains("Blocked"));
+        assert!(answer.final_answer.contains("no-progress"));
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 3);
+        let run = &db.agent_runs("u", 1).unwrap()[0];
+        assert_eq!(run.status, "blocked");
+        let audit = db.tool_runs("u", &run.id).unwrap();
+        assert_eq!(audit.len(), 3);
+        assert_eq!(audit[0].status, "failed");
+        assert!(audit[1..].iter().all(|tool| tool.status == "denied"));
+    }
+
+    #[tokio::test]
+    async fn codex_antigravity_and_custom_protocols_keep_the_same_agent_tool_workflow() {
+        for (id, protocol) in [
+            ("codex-parity", ToolProtocol::Native),
+            ("antigravity-parity", ToolProtocol::Native),
+            ("custom-native-parity", ToolProtocol::Native),
+            (
+                "custom-structured-parity",
+                ToolProtocol::StructuredJsonFallback,
+            ),
+        ] {
+            let provider = Arc::new(ParityProvider {
+                id,
+                protocol,
+                turns: AtomicUsize::new(0),
+            });
+            let (base, db, _, _tmp) = engine(id, provider.clone());
+            let registry = Arc::new(ToolRegistry::new(
+                ToolPolicy::default().allow_side_effect("parity_action"),
+                4_096,
+            ));
+            registry
+                .register(ParityTool {
+                    name: "parity_action",
+                    risk: ToolRisk::SideEffect,
+                    output: "{\"artifact\":\"created\"}",
+                })
+                .unwrap();
+            registry
+                .register(ParityTool {
+                    name: "parity_verify",
+                    risk: ToolRisk::ReadOnly,
+                    output: "{\"verification_evidence\":true}",
+                })
+                .unwrap();
+            let engine = AgentEngine::with_registry(
+                base.sessions.clone(),
+                db.clone(),
+                base.providers.clone(),
+                AgentConfig::default(),
+                registry,
+            );
+            let answer = engine
+                .submit_with_progress("u", "Create the parity artifact", None)
+                .await
+                .unwrap();
+            assert_eq!(answer.final_answer, "verified parity workflow", "{id}");
+            assert_eq!(provider.turns.load(Ordering::SeqCst), 3, "{id}");
+            let run = &db.agent_runs("u", 1).unwrap()[0];
+            assert_eq!(run.status, "completed", "{id}");
+            assert_eq!(db.tool_runs("u", &run.id).unwrap().len(), 2, "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn yolo_auto_approval_is_persisted_on_the_durable_tool_run() {
+        let provider = Arc::new(ParityProvider {
+            id: "yolo-parity",
+            protocol: ToolProtocol::Native,
+            turns: AtomicUsize::new(0),
+        });
+        let (base, db, session, _tmp) = engine("yolo-parity", provider);
+        db.set_session_yolo("u", &session, true).unwrap();
+        let registry = Arc::new(ToolRegistry::new(ToolPolicy::default(), 4_096));
+        registry
+            .register(ParityTool {
+                name: "parity_action",
+                risk: ToolRisk::Privileged,
+                output: "{\"changed\":true}",
+            })
+            .unwrap();
+        registry
+            .register(ParityTool {
+                name: "parity_verify",
+                risk: ToolRisk::ReadOnly,
+                output: "{\"verification_evidence\":true}",
+            })
+            .unwrap();
+        let engine = AgentEngine::with_registry(
+            base.sessions.clone(),
+            db.clone(),
+            base.providers.clone(),
+            AgentConfig::default(),
+            registry,
+        );
+        engine
+            .submit_with_progress("u", "Restart the typed service", None)
+            .await
+            .unwrap();
+        let run = &db.agent_runs("u", 1).unwrap()[0];
+        let tools = db.tool_runs("u", &run.id).unwrap();
+        assert_eq!(
+            tools[0].approval_mode.as_deref(),
+            Some("yolo_auto_approved")
+        );
+        assert_eq!(tools[0].policy_original.as_deref(), Some("ask"));
+        assert_eq!(tools[0].status, "succeeded");
     }
 
     #[tokio::test]
