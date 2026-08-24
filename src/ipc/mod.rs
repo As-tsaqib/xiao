@@ -986,7 +986,8 @@ async fn manager_providers(
                 "enabled": profile.enabled,
                 "reachability": profile.reachability,
                 "api_key_configured": profile.credential_ref.is_some(),
-                "safe_headers": profile.safe_headers().unwrap_or_default(),
+                // Header values are write-only just like API keys. The manager may expose
+                // names for inspection, but never returns stored values to a frontend.
                 "header_names": profile.safe_headers().unwrap_or_default().keys().cloned().collect::<Vec<_>>(),
                 "model_count": models.len(),
                 "models": models,
@@ -2896,7 +2897,13 @@ mod tests {
         ] {
             assert!(html.contains(section), "missing WebUI section {section}");
         }
-        for control in ["addCodex", "addAgy", "modelPickerPager"] {
+        for control in [
+            "addCodex",
+            "addAgy",
+            "sessionAiProvider",
+            "sessionAiBinding",
+            "sessionAiModel",
+        ] {
             assert!(html.contains(control), "missing WebUI control {control}");
         }
         for behavior in [
@@ -2904,7 +2911,7 @@ mod tests {
             "action: 'reconnect'",
             "action: 'test'",
             "kind: 'account'",
-            "Models / Use",
+            "Change AI Configuration",
             "recent_denied_actions",
             "counts.blocked_runs",
             "run.verification",

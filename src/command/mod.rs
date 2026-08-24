@@ -3619,6 +3619,9 @@ mod tests {
         let second = storage
             .create_session("p", "Second", "custom", None, "default", false, None)
             .unwrap();
+        // Establish an explicit frontend pointer before exercising exact-session management.
+        // Creating a raw storage session is intentionally not a frontend navigation action.
+        sessions.switch_main("p", &first.id).unwrap();
         storage.upsert_account(&account("c1", "codex")).unwrap();
         storage.set_account_owner("p", "c1").unwrap();
 

@@ -2334,7 +2334,7 @@ mod tests {
         cfg.paths.secrets_dir = temp.path().join("secrets");
         cfg.telegram.enabled = true;
         cfg.telegram.access.allowed_chat_ids = vec![100, 200];
-        cfg.telegram.access.allowed_user_ids = vec![10, 20];
+        cfg.telegram.access.owner_user_id = Some(10);
         cfg.providers.codex.enabled = false;
         cfg.providers.antigravity.enabled = false;
         cfg.providers.custom.enabled = true;
@@ -2386,8 +2386,9 @@ mod tests {
         .await
         .expect("fake provider never started");
 
-        // A different principal remains responsive while principal A is generating.
-        let status = message(2, 200, 20, "/status");
+        // Another allowed chat for the same single owner remains responsive while
+        // generation is active; no second owner/principal exists in Xiao.
+        let status = message(2, 200, 10, "/status");
         assert!(app
             .storage
             .enqueue_telegram_update(2, &serde_json::to_string(&status).unwrap())
@@ -2571,7 +2572,7 @@ mod tests {
         cfg.paths.secrets_dir = temp.path().join("secrets");
         cfg.telegram.enabled = true;
         cfg.telegram.access.allowed_chat_ids = vec![100];
-        cfg.telegram.access.allowed_user_ids = vec![10, 11];
+        cfg.telegram.access.owner_user_id = Some(10);
         cfg.save_atomic(&config_path).unwrap();
         let app = AppState::build_from_path(cfg, &config_path).await.unwrap();
         let adapter = TelegramAdapter {
@@ -2603,8 +2604,7 @@ mod tests {
             .unwrap();
 
         let skip = last_callbacks(&telegram_probe)[0].clone();
-        // An otherwise authorized different owner cannot mutate this menu or
-        // its custom-login state.
+        // A non-owner cannot mutate this menu or its custom-login state.
         adapter
             .handle_update(callback(4, 100, 10, 11, skip.clone()))
             .await
@@ -2977,8 +2977,8 @@ mod tests {
         async fn photo_download() -> Vec<u8> {
             vec![
                 137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
-                1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 252,
-                255, 31, 0, 3, 3, 2, 0, 238, 254, 95, 91, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+                1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100,
+                248, 15, 0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
                 130,
             ]
         }
@@ -3003,7 +3003,7 @@ mod tests {
         cfg.paths.logs_dir = temp.path().join("logs");
         cfg.paths.secrets_dir = temp.path().join("secrets");
         cfg.telegram.enabled = true;
-        cfg.telegram.access.allowed_user_ids = vec![10];
+        cfg.telegram.access.owner_user_id = Some(10);
         cfg.telegram.access.allowed_chat_ids = vec![100];
         let app = AppState::build(cfg).await.unwrap();
         let adapter = TelegramAdapter {

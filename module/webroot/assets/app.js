@@ -315,7 +315,9 @@ function editProfile(profile) {
   $('profileEditAlias').value = profile.alias;
   $('profileEditEndpoint').value = profile.endpoint;
   $('profileEditProtocol').value = profile.protocol;
-  $('profileEditHeaders').value = JSON.stringify(profile.safe_headers || {}, null, 2);
+  // Stored header values are write-only. Blank means preserve existing headers;
+  // entering JSON explicitly replaces them (use {} to clear all).
+  $('profileEditHeaders').value = '';
   $('profileCredentialAction').value = 'keep';
   $('profileEditKey').value = '';
   $('profileReplacementKeyRow').classList.add('hidden');
@@ -500,7 +502,10 @@ $('profileCredentialAction').onchange = () => $('profileReplacementKeyRow').clas
 $('profileEditForm').onsubmit = async event => {
   event.preventDefault();
   let headers;
-  try { headers = parseHeaders($('profileEditHeaders').value); } catch (error) { notice(error.message, 'bad'); return; }
+  const headerInput = $('profileEditHeaders').value.trim();
+  if (headerInput) {
+    try { headers = parseHeaders(headerInput); } catch (error) { notice(error.message, 'bad'); return; }
+  }
   const action = $('profileCredentialAction').value;
   const replacement = $('profileEditKey').value.trim();
   if (action === 'replace' && !replacement) { notice('Enter the replacement API key.', 'bad'); return; }
@@ -508,7 +513,7 @@ $('profileEditForm').onsubmit = async event => {
   const prior = (state.cache.providers?.custom_profiles || []).find(profile => profile.id === profileId);
   const endpoint = $('profileEditEndpoint').value.trim();
   const endpointChanged = prior && prior.endpoint !== endpoint;
-  const body = { action: 'edit', profile_id: profileId, alias: $('profileEditAlias').value.trim(), endpoint, protocol: $('profileEditProtocol').value, headers, remove_api_key: action === 'remove', keep_credential: endpointChanged && action === 'keep', ...(action === 'replace' ? { api_key: replacement } : {}) };
+  const body = { action: 'edit', profile_id: profileId, alias: $('profileEditAlias').value.trim(), endpoint, protocol: $('profileEditProtocol').value, ...(headers !== undefined ? { headers } : {}), remove_api_key: action === 'remove', keep_credential: endpointChanged && action === 'keep', ...(action === 'replace' ? { api_key: replacement } : {}) };
   if (endpointChanged && action === 'keep' && !confirm('The endpoint changes trust boundary. Explicitly keep the current credential for the new endpoint?')) return;
   $('profileEditDialog').close(); $('profileEditKey').value = '';
   await mutate('provider-custom', body, endpointChanged && action !== 'keep' ? 'Profile updated; endpoint change cleared/replaced credential as requested.' : 'Custom profile updated.');
