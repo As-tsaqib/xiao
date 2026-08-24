@@ -2549,19 +2549,31 @@ mod tests {
             .route(
                 "/v1/chat/completions",
                 post(|Json(body): Json<serde_json::Value>| async move {
-                    let content = body["messages"][0]["content"].as_str().unwrap();
-                    let nonce = content
-                        .split("nonce ")
+                    // Hidden vision challenge: extract from image_url fragment (#VISION-...), not from text prompt.
+                    let body_str = serde_json::to_string(&body).unwrap();
+                    let nonce = body_str
+                        .split("VISION-")
                         .nth(1)
-                        .unwrap()
-                        .split('.')
+                        .and_then(|tail| tail.split(|c| c == '"' || c == '#' || c == '\'' || c == ' ' || c == '}' ).next())
+                        .unwrap_or("")
+                        .split(|c| c == '\\' || c == '"' )
                         .next()
-                        .unwrap();
+                        .unwrap()
+                        .trim();
+                    // Fallback to legacy text extraction for compatibility (should not happen after P0-2).
+                    let fallback = body["messages"][0]["content"].as_str().unwrap_or("").to_string();
+                    let challenge = if !nonce.is_empty() {
+                        format!("VISION-{nonce}")
+                    } else if let Some(n) = fallback.split("nonce ").nth(1).and_then(|s| s.split('.').next()) {
+                        n.to_string()
+                    } else {
+                        "VISION-missing".to_string()
+                    };
                     Json(json!({
-                        "choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
+                        "choices":[{"message":{"role":"assistant","content":challenge.clone(),"tool_calls":[{
                             "id":"probe","type":"function","function":{
                                 "name":"xiao_capability_probe",
-                                "arguments":json!({"nonce":nonce}).to_string()
+                                "arguments":json!({"nonce":challenge.clone()}).to_string()
                             }
                         }]}}]
                     }))

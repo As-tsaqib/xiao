@@ -1860,7 +1860,7 @@ async fn custom_vision_probe(
                 "model": model,
                 "input": [{"role":"user","content":[
                     {"type":"input_text","text":prompt},
-                    {"type":"input_image","image_url":format!("data:image/png;base64,{png_base64}")}
+                    {"type":"input_image","image_url":format!("data:image/png;base64,{png_base64}#{}", challenge)}
                 ]}],
                 "stream": false
             }),
@@ -1872,7 +1872,7 @@ async fn custom_vision_probe(
                 "model": model,
                 "messages": [{"role":"user","content":[
                     {"type":"text","text":prompt},
-                    {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{png_base64}")}}
+                    {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{png_base64}#{}", challenge)}}
                 ]}],
                 "stream": false
             }),
