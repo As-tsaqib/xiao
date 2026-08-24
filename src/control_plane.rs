@@ -162,11 +162,6 @@ impl TelegramSetupService {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let bot = if input.test_connection {
-            Some(self.test_connection(supplied_token).await?)
-        } else {
-            None
-        };
 
         // P0-5: staging/compensation across config file, SecretStore and SQLite.
         // No partial commit is published; ConfigReloaded only after coherent commit.
