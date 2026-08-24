@@ -673,11 +673,22 @@ pub fn human_status(value: &Value) -> String {
         }
         if let Some(health) = obj.get("health") {
             if let Some(hobj) = health.as_object() {
-                let daemon = hobj.get("daemon_running").and_then(|v| v.as_bool()).map(|b| if b {"up"} else {"down"}).unwrap_or("unknown");
-                let uptime = hobj.get("uptime_seconds").and_then(|v| v.as_u64()).map(|s| format!("{}s", s)).unwrap_or_else(|| "-".into());
+                let daemon = hobj
+                    .get("daemon_running")
+                    .and_then(|v| v.as_bool())
+                    .map(|b| if b { "up" } else { "down" })
+                    .unwrap_or("unknown");
+                let uptime = hobj
+                    .get("uptime_seconds")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| format!("{}s", s))
+                    .unwrap_or_else(|| "-".into());
                 lines.push(format!("health: daemon {daemon} · uptime {uptime}"));
                 if let Some(states) = hobj.get("provider_states").and_then(|v| v.as_object()) {
-                    let summary: Vec<String> = states.iter().map(|(k,v)| format!("{}={}", k, v.as_str().unwrap_or("?"))).collect();
+                    let summary: Vec<String> = states
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or("?")))
+                        .collect();
                     if !summary.is_empty() {
                         lines.push(format!("providers: {}", summary.join(", ")));
                     }
@@ -687,7 +698,7 @@ pub fn human_status(value: &Value) -> String {
             }
         }
         if let Some(counts) = obj.get("counts").and_then(|v| v.as_object()) {
-            let c = |k:&str| counts.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            let c = |k: &str| counts.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
             lines.push(format!("counts: sessions {} · messages {} · runs {} ({} running) · memories {} · skills {} · approvals {}", c("sessions"), c("messages"), c("agent_runs"), c("running_runs"), c("memories"), c("skills"), c("pending_approvals")));
         }
         if let Some(ai) = obj.get("current_ai") {
@@ -696,7 +707,10 @@ pub fn human_status(value: &Value) -> String {
             } else if let Some(aobj) = ai.as_object() {
                 let p = aobj.get("provider").and_then(|v| v.as_str()).unwrap_or("-");
                 let m = aobj.get("model").and_then(|v| v.as_str()).unwrap_or("-");
-                let sid = aobj.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                let sid = aobj
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if sid.is_empty() {
                     lines.push(format!("current_ai: {p}/{m}"));
                 } else {
@@ -710,11 +724,14 @@ pub fn human_status(value: &Value) -> String {
             let termux = rt.get("termux").and_then(|v| v.as_bool()).unwrap_or(false);
             let root = rt.get("root").and_then(|v| v.as_bool()).unwrap_or(false);
             let selinux = rt.get("selinux").and_then(|v| v.as_str()).unwrap_or("-");
-            lines.push(format!("runtime: termux={} root={} selinux={}", termux, root, selinux));
+            lines.push(format!(
+                "runtime: termux={} root={} selinux={}",
+                termux, root, selinux
+            ));
         }
         if lines.is_empty() {
             // fallback generic scalar printing
-            for (k,v) in obj {
+            for (k, v) in obj {
                 if matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null) {
                     lines.push(format!("{}: {}", k, scalar(v)));
                 }
@@ -739,10 +756,20 @@ pub fn human_sessions(value: &Value) -> String {
                     let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let provider = obj.get("provider").and_then(|v| v.as_str()).unwrap_or("-");
                     let model = obj.get("model").and_then(|v| v.as_str()).unwrap_or("-");
-                    let msgs = obj.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let archived = obj.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let tag = if archived {" [archived]"} else {""};
-                    let label = if name.is_empty() { id.to_string() } else { format!("{id} \"{name}\"") };
+                    let msgs = obj
+                        .get("message_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let archived = obj
+                        .get("archived")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let tag = if archived { " [archived]" } else { "" };
+                    let label = if name.is_empty() {
+                        id.to_string()
+                    } else {
+                        format!("{id} \"{name}\"")
+                    };
                     lines.push(format!("  - {label}  {provider}/{model}  msgs={msgs}{tag}"));
                 } else {
                     lines.push(format!("  - {item}"));
@@ -787,9 +814,21 @@ pub fn human_doctor(value: &Value) -> String {
             fail
         ));
         for check in arr {
-            let name = check.get("name").or_else(|| check.get("id")).and_then(|v| v.as_str()).unwrap_or("check");
-            let status = check.get("status").or_else(|| check.get("state")).and_then(|v| v.as_str()).unwrap_or("-");
-            let evidence = check.get("evidence").or_else(|| check.get("detail")).and_then(|v| v.as_str()).unwrap_or("");
+            let name = check
+                .get("name")
+                .or_else(|| check.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("check");
+            let status = check
+                .get("status")
+                .or_else(|| check.get("state"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            let evidence = check
+                .get("evidence")
+                .or_else(|| check.get("detail"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let marker = match status {
                 "OK" => "✓",
                 "FAIL" => "✗",
@@ -800,7 +839,11 @@ pub fn human_doctor(value: &Value) -> String {
                 lines.push(format!("  {marker} {name}: {status}"));
             } else {
                 // truncate long evidence
-                let ev = if evidence.chars().count() > 120 { evidence.chars().take(120).collect::<String>() + "…" } else { evidence.to_string() };
+                let ev = if evidence.chars().count() > 120 {
+                    evidence.chars().take(120).collect::<String>() + "…"
+                } else {
+                    evidence.to_string()
+                };
                 lines.push(format!("  {marker} {name}: {status} · {ev}"));
             }
         }
@@ -810,7 +853,7 @@ pub fn human_doctor(value: &Value) -> String {
     } else {
         // generic fallback
         if let Some(obj) = value.as_object() {
-            for (k,v) in obj {
+            for (k, v) in obj {
                 lines.push(format!("{}: {}", k, scalar(v)));
             }
         } else {
@@ -834,9 +877,19 @@ pub fn human_model(value: &Value) -> String {
                 let provider = item.get("provider").and_then(|v| v.as_str()).unwrap_or("-");
                 let label = item.get("label").and_then(|v| v.as_str()).unwrap_or("");
                 let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("-");
-                let cred = item.get("credential_configured").and_then(|v| v.as_bool()).unwrap_or(false);
-                let models = item.get("models").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                lines.push(format!("  - {id}  {provider} \"{label}\"  status={status}  cred={}  models={}", cred, models));
+                let cred = item
+                    .get("credential_configured")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let models = item
+                    .get("models")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                lines.push(format!(
+                    "  - {id}  {provider} \"{label}\"  status={status}  cred={}  models={}",
+                    cred, models
+                ));
             }
         } else if items[0].get("alias").is_some() {
             lines.push(format!("custom profiles ({})", items.len()));
@@ -845,9 +898,17 @@ pub fn human_model(value: &Value) -> String {
                 let alias = item.get("alias").and_then(|v| v.as_str()).unwrap_or("-");
                 let endpoint = item.get("endpoint").and_then(|v| v.as_str()).unwrap_or("-");
                 let protocol = item.get("protocol").and_then(|v| v.as_str()).unwrap_or("-");
-                let prov = item.get("api_key_configured").and_then(|v| v.as_bool()).unwrap_or(false);
-                let count = item.get("model_count").and_then(|v| v.as_u64()).unwrap_or(0);
-                lines.push(format!("  - {id}  alias={alias}  {endpoint} [{protocol}]  key={prov}  models={count}"));
+                let prov = item
+                    .get("api_key_configured")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let count = item
+                    .get("model_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                lines.push(format!(
+                    "  - {id}  alias={alias}  {endpoint} [{protocol}]  key={prov}  models={count}"
+                ));
             }
         } else {
             lines.push(format!("items ({})", items.len()));
@@ -859,7 +920,10 @@ pub fn human_model(value: &Value) -> String {
     }
     // modelsForSession shape: session_id, provider, current_model, models
     if value.get("models").is_some() {
-        let provider = value.get("provider").and_then(|v| v.as_str()).unwrap_or("-");
+        let provider = value
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
         let current = value.get("current_model").and_then(|v| v.as_str()).unwrap_or("-");
         let sess = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("-");
         lines.push(format!("model for session {sess} · provider {provider} · current {current}"));
@@ -869,11 +933,15 @@ pub fn human_model(value: &Value) -> String {
             } else {
                 for m in models {
                     if let Some(s) = m.as_str() {
-                        let marker = if s == current {"*"} else {" "};
+                        let marker = if s == current { "*" } else { " " };
                         lines.push(format!("  {marker} {s}"));
                     } else if let Some(obj) = m.as_object() {
-                        let id = obj.get("model_id").or_else(|| obj.get("id")).and_then(|v| v.as_str()).unwrap_or("-");
-                        let marker = if id == current {"*"} else {" "};
+                        let id = obj
+                            .get("model_id")
+                            .or_else(|| obj.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let marker = if id == current { "*" } else { " " };
                         lines.push(format!("  {marker} {id}"));
                     } else {
                         lines.push(format!("    {m}"));
@@ -886,11 +954,16 @@ pub fn human_model(value: &Value) -> String {
     // single session/account
     if value.get("id").is_some() && value.get("provider").is_some() {
         let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("-");
-        let provider = value.get("provider").and_then(|v| v.as_str()).unwrap_or("-");
+        let provider = value
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
         let model = value.get("model").and_then(|v| v.as_str()).unwrap_or("-");
         lines.push(format!("session {id}  {provider}/{model}"));
-        for (k,v) in value.as_object().unwrap() {
-            if matches!(k.as_str(), "id"|"provider"|"model") { continue; }
+        for (k, v) in value.as_object().unwrap() {
+            if matches!(k.as_str(), "id" | "provider" | "model") {
+                continue;
+            }
             if matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_)) {
                 lines.push(format!("  {k}: {}", scalar(v)));
             }
@@ -899,7 +972,7 @@ pub fn human_model(value: &Value) -> String {
     }
     // fallback generic
     if let Some(obj) = value.as_object() {
-        for (k,v) in obj {
+        for (k, v) in obj {
             if v.is_string() || v.is_number() || v.is_boolean() || v.is_null() {
                 lines.push(format!("{k}: {}", scalar(v)));
             } else {
@@ -934,12 +1007,20 @@ mod tests {
         let low = s.to_ascii_lowercase();
         // view schema must not appear
         for needle in ["\"blocks\"", "\"actions\"", "\"buttons\"", "\"view\""] {
-            if low.contains(needle) { return false; }
+            if low.contains(needle) {
+                return false;
+            }
         }
         // secret values must not appear (but booleans token_configured are allowed)
         // Check that raw secret tokens we inject are gone
-        for secret in ["S3CR3T_TOKEN_XYZ", "APIKEY_SUPER_SECRET", "header_secret_value"] {
-            if s.contains(secret) { return false; }
+        for secret in [
+            "S3CR3T_TOKEN_XYZ",
+            "APIKEY_SUPER_SECRET",
+            "header_secret_value",
+        ] {
+            if s.contains(secret) {
+                return false;
+            }
         }
         true
     }
@@ -962,7 +1043,10 @@ mod tests {
             "extra_internal": "should_be_dropped"
         });
         let out = project_status(raw);
-        assert_eq!(out.get("owner_id").and_then(|v| v.as_str()), Some("owner-1"));
+        assert_eq!(
+            out.get("owner_id").and_then(|v| v.as_str()),
+            Some("owner-1")
+        );
         assert!(out.get("health").is_some());
         assert!(out.get("counts").is_some());
         assert!(out.get("current_ai").is_some());
@@ -997,10 +1081,16 @@ mod tests {
         let out = project_telegram(raw);
         let tel = out.get("telegram").unwrap();
         assert_eq!(tel.get("owner_user_id").and_then(|v| v.as_i64()), Some(123));
-        assert_eq!(tel.get("token_configured").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            tel.get("token_configured").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert!(tel.get("token").is_none());
         let bot = tel.get("bot").unwrap();
-        assert_eq!(bot.get("username").and_then(|v| v.as_str()), Some("xiao_bot"));
+        assert_eq!(
+            bot.get("username").and_then(|v| v.as_str()),
+            Some("xiao_bot")
+        );
         assert!(no_view_no_secret(&out));
     }
 
@@ -1013,7 +1103,9 @@ mod tests {
         });
         let out = project_sessions(raw);
         assert_eq!(out.get("page").and_then(|v| v.as_u64()), Some(1));
-        let item = out.get("items").and_then(|v| v.as_array()).unwrap()[0].as_object().unwrap();
+        let item = out.get("items").and_then(|v| v.as_array()).unwrap()[0]
+            .as_object()
+            .unwrap();
         assert!(item.contains_key("id"));
         assert!(!item.contains_key("extra"));
         assert!(no_view_no_secret(&out));
