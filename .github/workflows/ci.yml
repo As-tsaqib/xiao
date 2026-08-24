@@ -1,9 +1,13 @@
 name: ci
 on:
+  push:
+    branches:
+      - feat/v0.2.7-control-plane-unification
   pull_request:
   workflow_dispatch:
 
-# Temporary validation workflow; hardened to read-only after pre-release gates pass.
+# Temporary pre-release validation workflow. This write permission and the
+# autofix/persist step are removed after the source gates pass.
 permissions:
   contents: write
 
@@ -21,7 +25,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
       - run: shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
       - run: shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
-      - name: Restore test-only Custom probe helper and persist
+      - name: Apply mechanical Rust fixes and persist once
         shell: bash
         run: |
           set -euo pipefail
@@ -30,10 +34,6 @@ jobs:
           path = Path("src/providers/mod.rs")
           text = path.read_text()
           anchor = "\nfn result_state(result: &Result<bool>) -> CapabilityState {"
-          if anchor not in text:
-              raise SystemExit("test-helper insertion anchor missing")
-          if "fn probe_custom_tool_capability(" in text:
-              raise SystemExit("test helper already present unexpectedly")
           helper = '''
 #[cfg(test)]
 async fn probe_custom_tool_capability(
@@ -48,15 +48,20 @@ async fn probe_custom_tool_capability(
         .capabilities
 }
 '''
-          path.write_text(text.replace(anchor, helper + anchor, 1))
+          if "fn probe_custom_tool_capability(" not in text:
+              if anchor not in text:
+                  raise SystemExit("test-helper insertion anchor missing")
+              path.write_text(text.replace(anchor, helper + anchor, 1))
           PY
+          # Only machine-applicable compiler suggestions are accepted here.
+          cargo clippy --fix --locked --all-targets --all-features --allow-dirty --allow-staged -- -D warnings || true
           cargo fmt --all
           git diff --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/providers/mod.rs
+          git add -- '*.rs'
           if ! git diff --cached --quiet; then
-            git commit -m 'test: keep custom capability compatibility helper test-only'
+            git commit -m 'style: apply compiler-suggested v0.2.7 fixes'
             git push origin HEAD:feat/v0.2.7-control-plane-unification
           fi
           cargo fmt --all -- --check
