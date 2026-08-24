@@ -17,7 +17,10 @@ use crate::{
     context::{ContextEngine, SessionHistoryStore},
     learning::{LearningEvaluator, LearningTrace, SafeToolObservation},
     memory::{MemoryEvaluator, MemoryStore},
-    providers::{AgentEvent, ProviderRegistry, ProviderRequest, ProviderStep, ToolProtocol},
+    providers::{
+        AgentEvent, ProviderPdfFallback, ProviderRegistry, ProviderRequest, ProviderStep,
+        ToolProtocol,
+    },
     runtime::{
         DependencyResolver, ProcessExecutor, RuntimeState, SystemAndroidBroker, TermuxExecutor,
         TermuxPackageBackend, TermuxRepositoryBackend,
@@ -265,6 +268,8 @@ impl AgentEngine {
                 runtime.clone(),
                 attachments.clone(),
             )
+        } else if let Some(attachments) = &attachments {
+            ContextEngine::with_attachments(storage.clone(), config.clone(), attachments.clone())
         } else {
             ContextEngine::new(storage.clone(), config.clone())
         };
@@ -549,10 +554,6 @@ impl AgentEngine {
         }
 
         let result = async {
-            let context = self
-                .context_engine
-                .build(principal, &ctx, prompt)?
-                .messages;
             if resolved_model != ctx.active.model {
                 self.storage.set_session_provider(
                     principal,
@@ -573,15 +574,6 @@ impl AgentEngine {
                     }
                 }
             });
-            let tool_context = ToolContext {
-                principal: principal.to_owned(),
-                session_id: ctx.active.id.clone(),
-                agent_run_id: agent_run_id.clone(),
-                yolo_mode: ctx.active.yolo_mode,
-                messages: context.clone(),
-                cancellation: token.clone(),
-                progress: Some(tool_progress_tx),
-            };
             let provider_capabilities = provider.capabilities_for(
                 &resolved_model,
                 ctx.active.account_id.as_deref(),
@@ -593,13 +585,62 @@ impl AgentEngine {
                     prompt,
                     4,
                 )?;
+                for document in referenced.iter().filter(|attachment| {
+                    attachment.detected_mime == "application/pdf"
+                        && matches!(
+                            attachment.processing_status.as_str(),
+                            "needs_ocr" | "blocked"
+                        )
+                }) {
+                    let pdf_provider = ProviderPdfFallback::new(provider.as_ref());
+                    let path = attachments
+                        .process_pending_pdf_with_fallback(
+                            principal,
+                            &ctx.active.id,
+                            &document.attachment_id,
+                            prompt,
+                            &ctx.active.provider,
+                            ctx.active.account_id.as_deref(),
+                            &resolved_model,
+                            provider.pdf_fallback_capabilities(
+                                &resolved_model,
+                                ctx.active.account_id.as_deref(),
+                            ),
+                            &pdf_provider,
+                            &token,
+                        )
+                        .await?;
+                    if matches!(path, crate::attachments::PdfProcessingPath::Blocked) {
+                        let detail = attachments
+                            .recent_for_prompt(principal, &ctx.active.id, prompt, 4)?
+                            .into_iter()
+                            .find(|item| item.attachment_id == document.attachment_id)
+                            .and_then(|item| item.error.or(item.summary))
+                            .unwrap_or_else(|| {
+                                "no explicit local OCR, file-input, or vision path succeeded"
+                                    .into()
+                            });
+                        return Err(anyhow!(
+                            "{} could not be processed safely: {}. Xiao will not pretend the document was read.",
+                            document.original_name,
+                            detail
+                        ));
+                    }
+                }
+                let referenced = attachments.recent_for_prompt(
+                    principal,
+                    &ctx.active.id,
+                    prompt,
+                    4,
+                )?;
                 if let Some(document) = referenced
                     .iter()
-                    .find(|attachment| attachment.processing_status == "needs_ocr")
+                    .find(|attachment| attachment.processing_status != "ready")
                 {
                     return Err(anyhow!(
-                        "{} has no meaningful embedded text. OCR or an explicit PDF-to-image vision path is required; Xiao will not pretend the document was read.",
-                        document.original_name
+                        "{} is not ready for safe processing (status: {}). Xiao will not pretend the document was read.",
+                        document.original_name,
+                        document.processing_status
                     ));
                 }
                 let images = attachments.normalized_images(principal, &ctx.active.id, prompt)?;
@@ -611,6 +652,24 @@ impl AgentEngine {
                 images
             } else {
                 Vec::new()
+            };
+            // A scanned PDF may have been admitted as `needs_ocr` and completed
+            // through provider file/vision fallback above. Build the provider
+            // context after that planner so the same turn can retrieve the
+            // newly indexed extracted text instead of requiring a follow-up
+            // prompt.
+            let context = self
+                .context_engine
+                .build(principal, &ctx, prompt)?
+                .messages;
+            let tool_context = ToolContext {
+                principal: principal.to_owned(),
+                session_id: ctx.active.id.clone(),
+                agent_run_id: agent_run_id.clone(),
+                yolo_mode: ctx.active.yolo_mode,
+                messages: context.clone(),
+                cancellation: token.clone(),
+                progress: Some(tool_progress_tx),
             };
             if provider_capabilities.tool_protocol == ToolProtocol::ChatOnly
                 && tokio::select! {
@@ -635,6 +694,7 @@ impl AgentEngine {
                 messages: context,
                 tools: available_tools,
                 images,
+                files: Vec::new(),
             };
             let started = AgentEvent::GenerationStarted;
             if let Some(tx) = &progress { let _ = tx.send(started.clone()); }
@@ -825,7 +885,13 @@ impl AgentEngine {
                                     verification: blocked,
                                 });
                             }
-                            let started=AgentEvent::ToolStarted(call.name.clone()); if let Some(tx)=&progress{let _=tx.send(started.clone());} provider_events.push(started);
+                            let started=AgentEvent::ToolStartedWithId { tool: call.name.clone(), call_id: call.call_id.clone() }; if let Some(tx)=&progress{let _=tx.send(started.clone());}
+                            // Keep the historical, correlation-free event in the
+                            // durable answer for API compatibility. The live
+                            // transport receives only the identity-bearing event
+                            // so a late completion cannot close another tool.
+                            provider_events.push(AgentEvent::ToolStarted(call.name.clone()));
+                            provider_events.push(started);
                             let risk = self.tools.spec(&call.name).map(|spec| spec.risk.as_str()).unwrap_or("unknown");
                             let arguments = bounded_json(&redact_json(&call.arguments), 16_384);
                             let redacted_call_id = bound_text(redact_text(&call.call_id), 256);
@@ -874,11 +940,16 @@ impl AgentEngine {
                                     output: message.into(),
                                     is_error: true,
                                 };
-                                let completed = AgentEvent::ToolCompleted {
+                                let completed = AgentEvent::ToolCompletedWithId {
                                     tool: call.name.clone(),
+                                    call_id: call.call_id.clone(),
                                     summary: message.into(),
                                 };
                                 if let Some(tx) = &progress { let _ = tx.send(completed.clone()); }
+                                provider_events.push(AgentEvent::ToolCompleted {
+                                    tool: call.name.clone(),
+                                    summary: message.into(),
+                                });
                                 provider_events.push(completed);
                                 next.push(result);
                                 if identical_failure_repeats
@@ -998,7 +1069,9 @@ impl AgentEngine {
                                 }
                             }
                             let summary=if result.is_error { format!("failed: {}",result.output) } else { "completed".into() };
-                            let completed=AgentEvent::ToolCompleted{tool:call.name.clone(),summary}; if let Some(tx)=&progress{let _=tx.send(completed.clone());} provider_events.push(completed);
+                            let completed=AgentEvent::ToolCompletedWithId{tool:call.name.clone(),call_id:call.call_id.clone(),summary:summary.clone()}; if let Some(tx)=&progress{let _=tx.send(completed.clone());}
+                            provider_events.push(AgentEvent::ToolCompleted { tool: call.name.clone(), summary });
+                            provider_events.push(completed);
                             next.push(result);
                         }
                         tool_results=next;
@@ -1311,11 +1384,14 @@ fn automatic_title(prompt: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
+        attachments::{AttachmentIngest, AttachmentKind, ScannedPdfProcessor},
         auth::AuthManager,
+        config::AttachmentConfig,
         providers::{Provider, ProviderCapabilities, ProviderResponse, ProviderStep, ProviderTurn},
         tools::{Tool, ToolCall, ToolRisk, ToolSpec},
     };
     use async_trait::async_trait;
+    use std::path::Path;
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
@@ -1376,6 +1452,77 @@ mod tests {
             Ok(ProviderResponse {
                 events: vec![AgentEvent::Status("safe status".into())],
                 final_answer: format!("answer:{text}"),
+            })
+        }
+    }
+
+    struct NoLocalOcr;
+
+    impl ScannedPdfProcessor for NoLocalOcr {
+        fn extract(
+            &self,
+            _pdf: &[u8],
+            _scratch_root: &Path,
+            _config: &AttachmentConfig,
+        ) -> Result<Option<Vec<crate::attachments::ScannedPdfPage>>> {
+            Ok(None)
+        }
+    }
+
+    struct AgentPdfProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for AgentPdfProvider {
+        fn id(&self) -> &'static str {
+            "pdf-agent"
+        }
+        fn models(&self) -> Vec<String> {
+            vec!["m".into()]
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                text: true,
+                vision: false,
+                file_input: true,
+                native_tools: false,
+                tool_protocol: ToolProtocol::ChatOnly,
+                model_discovery: false,
+                structured_output: false,
+                continuation: false,
+                evidence: "deterministic provider file-input fixture".into(),
+            }
+        }
+        async fn run(
+            &self,
+            request: ProviderRequest,
+            _progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                assert_eq!(request.files.len(), 1);
+                assert_eq!(request.files[0].mime_type, "application/pdf");
+                assert!(request.files[0].bytes.starts_with(b"%PDF-"));
+                return Ok(ProviderResponse {
+                    events: vec![],
+                    final_answer: "provider extracted the scanned PDF text".into(),
+                });
+            }
+            assert!(request.files.is_empty());
+            assert!(request.messages.iter().any(|message| {
+                message.content.contains("SESSION_ATTACHMENTS")
+                    && message
+                        .content
+                        .contains("provider extracted the scanned PDF text")
+            }));
+            Ok(ProviderResponse {
+                events: vec![],
+                final_answer: "The scanned PDF says: provider extracted the scanned PDF text"
+                    .into(),
             })
         }
     }
@@ -1973,6 +2120,91 @@ mod tests {
             main.id,
             tmp,
         )
+    }
+
+    fn empty_pdf() -> Vec<u8> {
+        let stream = "BT /F1 14 Tf 72 760 Td () Tj ET";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_owned(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+            format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
+        ];
+        let mut pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[tokio::test]
+    async fn agent_engine_runs_scanned_pdf_provider_file_fallback_before_final_answer() {
+        let provider = Arc::new(AgentPdfProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (base, db, session, _fixture) = engine("pdf-agent", provider.clone());
+        let attachment_root = tempfile::tempdir().unwrap();
+        let attachments = Arc::new(
+            AttachmentManager::new(
+                db.clone(),
+                attachment_root.path(),
+                AttachmentConfig::default(),
+            )
+            .unwrap()
+            .with_scanned_pdf_processor(Arc::new(NoLocalOcr)),
+        );
+        let record = attachments
+            .ingest(AttachmentIngest {
+                owner_id: "u".into(),
+                session_id: session.clone(),
+                telegram_file_id: None,
+                telegram_unique_id: Some("agent-pdf-1".into()),
+                original_name: "scan.pdf".into(),
+                declared_mime: Some("application/pdf".into()),
+                expected_kind: AttachmentKind::Document,
+                bytes: empty_pdf(),
+            })
+            .unwrap();
+        assert_eq!(record.processing_status, "needs_ocr");
+
+        let agent = AgentEngine::with_registry_runtime(
+            base.sessions.clone(),
+            db.clone(),
+            base.providers.clone(),
+            AgentConfig::default(),
+            base.tools.clone(),
+            None,
+            Some(attachments.clone()),
+        );
+        let answer = agent
+            .submit_with_progress("u", "What does the attached document say?", None)
+            .await
+            .unwrap();
+        assert!(answer.final_answer.contains("provider extracted"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let stored = db.attachment("u", &record.attachment_id).unwrap().unwrap();
+        assert_eq!(stored.processing_status, "ready");
+        assert!(db
+            .search_attachment_chunks("u", &session, "provider extracted", 5)
+            .unwrap()
+            .iter()
+            .any(|chunk| chunk.text.contains("provider extracted")));
     }
 
     #[tokio::test]

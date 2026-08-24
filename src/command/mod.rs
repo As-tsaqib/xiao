@@ -697,7 +697,12 @@ impl CommandCore {
         if session.archived {
             return Ok(false);
         }
-        if self.agent.cancel_session(principal, session_id) {
+        let agent_cancelled = self.agent.cancel_session(principal, session_id);
+        let attachment_cancelled = self
+            .attachments
+            .as_ref()
+            .is_some_and(|attachments| attachments.cancel_ingest(principal, session_id));
+        if agent_cancelled || attachment_cancelled {
             return Ok(true);
         }
         let scope = self
@@ -1116,21 +1121,26 @@ impl CommandCore {
             }
             EditCustomEndpoint { profile, endpoint } => {
                 let profile = self.resolve_custom_profile(principal, &profile)?;
-                let credential = profile.credential_ref.clone();
-                ProviderProfileStore::new(self.storage.clone()).change_endpoint(
+                let service = crate::providers::CustomProfileService::with_auth(
+                    self.storage.clone(),
+                    self.auth.secrets().clone(),
+                    self.auth.clone(),
+                );
+                let result = service.edit_with_warnings(
                     principal,
                     &profile.profile_id,
-                    &endpoint,
+                    crate::providers::CustomProfileEdit {
+                        endpoint: Some(endpoint),
+                        ..Default::default()
+                    },
                 )?;
-                if let Some(reference) = credential {
-                    self.auth.logout(&reference)?;
-                }
                 self.storage.audit(
                     principal,
                     "custom_profile_endpoint_changed",
                     &format!(
-                        "profile_id={};credential_and_headers_cleared=true",
-                        profile.profile_id
+                        "profile_id={};credential_and_headers_cleared=true;cleanup_warnings={}",
+                        profile.profile_id,
+                        result.cleanup_warnings.len()
                     ),
                 )?;
                 Ok(CommandResult::ManagerView(
@@ -1157,15 +1167,20 @@ impl CommandCore {
             }
             DeleteCustomProfile { profile } => {
                 let profile = self.resolve_custom_profile(principal, &profile)?;
-                let credential = ProviderProfileStore::new(self.storage.clone())
-                    .delete(principal, &profile.profile_id)?;
-                if let Some(credential) = credential {
-                    self.auth.logout(&credential)?;
-                }
+                let result = crate::providers::CustomProfileService::with_auth(
+                    self.storage.clone(),
+                    self.auth.secrets().clone(),
+                    self.auth.clone(),
+                )
+                .delete_with_warnings(principal, &profile.profile_id)?;
                 self.storage.audit(
                     principal,
                     "custom_profile_deleted",
-                    &format!("profile_id={}", profile.profile_id),
+                    &format!(
+                        "profile_id={};cleanup_warnings={}",
+                        profile.profile_id,
+                        result.cleanup_warnings.len()
+                    ),
                 )?;
                 Ok(CommandResult::ManagerView(
                     self.custom_profiles_view(principal, scope, 1)?,
@@ -1207,7 +1222,7 @@ impl CommandCore {
             )),
             Stop => Ok(CommandResult::Confirmation(View::info(
                 "CANCEL",
-                if self.agent.cancel_in_scope(principal, scope) {
+                if self.cancel_active_scope(principal, scope)? {
                     "Cancellation requested"
                 } else {
                     "No active generation"
@@ -1407,6 +1422,20 @@ impl CommandCore {
                 self.doctor_view(principal, scope).await,
             )),
         }
+    }
+
+    fn cancel_active_scope(&self, principal: &str, scope: Option<TelegramScope>) -> Result<bool> {
+        let agent_cancelled = self.agent.cancel_in_scope(principal, scope);
+        let attachment_cancelled = self
+            .attachments
+            .as_ref()
+            .and_then(|attachments| {
+                self.session_context(principal, scope)
+                    .ok()
+                    .map(|context| attachments.cancel_ingest(principal, &context.active.id))
+            })
+            .unwrap_or(false);
+        Ok(agent_cancelled || attachment_cancelled)
     }
 
     fn session_view(
@@ -2074,6 +2103,8 @@ impl CommandCore {
                         model_discovery: true,
                         tool_protocol: "chat_only".into(),
                         evidence: "discovered; capability probe required".into(),
+                        probe_status: "unprobed".into(),
+                        probe_version: 1,
                         probed_at: now.clone(),
                     },
                 )
@@ -2537,10 +2568,18 @@ impl CommandCore {
         }
 
         if cfg.telegram.enabled {
-            let token = crate::security::secrets::SecretStore::new(cfg.paths.secrets_dir.clone())
-                .get("telegram-bot-token")
+            let token = self
+                .storage
+                .telegram_control_state()
                 .ok()
-                .flatten();
+                .flatten()
+                .and_then(|control| control.bot_token_ref)
+                .and_then(|reference| {
+                    crate::security::secrets::SecretStore::new(cfg.paths.secrets_dir.clone())
+                        .get(&reference)
+                        .ok()
+                        .flatten()
+                });
             match token {
                 Some(token) => match crate::telegram::client::TelegramClient::new(token) {
                     Ok(client) => match tokio::time::timeout(

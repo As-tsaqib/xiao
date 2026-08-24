@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct SecretStore {
@@ -24,6 +25,16 @@ impl SecretStore {
         fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
         set_0600(&path)?;
         Ok(())
+    }
+
+    /// Store a value under a fresh immutable reference. Callers update their
+    /// authoritative SQLite row to this returned ref in the same logical
+    /// control-plane operation; old refs can then be garbage-collected after
+    /// commit without overwriting a live secret in place.
+    pub fn put_versioned(&self, namespace: &str, value: &str) -> Result<String> {
+        let reference = format!("{namespace}:{}", Uuid::new_v4().simple());
+        self.put(&reference, value)?;
+        Ok(reference)
     }
     pub fn get(&self, key: &str) -> Result<Option<String>> {
         let path = self.path(key);

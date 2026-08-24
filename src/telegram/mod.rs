@@ -22,6 +22,7 @@ use tokio::{
     sync::{mpsc, Mutex as AsyncMutex},
     time::{interval, sleep, MissedTickBehavior},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::AgentAnswer,
@@ -30,7 +31,8 @@ use crate::{
     auth::{AuthChallenge, AuthEvent},
     command::CommandResult,
     presentation::{
-        Action, ActionTarget, Block, ProgressActivity, ProgressItem, ProgressState, View,
+        Action, ActionTarget, Block, ProgressActivity, ProgressIcon, ProgressItem, ProgressState,
+        View,
     },
     providers::AgentEvent,
     security::secrets::SecretStore,
@@ -66,14 +68,20 @@ struct CustomInputContext<'a> {
 impl TelegramAdapter {
     pub async fn from_app(app: AppState) -> Result<Self> {
         let cfg = app.config.read().await.clone();
-        let token = SecretStore::new(cfg.paths.secrets_dir.clone())
-            .get("telegram-bot-token")?
+        let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
+        let control = app.storage.telegram_control_state()?;
+        let token = control
+            .as_ref()
+            .and_then(|state| state.bot_token_ref.as_deref())
+            .map(|reference| secrets.get(reference))
+            .transpose()?
+            .flatten()
             .ok_or_else(|| anyhow!("Telegram is enabled but bot token is not configured"))?;
         let client = TelegramClient::new(token)?;
         if let Ok(bot) = client.get_me().await {
             let _ = app
                 .storage
-                .put_setting("telegram_bot_identity", &serde_json::to_string(&bot)?);
+                .set_telegram_bot_identity(&serde_json::to_string(&bot)?);
         }
         client
             .set_my_commands(&TelegramCommandRegistry::bot_commands())
@@ -115,7 +123,13 @@ impl TelegramAdapter {
             }
         }
         loop {
-            let enabled = self.app.config.read().await.telegram.enabled;
+            // SQLite control state is authoritative. The in-memory TOML is a
+            // compatibility projection and may lag after a failed snapshot.
+            let enabled = self
+                .app
+                .storage
+                .telegram_control_state()?
+                .is_some_and(|state| state.enabled);
             if !enabled {
                 self.app.health.set_telegram_polling(false).await;
                 sleep(Duration::from_secs(2)).await;
@@ -176,14 +190,32 @@ impl TelegramAdapter {
     }
 
     async fn policy(&self) -> AccessPolicy {
-        AccessPolicy::from(&self.app.config.read().await.telegram.access)
+        if let Ok(Some(control)) = self.app.storage.telegram_control_state() {
+            return AccessPolicy {
+                allowed_chat_ids: control.allowed_chat_ids,
+                owner_user_id: control.owner_user_id,
+                owner_resolution_required: self
+                    .app
+                    .storage
+                    .owner_resolution_candidates()
+                    .map(|candidates| !candidates.is_empty())
+                    .unwrap_or(true),
+            };
+        }
+        AccessPolicy {
+            allowed_chat_ids: Vec::new(),
+            owner_user_id: None,
+            owner_resolution_required: true,
+        }
     }
     async fn allowed(&self, chat_id: i64, user_id: Option<i64>, kind: &str) -> bool {
         self.policy().await.allows(chat_id, user_id, kind)
     }
     #[cfg(test)]
-    fn principal(user_id: i64) -> String {
-        crate::owner::OwnerIdentity::telegram(user_id).owner_id
+    fn principal(app: &AppState, user_id: i64) -> String {
+        app.storage
+            .management_owner_id()
+            .unwrap_or_else(|_| app.resolve_telegram_owner(user_id).unwrap().owner_id)
     }
     fn principal_lock(&self, principal: &str) -> Arc<AsyncMutex<()>> {
         let mut lanes = self
@@ -425,22 +457,35 @@ impl TelegramAdapter {
         let session_id = context.active.id;
         let telegram_file_id = file_id.to_owned();
         let telegram_unique_id = unique_id.to_owned();
-        let processing = tokio::task::spawn_blocking(move || {
-            manager.ingest(AttachmentIngest {
-                owner_id: owner,
-                session_id,
-                telegram_file_id: Some(telegram_file_id),
-                telegram_unique_id: Some(telegram_unique_id),
-                original_name,
-                declared_mime,
-                expected_kind: kind,
-                bytes,
-            })
+        let cancellation = CancellationToken::new();
+        let processing_token = cancellation.clone();
+        let mut processing = tokio::task::spawn_blocking(move || {
+            manager.ingest_with_cancellation(
+                AttachmentIngest {
+                    owner_id: owner,
+                    session_id,
+                    telegram_file_id: Some(telegram_file_id),
+                    telegram_unique_id: Some(telegram_unique_id),
+                    original_name,
+                    declared_mime,
+                    expected_kind: kind,
+                    bytes,
+                },
+                processing_token,
+            )
         });
-        let record = tokio::time::timeout(processing_timeout, processing)
-            .await
-            .map_err(|_| anyhow!("attachment processing exceeded the configured timeout"))?
-            .map_err(|_| anyhow!("attachment processor terminated unexpectedly"))??;
+        let record = match tokio::time::timeout(processing_timeout, &mut processing).await {
+            Ok(result) => {
+                result.map_err(|_| anyhow!("attachment processor terminated unexpectedly"))??
+            }
+            Err(_) => {
+                cancellation.cancel();
+                let _ = processing.await;
+                return Err(anyhow!(
+                    "attachment processing exceeded the configured timeout"
+                ));
+            }
+        };
         let caption = message
             .caption
             .as_deref()
@@ -1022,19 +1067,25 @@ impl TelegramAdapter {
             context.active.account_id.clone(),
             context.active.model.clone(),
         );
-        let profile_store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
-        let profile = profile_store.create(crate::storage::ProviderProfileInput {
-            profile_id: None,
-            owner_id: principal.into(),
-            alias: wizard.alias.clone(),
-            endpoint: wizard
+        let profile_service = crate::providers::CustomProfileService::new(
+            self.app.storage.clone(),
+            self.app.auth.secrets().clone(),
+        );
+        let profile_result = profile_service.create_profile_with_credential_ref(
+            principal,
+            &wizard.alias,
+            wizard
                 .endpoint
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow!("custom endpoint is missing"))?,
-            protocol: wizard.protocol.clone(),
-            credential_ref: wizard.credential_ref.clone(),
-            safe_headers_json: "{}".into(),
-        })?;
+            &wizard.protocol,
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            wizard.credential_ref.as_deref(),
+            None,
+        )?;
+        let profile = profile_result.profile;
+        let profile_store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
         let profile_models = wizard
             .models
             .iter()
@@ -1064,6 +1115,8 @@ impl TelegramAdapter {
                         model_discovery: true,
                         tool_protocol: "chat_only".into(),
                         evidence: "discovered but not capability-probed".into(),
+                        probe_status: "unprobed".into(),
+                        probe_version: 1,
                         probed_at: probed_at.clone(),
                     }
                 }
@@ -1613,23 +1666,26 @@ fn paginate_final_view(view: &View, max_chars: usize) -> Vec<View> {
 
 struct ProgressAggregator {
     items: Vec<ProgressItem>,
-    active_tool: Option<String>,
+    next_id: u64,
     detail: String,
     stream_chunks: usize,
 }
 
 struct ToolProgress {
     activity: ProgressActivity,
+    icon: ProgressIcon,
     active: String,
     completed: String,
     failed: String,
 }
 
+const PROGRESS_CHAR_BUDGET: usize = 3_500;
+
 impl ProgressAggregator {
     fn new(detail: String) -> Self {
         Self {
             items: vec![],
-            active_tool: None,
+            next_id: 1,
             detail,
             stream_chunks: 0,
         }
@@ -1646,10 +1702,21 @@ impl ProgressAggregator {
             }
             AgentEvent::ToolStarted(tool) => {
                 let progress = tool_progress(&tool);
-                self.set_active_for_tool(progress.active, progress.activity, tool);
+                self.set_active_for_tool(progress.active, progress.activity, tool, None);
+            }
+            AgentEvent::ToolStartedWithId { tool, call_id } => {
+                let progress = tool_progress(&tool);
+                self.set_active_for_tool(progress.active, progress.activity, tool, Some(call_id));
             }
             AgentEvent::ToolCompleted { tool, summary } => {
-                self.complete_tool(&tool, &summary);
+                self.complete_tool(&tool, None, &summary);
+            }
+            AgentEvent::ToolCompletedWithId {
+                tool,
+                call_id,
+                summary,
+            } => {
+                self.complete_tool(&tool, Some(call_id), &summary);
             }
             AgentEvent::StreamChunk { .. } => self.stream_chunk(),
             AgentEvent::GenerationCompleted => {
@@ -1660,69 +1727,117 @@ impl ProgressAggregator {
     }
 
     fn set_active(&mut self, label: String, activity: ProgressActivity) {
-        self.set_active_entry(label, activity, None);
+        self.set_active_entry(
+            label,
+            activity,
+            ProgressIcon::from_activity(activity),
+            None,
+            None,
+        );
     }
 
-    fn set_active_for_tool(&mut self, label: String, activity: ProgressActivity, tool: String) {
-        self.set_active_entry(label, activity, Some(normalize_tool_name(&tool)));
+    fn set_active_for_tool(
+        &mut self,
+        label: String,
+        activity: ProgressActivity,
+        tool: String,
+        correlation: Option<String>,
+    ) {
+        let progress = tool_progress(&tool);
+        self.set_active_entry(
+            label,
+            activity,
+            progress.icon,
+            Some(normalize_tool_name(&tool)),
+            correlation,
+        );
     }
 
     fn set_active_entry(
         &mut self,
         label: String,
         activity: ProgressActivity,
+        icon: ProgressIcon,
         tool: Option<String>,
+        correlation: Option<String>,
     ) {
-        if self
-            .items
-            .last()
-            .is_some_and(|item| item.state == ProgressState::Active)
-        {
-            if self
-                .items
-                .last()
-                .is_some_and(|item| item.activity == activity)
-            {
-                self.items.last_mut().expect("active item exists").label = label;
-                self.active_tool = tool;
-                return;
-            }
-            let retain = self.items.last().is_some_and(|item| {
-                !matches!(
-                    item.activity,
-                    ProgressActivity::Thinking | ProgressActivity::Writing
-                )
-            });
-            if retain {
-                let previous_tool = self.active_tool.take();
-                let item = self.items.last_mut().expect("active item exists");
-                item.state = ProgressState::Done;
-                if let Some(previous_tool) = previous_tool {
-                    item.label = tool_progress(&previous_tool).completed;
+        let same_action = self.items.iter().rposition(|item| {
+            item.state == ProgressState::Active
+                && match (
+                    item.action_key.as_deref(),
+                    tool.as_deref(),
+                    item.correlation_id.as_deref(),
+                    correlation.as_deref(),
+                ) {
+                    (Some(current), Some(next), Some(current_id), Some(next_id)) => {
+                        current == next && current_id == next_id
+                    }
+                    (Some(current), Some(next), None, None) => current == next,
+                    (None, None, None, None) => item.activity == activity,
+                    _ => false,
                 }
-            } else {
-                self.items.pop();
-                self.active_tool = None;
+        });
+        if let Some(index) = same_action {
+            let item = &mut self.items[index];
+            item.label = label;
+            item.activity = activity;
+            item.icon = icon;
+            item.action_key = tool;
+            item.correlation_id = correlation;
+            return;
+        }
+
+        // A timeline has one current active row. Starting a genuinely new
+        // action closes the previous row in place; it never removes history.
+        if let Some(index) = self
+            .items
+            .iter()
+            .rposition(|item| item.state == ProgressState::Active)
+        {
+            let previous_tool = self.items[index].action_key.clone();
+            let item = &mut self.items[index];
+            item.state = ProgressState::Done;
+            if let Some(previous_tool) = previous_tool {
+                item.label = tool_progress(&previous_tool).completed;
             }
         }
         self.items.push(ProgressItem {
+            id: self.next_id,
             state: ProgressState::Active,
             activity,
+            icon,
+            action_key: tool,
+            correlation_id: correlation,
+            summary: None,
             label,
         });
-        self.active_tool = tool;
+        self.next_id = self.next_id.saturating_add(1);
         self.trim();
     }
 
-    fn complete_tool(&mut self, tool: &str, summary: &str) {
+    fn complete_tool(&mut self, tool: &str, correlation: Option<String>, summary: &str) {
         let progress = tool_progress(tool);
         let safe_summary = safe_progress(summary);
-        let failed = safe_summary.to_ascii_lowercase().starts_with("failed");
+        let lower = safe_summary.to_ascii_lowercase();
+        let failed = lower.starts_with("failed")
+            || lower.starts_with("error")
+            || lower.starts_with("cancelled");
         let mut label = if failed {
             progress.failed
         } else {
             progress.completed
         };
+        if failed {
+            let detail = safe_summary
+                .strip_prefix("failed: ")
+                .or_else(|| safe_summary.strip_prefix("error: "))
+                .or_else(|| safe_summary.strip_prefix("cancelled: "))
+                .unwrap_or(&safe_summary);
+            if !detail.is_empty() && detail != "failed" {
+                label.push_str(" · ");
+                label.push_str(detail);
+            }
+        }
         if self.detail == "detailed" && !matches!(safe_summary.as_str(), "completed" | "failed") {
             let detail = safe_summary
                 .strip_prefix("failed: ")
@@ -1736,46 +1851,35 @@ impl ProgressAggregator {
             ProgressState::Done
         };
         let tool_key = normalize_tool_name(tool);
-        if self.active_tool.as_deref() == Some(tool_key.as_str()) {
-            let Some(active) = self
-                .items
-                .last_mut()
-                .filter(|item| item.state == ProgressState::Active)
-            else {
-                self.active_tool = None;
-                return;
-            };
-            active.state = state;
-            active.activity = progress.activity;
-            active.label = label;
-            self.active_tool = None;
-        } else if self.active_tool.is_some() {
-            // A late completion from an older or parallel tool must never
-            // complete the tool that is currently shown as active.
-            return;
+        let index = if let Some(correlation) = correlation.as_deref() {
+            // Correlation IDs are the only safe way to complete an older row
+            // after another action has started. The tool name is checked too
+            // so a malformed provider event cannot cross tool boundaries.
+            self.items.iter().position(|item| {
+                item.action_key.as_deref() == Some(tool_key.as_str())
+                    && item.correlation_id.as_deref() == Some(correlation)
+            })
         } else {
-            if let Some(active) = self
-                .items
-                .last()
-                .filter(|item| item.state == ProgressState::Active)
-            {
-                if matches!(
-                    active.activity,
-                    ProgressActivity::Thinking | ProgressActivity::Writing
-                ) {
-                    self.items.pop();
-                } else {
-                    return;
-                }
-            }
-            self.items.push(ProgressItem {
-                state,
-                activity: progress.activity,
-                label,
-            });
+            // Legacy events without a call ID are intentionally limited to
+            // the current active row. They cannot complete a newer/different
+            // action or guess at a historical row.
+            self.items.iter().rposition(|item| {
+                item.state == ProgressState::Active
+                    && item.action_key.as_deref() == Some(tool_key.as_str())
+                    && item.correlation_id.is_none()
+            })
+        };
+        let Some(index) = index else {
+            return;
+        };
+        if let Some(item) = self.items.get_mut(index) {
+            item.state = state;
+            item.activity = progress.activity;
+            item.icon = progress.icon;
+            item.label = label;
+            item.summary = Some(safe_summary.clone());
         }
         self.trim();
-        self.set_active("Thinking".into(), ProgressActivity::Thinking);
     }
 
     fn stream_chunk(&mut self) {
@@ -1790,6 +1894,20 @@ impl ProgressAggregator {
             return;
         }
         if let Some(active) = self.items.last_mut().filter(|item| {
+            item.state == ProgressState::Active && item.activity == ProgressActivity::Thinking
+        }) {
+            // The first provider chunk is the same generation action changing
+            // phase, not a new row. This keeps streaming as one Writing item.
+            active.activity = ProgressActivity::Writing;
+            active.icon = ProgressIcon::Writing;
+            active.label = if self.detail == "detailed" {
+                format!("Writing response · {} chunks", self.stream_chunks)
+            } else {
+                "Writing response".into()
+            };
+            return;
+        }
+        if let Some(active) = self.items.last_mut().filter(|item| {
             item.state == ProgressState::Active && item.activity == ProgressActivity::Writing
         }) {
             if self.detail == "detailed" && self.stream_chunks.is_multiple_of(8) {
@@ -1801,7 +1919,6 @@ impl ProgressAggregator {
     }
 
     fn fail(&mut self, error: &str) {
-        self.active_tool = None;
         let label = if self.detail == "detailed" {
             format!("Request failed · {}", safe_progress(error))
         } else {
@@ -1809,17 +1926,25 @@ impl ProgressAggregator {
         };
         if let Some(active) = self
             .items
-            .last_mut()
-            .filter(|item| item.state == ProgressState::Active)
+            .iter_mut()
+            .rev()
+            .find(|item| item.state == ProgressState::Active)
         {
             active.state = ProgressState::Failed;
             active.label = label;
+            active.summary = Some(safe_progress(error));
         } else {
             self.items.push(ProgressItem {
+                id: self.next_id,
                 state: ProgressState::Failed,
                 activity: ProgressActivity::Thinking,
+                icon: ProgressIcon::Thinking,
+                action_key: None,
+                correlation_id: None,
+                summary: Some(safe_progress(error)),
                 label,
             });
+            self.next_id = self.next_id.saturating_add(1);
         }
         self.trim();
     }
@@ -1827,11 +1952,12 @@ impl ProgressAggregator {
     fn trim(&mut self) {
         let max = match self.detail.as_str() {
             "minimal" => 1,
-            "detailed" => 6,
-            _ => 3,
+            "detailed" => 30,
+            _ => 24,
         };
         if self.items.len() > max {
-            drop(self.items.drain(..self.items.len() - max));
+            let remove = self.items.len() - max;
+            self.items.drain(..remove);
         }
     }
 
@@ -1839,10 +1965,37 @@ impl ProgressAggregator {
         let mut items = self.items.clone();
         if items.is_empty() {
             items.push(ProgressItem {
+                id: self.next_id,
                 state: ProgressState::Active,
                 activity: ProgressActivity::Thinking,
+                icon: ProgressIcon::Thinking,
+                action_key: Some("generation".into()),
+                correlation_id: None,
+                summary: None,
                 label: "Thinking".into(),
             });
+        }
+        // Keep the current active row and the newest history while satisfying
+        // the Telegram draft budget. Labels are already bounded, so this is
+        // only reached for an unusually long timeline.
+        while items.len() > 1 && progress_text_length(&items) > PROGRESS_CHAR_BUDGET {
+            let active_index = items
+                .iter()
+                .rposition(|item| item.state == ProgressState::Active)
+                .unwrap_or(items.len().saturating_sub(1));
+            if active_index == 0 {
+                break;
+            }
+            items.remove(0);
+        }
+        if progress_text_length(&items) > PROGRESS_CHAR_BUDGET {
+            let index = items
+                .iter()
+                .rposition(|item| item.state == ProgressState::Active)
+                .unwrap_or_else(|| items.len().saturating_sub(1));
+            if let Some(active) = items.get_mut(index) {
+                active.label = safe_progress(&active.label);
+            }
         }
         View {
             title: None,
@@ -1851,6 +2004,14 @@ impl ProgressAggregator {
             side_mode: false,
         }
     }
+}
+
+fn progress_text_length(items: &[ProgressItem]) -> usize {
+    items
+        .iter()
+        .map(|item| item.label.chars().count() + 4)
+        .sum::<usize>()
+        .saturating_add(items.len().saturating_sub(1))
 }
 
 fn status_progress(value: &str) -> (String, ProgressActivity) {
@@ -1891,6 +2052,11 @@ fn tool_progress(tool: &str) -> ToolProgress {
         let scope = if web { "the web" } else { "files" };
         ToolProgress {
             activity: ProgressActivity::Searching,
+            icon: if web {
+                ProgressIcon::WebSearch
+            } else {
+                ProgressIcon::FileSearch
+            },
             active: format!("Searching {scope}"),
             completed: format!("Searched {scope}"),
             failed: if web {
@@ -1906,6 +2072,11 @@ fn tool_progress(tool: &str) -> ToolProgress {
     {
         ToolProgress {
             activity: ProgressActivity::Fetching,
+            icon: if normalized.contains("read") || normalized.contains("document") {
+                ProgressIcon::DocumentRead
+            } else {
+                ProgressIcon::Fetching
+            },
             active: "Fetching a page".into(),
             completed: "Fetched the page".into(),
             failed: "Page fetch failed".into(),
@@ -1917,6 +2088,13 @@ fn tool_progress(tool: &str) -> ToolProgress {
     {
         ToolProgress {
             activity: ProgressActivity::Media,
+            icon: if normalized.contains("audio") {
+                ProgressIcon::Audio
+            } else if normalized.contains("video") {
+                ProgressIcon::Video
+            } else {
+                ProgressIcon::ImageInspect
+            },
             active: "Processing media".into(),
             completed: "Processed media".into(),
             failed: "Media processing failed".into(),
@@ -1932,6 +2110,17 @@ fn tool_progress(tool: &str) -> ToolProgress {
     {
         ToolProgress {
             activity: ProgressActivity::Coding,
+            icon: if normalized.contains("edit") || normalized.contains("patch") {
+                ProgressIcon::Editing
+            } else if normalized.contains("shell")
+                || normalized.contains("exec")
+                || normalized.contains("terminal")
+                || normalized.contains("command")
+            {
+                ProgressIcon::Terminal
+            } else {
+                ProgressIcon::Coding
+            },
             active: "Working with code".into(),
             completed: "Finished code work".into(),
             failed: "Code work failed".into(),
@@ -1944,6 +2133,11 @@ fn tool_progress(tool: &str) -> ToolProgress {
     {
         ToolProgress {
             activity: ProgressActivity::Analyzing,
+            icon: if normalized.contains("read") || normalized.contains("inspect") {
+                ProgressIcon::DocumentRead
+            } else {
+                ProgressIcon::Analyzing
+            },
             active: "Checking conversation context".into(),
             completed: "Checked conversation context".into(),
             failed: "Context check failed".into(),
@@ -1952,6 +2146,13 @@ fn tool_progress(tool: &str) -> ToolProgress {
         let name = humanize_tool_name(tool);
         ToolProgress {
             activity: ProgressActivity::Tool,
+            icon: if normalized.contains("install") {
+                ProgressIcon::Installing
+            } else if normalized.contains("test") {
+                ProgressIcon::Testing
+            } else {
+                ProgressIcon::Tool
+            },
             active: format!("Running {name}"),
             completed: format!("Ran {name}"),
             failed: format!("{name} failed"),
@@ -2025,6 +2226,7 @@ fn auth_view(challenge: &AuthChallenge) -> View {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{ToolContext, ToolEffect, ToolOrigin, ToolPolicy, ToolRisk, ToolSpec};
     use axum::{
         body::Bytes,
         extract::State,
@@ -2279,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_tool_becomes_quiet_history_then_thinking_resumes() {
+    fn completed_tool_remains_visible_without_synthetic_thinking() {
         let mut progress = ProgressAggregator::new("normal".into());
         progress.push(AgentEvent::GenerationStarted);
         progress.push(AgentEvent::ToolStarted("web_search".into()));
@@ -2295,10 +2497,9 @@ mod tests {
         let items = progress_items(&view);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].state, ProgressState::Done);
-        assert_eq!(items[0].label, "Searched the web");
-        assert_eq!(items[1].state, ProgressState::Active);
-        assert_eq!(items[1].activity, ProgressActivity::Thinking);
-        assert_eq!(items[1].label, "Thinking");
+        assert_eq!(items[0].label, "Thinking");
+        assert_eq!(items[1].state, ProgressState::Done);
+        assert_eq!(items[1].label, "Searched the web");
     }
 
     #[test]
@@ -2319,7 +2520,7 @@ mod tests {
     }
 
     #[test]
-    fn minimal_progress_keeps_only_the_current_animation() {
+    fn minimal_progress_keeps_the_completed_action_visible() {
         let mut progress = ProgressAggregator::new("minimal".into());
         progress.push(AgentEvent::GenerationStarted);
         progress.push(AgentEvent::ToolStarted("web_fetch".into()));
@@ -2335,10 +2536,7 @@ mod tests {
         });
         let resumed = progress.view();
         assert_eq!(progress_items(&resumed).len(), 1);
-        assert_eq!(
-            progress_items(&resumed)[0].activity,
-            ProgressActivity::Thinking
-        );
+        assert_eq!(progress_items(&resumed)[0].state, ProgressState::Done);
     }
 
     #[test]
@@ -2363,6 +2561,165 @@ mod tests {
         let active = items.last().unwrap();
         assert_eq!(active.activity, ProgressActivity::Coding);
         assert_eq!(active.label, "Working with code");
+    }
+
+    #[test]
+    fn normal_timeline_retains_24_append_oriented_rows() {
+        let mut progress = ProgressAggregator::new("normal".into());
+        for index in 0..40 {
+            progress.push(AgentEvent::ToolStartedWithId {
+                tool: format!("operation_{index}"),
+                call_id: format!("call-{index}"),
+            });
+        }
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(items.len(), 24);
+        assert!(items[..23]
+            .iter()
+            .all(|item| item.state == ProgressState::Done));
+        assert_eq!(items.last().unwrap().state, ProgressState::Active);
+        assert_eq!(
+            items.last().unwrap().correlation_id.as_deref(),
+            Some("call-39")
+        );
+    }
+
+    #[test]
+    fn detailed_timeline_retains_30_append_oriented_rows() {
+        let mut progress = ProgressAggregator::new("detailed".into());
+        for index in 0..40 {
+            progress.push(AgentEvent::ToolStartedWithId {
+                tool: format!("operation_{index}"),
+                call_id: format!("call-{index}"),
+            });
+        }
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(items.len(), 30);
+        assert!(items[..29]
+            .iter()
+            .all(|item| item.state == ProgressState::Done));
+        assert_eq!(items.last().unwrap().state, ProgressState::Active);
+        assert_eq!(
+            items.last().unwrap().correlation_id.as_deref(),
+            Some("call-39")
+        );
+    }
+
+    #[test]
+    fn correlation_id_completes_exact_tool_row_and_rejects_wrong_id() {
+        let mut progress = ProgressAggregator::new("normal".into());
+        progress.push(AgentEvent::ToolStartedWithId {
+            tool: "web_search".into(),
+            call_id: "old-call".into(),
+        });
+        progress.push(AgentEvent::ToolStartedWithId {
+            tool: "web_search".into(),
+            call_id: "new-call".into(),
+        });
+        progress.push(AgentEvent::ToolCompletedWithId {
+            tool: "web_search".into(),
+            call_id: "wrong-call".into(),
+            summary: "completed".into(),
+        });
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(items[0].state, ProgressState::Done);
+        assert_eq!(items[1].state, ProgressState::Active);
+        progress.push(AgentEvent::ToolCompletedWithId {
+            tool: "web_search".into(),
+            call_id: "old-call".into(),
+            summary: "completed".into(),
+        });
+        progress.push(AgentEvent::ToolCompletedWithId {
+            tool: "web_search".into(),
+            call_id: "new-call".into(),
+            summary: "completed".into(),
+        });
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert!(items.iter().all(|item| item.state == ProgressState::Done));
+        assert_eq!(items[0].correlation_id.as_deref(), Some("old-call"));
+        assert_eq!(items[1].correlation_id.as_deref(), Some("new-call"));
+    }
+
+    #[test]
+    fn failed_tool_stays_visible_with_redacted_error_and_failure_icon() {
+        let mut progress = ProgressAggregator::new("detailed".into());
+        progress.push(AgentEvent::ToolStartedWithId {
+            tool: "terminal".into(),
+            call_id: "terminal-1".into(),
+        });
+        progress.push(AgentEvent::ToolCompletedWithId {
+            tool: "terminal".into(),
+            call_id: "terminal-1".into(),
+            summary: "failed: Authorization: very-secret-token".into(),
+        });
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state, ProgressState::Failed);
+        let rendered = rich::render(&view, true).to_string();
+        assert!(rendered.contains("✗"));
+        assert!(!rendered.contains("very-secret-token"));
+    }
+
+    #[test]
+    fn hard_progress_budget_preserves_active_and_recent_rows() {
+        let mut progress = ProgressAggregator::new("detailed".into());
+        for index in 0..30 {
+            progress.push(AgentEvent::ToolStartedWithId {
+                tool: format!("operation_{index}_{}", "x".repeat(180)),
+                call_id: format!("call-{index}"),
+            });
+        }
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert!(progress_text_length(items) <= PROGRESS_CHAR_BUDGET);
+        assert_eq!(items.last().unwrap().state, ProgressState::Active);
+        assert_eq!(
+            items.last().unwrap().correlation_id.as_deref(),
+            Some("call-29")
+        );
+        assert!(items.len() >= 2);
+        assert_eq!(
+            items[items.len() - 2].correlation_id.as_deref(),
+            Some("call-28")
+        );
+    }
+
+    #[test]
+    fn action_classifier_is_presentation_only_and_does_not_relax_policy() {
+        let classified = tool_progress("termux_terminal");
+        assert_eq!(classified.icon, ProgressIcon::Terminal);
+        let spec = ToolSpec {
+            name: "termux_terminal".into(),
+            description: "test".into(),
+            parameters: serde_json::json!({"type":"object"}),
+            risk: ToolRisk::SideEffect,
+            origin: ToolOrigin::Termux,
+            effect: ToolEffect::NonIdempotent,
+            required_capabilities: Vec::new(),
+            timeout_ms: 1_000,
+        };
+        let context = ToolContext {
+            principal: "owner".into(),
+            session_id: "session".into(),
+            agent_run_id: "run".into(),
+            yolo_mode: false,
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+            progress: None,
+        };
+        assert!(matches!(
+            ToolPolicy::default().evaluate_call(
+                &spec,
+                &serde_json::json!({"program":"rm","args":["file"]}),
+                &context,
+            ),
+            crate::tools::PolicyDecision::RequireApproval(_)
+        ));
     }
 
     #[test]
@@ -2411,12 +2768,14 @@ mod tests {
                 native_tool_calls: true,
                 structured_output: false,
                 continuation: true,
+                probe_status: "completed".into(),
+                probe_version: 1,
                 probed_at: chrono::Utc::now().to_rfc3339(),
                 evidence: "fixture isolates native agent cancellation from semantic evaluation"
                     .into(),
             })
             .unwrap();
-        let principal_a = TelegramAdapter::principal(10);
+        let principal_a = TelegramAdapter::principal(&app, 10);
         let main = app.sessions.ensure_default_session(&principal_a).unwrap();
         app.storage
             .set_session_provider(&principal_a, &main.id, "custom", None, "m")
@@ -2555,7 +2914,7 @@ mod tests {
             .await
             .unwrap();
 
-        let principal = TelegramAdapter::principal(10);
+        let principal = TelegramAdapter::principal(&app, 10);
         let topic_10 = app
             .sessions
             .context_for_telegram(&principal, TelegramScope::new(100, Some(10)))
@@ -2713,7 +3072,7 @@ mod tests {
             .await
             .unwrap();
 
-        let principal = TelegramAdapter::principal(10);
+        let principal = TelegramAdapter::principal(&app, 10);
         let session = app
             .sessions
             .context_for_telegram(&principal, TelegramScope::new(100, Some(10)))

@@ -40,7 +40,11 @@ pub struct PackageCandidate {
 
 #[async_trait]
 pub trait TrustedPackageRepository: Send + Sync {
-    async fn search(&self, binary: &str) -> Result<Vec<PackageCandidate>>;
+    async fn search(
+        &self,
+        binary: &str,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<PackageCandidate>>;
 }
 
 #[async_trait]
@@ -164,7 +168,11 @@ impl TermuxRepositoryBackend {
 
 #[async_trait]
 impl TrustedPackageRepository for TermuxRepositoryBackend {
-    async fn search(&self, binary: &str) -> Result<Vec<PackageCandidate>> {
+    async fn search(
+        &self,
+        binary: &str,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<PackageCandidate>> {
         validate_binary(binary)?;
         let (program, args) = if self.manager_name == "pkg" {
             ("pkg".to_owned(), vec!["search".into(), binary.into()])
@@ -186,7 +194,7 @@ impl TrustedPackageRepository for TermuxRepositoryBackend {
                     max_output_chars: 64_000,
                     purpose: ExecutionPurpose::Verification,
                 },
-                CancellationToken::new(),
+                cancellation,
             )
             .await?;
         if !outcome.succeeded() {
@@ -280,7 +288,7 @@ impl DependencyResolver {
                     "binary {binary} is missing and no trusted Termux repository discovery source is configured"
                 )
             })?;
-            let candidates = repository.search(binary).await?;
+            let candidates = repository.search(binary, cancellation.clone()).await?;
             let candidate = validated_candidate(binary, candidates)?;
             (candidate.package, candidate.source)
         };

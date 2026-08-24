@@ -89,6 +89,27 @@ impl ContextEngine {
         Self::with_runtime_and_attachments(storage, config, runtime, None)
     }
 
+    /// Build the ordinary host/test context with durable attachment retrieval
+    /// enabled. Runtime-backed callers use `with_runtime_and_attachments`,
+    /// but attachment processing is also a valid control-plane dependency for
+    /// callers that deliberately do not expose a RuntimeState.
+    pub fn with_attachments(
+        storage: Arc<Storage>,
+        config: AgentConfig,
+        attachments: Arc<AttachmentManager>,
+    ) -> Self {
+        Self {
+            memories: MemoryStore::new(storage.clone()),
+            history: SessionHistoryStore::new(storage.clone()),
+            skills: SkillRegistry::new(Arc::new(SkillStore::new(storage.clone()))),
+            storage,
+            config,
+            workspace: None,
+            runtime: None,
+            attachments: Some(attachments),
+        }
+    }
+
     pub fn with_runtime_and_attachments(
         storage: Arc<Storage>,
         config: AgentConfig,

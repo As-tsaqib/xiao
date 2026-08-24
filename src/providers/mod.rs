@@ -21,7 +21,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    attachments::NormalizedImage,
+    attachments::{
+        NormalizedFile, NormalizedImage, PdfFallbackCapabilities, PdfFallbackProvider,
+        PdfFallbackRequest,
+    },
     auth::{antigravity_user_agent, AuthManager},
     config::{AppConfig, CustomProviderConfig},
     security::redact::redact_text,
@@ -124,6 +127,8 @@ pub fn profile_model_from_probe(
         model_discovery: probe.capabilities.model_discovery,
         tool_protocol: probe.capabilities.tool_protocol.as_str().into(),
         evidence: probe.capabilities.evidence.clone(),
+        probe_status: "completed".into(),
+        probe_version: 1,
         probed_at: probed_at.to_owned(),
     }
 }
@@ -182,8 +187,23 @@ pub enum AgentEvent {
     GenerationStarted,
     Status(String),
     ToolStarted(String),
-    ToolCompleted { tool: String, summary: String },
-    StreamChunk { provider: String, bytes: usize },
+    ToolCompleted {
+        tool: String,
+        summary: String,
+    },
+    ToolStartedWithId {
+        tool: String,
+        call_id: String,
+    },
+    ToolCompletedWithId {
+        tool: String,
+        call_id: String,
+        summary: String,
+    },
+    StreamChunk {
+        provider: String,
+        bytes: usize,
+    },
     GenerationCompleted,
     GenerationFailed(String),
 }
@@ -203,6 +223,10 @@ pub struct ProviderRequest {
     /// selected model explicitly declares vision capability.
     #[serde(default)]
     pub images: Vec<NormalizedImage>,
+    /// Runtime-validated bounded files. Adapters serialize these only for an
+    /// explicitly file-input-capable selected model.
+    #[serde(default)]
+    pub files: Vec<NormalizedFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +267,95 @@ pub trait Provider: Send + Sync {
         _account_or_profile_id: Option<&str>,
     ) -> ProviderCapabilities {
         self.capabilities(model)
+    }
+    fn pdf_fallback_capabilities(
+        &self,
+        model: &str,
+        account_or_profile_id: Option<&str>,
+    ) -> PdfFallbackCapabilities {
+        let capabilities = self.capabilities_for(model, account_or_profile_id);
+        PdfFallbackCapabilities {
+            file_input: capabilities.file_input,
+            vision: capabilities.vision,
+        }
+    }
+    async fn pdf_file_input(
+        &self,
+        request: &PdfFallbackRequest,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<String> {
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("attachment provider file input cancelled"));
+        }
+        let capabilities =
+            self.capabilities_for(&request.model, request.account_or_profile_id.as_deref());
+        if !capabilities.file_input {
+            return Err(anyhow!(
+                "selected provider/model does not declare file-input capability"
+            ));
+        }
+        let provider_request = ProviderRequest {
+            session_id: request.session_id.clone(),
+            account_id: request.account_or_profile_id.clone(),
+            model: request.model.clone(),
+            messages: vec![MessageRecord {
+                role: "user".into(),
+                content: request.prompt.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            }],
+            tools: Vec::new(),
+            images: Vec::new(),
+            files: vec![NormalizedFile {
+                attachment_id: request.attachment_id.clone(),
+                filename: request.original_name.clone(),
+                mime_type: "application/pdf".into(),
+                bytes: request.pdf.clone(),
+                caption: request.prompt.clone(),
+            }],
+        };
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(anyhow!("attachment provider file input cancelled")),
+            result = self.generate_text(provider_request) => result,
+        }
+    }
+    async fn pdf_vision(
+        &self,
+        request: &PdfFallbackRequest,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<String> {
+        if request.rendered_pages.is_empty() {
+            return Err(anyhow!("PDF vision adapter received no rendered pages"));
+        }
+        let images = request
+            .rendered_pages
+            .iter()
+            .take(4)
+            .map(|page| NormalizedImage {
+                attachment_id: format!("{}:page:{}", request.attachment_id, page.page_no),
+                mime_type: page.mime_type.clone(),
+                bytes: page.bytes.clone(),
+                width: page.width,
+                height: page.height,
+                caption: request.prompt.clone(),
+            })
+            .collect();
+        let request = ProviderRequest {
+            session_id: request.attachment_id.clone(),
+            account_id: request.account_or_profile_id.clone(),
+            model: request.model.clone(),
+            messages: vec![MessageRecord {
+                role: "user".into(),
+                content: request.prompt.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            }],
+            tools: Vec::new(),
+            images,
+            files: Vec::new(),
+        };
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(anyhow!("attachment provider vision cancelled")),
+            result = self.generate_text(request) => result,
+        }
     }
     fn models_for(&self, _account_or_profile_id: Option<&str>) -> Vec<String> {
         self.models()
@@ -286,6 +399,35 @@ pub trait Provider: Send + Sync {
             continuation: None,
             events: response.events,
         })
+    }
+}
+
+pub struct ProviderPdfFallback<'a> {
+    provider: &'a dyn Provider,
+}
+
+impl<'a> ProviderPdfFallback<'a> {
+    pub fn new(provider: &'a dyn Provider) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait]
+impl PdfFallbackProvider for ProviderPdfFallback<'_> {
+    async fn file_input(
+        &self,
+        request: &PdfFallbackRequest,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<String> {
+        self.provider.pdf_file_input(request, cancellation).await
+    }
+
+    async fn vision(
+        &self,
+        request: &PdfFallbackRequest,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<String> {
+        self.provider.pdf_vision(request, cancellation).await
     }
 }
 
@@ -545,24 +687,103 @@ fn antigravity_model_supports_vision(model: &str) -> bool {
 
 fn capabilities_from_record(
     record: crate::storage::ProviderCapabilityRecord,
-) -> Option<ProviderCapabilities> {
+) -> ProviderCapabilities {
+    if !probe_is_completed(
+        &record.probe_status,
+        record.probe_version,
+        &record.probed_at,
+    ) {
+        return ProviderCapabilities {
+            model_discovery: true,
+            ..ProviderCapabilities::chat_only(format!(
+                "model capability probe is {}",
+                normalized_probe_status(&record.probe_status)
+            ))
+        };
+    }
     let tool_protocol = match record.tool_protocol.as_str() {
         "native" => ToolProtocol::Native,
         "structured_json_fallback" | "structured_json" => ToolProtocol::StructuredJsonFallback,
         "chat_only" => ToolProtocol::ChatOnly,
-        _ => return None,
+        _ => ToolProtocol::ChatOnly,
     };
-    Some(ProviderCapabilities {
+    let tool_protocol = match tool_protocol {
+        ToolProtocol::Native if record.native_tool_calls && record.continuation => {
+            ToolProtocol::Native
+        }
+        ToolProtocol::StructuredJsonFallback if record.structured_output && record.continuation => {
+            ToolProtocol::StructuredJsonFallback
+        }
+        _ => ToolProtocol::ChatOnly,
+    };
+    ProviderCapabilities {
         text: true,
         vision: false,
         file_input: false,
-        native_tools: record.native_tool_calls,
+        native_tools: tool_protocol == ToolProtocol::Native,
         tool_protocol,
         model_discovery: true,
         structured_output: record.structured_output,
         continuation: record.continuation,
         evidence: record.evidence,
-    })
+    }
+}
+
+fn normalized_probe_status(status: &str) -> &str {
+    match status {
+        "completed" | "indeterminate" | "unprobed" => status,
+        _ => "indeterminate",
+    }
+}
+
+fn probe_is_completed(status: &str, version: u32, probed_at: &str) -> bool {
+    status == "completed" && version > 0 && !probed_at.trim().is_empty()
+}
+
+fn profile_capabilities_from_record(
+    record: crate::storage::ProviderProfileModelRecord,
+) -> ProviderCapabilities {
+    let completed = probe_is_completed(
+        &record.probe_status,
+        record.probe_version,
+        &record.probed_at,
+    );
+    if !completed {
+        return ProviderCapabilities {
+            model_discovery: record.model_discovery,
+            ..ProviderCapabilities::chat_only(format!(
+                "model capability probe is {}",
+                normalized_probe_status(&record.probe_status)
+            ))
+        };
+    }
+
+    let protocol = match record.tool_protocol.as_str() {
+        "native"
+            if record.native_tools_state == "supported"
+                && record.continuation_state == "supported" =>
+        {
+            ToolProtocol::Native
+        }
+        "structured_json_fallback" | "structured_json"
+            if record.structured_output_state == "supported"
+                && record.continuation_state == "supported" =>
+        {
+            ToolProtocol::StructuredJsonFallback
+        }
+        _ => ToolProtocol::ChatOnly,
+    };
+    ProviderCapabilities {
+        text: record.text_capable,
+        vision: record.vision_state == "supported" && record.vision_capable,
+        file_input: record.file_input_state == "supported" && record.file_input_capable,
+        native_tools: protocol == ToolProtocol::Native,
+        tool_protocol: protocol,
+        model_discovery: record.model_discovery,
+        structured_output: record.structured_output_state == "supported",
+        continuation: record.continuation_state == "supported",
+        evidence: record.evidence,
+    }
 }
 
 struct CodexProvider {
@@ -670,6 +891,7 @@ impl Provider for CodexProvider {
             .ok_or_else(|| anyhow!("ChatGPT account id missing"))?;
         let mut payload = responses_payload(&req.messages, Some(CODEX_DEFAULT_INSTRUCTIONS));
         append_responses_images(&mut payload.input, &req.images)?;
+        append_responses_files(&mut payload.input, &req.files)?;
         let mut input = continuation
             .and_then(|value| value.get("input").and_then(|item| item.as_array()).cloned())
             .unwrap_or(payload.input);
@@ -756,6 +978,21 @@ fn image_data_url(image: &NormalizedImage) -> Result<String> {
     ))
 }
 
+fn file_data_url(file: &NormalizedFile) -> Result<String> {
+    if file.mime_type != "application/pdf"
+        || file.bytes.is_empty()
+        || file.bytes.len() > 25 * 1024 * 1024
+        || file.filename.trim().is_empty()
+    {
+        return Err(anyhow!("normalized file violates provider input bounds"));
+    }
+    Ok(format!(
+        "data:{};base64,{}",
+        file.mime_type,
+        STANDARD.encode(&file.bytes)
+    ))
+}
+
 fn append_responses_images(
     input: &mut Vec<serde_json::Value>,
     images: &[NormalizedImage],
@@ -767,6 +1004,23 @@ fn append_responses_images(
             "content":[
                 {"type":"input_text","text":image.caption},
                 {"type":"input_image","image_url":image_data_url(image)?,"detail":"auto"}
+            ]
+        }));
+    }
+    Ok(())
+}
+
+fn append_responses_files(
+    input: &mut Vec<serde_json::Value>,
+    files: &[NormalizedFile],
+) -> Result<()> {
+    for file in files.iter().take(2) {
+        input.push(serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": file.caption},
+                {"type": "input_file", "filename": file.filename, "file_data": file_data_url(file)?}
             ]
         }));
     }
@@ -787,6 +1041,22 @@ fn append_chat_images(messages: &mut Vec<serde_json::Value>, images: &[Normalize
     }
 }
 
+fn append_chat_files(
+    messages: &mut Vec<serde_json::Value>,
+    files: &[NormalizedFile],
+) -> Result<()> {
+    for file in files.iter().take(2) {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": file.caption},
+                {"type": "file", "file": {"filename": file.filename, "file_data": file_data_url(file)?}}
+            ]
+        }));
+    }
+    Ok(())
+}
+
 fn append_antigravity_images(
     body: &mut serde_json::Value,
     images: &[NormalizedImage],
@@ -804,6 +1074,30 @@ fn append_antigravity_images(
             "parts":[
                 {"text":image.caption},
                 {"inlineData":{"mimeType":image.mime_type,"data":STANDARD.encode(&image.bytes)}}
+            ]
+        }));
+    }
+    Ok(())
+}
+
+fn append_antigravity_files(body: &mut serde_json::Value, files: &[NormalizedFile]) -> Result<()> {
+    let Some(contents) = body
+        .pointer_mut("/request/contents")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Err(anyhow!("Antigravity request has no contents array"));
+    };
+    for file in files.iter().take(2) {
+        let data_url = file_data_url(file)?;
+        let encoded = data_url
+            .split_once(',')
+            .map(|(_, value)| value)
+            .unwrap_or_default();
+        contents.push(serde_json::json!({
+            "role": "user",
+            "parts": [
+                {"text": file.caption},
+                {"inlineData": {"mimeType": file.mime_type, "data": encoded}}
             ]
         }));
     }
@@ -948,6 +1242,7 @@ impl Provider for AntigravityProvider {
         );
         let mut body = antigravity_body(project, &req.model, &req.messages, &request_id);
         append_antigravity_images(&mut body, &req.images)?;
+        append_antigravity_files(&mut body, &req.files)?;
         let mut contents = continuation
             .as_ref()
             .and_then(|value| value.get("contents"))
@@ -1092,35 +1387,12 @@ impl CustomProvider {
         })
     }
 
-    fn configured_capabilities(&self) -> ProviderCapabilities {
-        match self.cfg.tool_protocol.as_str() {
-            "chat_only" => ProviderCapabilities {
-                model_discovery: true,
-                ..ProviderCapabilities::chat_only(
-                    "capability probe marked this custom model ChatOnly",
-                )
-            },
-            "structured_json" => ProviderCapabilities {
-                text: true,
-                vision: false,
-                file_input: false,
-                native_tools: false,
-                tool_protocol: ToolProtocol::StructuredJsonFallback,
-                model_discovery: true,
-                structured_output: true,
-                continuation: true,
-                evidence: "validated strict structured-JSON agent protocol".into(),
-            },
-            "native" => ProviderCapabilities {
-                model_discovery: true,
-                ..ProviderCapabilities::native("OpenAI-compatible native function/tool protocol")
-            },
-            _ => ProviderCapabilities {
-                model_discovery: true,
-                ..ProviderCapabilities::chat_only(
-                    "custom model capability has not been probed; select it through /login",
-                )
-            },
+    fn unprobed_capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            model_discovery: true,
+            ..ProviderCapabilities::chat_only(
+                "custom model capability has not been probed; run an exact-model probe",
+            )
         }
     }
 }
@@ -1179,8 +1451,8 @@ impl Provider for CustomProvider {
             .provider_capability("custom", model)
             .ok()
             .flatten()
-            .and_then(capabilities_from_record)
-            .unwrap_or_else(|| self.configured_capabilities())
+            .map(capabilities_from_record)
+            .unwrap_or_else(|| self.unprobed_capabilities())
     }
     fn capabilities_for(&self, model: &str, profile_id: Option<&str>) -> ProviderCapabilities {
         let Some(profile_id) = profile_id else {
@@ -1190,21 +1462,7 @@ impl Provider for CustomProvider {
             .model(profile_id, model)
             .ok()
             .flatten()
-            .map(|record| ProviderCapabilities {
-                text: record.text_capable,
-                vision: record.vision_capable,
-                file_input: record.file_input_capable,
-                native_tools: record.native_tools,
-                tool_protocol: match record.tool_protocol.as_str() {
-                    "native" => ToolProtocol::Native,
-                    "structured_json_fallback" => ToolProtocol::StructuredJsonFallback,
-                    _ => ToolProtocol::ChatOnly,
-                },
-                model_discovery: record.model_discovery,
-                structured_output: record.structured_output,
-                continuation: record.continuation,
-                evidence: record.evidence,
-            })
+            .map(profile_capabilities_from_record)
             .unwrap_or_else(|| {
                 ProviderCapabilities::chat_only(
                     "selected Custom profile/model has not passed capability probing",
@@ -1217,11 +1475,7 @@ impl Provider for CustomProvider {
             .provider_capability("custom", model)
             .ok()
             .flatten()
-            .is_some()
-            || matches!(
-                self.cfg.tool_protocol.as_str(),
-                "native" | "structured_json"
-            ))
+            .is_some())
             && self.capabilities(model).structured_output
     }
     fn supports_semantic_evaluation_for(&self, model: &str, profile_id: Option<&str>) -> bool {
@@ -1246,9 +1500,9 @@ impl Provider for CustomProvider {
             request = request.bearer_auth(key);
         }
         let body = if target.protocol == "openai_chat_completions" {
-            custom_chat_body(&req, None, &[], ToolProtocol::ChatOnly)
+            custom_chat_body(&req, None, &[], ToolProtocol::ChatOnly)?
         } else {
-            custom_responses_body(&req, None, &[], ToolProtocol::ChatOnly)
+            custom_responses_body(&req, None, &[], ToolProtocol::ChatOnly)?
         };
         let value: serde_json::Value = ensure_success(
             request.json(&body).send().await?,
@@ -1299,6 +1553,11 @@ impl Provider for CustomProvider {
                 "selected Custom profile/model does not declare vision capability"
             ));
         }
+        if !req.files.is_empty() && !capabilities.file_input {
+            return Err(anyhow!(
+                "selected Custom profile/model does not declare file-input capability"
+            ));
+        }
         emit(
             &progress,
             AgentEvent::Status("Sending request to custom provider".into()),
@@ -1327,14 +1586,14 @@ impl Provider for CustomProvider {
                 continuation.as_ref(),
                 &tool_results,
                 capabilities.tool_protocol,
-            )
+            )?
         } else {
             custom_responses_body(
                 &req,
                 continuation.as_ref(),
                 &tool_results,
                 capabilities.tool_protocol,
-            )
+            )?
         };
         let response = request.json(&body).send().await?;
         let response = ensure_success(response, "Custom provider").await?;
@@ -1397,7 +1656,7 @@ fn custom_chat_body(
     continuation: Option<&serde_json::Value>,
     tool_results: &[ToolResult],
     protocol: ToolProtocol,
-) -> serde_json::Value {
+) -> Result<serde_json::Value> {
     let mut messages = continuation
         .and_then(|value| value.get("messages"))
         .and_then(serde_json::Value::as_array)
@@ -1405,6 +1664,7 @@ fn custom_chat_body(
         .unwrap_or_else(|| chat_messages(&req.messages));
     if continuation.is_none() {
         append_chat_images(&mut messages, &req.images);
+        append_chat_files(&mut messages, &req.files)?;
     }
     if protocol == ToolProtocol::Native {
         messages.extend(tool_results.iter().map(|result| {
@@ -1440,7 +1700,7 @@ fn custom_chat_body(
         );
         body["tool_choice"] = serde_json::Value::String("auto".into());
     }
-    body
+    Ok(body)
 }
 
 fn custom_responses_body(
@@ -1448,12 +1708,13 @@ fn custom_responses_body(
     continuation: Option<&serde_json::Value>,
     tool_results: &[ToolResult],
     protocol: ToolProtocol,
-) -> serde_json::Value {
+) -> Result<serde_json::Value> {
     let mut payload = responses_payload(&req.messages, None);
     if continuation.is_none() {
         // Any image reaching this point was validated by the runtime and the
         // selected profile/model capability gate.
         let _ = append_responses_images(&mut payload.input, &req.images);
+        append_responses_files(&mut payload.input, &req.files)?;
     }
     let mut input = continuation
         .and_then(|value| value.get("input"))
@@ -1480,7 +1741,7 @@ fn custom_responses_body(
     if protocol == ToolProtocol::Native && !req.tools.is_empty() {
         body["tools"] = serde_json::Value::Array(responses_tool_specs(&req.tools));
     }
-    body
+    Ok(body)
 }
 
 fn parse_custom_chat_turn(
@@ -2604,6 +2865,7 @@ mod tests {
             messages,
             tools: vec![],
             images: vec![],
+            files: vec![],
         }
     }
 
@@ -2697,6 +2959,8 @@ mod tests {
             model_discovery: true,
             tool_protocol: tool_protocol.as_str().into(),
             evidence: "deterministic production-path test".into(),
+            probe_status: "completed".into(),
+            probe_version: 1,
             probed_at: chrono::Utc::now().to_rfc3339(),
         }
     }
@@ -2951,6 +3215,7 @@ mod tests {
             .unwrap();
         let mut vision = profile_model(&profile.profile_id, "vision-m", ToolProtocol::ChatOnly);
         vision.vision_capable = true;
+        vision.vision_state = "supported".into();
         let no_vision = profile_model(&profile.profile_id, "text-m", ToolProtocol::ChatOnly);
         profiles
             .replace_models(owner, &profile.profile_id, &[vision, no_vision])
@@ -3073,6 +3338,20 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let (auth, _directory) = test_auth();
+        auth.storage()
+            .upsert_provider_capability(&crate::storage::ProviderCapabilityRecord {
+                provider: "custom".into(),
+                model: "m".into(),
+                tool_protocol: "native".into(),
+                native_tool_calls: true,
+                structured_output: true,
+                continuation: true,
+                probe_status: "completed".into(),
+                probe_version: 1,
+                probed_at: chrono::Utc::now().to_rfc3339(),
+                evidence: "deterministic exact-model probe fixture".into(),
+            })
+            .unwrap();
         let provider = CustomProvider::new(
             CustomProviderConfig {
                 enabled: true,

@@ -8,14 +8,14 @@ use crate::{
     event::AppEvent,
     memory::MemoryStore,
     providers::{ProviderProfileStore, ProviderRegistry},
+    security::redact::redact_text,
     security::secrets::SecretStore,
     skills::{FilesystemSkills, SkillStore},
-    storage::{SessionRecord, Storage},
+    storage::{SessionRecord, Storage, TelegramControlState},
     telegram::{client::TelegramClient, types::BotIdentity},
 };
 
 const TELEGRAM_TOKEN_KEY: &str = "telegram-bot-token";
-const TELEGRAM_IDENTITY_KEY: &str = "telegram_bot_identity";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +44,7 @@ pub struct TelegramConfigureInput {
     pub confirm_owner_change: bool,
     pub allowed_chat_ids: Option<Vec<i64>>,
     pub test_connection: bool,
+    pub resolve_legacy_owners: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +52,8 @@ pub struct TelegramConfigureResult {
     pub applied: bool,
     pub tested: bool,
     pub status: TelegramSetupStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Clone)]
@@ -69,27 +72,46 @@ impl TelegramSetupService {
 
     pub async fn status(&self) -> Result<TelegramSetupStatus> {
         let cfg = self.app.config.read().await.clone();
-        let access = &cfg.telegram.access;
-        let owner_state = if access.owner_user_id.is_some() {
-            OwnerSetupState::Configured
-        } else if access.owner_resolution_required() {
+        let control = self
+            .app
+            .storage
+            .telegram_control_state()?
+            .unwrap_or(TelegramControlState {
+                enabled: cfg.telegram.enabled,
+                owner_user_id: cfg.telegram.access.owner_user_id,
+                allowed_chat_ids: cfg.telegram.access.allowed_chat_ids.clone(),
+                bot_token_ref: None,
+                bot_identity_json: None,
+                updated_at: String::new(),
+            });
+        let candidates = self.app.storage.owner_resolution_candidates()?;
+        let owner_state = if !candidates.is_empty() {
             OwnerSetupState::ResolutionRequired
+        } else if control.owner_user_id.is_some() {
+            OwnerSetupState::Configured
         } else {
             OwnerSetupState::SetupRequired
         };
         let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
-        let token_configured = secrets.get(TELEGRAM_TOKEN_KEY)?.is_some();
-        let bot = self
-            .app
-            .storage
-            .setting(TELEGRAM_IDENTITY_KEY)?
-            .and_then(|raw| serde_json::from_str::<BotIdentity>(&raw).ok());
+        // Once the schema exists, only the immutable ref recorded in SQLite
+        // is authoritative. The legacy unversioned secret is imported during
+        // AppState bootstrap and is never consulted as a fallback here.
+        let token_configured = control
+            .bot_token_ref
+            .as_deref()
+            .map(|reference| secrets.get(reference).map(|value| value.is_some()))
+            .transpose()?
+            .unwrap_or(false);
+        let bot = control
+            .bot_identity_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<BotIdentity>(raw).ok());
         Ok(TelegramSetupStatus {
-            enabled: cfg.telegram.enabled,
-            owner_user_id: access.owner_user_id,
+            enabled: control.enabled,
+            owner_user_id: control.owner_user_id,
             owner_state,
-            legacy_candidate_count: access.allowed_user_ids.len(),
-            allowed_chat_ids: access.allowed_chat_ids.clone(),
+            legacy_candidate_count: candidates.len(),
+            allowed_chat_ids: control.allowed_chat_ids,
             token_configured,
             bot,
         })
@@ -102,9 +124,20 @@ impl TelegramSetupService {
             .filter(|value| !value.is_empty())
         {
             Some(value) => value.to_owned(),
-            None => SecretStore::new(cfg.paths.secrets_dir)
-                .get(TELEGRAM_TOKEN_KEY)?
-                .ok_or_else(|| anyhow!("Telegram bot token is not configured"))?,
+            None => {
+                let control = self.app.storage.telegram_control_state()?;
+                let secrets = SecretStore::new(cfg.paths.secrets_dir);
+                match control.and_then(|state| state.bot_token_ref) {
+                    Some(reference) => secrets
+                        .get(&reference)?
+                        .ok_or_else(|| anyhow!("Telegram bot token reference is unavailable"))?,
+                    None => {
+                        return Err(anyhow!(
+                        "Telegram bot token is not configured in the authoritative control plane"
+                    ))
+                    }
+                }
+            }
         };
         let client = TelegramClient::new(token)?;
         tokio::time::timeout(Duration::from_secs(15), client.get_me())
@@ -117,197 +150,199 @@ impl TelegramSetupService {
         input: TelegramConfigureInput,
     ) -> Result<TelegramConfigureResult> {
         let old = self.app.config.read().await.clone();
-        let mut next = old.clone();
-
-        if let Some(enabled) = input.enabled {
-            next.telegram.enabled = enabled;
+        let current = self
+            .app
+            .storage
+            .telegram_control_state()?
+            .unwrap_or(TelegramControlState {
+                enabled: old.telegram.enabled,
+                owner_user_id: old.telegram.access.owner_user_id,
+                allowed_chat_ids: old.telegram.access.allowed_chat_ids.clone(),
+                bot_token_ref: None,
+                bot_identity_json: None,
+                updated_at: String::new(),
+            });
+        let owner_user_id = input.owner_user_id.or(current.owner_user_id);
+        if owner_user_id.is_some_and(|id| id <= 0) {
+            return Err(anyhow!("Telegram owner user id must be positive"));
         }
-        if let Some(owner_user_id) = input.owner_user_id {
-            if owner_user_id <= 0 {
-                return Err(anyhow!(
-                    "Telegram owner user id must be positive (got {owner_user_id})"
-                ));
-            }
-            if old
-                .telegram
-                .access
-                .owner_user_id
-                .is_some_and(|old_id| old_id != owner_user_id)
-                && !input.confirm_owner_change
-            {
-                return Err(anyhow!(
-                    "changing Telegram owner requires explicit confirmation"
-                ));
-            }
-            next.telegram.access.owner_user_id = Some(owner_user_id);
-            next.telegram.access.allowed_user_ids.clear();
+        if current
+            .owner_user_id
+            .is_some_and(|id| Some(id) != input.owner_user_id)
+            && input.owner_user_id.is_some()
+            && !input.confirm_owner_change
+        {
+            return Err(anyhow!(
+                "changing Telegram owner requires explicit confirmation"
+            ));
         }
-        if let Some(mut allowed_chat_ids) = input.allowed_chat_ids {
-            if allowed_chat_ids.contains(&0) {
-                return Err(anyhow!("allowed chat ids cannot contain zero"));
-            }
-            allowed_chat_ids.sort_unstable();
-            allowed_chat_ids.dedup();
-            next.telegram.access.allowed_chat_ids = allowed_chat_ids;
+        let mut allowed_chat_ids = input
+            .allowed_chat_ids
+            .unwrap_or_else(|| current.allowed_chat_ids.clone());
+        if allowed_chat_ids.contains(&0) {
+            return Err(anyhow!("allowed chat ids cannot contain zero"));
         }
-        next.telegram.access.migrate_legacy_owner();
-        next.validate()?;
-        // P0-5: validate all inputs before durable mutation.
-        if input.owner_user_id.is_some() && next.telegram.access.owner_user_id.is_none() {
-            return Err(anyhow!("owner_user_id validation failed after migration"));
-        }
-
+        allowed_chat_ids.sort_unstable();
+        allowed_chat_ids.dedup();
+        let enabled = input.enabled.unwrap_or(current.enabled);
+        let secrets = SecretStore::new(old.paths.secrets_dir.clone());
         let supplied_token = input
             .bot_token
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-
-        // P0-5: staging/compensation across config file, SecretStore and SQLite.
-        // No partial commit is published; ConfigReloaded only after coherent commit.
-        // Snapshot old config for rollback if later step fails.
-        let secrets = SecretStore::new(next.paths.secrets_dir.clone());
-        let staged_secret = supplied_token.is_some();
-
-        // 1. If new token supplied, stage it via put_staged (preserving old live token untouched!)
+        let mut new_ref = current.bot_token_ref.clone();
+        let mut created_ref = None;
         if let Some(token) = supplied_token {
-            if let Err(e) = secrets.put_staged(TELEGRAM_TOKEN_KEY, token) {
-                return Err(anyhow!("stage telegram token: {e}"));
+            let reference = secrets.put_versioned(TELEGRAM_TOKEN_KEY, token)?;
+            new_ref = Some(reference.clone());
+            created_ref = Some(reference);
+        } else if new_ref.is_none() {
+            if let Some(token) = secrets.get(TELEGRAM_TOKEN_KEY)? {
+                let reference = secrets.put_versioned(TELEGRAM_TOKEN_KEY, &token)?;
+                new_ref = Some(reference.clone());
+                created_ref = Some(reference);
             }
         }
-
-        // 2. Perform test_connection if requested
-        let bot = if input.test_connection {
-            match self.test_connection(supplied_token).await {
-                Ok(b) => Some(b),
-                Err(e) => {
-                    if staged_secret {
-                        let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
-                    }
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
-
-        // 3. Fault injection check: secret_stage
-        if let Ok(inj) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
-            if inj.contains("secret_stage") || inj == "all" {
-                if staged_secret {
-                    let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+        if let Ok(injection) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
+            if injection.contains("secret_stage") || injection == "all" {
+                if let Some(reference) = created_ref.as_deref() {
+                    let _ = secrets.remove(reference);
                 }
                 return Err(anyhow!("injected failure: secret_stage"));
             }
         }
-
-        // 4. Save durable config to disk atomically
-        if let Err(e) = next.save_atomic(&self.config_path) {
-            if staged_secret {
-                let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
-            }
-            return Err(anyhow!("persist config: {e}"));
-        }
-
-        // 5. Fault injection check: config
-        if let Ok(inj) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
-            if inj.contains("config") || inj == "all" {
-                if staged_secret {
-                    let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+        // Probe the staged token exactly once. The result is also the bot
+        // identity committed with the control-plane row; a second pre-commit
+        // getMe would make a flaky provider look like a split transition.
+        let staged_token = if let Some(reference) = created_ref.as_deref() {
+            secrets.get(reference)?
+        } else {
+            None
+        };
+        let probe_token = supplied_token.map(str::to_owned).or(staged_token);
+        if let Ok(injection) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
+            if injection == "probe" {
+                if let Some(reference) = created_ref.as_deref() {
+                    let _ = secrets.remove(reference);
                 }
-                let _ = old.save_atomic(&self.config_path);
-                return Err(anyhow!("injected failure: config"));
+                return Err(anyhow!("injected failure: probe"));
             }
         }
-
-        // 6. Persist bot identity if probed
-        if let Some(bot) = bot.as_ref() {
-            if let Err(e) = self.app.storage.put_setting(
-                TELEGRAM_IDENTITY_KEY,
-                &serde_json::to_string(bot).unwrap_or_default(),
-            ) {
-                if staged_secret {
-                    let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+        let bot = if input.test_connection {
+            Some(
+                self.test_connection(probe_token.as_deref())
+                    .await
+                    .inspect_err(|_| {
+                        if let Some(reference) = created_ref.as_deref() {
+                            let _ = secrets.remove(reference);
+                        }
+                    })?,
+            )
+        } else {
+            current
+                .bot_identity_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<BotIdentity>(raw).ok())
+        };
+        let identity_json = bot.as_ref().map(serde_json::to_string).transpose()?;
+        if let Ok(injection) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
+            if injection.contains("db") || injection == "all" {
+                if let Some(reference) = created_ref.as_deref() {
+                    let _ = secrets.remove(reference);
                 }
-                let _ = old.save_atomic(&self.config_path);
-                return Err(anyhow!("persist bot identity: {e}"));
-            }
-        }
-
-        // 7. Fault injection check: db
-        if let Ok(inj) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
-            if inj.contains("db") || inj == "all" {
-                if staged_secret {
-                    let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
-                }
-                let _ = old.save_atomic(&self.config_path);
                 return Err(anyhow!("injected failure: db"));
             }
         }
-
-        // 8. Reconcile owner migration transactionally
-        if let Some(owner_user_id) = next.telegram.access.owner_user_id {
-            let migration = match self.app.storage.ensure_telegram_owner(owner_user_id) {
-                Ok(m) => m,
-                Err(e) => {
-                    if staged_secret {
-                        let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
-                    }
-                    let _ = old.save_atomic(&self.config_path);
-                    return Err(anyhow!("ensure telegram owner: {e}"));
+        let migration = match self.app.storage.commit_telegram_control_plane(
+            enabled,
+            owner_user_id,
+            &allowed_chat_ids,
+            new_ref.as_deref(),
+            identity_json.as_deref(),
+            input.resolve_legacy_owners,
+        ) {
+            Ok(migration) => migration,
+            Err(error) => {
+                if let Some(reference) = created_ref.as_deref() {
+                    let _ = secrets.remove(reference);
                 }
-            };
-            if migration.requires_file_reconcile {
-                if let Err(e) = (|| -> Result<()> {
-                    MemoryStore::with_workspace(
-                        self.app.storage.clone(),
-                        self.app.identity.clone(),
-                    )
+                return Err(error);
+            }
+        };
+        let mut warnings = Vec::new();
+        if migration.requires_file_reconcile {
+            if let Err(error) = (|| -> Result<()> {
+                MemoryStore::with_workspace(self.app.storage.clone(), self.app.identity.clone())
                     .reconcile(&migration.owner_id)?;
-                    FilesystemSkills::new(
-                        self.app.identity.clone(),
-                        std::sync::Arc::new(SkillStore::new(self.app.storage.clone())),
-                    )
-                    .reconcile(&migration.owner_id)?;
-                    Ok(())
-                })() {
-                    if staged_secret {
-                        let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
-                    }
-                    let _ = old.save_atomic(&self.config_path);
-                    return Err(anyhow!("reconcile owner files: {e}"));
+                FilesystemSkills::new(
+                    self.app.identity.clone(),
+                    Arc::new(SkillStore::new(self.app.storage.clone())),
+                )
+                .reconcile(&migration.owner_id)?;
+                Ok(())
+            })() {
+                warnings.push(format!(
+                    "owner file reconciliation pending: {}",
+                    redact_text(&error.to_string())
+                ));
+            }
+        }
+        if let (Some(old_ref), Some(new_ref)) =
+            (current.bot_token_ref.as_deref(), new_ref.as_deref())
+        {
+            if old_ref != new_ref {
+                let injected_cleanup_failure = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE")
+                    .ok()
+                    .is_some_and(|value| value == "cleanup");
+                if injected_cleanup_failure {
+                    warnings
+                        .push("obsolete Telegram secret cleanup pending: injected failure".into());
+                } else if let Err(error) = secrets.remove(old_ref) {
+                    warnings.push(format!(
+                        "obsolete Telegram secret cleanup pending: {}",
+                        redact_text(&error.to_string())
+                    ));
                 }
             }
         }
-
-        // 9. Fault injection check: reconcile
-        if let Ok(inj) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
-            if inj.contains("reconcile") || inj == "all" {
-                if staged_secret {
-                    let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
-                }
-                let _ = old.save_atomic(&self.config_path);
-                return Err(anyhow!("injected failure: reconcile"));
+        let mut next = old.clone();
+        next.telegram.enabled = enabled;
+        next.telegram.access.owner_user_id = owner_user_id;
+        next.telegram.access.allowed_chat_ids = allowed_chat_ids;
+        next.telegram.access.allowed_user_ids.clear();
+        if let Ok(injection) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
+            if injection.contains("config") || injection == "all" {
+                warnings.push(
+                    "config snapshot persistence pending; SQLite control state is authoritative"
+                        .into(),
+                );
+            } else if let Err(error) = next.save_atomic(&self.config_path) {
+                warnings.push(format!(
+                    "config snapshot persistence pending: {}",
+                    redact_text(&error.to_string())
+                ));
             }
+        } else if let Err(error) = next.save_atomic(&self.config_path) {
+            warnings.push(format!(
+                "config snapshot persistence pending: {}",
+                redact_text(&error.to_string())
+            ));
         }
-
-        // 10. Commit staged secret
-        if staged_secret {
-            if let Err(e) = secrets.commit_staged(TELEGRAM_TOKEN_KEY) {
-                let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
-                let _ = old.save_atomic(&self.config_path);
-                return Err(anyhow!("commit telegram token: {e}"));
-            }
+        if !warnings.is_empty() {
+            let _ = self.app.storage.audit(
+                &migration.owner_id,
+                "telegram_control_plane_warning",
+                &redact_text(&warnings.join("; ")),
+            );
         }
-
-        // 11. Update in-memory config & publish ConfigReloaded
         *self.app.config.write().await = next;
         self.app.events.publish(AppEvent::ConfigReloaded);
-
         Ok(TelegramConfigureResult {
             applied: true,
             tested: input.test_connection,
             status: self.status().await?,
+            warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
         })
     }
 }
@@ -349,12 +384,11 @@ impl SessionAiService {
     pub fn model_readiness(
         record: &crate::storage::ProviderProfileModelRecord,
     ) -> CustomModelReadiness {
-        if record.probed_at.trim().is_empty()
-            || record.evidence.contains("probe budget not spent")
-            || record.evidence.contains("not been probed")
-            || record.evidence.contains("discovered;")
-        {
-            return CustomModelReadiness::Unprobed;
+        match record.probe_status.as_str() {
+            "unprobed" => return CustomModelReadiness::Unprobed,
+            "indeterminate" => return CustomModelReadiness::Indeterminate,
+            "completed" if !record.probed_at.trim().is_empty() => {}
+            _ => return CustomModelReadiness::Unprobed,
         }
         if record.native_tools_state == "supported" && record.continuation_state == "supported" {
             return CustomModelReadiness::AgentNative;
@@ -516,6 +550,9 @@ impl SessionAiService {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use std::sync::OnceLock;
+
+    static TELEGRAM_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
     async fn test_service() -> (TelegramSetupService, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
@@ -608,6 +645,8 @@ mod tests {
                     "chat_only".into()
                 },
                 evidence: ev.into(),
+                probe_status: "completed".into(),
+                probe_version: 1,
                 probed_at: probed.into(),
             }
         };
@@ -694,7 +733,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telegram_setup_rollback_preserves_old_token_on_injected_failure() {
+    async fn telegram_setup_config_snapshot_failure_commits_authoritative_state_with_warning() {
+        let _guard = TELEGRAM_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
         let (service, _directory) = test_service().await;
         service
             .configure(TelegramConfigureInput {
@@ -708,7 +751,7 @@ mod tests {
 
         // Inject failure during config write
         std::env::set_var("XIAO_INJECT_TELEGRAM_FAILURE", "config");
-        let failed = service
+        let result = service
             .configure(TelegramConfigureInput {
                 bot_token: Some("123456:NEW_CANDIDATE_TOKEN_THAT_FAILS".into()),
                 owner_user_id: Some(101),
@@ -717,11 +760,194 @@ mod tests {
             })
             .await;
         std::env::remove_var("XIAO_INJECT_TELEGRAM_FAILURE");
-        assert!(failed.is_err());
+        let applied = result.unwrap();
+        assert!(applied.applied);
+        assert!(applied
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("authoritative")));
 
-        // Old state must be preserved
+        // SQLite is authoritative even when the compatibility TOML snapshot
+        // cannot be persisted. There is no fake rollback after commit.
         let status = service.status().await.unwrap();
-        assert_eq!(status.owner_user_id, Some(100));
+        assert_eq!(status.owner_user_id, Some(101));
         assert!(status.token_configured);
+    }
+
+    #[tokio::test]
+    async fn telegram_probe_failure_keeps_old_token_binding_and_control_state_active() {
+        let _guard = TELEGRAM_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (service, _directory) = test_service().await;
+        service
+            .configure(TelegramConfigureInput {
+                enabled: Some(true),
+                bot_token: Some("123456:OLD_TOKEN_SENTINEL".into()),
+                owner_user_id: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let before = service
+            .app
+            .storage
+            .telegram_control_state()
+            .unwrap()
+            .unwrap();
+        std::env::set_var("XIAO_INJECT_TELEGRAM_FAILURE", "probe");
+        let error = service
+            .configure(TelegramConfigureInput {
+                bot_token: Some("123456:NEW_TOKEN_MUST_NOT_COMMIT".into()),
+                owner_user_id: Some(101),
+                confirm_owner_change: true,
+                test_connection: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        std::env::remove_var("XIAO_INJECT_TELEGRAM_FAILURE");
+        assert!(error.contains("injected failure: probe"));
+        let after = service
+            .app
+            .storage
+            .telegram_control_state()
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.owner_user_id, before.owner_user_id);
+        assert_eq!(after.bot_token_ref, before.bot_token_ref);
+        assert_eq!(service.status().await.unwrap().owner_user_id, Some(100));
+        let binding: String = service
+            .app
+            .storage
+            .with_conn(|connection| {
+                connection
+                    .query_row(
+                        "SELECT external_id FROM owner_bindings WHERE binding_kind='telegram_user'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(binding, "100");
+    }
+
+    #[tokio::test]
+    async fn telegram_late_db_failure_rolls_back_binding_and_staged_token_as_one_transaction() {
+        let (service, _directory) = test_service().await;
+        service
+            .configure(TelegramConfigureInput {
+                enabled: Some(true),
+                bot_token: Some("123456:OLD_DB_TOKEN".into()),
+                owner_user_id: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let before = service
+            .app
+            .storage
+            .telegram_control_state()
+            .unwrap()
+            .unwrap();
+        service
+            .app
+            .storage
+            .with_conn(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER reject_telegram_control_update
+                     BEFORE UPDATE ON telegram_control_state
+                     WHEN NEW.owner_user_id=101
+                     BEGIN SELECT RAISE(FAIL,'synthetic Telegram DB failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let error = service
+            .configure(TelegramConfigureInput {
+                bot_token: Some("123456:NEW_DB_TOKEN_MUST_NOT_COMMIT".into()),
+                owner_user_id: Some(101),
+                confirm_owner_change: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("synthetic Telegram DB failure"));
+        let after = service
+            .app
+            .storage
+            .telegram_control_state()
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.owner_user_id, before.owner_user_id);
+        assert_eq!(after.bot_token_ref, before.bot_token_ref);
+        assert_eq!(service.status().await.unwrap().owner_user_id, Some(100));
+        service
+            .app
+            .storage
+            .with_conn(|connection| {
+                connection.execute_batch("DROP TRIGGER reject_telegram_control_update;")?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn telegram_post_commit_secret_cleanup_failure_is_success_with_warning() {
+        let _guard = TELEGRAM_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let (service, _directory) = test_service().await;
+        service
+            .configure(TelegramConfigureInput {
+                enabled: Some(true),
+                bot_token: Some("123456:OLD_GC_TOKEN".into()),
+                owner_user_id: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let old_ref = service
+            .app
+            .storage
+            .telegram_control_state()
+            .unwrap()
+            .unwrap()
+            .bot_token_ref
+            .unwrap();
+        let cfg = service.app.config.read().await.clone();
+        let secrets = SecretStore::new(cfg.paths.secrets_dir);
+        std::env::set_var("XIAO_INJECT_TELEGRAM_FAILURE", "cleanup");
+        let result = service
+            .configure(TelegramConfigureInput {
+                bot_token: Some("123456:NEW_GC_TOKEN".into()),
+                owner_user_id: Some(101),
+                confirm_owner_change: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        std::env::remove_var("XIAO_INJECT_TELEGRAM_FAILURE");
+        assert!(result.applied);
+        assert!(result
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("cleanup pending")));
+        let current_ref = service
+            .app
+            .storage
+            .telegram_control_state()
+            .unwrap()
+            .unwrap()
+            .bot_token_ref
+            .unwrap();
+        assert_ne!(current_ref, old_ref);
+        assert!(secrets.exists(&old_ref).unwrap());
+        assert_eq!(service.status().await.unwrap().owner_user_id, Some(101));
     }
 }

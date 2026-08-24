@@ -3,6 +3,10 @@
 GitHub Actions is the authoritative Rust/Android validation environment for this release candidate.
 Authoritative release validation is the latest successful required CI run whose `head_sha` exactly equals the release candidate commit.
 
+This document is updated from the actual hardening worktree. A local green host
+run is evidence for the committed source only after the final SHA is recorded;
+it does not substitute for the required exact-head GitHub Actions Android job.
+
 ## Authoritative Validation Methodology
 
 Release validation requires both `rust` and `android-arm64` jobs in `.github/workflows/ci.yml` to succeed on the exact commit without waivers or skipped checks.
@@ -29,8 +33,8 @@ All gates run on `ubuntu-24.04` with `Rust 1.98.0`, `CARGO_TERM_COLOR=always`, `
 | 8 | WebUI syntax app.js | `node --check module/webroot/assets/app.js` | PASS |
 | 9 | WebUI syntax ksu-bridge.js | `node --check module/webroot/assets/ksu-bridge.js` | PASS |
 | 10 | Static acceptance | `./scripts/acceptance.sh --static-only` | PASS (60+ static invariants) |
-| 11 | Android arm64 cross-compile | `cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao` | PASS (`aarch64-linux-android`) |
-| 12 | Deterministic module ZIP | `packaging/build-module.sh` (twice) → `sha256 equality`, `sha256sum -c dist/*.sha256`, `unzip -t` | PASS (identical checksums) |
+| 11 | Android arm64 cross-compile | `cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao` | **OPEN/BLOCKED locally** — Android NDK is not installed in this environment; CI exact-head gate remains required |
+| 12 | Deterministic module ZIP | `packaging/build-module.sh` (twice) → `sha256 equality`, `sha256sum -c dist/*.sha256`, `unzip -t` | **OPEN/BLOCKED locally** — packaging is intentionally GitHub-Actions-only and requires the arm64 build outputs |
 | 13 | Whitespace hygiene | `git diff --check` | PASS |
 
 Historical pre-release gate (informational, not the v0.2.7 artifact):
@@ -39,35 +43,40 @@ the full matrix; produced `xiao-v0.2.6-kernelsu-arm64` (artifact `9506162200`) a
 
 ## P0 / P1 / P2 status
 
-Source of truth for priorities: commit-scoped fixes (`p0-*`, `p1-*`, `p2-*`) plus the mandatory 24-scenario
-matrix in `docs/ACCEPTANCE.md` and the addendum. All host-verifiable criteria are PASS on `b9240c9`;
-only rooted-device / live-network checks remain open (see below).
+Source of truth for priorities: the mandatory scenario matrix in `docs/ACCEPTANCE.md`
+and the final-hardening architecture package. Host-verifiable criteria below are
+covered by deterministic tests; exact-head CI, rooted-device, and live-network
+checks remain open where this environment cannot exercise them.
 
 ### P0 — Release-blocking (control-plane & safety)
 
 | Item | Scope | Host evidence | Status |
 |------|-------|---------------|--------|
-| P0-1 | Single-owner enforcement (`owner_user_id` canonical; `allowed_user_ids` migration) | `stable_owner_state_is_global_while_dm_group_and_topics_stay_isolated`, `representative_v025_state_migrates_transactionally_and_idempotently`, `webui_first_local_owner_is_transactionally_claimed_by_telegram_owner` | **PASS** |
-| P0-2 | Shared Telegram setup service (masked/write-only token, atomic owner-id confirmation, `getMe` probe) | `control_plane::tests` (telegram_token_write_only, owner_change_requires_confirmation), `telegram/mod.rs` wizard tests | **PASS** |
-| P0-3 | Structured CLI command tree & stable JSON/error/exit semantics (unknown → usage exit 2, never chat) | `tests/cli_integration.rs` (root help snapshot, typo→2, aliases→2, JSON envelope, subcommand help), `cargo test` 242 PASS | **PASS** |
+| P0-1 | Stable installation owner and replaceable Telegram binding; ambiguous legacy owners fail closed | `stable_owner_state_is_global_while_dm_group_and_topics_stay_isolated`, `installation_owner_has_no_telegram_identity_semantics`, `representative_v025_state_migrates_transactionally_and_idempotently`, `multiple_legacy_owner_rows_fail_closed_until_explicit_telegram_resolution` | **PASS (host)** |
+| P0-2 | Shared Telegram setup service (write-only/versioned token, atomic owner binding, probe-before-commit, authoritative SQLite) | `telegram_setup_config_snapshot_failure_commits_authoritative_state_with_warning`, `telegram_probe_failure_keeps_old_token_binding_and_control_state_active`, `telegram_late_db_failure_rolls_back_binding_and_staged_token_as_one_transaction`, `telegram_post_commit_secret_cleanup_failure_is_success_with_warning` | **PASS (host)** |
+| P0-3 | Structured CLI command tree & stable JSON/error/exit semantics (unknown → usage exit 2, never chat) | `tests/cli_integration.rs` (root help snapshot, typo→2, aliases→2, JSON envelope, subcommand help) | **PASS (host)** |
 | P0-4 | Explicit session targeting (CLI sessions independent unless `--session ID`; no cross-leak) | `command/mod.rs` session tests, `session/mod.rs` cross-principal rejection | **PASS** |
 | P0-5 | Exact one-shot durable approval binding (owner/session/run/call/tool/args hash) | `approval_is_exact_one_shot_and_cannot_cross_sessions_or_runs`, `privileged_tool_requires_exact_durable_one_shot_approval` | **PASS** |
 | P0-6 | No unrestricted root shell / no `Command::new("sh|bash|su")` path | `acceptance.sh` rejects `Command::new("sh"...` + `RootShell` sentinel | **PASS** |
 | P0-7 | No MCP / subagents / vector DB / cron / native plugins | `acceptance.sh` sentinel `No MCP…` | **PASS** |
+| P0-8 | Exact-model probe lifecycle; Unprobed/Indeterminate agent protocol cannot activate | `unprobed_custom_model_is_explicitly_chat_only`, `custom_model_readiness_semantics_handles_optional_vision_and_file_capabilities` | **PASS (host)** |
 
 ### P1 — Control-plane parity (feature completeness)
 
 | Item | Scope | Host evidence | Status |
 |------|-------|---------------|--------|
 | P1-1 | WebUI Telegram setup + exact-session AI configuration (typed `xiaod` admin actions only) | `webui_uses_only_typed_xiaod_manager_actions`, `manager_*` tests | **PASS** |
-| P1-2 | Tri-state Custom tools / structured / continuation / vision / file capabilities (cached probe, non-destructive doctor) | `probe_custom_tool_capability`, `codex_antigravity_and_custom_protocols_keep_the_same_agent_tool_workflow`, `production_custom_structured_fallback_retains_tool_a_and_b_results_until_final` | **PASS** |
+| P1-2 | Tri-state Custom tools / structured / continuation / vision / file capabilities (cached probe, non-destructive doctor) | `probe_custom_tool_capability`, `codex_antigravity_and_custom_protocols_keep_the_same_agent_tool_workflow`, `production_custom_structured_fallback_retains_tool_a_and_b_results_until_final`, `unprobed_custom_model_is_explicitly_chat_only` | **PASS (host)** |
 | P1-3 | CLI file/image chat (`xiao chat --file/--image`) + session scoping | `attachments::tests`, `bin_cli.rs` ingestion paths, `telegram_photo_and_document_are_downloaded_scoped_and_indexed` | **PASS** |
-| P1-4 | Scanned-PDF OCR/vision fallback after embedded extraction | `wrong_txt_extension_cannot_override_pdf_magic_and_empty_pdf_requires_ocr`, `text_pdf_and_docx_extract_into_fts_without_macro_content` | **PASS** |
-| P1-5 | Attachment quota / retention / orphan / active-run protection | `malicious_name_stays_inside_private_store_and_oversize_is_rejected`, storage version 16–17 migration tests | **PASS** |
-| P1-6 | Full Custom profile editing with credential/header safety | `endpoint_edit_clears_credentials_and_headers`, `custom_profile_without_key_never_inherits_another_profiles_secret_or_header`, rollback test | **PASS** |
+| P1-4 | Scanned-PDF planner: embedded text, bounded OCR, verified provider file/vision fallback, explicit blocked state | `wrong_txt_extension_cannot_override_pdf_magic_and_empty_pdf_requires_ocr`, `scanned_pdf_provider_file_input_path_is_durable_and_real`, `scanned_pdf_provider_vision_renders_pages_before_calling_provider`, `agent_engine_runs_scanned_pdf_provider_file_fallback_before_final_answer`, `scanned_pdf_unknown_or_unsupported_capabilities_are_blocked_explicitly` | **PASS (host)** |
+| P1-5 | Attachment quota / retention / orphan / active-run protection with atomic session/owner/global reservations | `concurrent_quota_reservations_cannot_exceed_session_quota`, `concurrent_quota_reservations_cannot_exceed_owner_or_global_quota`, `quota_reservation_release_and_orphan_cleanup_are_durable`, `active_run_protects_attachment_from_manual_and_retention_cleanup` | **PASS (host)** |
+| P1-6 | Full Custom profile editing/deletion with credential/header safety and post-commit cleanup warnings | `endpoint_edit_clears_credentials_and_headers`, `endpoint_replacement_swaps_all_profile_scoped_secrets_in_one_patch`, `custom_profile_a_secrets_never_reach_profile_b`, `existing_credential_ref_must_be_same_owner_and_custom_provider`, `profile_db_failure_after_secret_staging_leaves_old_state_and_no_new_refs`, `post_commit_secret_gc_failure_is_success_with_bounded_warning`, `profile_delete_commits_then_collects_versioned_secret_and_credential` | **PASS (host)** |
 | P1-7 | Bounded live-or-CACHED Doctor probes | `doctor_reports_memory_failure_independently_from_healthy_database`, doctor/manager tests | **PASS** |
 | P1-8 | Telegram/CLI/WebUI parity (provider, memory, skill, approval, diagnostics, session AI) | `acceptance.sh` v0.2.7 surfaces check, `telegram/scope.rs` + `telegram/commands.rs` tests | **PASS** |
 | P1-9 | CLI DTO hygiene & alias collision fixes | `clippy -D warnings` PASS, `root_help_matches_snapshot` snapshot stable | **PASS** |
+| P1-10 | Parent cancellation through attachment/OCR/provider/tool work | `scanned_pdf_provider_fallback_honors_run_cancellation`, `cancellation_during_tool_marks_both_run_boundaries_terminal`, Telegram attachment cancellation path | **PASS (host)** |
+| P1-11 | Append-oriented live timeline, safe budget, exact correlation, redacted failures, and final stripping | `normal_timeline_retains_24_append_oriented_rows`, `detailed_timeline_retains_30_append_oriented_rows`, `correlation_id_completes_exact_tool_row_and_rejects_wrong_id`, `failed_tool_stays_visible_with_redacted_error_and_failure_icon`, `hard_progress_budget_preserves_active_and_recent_rows`, `completed_tool_remains_visible_without_synthetic_thinking`, `stream_progress_updates_one_writing_step_in_place`, `final_surface_excludes_progress_and_keeps_side_marker` | **PASS (host)** |
+| P1-12 | Semantic ProgressIcon/TelegramEmojiRegistry with validated custom-ID fallback and policy isolation | `invalid_custom_emoji_id_falls_back_to_unicode_without_broken_draft`, `active_progress_uses_the_official_ai_actions_emoji`, `action_classifier_is_presentation_only_and_does_not_relax_policy` | **PASS (host)** |
 
 ### P2 — Polish & robustness
 
@@ -75,10 +84,12 @@ only rooted-device / live-network checks remain open (see below).
 |------|-------|---------------|--------|
 | P2-1 | Skills pagination 13→5/5/3 with bounded selection | `skills_manager_paginates_thirteen_entries_as_five_five_three` | **PASS** |
 | P2-2 | Wizard Back/pagination index & vision nonce fragment fix | commit `40d41dd` + `1cbc7df` covered by `discovery_failure_exposes_concrete_recovery_actions`, `custom_wizard_retry_and_back_are_phase_aware_and_replace_transient_keys` | **PASS** |
-| P2-3 | Deterministic packaging & checksum sidecar | android-arm64 `build-module.sh ×2` hash equality PASS | **PASS** |
+| P2-3 | Deterministic packaging & checksum sidecar | Required CI packaging job; local environment has no Android NDK and packaging guard is GitHub-Actions-only | **OPEN/BLOCKED locally** |
 | P2-4 | Shell/JS/TOML hygiene | ShellCheck ×2 + `node --check` ×2 + `TOML parses` PASS | **PASS** |
 
-All P0/P1/P2 host checks are green; no waivers.
+All host-verifiable P0/P1/P2 checks are green. Android arm64, deterministic
+module packaging, exact-head CI, and real-device/live-provider checks are not
+claimed green here.
 
 ## Remaining real-device checks (not claimed)
 
@@ -119,18 +130,9 @@ P0/P1/P2 table: item | scope | host evidence | PASS
 Real-device: 7 checklist items — OPEN / PASS with device evidence where completed
 ```
 
-Example for this head:
-
-```text
-Head: 207832b5a7b5069ce8899d3b8938b32eec85d281
-Run:  https://github.com/As-tsaqib/xiao/actions/runs/32721509247
-Jobs: rust https://github.com/As-tsaqib/xiao/actions/runs/32721509247/job/97413731206 success
-      android-arm64 https://github.com/As-tsaqib/xiao/actions/runs/32721509247/job/97416446474 success
-Tests: 254 passed, 0 failed (241 lib + 8 bin + 5 doc-tests)
-Artifact: xiao-v0.2.7-kernelsu-arm64 — deterministic, SHA + unzip verified
-P0: 5/5 PASS  P1: 9/9 PASS  P2: 2/2 PASS
-Real-device: 7 items OPEN (host-only validation)
-```
+No CI run or Android/package artifact is currently available for this candidate head.
+Those fields must be filled with evidence for the exact final SHA before release is
+declared.
 
 `cargo fmt --all -- --check` is a hard gate: any formatting diff is a FAIL.
 

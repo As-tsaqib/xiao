@@ -3,10 +3,12 @@ use std::{collections::BTreeMap, sync::Arc};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
+    auth::AuthManager,
     config::CustomProviderConfig,
     security::{redact::redact_text, secrets::SecretStore},
     storage::{ProviderProfileInput, ProviderProfileModelRecord, ProviderProfileRecord, Storage},
@@ -283,8 +285,8 @@ impl ProviderProfileStore {
                     return Err(anyhow!("Custom model id is empty or too long"));
                 }
                 transaction.execute(
-                    "INSERT INTO provider_profile_models(profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,native_tools_state,structured_output_state,continuation_state,vision_state,file_input_state,model_discovery,tool_protocol,evidence,probed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    params![profile_id, model.model_id, model.text_capable as i32, model.vision_capable as i32, model.file_input_capable as i32, model.native_tools as i32, model.structured_output as i32, model.continuation as i32, model.native_tools_state, model.structured_output_state, model.continuation_state, model.vision_state, model.file_input_state, model.model_discovery as i32, model.tool_protocol, model.evidence, model.probed_at],
+                    "INSERT INTO provider_profile_models(profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,native_tools_state,structured_output_state,continuation_state,vision_state,file_input_state,model_discovery,tool_protocol,evidence,probe_status,probe_version,probed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![profile_id, model.model_id, model.text_capable as i32, model.vision_capable as i32, model.file_input_capable as i32, model.native_tools as i32, model.structured_output as i32, model.continuation as i32, model.native_tools_state, model.structured_output_state, model.continuation_state, model.vision_state, model.file_input_state, model.model_discovery as i32, model.tool_protocol, model.evidence, model.probe_status, model.probe_version, model.probed_at],
                 )?;
             }
             transaction.execute(
@@ -299,7 +301,7 @@ impl ProviderProfileStore {
     pub fn models(&self, profile_id: &str) -> Result<Vec<ProviderProfileModelRecord>> {
         self.storage.with_conn(|connection| {
             let mut statement = connection.prepare(
-                "SELECT profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,native_tools_state,structured_output_state,continuation_state,vision_state,file_input_state,model_discovery,tool_protocol,evidence,probed_at FROM provider_profile_models WHERE profile_id=? ORDER BY model_id",
+                "SELECT profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,native_tools_state,structured_output_state,continuation_state,vision_state,file_input_state,model_discovery,tool_protocol,evidence,probe_status,probe_version,probed_at FROM provider_profile_models WHERE profile_id=? ORDER BY model_id",
             )?;
             let rows = statement.query_map(params![profile_id], row_profile_model)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -324,7 +326,7 @@ impl ProviderProfileStore {
         self.storage.with_conn(|connection| {
             connection
                 .query_row(
-                    "SELECT profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,native_tools_state,structured_output_state,continuation_state,vision_state,file_input_state,model_discovery,tool_protocol,evidence,probed_at FROM provider_profile_models WHERE profile_id=? AND model_id=?",
+                    "SELECT profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,native_tools_state,structured_output_state,continuation_state,vision_state,file_input_state,model_discovery,tool_protocol,evidence,probe_status,probe_version,probed_at FROM provider_profile_models WHERE profile_id=? AND model_id=?",
                     params![profile_id, model_id],
                     row_profile_model,
                 )
@@ -447,6 +449,8 @@ impl ProviderProfileStore {
                 }
                 .into(),
                 evidence: "migrated v0.2.5 Custom capability; re-probe recommended".into(),
+                probe_status: "unprobed".into(),
+                probe_version: 1,
                 probed_at: Utc::now().to_rfc3339(),
             })
             .collect::<Vec<_>>();
@@ -515,16 +519,206 @@ pub struct CustomProfileEdit {
     pub secret_headers: Option<BTreeMap<String, String>>,
     pub clear_secret_headers: bool,
     pub keep_credential_on_endpoint_change: bool,
+    pub keep_safe_headers_on_endpoint_change: bool,
+    pub keep_secret_headers_on_endpoint_change: bool,
+    pub api_key: Option<String>,
+    pub remove_api_key: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomProfileEditResult {
+    pub profile: ProviderProfileRecord,
+    pub cleanup_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomProfileDeleteResult {
+    pub credential_ref: Option<String>,
+    pub cleanup_warnings: Vec<String>,
 }
 
 pub struct CustomProfileService {
     storage: Arc<Storage>,
     secrets: SecretStore,
+    auth: Option<Arc<AuthManager>>,
 }
 
 impl CustomProfileService {
     pub fn new(storage: Arc<Storage>, secrets: SecretStore) -> Self {
-        Self { storage, secrets }
+        Self {
+            storage,
+            secrets,
+            auth: None,
+        }
+    }
+
+    pub fn with_auth(storage: Arc<Storage>, secrets: SecretStore, auth: Arc<AuthManager>) -> Self {
+        Self {
+            storage,
+            secrets,
+            auth: Some(auth),
+        }
+    }
+
+    /// Create a profile and all of its write-only credentials as one logical
+    /// application operation. Secret material is durable before the profile
+    /// row can reference it; a failed DB transaction removes only the newly
+    /// staged refs and credential.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_profile(
+        &self,
+        owner_id: &str,
+        alias: &str,
+        endpoint: &str,
+        protocol: &str,
+        safe_headers: BTreeMap<String, String>,
+        secret_headers: BTreeMap<String, String>,
+        api_key: Option<&str>,
+    ) -> Result<CustomProfileEditResult> {
+        self.create_profile_with_credential_ref(
+            owner_id,
+            alias,
+            endpoint,
+            protocol,
+            safe_headers,
+            secret_headers,
+            None,
+            api_key,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_profile_with_credential_ref(
+        &self,
+        owner_id: &str,
+        alias: &str,
+        endpoint: &str,
+        protocol: &str,
+        safe_headers: BTreeMap<String, String>,
+        secret_headers: BTreeMap<String, String>,
+        existing_credential_ref: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Result<CustomProfileEditResult> {
+        if existing_credential_ref.is_some() && api_key.is_some() {
+            return Err(anyhow!(
+                "cannot attach an existing credential and create a replacement API key"
+            ));
+        }
+        let alias = canonical_alias(alias)?;
+        let endpoint = validate_endpoint(endpoint)?;
+        validate_protocol(protocol)?;
+        let safe_headers_json =
+            serde_json::to_string(&parse_safe_headers(&serde_json::to_string(&safe_headers)?)?)?;
+        validate_secret_headers(&secret_headers)?;
+        let profile_id = format!("custom:{}", Uuid::new_v4().simple());
+        let new_secret_ref = if secret_headers.is_empty() {
+            None
+        } else {
+            Some(self.secrets.put_versioned(
+                &format!("custom-secret-headers-{profile_id}"),
+                &serde_json::to_string(&secret_headers)?,
+            )?)
+        };
+        let replacement_key = api_key.map(str::trim).filter(|value| !value.is_empty());
+        let new_credential = if let Some(key) = replacement_key {
+            let Some(auth) = self.auth.as_ref() else {
+                if let Some(reference) = new_secret_ref.as_deref() {
+                    let _ = self.secrets.remove(reference);
+                }
+                return Err(anyhow!(
+                    "Custom profile API-key edits require the auth service"
+                ));
+            };
+            match auth.create_api_key_credential("custom", &alias, key) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    if let Some(reference) = new_secret_ref.as_deref() {
+                        let _ = self.secrets.remove(reference);
+                    }
+                    return Err(anyhow!(redact_text(&error.to_string())));
+                }
+            }
+        } else {
+            None
+        };
+        let credential_ref = new_credential
+            .as_ref()
+            .map(|record| record.id.as_str())
+            .or(existing_credential_ref);
+        let now = Utc::now().to_rfc3339();
+        let db_result = self.storage.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,NULL,?,?)",
+                params![owner_id, now, now],
+            )?;
+            if let Some(credential_ref) = existing_credential_ref {
+                let credential = transaction
+                    .query_row(
+                        "SELECT owner_id,provider FROM provider_accounts WHERE id=?",
+                        params![credential_ref],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, String>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                    .ok_or_else(|| anyhow!("prepared Custom profile credential is missing"))?;
+                if credential.0.as_deref() != Some(owner_id) {
+                    return Err(anyhow!(
+                        "prepared Custom profile credential belongs to another owner"
+                    ));
+                }
+                if credential.1 != "custom" {
+                    return Err(anyhow!(
+                        "prepared Custom profile credential is not a Custom credential"
+                    ));
+                }
+            }
+            if let Some(credential_ref) = new_credential.as_ref().map(|record| record.id.as_str())
+            {
+                if transaction.execute(
+                    "UPDATE provider_accounts SET owner_id=? WHERE id=? AND (owner_id IS NULL OR owner_id=?)",
+                    params![owner_id, credential_ref, owner_id],
+                )? != 1 {
+                    return Err(anyhow!("prepared Custom profile credential is missing"));
+                }
+            }
+            transaction.execute(
+                "INSERT INTO provider_profiles(profile_id,owner_id,provider_kind,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at) VALUES(?,?,'custom',?,?,?,?,?, ?,1,'unknown',?,?)",
+                params![profile_id, owner_id, alias, endpoint, protocol, credential_ref, safe_headers_json, new_secret_ref, now, now],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        });
+        if let Err(error) = db_result {
+            if let Some(reference) = new_secret_ref.as_deref() {
+                let _ = self.secrets.remove(reference);
+            }
+            if let (Some(auth), Some(credential)) = (self.auth.as_ref(), new_credential.as_ref()) {
+                let _ = auth.logout(&credential.id);
+            }
+            return Err(anyhow!(redact_text(&error.to_string())));
+        }
+        let profile = self
+            .storage
+            .with_conn(|connection| {
+                connection
+                    .query_row(
+                        "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
+                        params![owner_id, profile_id],
+                        row_profile,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })?
+            .ok_or_else(|| anyhow!("created Custom profile is missing"))?;
+        Ok(CustomProfileEditResult {
+            profile,
+            cleanup_warnings: Vec::new(),
+        })
     }
 
     pub fn edit(
@@ -533,7 +727,20 @@ impl CustomProfileService {
         profile_id: &str,
         edit: CustomProfileEdit,
     ) -> Result<ProviderProfileRecord> {
-        // 1. Validate inputs upfront; redacted on error.
+        Ok(self.edit_with_warnings(owner_id, profile_id, edit)?.profile)
+    }
+
+    pub fn edit_with_warnings(
+        &self,
+        owner_id: &str,
+        profile_id: &str,
+        edit: CustomProfileEdit,
+    ) -> Result<CustomProfileEditResult> {
+        if edit.api_key.is_some() && edit.remove_api_key {
+            return Err(anyhow!("cannot set and remove an API key in one edit"));
+        }
+
+        // Validate every non-secret field before preparing any replacement.
         let alias = edit
             .alias
             .as_deref()
@@ -550,25 +757,28 @@ impl CustomProfileService {
             validate_protocol(protocol)
                 .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
         }
-        let safe_headers_json = if let Some(headers) = edit.safe_headers.as_ref() {
-            let normalized = parse_safe_headers(&serde_json::to_string(headers)?)
-                .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
-            Some(serde_json::to_string(&normalized)?)
-        } else {
-            None
-        };
-        let secret_headers_json = if let Some(headers) = edit.secret_headers.as_ref() {
-            validate_secret_headers(headers)
-                .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
-            Some(serde_json::to_string(headers)?)
-        } else {
-            None
-        };
+        let safe_headers_json = edit
+            .safe_headers
+            .as_ref()
+            .map(|headers| {
+                let normalized = parse_safe_headers(&serde_json::to_string(headers)?)?;
+                Ok::<_, anyhow::Error>(serde_json::to_string(&normalized)?)
+            })
+            .transpose()
+            .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
+        let secret_headers_json = edit
+            .secret_headers
+            .as_ref()
+            .map(|headers| {
+                validate_secret_headers(headers)?;
+                Ok::<_, anyhow::Error>(serde_json::to_string(headers)?)
+            })
+            .transpose()
+            .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
         if edit.secret_headers.is_some() && edit.clear_secret_headers {
             return Err(anyhow!("cannot set and clear secret headers in one edit"));
         }
 
-        // 2. Load current profile to determine deltas.
         let current = self
             .storage
             .with_conn(|connection| {
@@ -590,30 +800,81 @@ impl CustomProfileService {
             .protocol
             .as_deref()
             .is_some_and(|value| value != current.protocol);
+        let replacement_key = edit
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
 
-        // 3. Stage secret write-only headers before DB commit.
-        let secret_ref = secret_headers_ref_for(profile_id);
-        let staged = secret_headers_json.is_some();
-        let mut old_secret_json: Option<String> = None;
-        if let Some(reference) = current.secret_headers_ref.as_deref() {
-            old_secret_json = self.secrets.get(reference)?;
-        }
-        if let Some(json) = secret_headers_json.as_deref() {
-            self.secrets
-                .put_staged(&secret_ref, json)
-                .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
-        }
-
-        // Determine next secret ref/value for DB.
-        let next_secret_ref: Option<String> = if endpoint_changed || edit.clear_secret_headers {
+        // Prepare immutable references before the authoritative transaction.
+        // If the transaction fails, these fresh values are garbage-collected;
+        // the old profile remains untouched.
+        let new_secret_ref = if let Some(json) = secret_headers_json.as_deref() {
+            Some(
+                self.secrets
+                    .put_versioned(&format!("custom-secret-headers-{profile_id}"), json)
+                    .map_err(|error| anyhow!(redact_text(&error.to_string())))?,
+            )
+        } else {
             None
-        } else if secret_headers_json.is_some() {
-            Some(secret_ref.clone())
+        };
+        let new_credential = if let Some(key) = replacement_key {
+            let auth = self
+                .auth
+                .as_ref()
+                .ok_or_else(|| anyhow!("Custom profile API-key edits require the auth service"));
+            match auth {
+                Ok(auth) => match auth.create_api_key_credential(
+                    "custom",
+                    alias.as_deref().unwrap_or(&current.alias),
+                    key,
+                ) {
+                    Ok(record) => Some(record),
+                    Err(error) => {
+                        if let Some(reference) = new_secret_ref.as_deref() {
+                            let _ = self.secrets.remove(reference);
+                        }
+                        return Err(anyhow!(redact_text(&error.to_string())));
+                    }
+                },
+                Err(error) => {
+                    if let Some(reference) = new_secret_ref.as_deref() {
+                        let _ = self.secrets.remove(reference);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let new_credential_ref = new_credential.as_ref().map(|record| record.id.clone());
+
+        let next_safe_headers = if let Some(headers) = safe_headers_json.as_deref() {
+            headers.to_owned()
+        } else if endpoint_changed && !edit.keep_safe_headers_on_endpoint_change {
+            "{}".into()
+        } else {
+            current.safe_headers_json.clone()
+        };
+        let next_secret_ref = if edit.clear_secret_headers {
+            None
+        } else if let Some(reference) = new_secret_ref.as_deref() {
+            Some(reference.to_owned())
+        } else if endpoint_changed && !edit.keep_secret_headers_on_endpoint_change {
+            None
         } else {
             current.secret_headers_ref.clone()
         };
+        let next_credential_ref = if edit.remove_api_key {
+            None
+        } else if let Some(reference) = new_credential_ref.as_deref() {
+            Some(reference.to_owned())
+        } else if endpoint_changed && !edit.keep_credential_on_endpoint_change {
+            None
+        } else {
+            current.credential_ref.clone()
+        };
 
-        // 4. DB transaction: update profile and invalidate models on endpoint/protocol change.
         let db_result: Result<()> = self.storage.with_conn(|connection| {
             let transaction = connection.transaction()?;
             let exists: bool = transaction.query_row(
@@ -624,26 +885,22 @@ impl CustomProfileService {
             if !exists {
                 return Err(anyhow!("Custom profile not found for owner"));
             }
+            if let Some(credential_ref) = new_credential_ref.as_deref() {
+                let assigned = transaction.execute(
+                    "UPDATE provider_accounts SET owner_id=? WHERE id=?",
+                    params![owner_id, credential_ref],
+                )?;
+                if assigned != 1 {
+                    return Err(anyhow!("prepared Custom profile credential is missing"));
+                }
+            }
             let next_alias = alias.as_deref().unwrap_or(&current.alias);
             let next_endpoint = endpoint.as_deref().unwrap_or(&current.endpoint);
             let next_protocol = edit.protocol.as_deref().unwrap_or(&current.protocol);
-            let next_safe = safe_headers_json.as_deref().unwrap_or(&current.safe_headers_json);
-            // Validate alias uniqueness via DB constraint will surface as rusqlite error; map to redacted.
-            // Endpoint change clears credential by default unless keep_credential is true.
-            let next_credential: Option<String> = if endpoint_changed
-                && !edit.keep_credential_on_endpoint_change
-            {
-                None
-            } else {
-                current.credential_ref.clone()
-            };
-            let updated = transaction.execute(
+            transaction.execute(
                 "UPDATE provider_profiles SET alias=?,endpoint=?,protocol=?,safe_headers_json=?,secret_headers_ref=?,credential_ref=?,reachability='unknown',last_probe_at=NULL,updated_at=? WHERE owner_id=? AND profile_id=?",
-                params![next_alias, next_endpoint, next_protocol, next_safe, next_secret_ref, next_credential, Utc::now().to_rfc3339(), owner_id, profile_id],
+                params![next_alias, next_endpoint, next_protocol, next_safe_headers, next_secret_ref, next_credential_ref, Utc::now().to_rfc3339(), owner_id, profile_id],
             )?;
-            if updated != 1 {
-                return Err(anyhow!("Custom profile not found for owner"));
-            }
             if endpoint_changed || protocol_changed {
                 transaction.execute(
                     "DELETE FROM provider_profile_models WHERE profile_id=?",
@@ -654,67 +911,164 @@ impl CustomProfileService {
             Ok(())
         });
 
-        // 5. Commit or rollback staged secret.
-        match db_result {
-            Ok(()) => {
-                if staged {
-                    if let Err(error) = self.secrets.commit_staged(&secret_ref) {
-                        // DB already committed; surface redacted error but profile is updated.
-                        return Err(anyhow!(redact_text(&error.to_string())));
-                    }
-                }
-                if endpoint_changed || edit.clear_secret_headers {
-                    // Delete old secret after successful endpoint/clear.
-                    if let Some(reference) = current.secret_headers_ref.as_deref() {
-                        let _ = self.secrets.remove(reference);
-                    }
-                    if endpoint_changed {
-                        let _ = self.secrets.remove(&secret_ref);
-                        let _ = self.secrets.rollback_staged(&secret_ref);
-                    }
-                    if edit.clear_secret_headers && !endpoint_changed {
-                        let _ = self.secrets.remove(&secret_ref);
-                        let _ = self.secrets.rollback_staged(&secret_ref);
-                    }
-                } else if staged {
-                    // On secret update, old value is overwritten by staged commit; if old ref differed, clean.
-                    if let Some(old_ref) = current.secret_headers_ref.as_deref() {
-                        if old_ref != secret_ref {
-                            let _ = self.secrets.remove(old_ref);
-                        }
-                    }
-                }
-                // Ensure no leftover staged file.
-                let _ = self.secrets.rollback_staged(&secret_ref);
-                // Return updated profile; invalidate models already handled.
-                self.storage
-                    .with_conn(|connection| {
-                        connection
-                            .query_row(
-                                "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
-                                params![owner_id, profile_id],
-                                row_profile,
-                            )
-                            .optional()
-                            .map_err(Into::into)
-                    })?
-                    .ok_or_else(|| anyhow!("edited Custom profile is missing"))
+        if let Err(error) = db_result {
+            if let Some(reference) = new_secret_ref.as_deref() {
+                let _ = self.secrets.remove(reference);
             }
-            Err(error) => {
-                // Roll back staged secret so old remains.
-                let _ = self.secrets.rollback_staged(&secret_ref);
-                // If we staged a new secret that overwrote old file name, restore old if existed.
-                if staged {
-                    if let Some(old_json) = old_secret_json.as_deref() {
-                        let _ = self.secrets.put(&secret_ref, old_json);
-                    } else if current.secret_headers_ref.is_none() {
-                        // No prior secret; ensure no final file left from staged commit attempt.
-                        let _ = self.secrets.remove(&secret_ref);
-                    }
+            if let (Some(auth), Some(credential)) = (self.auth.as_ref(), new_credential.as_ref()) {
+                let _ = auth.logout(&credential.id);
+            }
+            return Err(anyhow!(redact_text(&error.to_string())));
+        }
+
+        let mut cleanup_warnings = Vec::new();
+        if current.secret_headers_ref.as_deref() != next_secret_ref.as_deref() {
+            if let Some(reference) = current.secret_headers_ref.as_deref() {
+                let injected_cleanup_failure = std::env::var("XIAO_INJECT_PROFILE_FAILURE")
+                    .ok()
+                    .is_some_and(|value| value == "secret_gc");
+                if injected_cleanup_failure {
+                    cleanup_warnings.push(
+                        "obsolete secret-header reference cleanup deferred: injected failure"
+                            .into(),
+                    );
+                } else if let Err(error) = self.secrets.remove(reference) {
+                    cleanup_warnings.push(format!(
+                        "obsolete secret-header reference cleanup deferred: {}",
+                        redact_text(&error.to_string())
+                    ));
                 }
-                Err(anyhow!(redact_text(&error.to_string())))
             }
         }
+        if current.credential_ref.as_deref() != next_credential_ref.as_deref() {
+            if let Some(reference) = current.credential_ref.as_deref() {
+                if let Some(auth) = self.auth.as_ref() {
+                    let injected_cleanup_failure = std::env::var("XIAO_INJECT_PROFILE_FAILURE")
+                        .ok()
+                        .is_some_and(|value| value == "credential_gc");
+                    if injected_cleanup_failure {
+                        cleanup_warnings
+                            .push("obsolete credential cleanup deferred: injected failure".into());
+                    } else if let Err(error) = auth.logout(reference) {
+                        cleanup_warnings.push(format!(
+                            "obsolete credential cleanup deferred: {}",
+                            redact_text(&error.to_string())
+                        ));
+                    }
+                } else {
+                    cleanup_warnings
+                        .push("obsolete credential cleanup requires the auth service".into());
+                }
+            }
+        }
+        if endpoint_changed
+            && (edit.keep_credential_on_endpoint_change
+                || edit.keep_safe_headers_on_endpoint_change
+                || edit.keep_secret_headers_on_endpoint_change)
+        {
+            if let Err(error) = self.storage.audit(
+                owner_id,
+                "custom_profile_endpoint_credentials_retained",
+                &format!(
+                    "profile_id={profile_id};credential={};safe_headers={};secret_headers={}",
+                    edit.keep_credential_on_endpoint_change,
+                    edit.keep_safe_headers_on_endpoint_change,
+                    edit.keep_secret_headers_on_endpoint_change
+                ),
+            ) {
+                cleanup_warnings.push(format!(
+                    "retention audit deferred: {}",
+                    redact_text(&error.to_string())
+                ));
+            }
+        }
+        if !cleanup_warnings.is_empty() {
+            let audit = cleanup_warnings.join("; ");
+            if let Err(error) = self.storage.audit(
+                owner_id,
+                "custom_profile_cleanup_warning",
+                &format!("profile_id={profile_id};{audit}"),
+            ) {
+                cleanup_warnings.push(format!(
+                    "cleanup warning audit deferred: {}",
+                    redact_text(&error.to_string())
+                ));
+            }
+        }
+
+        let profile = self
+            .storage
+            .with_conn(|connection| {
+                connection
+                    .query_row(
+                        "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
+                        params![owner_id, profile_id],
+                        row_profile,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })?
+            .ok_or_else(|| anyhow!("edited Custom profile is missing"))?;
+        Ok(CustomProfileEditResult {
+            profile,
+            cleanup_warnings,
+        })
+    }
+
+    /// Delete a profile through the same application service as create/edit.
+    /// The profile row is authoritative once its transaction commits; secret
+    /// and credential cleanup is deliberately post-commit and therefore
+    /// returns bounded warnings instead of manufacturing a rollback/error.
+    pub fn delete_with_warnings(
+        &self,
+        owner_id: &str,
+        profile_id: &str,
+    ) -> Result<CustomProfileDeleteResult> {
+        let current = ProviderProfileStore::new(self.storage.clone())
+            .get(owner_id, profile_id)?
+            .ok_or_else(|| anyhow!("Custom profile not found for owner"))?;
+        let credential_ref =
+            ProviderProfileStore::new(self.storage.clone()).delete(owner_id, profile_id)?;
+        let mut cleanup_warnings = Vec::new();
+
+        if let Some(reference) = current.secret_headers_ref.as_deref() {
+            if let Err(error) = self.secrets.remove(reference) {
+                cleanup_warnings.push(format!(
+                    "obsolete secret-header reference cleanup deferred: {}",
+                    redact_text(&error.to_string())
+                ));
+            }
+        }
+        if let Some(reference) = credential_ref.as_deref() {
+            if let Some(auth) = self.auth.as_ref() {
+                if let Err(error) = auth.logout(reference) {
+                    cleanup_warnings.push(format!(
+                        "obsolete credential cleanup deferred: {}",
+                        redact_text(&error.to_string())
+                    ));
+                }
+            } else {
+                cleanup_warnings
+                    .push("obsolete credential cleanup requires the auth service".into());
+            }
+        }
+        if !cleanup_warnings.is_empty() {
+            let audit = cleanup_warnings.join("; ");
+            if let Err(error) = self.storage.audit(
+                owner_id,
+                "custom_profile_cleanup_warning",
+                &format!("profile_id={profile_id};{audit}"),
+            ) {
+                cleanup_warnings.push(format!(
+                    "cleanup warning audit deferred: {}",
+                    redact_text(&error.to_string())
+                ));
+            }
+        }
+        Ok(CustomProfileDeleteResult {
+            credential_ref,
+            cleanup_warnings,
+        })
     }
 }
 
@@ -754,7 +1108,9 @@ fn row_profile_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderProfil
         model_discovery: row.get::<_, i64>(13)? != 0,
         tool_protocol: row.get(14)?,
         evidence: row.get(15)?,
-        probed_at: row.get(16)?,
+        probe_status: row.get(16)?,
+        probe_version: row.get::<_, i64>(17)? as u32,
+        probed_at: row.get(18)?,
     })
 }
 
@@ -836,9 +1192,6 @@ fn validate_secret_headers(headers: &BTreeMap<String, String>) -> Result<()> {
             return Err(anyhow!("Custom secret header name or value is invalid"));
         }
     }
-    if headers.is_empty() {
-        return Err(anyhow!("secret headers must not be empty when provided"));
-    }
     Ok(())
 }
 
@@ -874,6 +1227,60 @@ fn short_owner(owner_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn fixture() -> (
+        Arc<Storage>,
+        Arc<AuthManager>,
+        SecretStore,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let config = Arc::new(tokio::sync::RwLock::new(crate::config::AppConfig::default()));
+        let auth = Arc::new(AuthManager::with_config(
+            storage.clone(),
+            directory.path().join("secrets"),
+            config,
+        ));
+        let secrets = auth.secrets().clone();
+        (storage, auth, secrets, directory)
+    }
+
+    fn probed_model(profile_id: &str, model_id: &str) -> ProviderProfileModelRecord {
+        ProviderProfileModelRecord {
+            profile_id: profile_id.into(),
+            model_id: model_id.into(),
+            text_capable: true,
+            vision_capable: false,
+            file_input_capable: false,
+            native_tools: true,
+            structured_output: true,
+            continuation: true,
+            native_tools_state: "supported".into(),
+            structured_output_state: "supported".into(),
+            continuation_state: "supported".into(),
+            vision_state: "unknown".into(),
+            file_input_state: "unknown".into(),
+            model_discovery: true,
+            tool_protocol: "native".into(),
+            evidence: "deterministic exact-model probe".into(),
+            probe_status: "completed".into(),
+            probe_version: 1,
+            probed_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn secret_filenames(directory: &tempfile::TempDir) -> Vec<String> {
+        let mut names = std::fs::read_dir(directory.path().join("secrets"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    static PROFILE_ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
     #[test]
     fn endpoint_edit_clears_credentials_and_headers() {
@@ -900,5 +1307,371 @@ mod tests {
         assert_eq!(changed.endpoint, "https://b.example/v1");
         assert!(changed.credential_ref.is_none());
         assert!(changed.safe_headers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn custom_profile_a_secrets_never_reach_profile_b() {
+        let (storage, auth, secrets, _directory) = fixture();
+        let service = CustomProfileService::with_auth(storage, secrets.clone(), auth.clone());
+        let profile_a = service
+            .create_profile(
+                "owner:test",
+                "profile-a",
+                "https://a.example/v1",
+                "openai_chat_completions",
+                [("X-Profile-A", "safe-a")]
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                [("X-Secret-A", "secret-a")]
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                Some("API_KEY_A"),
+            )
+            .unwrap()
+            .profile;
+        let profile_b = service
+            .create_profile(
+                "owner:test",
+                "profile-b",
+                "https://b.example/v1",
+                "openai_chat_completions",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                None,
+            )
+            .unwrap()
+            .profile;
+
+        assert_eq!(
+            profile_a
+                .secret_headers(&secrets)
+                .unwrap()
+                .get("X-Secret-A")
+                .map(String::as_str),
+            Some("secret-a")
+        );
+        assert!(profile_b.merged_headers(&secrets).unwrap().is_empty());
+        assert!(profile_b.credential_ref.is_none());
+        assert!(profile_a
+            .credential_ref
+            .as_deref()
+            .and_then(|id| auth.credential(id).unwrap())
+            .is_some_and(|credential| credential.api_key.as_deref() == Some("API_KEY_A")));
+    }
+
+    #[test]
+    fn existing_credential_ref_must_be_same_owner_and_custom_provider() {
+        let (storage, auth, secrets, _directory) = fixture();
+        let service = CustomProfileService::with_auth(storage.clone(), secrets, auth.clone());
+        let credential = auth
+            .create_api_key_credential("custom", "owner-a", "API_KEY_A")
+            .unwrap();
+        storage
+            .set_account_owner("owner:a", &credential.id)
+            .unwrap();
+
+        let cross_owner = service
+            .create_profile_with_credential_ref(
+                "owner:b",
+                "cross-owner",
+                "https://b.example/v1",
+                "openai_chat_completions",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                Some(&credential.id),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(cross_owner.contains("another owner"));
+        assert!(ProviderProfileStore::new(storage.clone())
+            .list("owner:b")
+            .unwrap()
+            .is_empty());
+
+        let other_provider = auth
+            .create_api_key_credential("codex", "codex", "OAUTH_MATERIAL")
+            .unwrap();
+        storage
+            .set_account_owner("owner:a", &other_provider.id)
+            .unwrap();
+        let wrong_provider = service
+            .create_profile_with_credential_ref(
+                "owner:a",
+                "wrong-provider",
+                "https://a.example/v1",
+                "openai_chat_completions",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                Some(&other_provider.id),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_provider.contains("not a Custom credential"));
+    }
+
+    #[test]
+    fn endpoint_replacement_swaps_all_profile_scoped_secrets_in_one_patch() {
+        let (storage, auth, secrets, _directory) = fixture();
+        let service =
+            CustomProfileService::with_auth(storage.clone(), secrets.clone(), auth.clone());
+        let old = service
+            .create_profile(
+                "owner:test",
+                "replace-me",
+                "https://old.example/v1",
+                "openai_chat_completions",
+                [("X-Old-Safe", "safe-old")]
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                [("X-Old-Secret", "secret-old")]
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                Some("API_KEY_OLD"),
+            )
+            .unwrap()
+            .profile;
+        let old_credential = old.credential_ref.clone().unwrap();
+        let old_secret_ref = old.secret_headers_ref.clone().unwrap();
+        ProviderProfileStore::new(storage.clone())
+            .replace_models(
+                "owner:test",
+                &old.profile_id,
+                &[probed_model(&old.profile_id, "old-model")],
+            )
+            .unwrap();
+
+        let edited = service
+            .edit_with_warnings(
+                "owner:test",
+                &old.profile_id,
+                CustomProfileEdit {
+                    endpoint: Some("https://new.example/v1".into()),
+                    api_key: Some("API_KEY_NEW".into()),
+                    safe_headers: Some(
+                        [("X-New-Safe", "safe-new")]
+                            .into_iter()
+                            .map(|(key, value)| (key.into(), value.into()))
+                            .collect(),
+                    ),
+                    secret_headers: Some(
+                        [("X-New-Secret", "secret-new")]
+                            .into_iter()
+                            .map(|(key, value)| (key.into(), value.into()))
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let current = edited.profile;
+        assert_eq!(current.endpoint, "https://new.example/v1");
+        assert_eq!(
+            current
+                .safe_headers()
+                .unwrap()
+                .get("X-New-Safe")
+                .map(String::as_str),
+            Some("safe-new")
+        );
+        assert_eq!(
+            current
+                .secret_headers(&secrets)
+                .unwrap()
+                .get("X-New-Secret")
+                .map(String::as_str),
+            Some("secret-new")
+        );
+        assert_ne!(
+            current.credential_ref.as_deref(),
+            Some(old_credential.as_str())
+        );
+        assert_ne!(
+            current.secret_headers_ref.as_deref(),
+            Some(old_secret_ref.as_str())
+        );
+        assert!(auth.credential(&old_credential).unwrap().is_none());
+        assert!(secrets.get(&old_secret_ref).unwrap().is_none());
+        assert!(current
+            .credential_ref
+            .as_deref()
+            .and_then(|id| auth.credential(id).unwrap())
+            .is_some_and(|credential| credential.api_key.as_deref() == Some("API_KEY_NEW")));
+        assert!(ProviderProfileStore::new(storage.clone())
+            .models(&current.profile_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(current.reachability, "unknown");
+        assert!(current.last_probe_at.is_none());
+    }
+
+    #[test]
+    fn profile_db_failure_after_secret_staging_leaves_old_state_and_no_new_refs() {
+        let (storage, auth, secrets, directory) = fixture();
+        let service =
+            CustomProfileService::with_auth(storage.clone(), secrets.clone(), auth.clone());
+        let old = service
+            .create_profile(
+                "owner:test",
+                "stable",
+                "https://stable.example/v1",
+                "openai_chat_completions",
+                BTreeMap::new(),
+                [("X-Stable", "stable-secret")]
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                Some("STABLE_KEY"),
+            )
+            .unwrap()
+            .profile;
+        let before_files = secret_filenames(&directory);
+        storage
+            .with_conn(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER reject_profile_edit BEFORE UPDATE ON provider_profiles
+                     WHEN NEW.alias='reject'
+                     BEGIN SELECT RAISE(FAIL,'synthetic profile DB failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let error = service
+            .edit_with_warnings(
+                "owner:test",
+                &old.profile_id,
+                CustomProfileEdit {
+                    alias: Some("reject".into()),
+                    api_key: Some("NEW_KEY_MUST_NOT_COMMIT".into()),
+                    secret_headers: Some(
+                        [("X-New", "new-secret")]
+                            .into_iter()
+                            .map(|(key, value)| (key.into(), value.into()))
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("synthetic profile DB failure"));
+        let current = ProviderProfileStore::new(storage.clone())
+            .get("owner:test", &old.profile_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.alias, "stable");
+        assert_eq!(current.credential_ref, old.credential_ref);
+        assert_eq!(current.secret_headers_ref, old.secret_headers_ref);
+        assert_eq!(secret_filenames(&directory), before_files);
+        assert!(!auth
+            .accounts(Some("custom"))
+            .unwrap()
+            .iter()
+            .any(|account| auth.credential(&account.id).unwrap().is_some_and(
+                |credential| credential.api_key.as_deref() == Some("NEW_KEY_MUST_NOT_COMMIT")
+            )));
+        storage
+            .with_conn(|connection| {
+                connection.execute_batch("DROP TRIGGER reject_profile_edit;")?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn post_commit_secret_gc_failure_is_success_with_bounded_warning() {
+        let _guard = PROFILE_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let (storage, auth, secrets, _directory) = fixture();
+        let service = CustomProfileService::with_auth(storage, secrets.clone(), auth);
+        let old = service
+            .create_profile(
+                "owner:test",
+                "gc",
+                "https://old.example/v1",
+                "openai_chat_completions",
+                BTreeMap::new(),
+                [("X-Old", "old-secret")]
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                None,
+            )
+            .unwrap()
+            .profile;
+        let old_ref = old.secret_headers_ref.clone().unwrap();
+        std::env::set_var("XIAO_INJECT_PROFILE_FAILURE", "secret_gc");
+        let result = service
+            .edit_with_warnings(
+                "owner:test",
+                &old.profile_id,
+                CustomProfileEdit {
+                    endpoint: Some("https://new.example/v1".into()),
+                    secret_headers: Some(
+                        [("X-New", "new-secret")]
+                            .into_iter()
+                            .map(|(key, value)| (key.into(), value.into()))
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::env::remove_var("XIAO_INJECT_PROFILE_FAILURE");
+        assert_eq!(result.profile.endpoint, "https://new.example/v1");
+        assert!(result
+            .cleanup_warnings
+            .iter()
+            .any(|warning| warning.contains("secret-header") && warning.contains("deferred")));
+        assert!(secrets.get(&old_ref).unwrap().is_some());
+        assert_ne!(
+            result.profile.secret_headers_ref.as_deref(),
+            Some(old_ref.as_str())
+        );
+    }
+
+    #[test]
+    fn profile_delete_commits_then_collects_versioned_secret_and_credential() {
+        let (storage, auth, secrets, _directory) = fixture();
+        let service =
+            CustomProfileService::with_auth(storage.clone(), secrets.clone(), auth.clone());
+        let profile = service
+            .create_profile(
+                "owner:test",
+                "delete-me",
+                "https://delete.example/v1",
+                "openai_chat_completions",
+                BTreeMap::new(),
+                [("X-Secret", "delete-secret")]
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                Some("DELETE_KEY"),
+            )
+            .unwrap()
+            .profile;
+        let secret_ref = profile.secret_headers_ref.clone().unwrap();
+        let credential_ref = profile.credential_ref.clone().unwrap();
+        let result = service
+            .delete_with_warnings("owner:test", &profile.profile_id)
+            .unwrap();
+        assert!(result.cleanup_warnings.is_empty());
+        assert_eq!(
+            result.credential_ref.as_deref(),
+            Some(credential_ref.as_str())
+        );
+        assert!(ProviderProfileStore::new(storage.clone())
+            .get("owner:test", &profile.profile_id)
+            .unwrap()
+            .is_none());
+        assert!(secrets.get(&secret_ref).unwrap().is_none());
+        assert!(auth.credential(&credential_ref).unwrap().is_none());
     }
 }

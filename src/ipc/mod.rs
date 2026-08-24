@@ -33,8 +33,7 @@ use crate::{
     providers::{ProviderProfileStore, ToolProtocol},
     security::{redact::redact_text, secrets::SecretStore},
     skills::{FilesystemSkills, SkillStore},
-    storage::{ProviderProfileInput, ProviderProfileModelRecord},
-    telegram::client::TelegramClient,
+    storage::ProviderProfileModelRecord,
 };
 
 #[derive(Clone)]
@@ -167,6 +166,10 @@ struct CustomProfileActionRequest {
     remove_api_key: bool,
     #[serde(default)]
     keep_credential: bool,
+    #[serde(default)]
+    keep_safe_headers: bool,
+    #[serde(default)]
+    keep_secret_headers: bool,
     #[serde(default)]
     headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -489,7 +492,14 @@ async fn admin_snapshot(
     }
     let cfg = state.app.config.read().await.clone();
     let store = SecretStore::new(cfg.paths.secrets_dir.clone());
-    let bot = store.get("telegram-bot-token").map_err(bad)?;
+    let control = state.app.storage.telegram_control_state().map_err(bad)?;
+    let bot = control
+        .as_ref()
+        .and_then(|state| state.bot_token_ref.as_deref())
+        .map(|reference| store.get(reference))
+        .transpose()
+        .map_err(bad)?
+        .flatten();
     let custom_api_key_configured = stored_provider_api_key(&state.app, "custom")
         .map_err(bad)?
         .is_some();
@@ -514,7 +524,7 @@ async fn admin_snapshot(
         },
         "telegram": {
             "token_configured": bot.is_some(),
-            "allowed_chat_ids": cfg.telegram.access.allowed_chat_ids
+            "allowed_chat_ids": control.as_ref().map(|state| state.allowed_chat_ids.clone()).unwrap_or_default()
         },
         "config": {
             "custom": {
@@ -715,17 +725,9 @@ async fn test_telegram(
     if !authorized_admin(&headers, &state) {
         return Err(deny());
     }
-    let cfg = state.app.config.read().await.clone();
-    let token = match req.token.filter(|x| !x.trim().is_empty()) {
-        Some(v) => v,
-        None => SecretStore::new(cfg.paths.secrets_dir)
-            .get("telegram-bot-token")
-            .map_err(bad)?
-            .ok_or_else(|| bad("Telegram token is not configured"))?,
-    };
-    let bot = TelegramClient::new(token)
-        .map_err(bad)?
-        .get_me()
+    let service = TelegramSetupService::new(state.app.clone(), state.config_path.clone());
+    let bot = service
+        .test_connection(req.token.as_deref())
         .await
         .map_err(bad)?;
     Ok(Json(
@@ -764,6 +766,7 @@ async fn manager_telegram_action(
                     confirm_owner_change: req.confirm_owner_change,
                     allowed_chat_ids: req.allowed_chat_ids,
                     test_connection: false,
+                    resolve_legacy_owners: false,
                 })
                 .await
                 .map_err(bad)?;
@@ -778,6 +781,7 @@ async fn manager_telegram_action(
                     confirm_owner_change: req.confirm_owner_change,
                     allowed_chat_ids: req.allowed_chat_ids,
                     test_connection: true,
+                    resolve_legacy_owners: false,
                 })
                 .await
                 .map_err(bad)?;
@@ -852,17 +856,10 @@ fn stored_provider_api_key(app: &AppState, provider: &str) -> Result<Option<Stri
 }
 
 async fn management_owner(state: &ApiState) -> Result<String> {
-    let access = state.app.config.read().await.telegram.access.clone();
-    if access.owner_resolution_required() {
-        return Err(anyhow!(
-            "multiple legacy owners require explicit owner resolution"
-        ));
-    }
-    let owner = if let Some(user_id) = access.owner_user_id {
-        state.app.resolve_telegram_owner(user_id)?.owner_id
-    } else {
-        state.app.storage.management_owner_id()?
-    };
+    // The installation owner is durable SQLite state. The TOML owner field is
+    // only a compatibility projection and must never be allowed to rebind the
+    // owner when it is stale or manually edited.
+    let owner = state.app.storage.management_owner_id()?;
     MemoryStore::with_workspace(state.app.storage.clone(), state.app.identity.clone())
         .reconcile(&owner)?;
     FilesystemSkills::new(
@@ -1031,85 +1028,22 @@ async fn manager_custom_profile_action(
                 .ok_or_else(|| bad("endpoint is required"))?;
             let protocol = req.protocol.as_deref().unwrap_or("openai_chat_completions");
             let safe_headers = req.headers.clone().unwrap_or_default();
-            let safe_json = serde_json::to_string(&safe_headers).map_err(bad)?;
-            let mut profile = profiles
-                .create(ProviderProfileInput {
-                    profile_id: None,
-                    owner_id: owner.clone(),
-                    alias: alias.to_owned(),
-                    endpoint: endpoint.to_owned(),
-                    protocol: protocol.to_owned(),
-                    credential_ref: None,
-                    safe_headers_json: safe_json,
-                })
-                .map_err(|error| bad(redact_text(&error.to_string())))?;
-            // P1-4: secret_headers -> SecretStore write-only, only names ever in JSON.
-            if let Some(secret_map) = req.secret_headers.clone() {
-                if !secret_map.is_empty() {
-                    let secret_ref = crate::providers::secret_headers_ref_for(&profile.profile_id);
-                    let json = serde_json::to_string(&secret_map).map_err(bad)?;
-                    if let Err(error) = secrets.put(&secret_ref, &json) {
-                        let _ = profiles.delete_with_secrets(&owner, &profile.profile_id, &secrets);
-                        return Err(bad(redact_text(&error.to_string())));
-                    }
-                    if let Err(error) = state.app.storage.with_conn(|connection| {
-                        connection.execute(
-                            "UPDATE provider_profiles SET secret_headers_ref=? WHERE profile_id=?",
-                            rusqlite::params![secret_ref, profile.profile_id],
-                        )?;
-                        Ok(())
-                    }) {
-                        let _ = secrets.remove(&secret_ref);
-                        let _ = profiles.delete_with_secrets(&owner, &profile.profile_id, &secrets);
-                        return Err(bad(error));
-                    }
-                    let names = secret_map.keys().cloned().collect::<Vec<_>>().join(",");
-                    let _ = state.app.storage.audit(
-                        &owner,
-                        "custom_profile_secret_headers_set",
-                        &redact_text(&format!(
-                            "profile_id={} headers={}",
-                            profile.profile_id, names
-                        )),
-                    );
-                }
-            }
-            if req.clear_secret_headers {
-                let secret_ref = crate::providers::secret_headers_ref_for(&profile.profile_id);
-                let _ = secrets.remove(&secret_ref);
-                let _ = secrets.rollback_staged(&secret_ref);
-            }
-            if let Some(key) = req
-                .api_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-            {
-                let credential = match state
-                    .app
-                    .auth
-                    .create_api_key_credential("custom", alias, key)
-                {
-                    Ok(credential) => credential,
-                    Err(error) => {
-                        let _ = profiles.delete_with_secrets(&owner, &profile.profile_id, &secrets);
-                        return Err(bad(error));
-                    }
-                };
-                if let Err(error) = state.app.storage.set_account_owner(&owner, &credential.id) {
-                    let _ = state.app.auth.logout(&credential.id);
-                    let _ = profiles.delete_with_secrets(&owner, &profile.profile_id, &secrets);
-                    return Err(bad(error));
-                }
-                if let Err(error) =
-                    profiles.set_credential(&owner, &profile.profile_id, Some(&credential.id))
-                {
-                    let _ = state.app.auth.logout(&credential.id);
-                    let _ = profiles.delete_with_secrets(&owner, &profile.profile_id, &secrets);
-                    return Err(bad(error));
-                }
-                profile.credential_ref = Some(credential.id);
-            }
+            let result = crate::providers::CustomProfileService::with_auth(
+                state.app.storage.clone(),
+                secrets.clone(),
+                state.app.auth.clone(),
+            )
+            .create_profile(
+                &owner,
+                alias,
+                endpoint,
+                protocol,
+                safe_headers,
+                req.secret_headers.clone().unwrap_or_default(),
+                req.api_key.as_deref(),
+            )
+            .map_err(|error| bad(redact_text(&error.to_string())))?;
+            let profile = result.profile;
             state
                 .app
                 .storage
@@ -1137,9 +1071,10 @@ async fn manager_custom_profile_action(
                 .filter(|value| !value.is_empty())
                 .is_some_and(|value| value != prior.endpoint);
             // P1-5: atomic edit via CustomProfileService (validate -> stage secret -> DB txn -> commit -> delete old -> rollback on fail -> invalidate models on endpoint change)
-            let service = crate::providers::CustomProfileService::new(
+            let service = crate::providers::CustomProfileService::with_auth(
                 state.app.storage.clone(),
                 secrets.clone(),
+                state.app.auth.clone(),
             );
             let edit = crate::providers::CustomProfileEdit {
                 alias: req.alias.clone(),
@@ -1149,62 +1084,15 @@ async fn manager_custom_profile_action(
                 secret_headers: req.secret_headers.clone(),
                 clear_secret_headers: req.clear_secret_headers,
                 keep_credential_on_endpoint_change: req.keep_credential,
+                keep_safe_headers_on_endpoint_change: req.keep_safe_headers,
+                keep_secret_headers_on_endpoint_change: req.keep_secret_headers,
+                api_key: req.api_key.clone(),
+                remove_api_key: req.remove_api_key,
             };
-            let mut profile = service.edit(&owner, profile_id, edit).map_err(bad)?;
-            // Credential handling remains after atomic profile edit; endpoint change already cleared credential in DB if not kept.
-            if endpoint_changed && !req.keep_credential {
-                if let Some(reference) = prior.credential_ref.as_deref() {
-                    let _ = state.app.auth.logout(reference);
-                }
-            }
-            if req.remove_api_key {
-                if let Some(reference) = profiles
-                    .get(&owner, profile_id)
-                    .map_err(bad)?
-                    .and_then(|profile| profile.credential_ref)
-                {
-                    profiles
-                        .set_credential(&owner, profile_id, None)
-                        .map_err(bad)?;
-                    let _ = state.app.auth.logout(&reference);
-                }
-            }
-            if let Some(key) = req
-                .api_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-            {
-                let current = profiles
-                    .get(&owner, profile_id)
-                    .map_err(bad)?
-                    .ok_or_else(|| bad("Custom profile not found"))?;
-                let old = current.credential_ref.clone();
-                let credential = state
-                    .app
-                    .auth
-                    .create_api_key_credential("custom", &current.alias, key)
-                    .map_err(bad)?;
-                if let Err(error) = state.app.storage.set_account_owner(&owner, &credential.id) {
-                    let _ = state.app.auth.logout(&credential.id);
-                    return Err(bad(error));
-                }
-                if let Err(error) =
-                    profiles.set_credential(&owner, profile_id, Some(&credential.id))
-                {
-                    let _ = state.app.auth.logout(&credential.id);
-                    return Err(bad(error));
-                }
-                if let Some(reference) = old {
-                    if reference != credential.id {
-                        let _ = state.app.auth.logout(&reference);
-                    }
-                }
-                profile = profiles
-                    .get(&owner, profile_id)
-                    .map_err(bad)?
-                    .ok_or_else(|| bad("Custom profile not found"))?;
-            }
+            let result = service
+                .edit_with_warnings(&owner, profile_id, edit)
+                .map_err(bad)?;
+            let profile = result.profile;
             state
                 .app
                 .storage
@@ -1212,8 +1100,10 @@ async fn manager_custom_profile_action(
                     &owner,
                     "custom_profile_edited",
                     &redact_text(&format!(
-                        "profile_id={profile_id};endpoint_changed={endpoint_changed};credential_kept={}",
-                        endpoint_changed && req.keep_credential
+                        "profile_id={profile_id};endpoint_changed={endpoint_changed};credential_kept={};safe_headers_kept={};secret_headers_kept={}",
+                        endpoint_changed && req.keep_credential,
+                        endpoint_changed && req.keep_safe_headers,
+                        endpoint_changed && req.keep_secret_headers
                     )),
                 )
                 .map_err(bad)?;
@@ -1236,6 +1126,9 @@ async fn manager_custom_profile_action(
                     "header_names": header_names,
                 },
                 "credential_cleared_on_endpoint_change": endpoint_changed && !req.keep_credential,
+                "safe_headers_cleared_on_endpoint_change": endpoint_changed && !req.keep_safe_headers,
+                "secret_headers_cleared_on_endpoint_change": endpoint_changed && !req.keep_secret_headers,
+                "cleanup_warnings": result.cleanup_warnings,
             })))
         }
         "edit_endpoint" => {
@@ -1247,27 +1140,34 @@ async fn manager_custom_profile_action(
                 .endpoint
                 .as_deref()
                 .ok_or_else(|| bad("endpoint is required"))?;
-            let prior = profiles
-                .get(&owner, profile_id)
-                .map_err(bad)?
-                .ok_or_else(|| bad("Custom profile not found"))?;
-            profiles
-                .change_endpoint_with_secrets(&owner, profile_id, endpoint, &secrets)
-                .map_err(bad)?;
-            if let Some(reference) = prior.credential_ref {
-                let _ = state.app.auth.logout(&reference);
-            }
+            let result = crate::providers::CustomProfileService::with_auth(
+                state.app.storage.clone(),
+                secrets.clone(),
+                state.app.auth.clone(),
+            )
+            .edit_with_warnings(
+                &owner,
+                profile_id,
+                crate::providers::CustomProfileEdit {
+                    endpoint: Some(endpoint.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .map_err(bad)?;
             state
                 .app
                 .storage
                 .audit(
                     &owner,
                     "custom_profile_endpoint_changed",
-                    &redact_text(&format!("profile_id={profile_id};credential_cleared=true")),
+                    &redact_text(&format!(
+                        "profile_id={profile_id};credential_cleared=true;cleanup_warnings={}",
+                        result.cleanup_warnings.len()
+                    )),
                 )
                 .map_err(bad)?;
             Ok(Json(
-                json!({"ok":true,"credential_cleared":true,"headers_cleared":true}),
+                json!({"ok":true,"credential_cleared":true,"headers_cleared":true,"cleanup_warnings":result.cleanup_warnings}),
             ))
         }
         "test" => {
@@ -1351,6 +1251,8 @@ async fn manager_custom_profile_action(
                             tool_protocol: ToolProtocol::ChatOnly.as_str().into(),
                             evidence:
                                 "model discovered; active capability probe budget not spent".into(),
+                            probe_status: "unprobed".into(),
+                            probe_version: 1,
                             probed_at: now.clone(),
                         },
                     ));
@@ -1439,22 +1341,29 @@ async fn manager_custom_profile_action(
                 .profile_id
                 .as_deref()
                 .ok_or_else(|| bad("profile_id is required"))?;
-            let credential = profiles
-                .delete_with_secrets(&owner, profile_id, &secrets)
-                .map_err(bad)?;
-            if let Some(reference) = credential {
-                let _ = state.app.auth.logout(&reference);
-            }
+            let result = crate::providers::CustomProfileService::with_auth(
+                state.app.storage.clone(),
+                secrets.clone(),
+                state.app.auth.clone(),
+            )
+            .delete_with_warnings(&owner, profile_id)
+            .map_err(bad)?;
             state
                 .app
                 .storage
                 .audit(
                     &owner,
                     "custom_profile_deleted",
-                    &redact_text(&format!("profile_id={profile_id}")),
+                    &redact_text(&format!(
+                        "profile_id={profile_id};cleanup_warnings={}",
+                        result.cleanup_warnings.len()
+                    )),
                 )
                 .map_err(bad)?;
-            Ok(Json(json!({"ok":true})))
+            Ok(Json(json!({
+                "ok": true,
+                "cleanup_warnings": result.cleanup_warnings
+            })))
         }
         _ => Err(bad("unsupported Custom profile action")),
     }
@@ -2659,6 +2568,8 @@ mod tests {
                 api_key: Some("SECRET_BROWSER_SENTINEL".into()),
                 remove_api_key: false,
                 keep_credential: false,
+                keep_safe_headers: false,
+                keep_secret_headers: false,
                 headers: Some(safe_headers),
                 secret_headers: None,
                 clear_secret_headers: false,
@@ -2692,6 +2603,8 @@ mod tests {
                 api_key: Some("x".repeat(16_385)),
                 remove_api_key: false,
                 keep_credential: false,
+                keep_safe_headers: false,
+                keep_secret_headers: false,
                 headers: Some(BTreeMap::new()),
                 secret_headers: None,
                 clear_secret_headers: false,

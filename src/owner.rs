@@ -2,27 +2,25 @@ use serde::{Deserialize, Serialize};
 
 /// Stable, installation-local identity for Xiao's single owner.
 ///
-/// Telegram chat and topic identifiers deliberately never enter this value;
-/// they belong to `TelegramScope` and only namespace conversations.
+/// Telegram authentication is deliberately not part of this value. The
+/// current Telegram user is an `OwnerBinding` maintained by SQLite, while
+/// chat/topic identifiers remain `TelegramScope` conversation namespaces.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct OwnerIdentity {
     pub owner_id: String,
-    pub telegram_user_id: Option<i64>,
 }
 
 impl OwnerIdentity {
-    pub fn telegram(user_id: i64) -> Self {
+    pub fn from_owner_id(owner_id: impl Into<String>) -> Self {
         Self {
-            owner_id: format!("owner:telegram:{user_id}"),
-            telegram_user_id: Some(user_id),
+            owner_id: owner_id.into(),
         }
     }
 
-    pub fn local() -> Self {
-        Self {
-            owner_id: "owner:local".into(),
-            telegram_user_id: None,
-        }
+    /// Construct the only safe kind of new owner identity. Existing installs
+    /// get their ID from the durable `installation_owner` row instead.
+    pub fn new_installation() -> Self {
+        Self::from_owner_id(format!("owner:installation:{}", uuid::Uuid::new_v4()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -30,13 +28,27 @@ impl OwnerIdentity {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerBinding {
+    pub owner_id: String,
+    pub kind: OwnerBindingKind,
+    pub external_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerBindingKind {
+    TelegramUser,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn telegram_owner_is_independent_of_chat_and_topic() {
-        assert_eq!(OwnerIdentity::telegram(42), OwnerIdentity::telegram(42));
-        assert_eq!(OwnerIdentity::telegram(42).as_str(), "owner:telegram:42");
+    fn installation_owner_has_no_telegram_identity_semantics() {
+        let owner = OwnerIdentity::new_installation();
+        assert!(owner.as_str().starts_with("owner:installation:"));
+        assert!(!owner.as_str().starts_with("owner:telegram:"));
     }
 }

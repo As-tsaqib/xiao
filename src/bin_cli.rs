@@ -1172,6 +1172,8 @@ async fn custom_edit(
     let mut api_key = None;
     let mut remove_api_key = false;
     let mut keep_credential = false;
+    let mut keep_safe_headers = false;
+    let mut keep_secret_headers = false;
     let mut headers = None::<BTreeMap<String, String>>;
     let mut secret_headers = None::<BTreeMap<String, String>>;
     let mut clear_secret_headers = false;
@@ -1199,6 +1201,8 @@ async fn custom_edit(
             }
             "--remove-key" => remove_api_key = true,
             "--keep-credential" => keep_credential = true,
+            "--keep-safe-headers" => keep_safe_headers = true,
+            "--keep-secret-headers" => keep_secret_headers = true,
             "--clear-secret-headers" => clear_secret_headers = true,
             "--headers-file" => {
                 index += 1;
@@ -1255,6 +1259,8 @@ async fn custom_edit(
                     "api_key":api_key,
                     "remove_api_key":remove_api_key,
                     "keep_credential":keep_credential,
+                    "keep_safe_headers":keep_safe_headers,
+                    "keep_secret_headers":keep_secret_headers,
                     "headers":headers,
                     "secret_headers":secret_headers,
                     "clear_secret_headers":clear_secret_headers,
