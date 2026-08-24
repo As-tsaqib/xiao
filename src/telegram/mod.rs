@@ -2633,8 +2633,8 @@ mod tests {
             .unwrap();
 
         let model_page_one = last_callbacks(&telegram_probe);
-        assert_eq!(model_page_one.len(), 9);
-        let next = model_page_one[7].clone();
+        assert_eq!(model_page_one.len(), 10);
+        let next = model_page_one[8].clone();
         adapter
             .handle_update(callback(8, 100, 10, 10, next))
             .await
