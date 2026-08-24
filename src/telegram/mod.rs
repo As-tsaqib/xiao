@@ -737,6 +737,7 @@ impl TelegramAdapter {
         Ok(store.get_by_alias(principal, alias)?.is_some())
     }
 
+    #[allow(dead_code)]
     fn ensure_custom_alias_available(&self, principal: &str, alias: &str) -> Result<()> {
         if self.custom_alias_exists(principal, alias)? {
             return Err(anyhow!(
@@ -2554,9 +2555,9 @@ mod tests {
                     let nonce = body_str
                         .split("VISION-")
                         .nth(1)
-                        .and_then(|tail| tail.split(|c| c == '"' || c == '#' || c == '\'' || c == ' ' || c == '}' ).next())
+                        .and_then(|tail| tail.split(['"', '#', '\'', ' ', '}']).next())
                         .unwrap_or("")
-                        .split(|c| c == '\\' || c == '"' )
+                        .split(['\\', '"'])
                         .next()
                         .unwrap()
                         .trim();

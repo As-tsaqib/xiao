@@ -2616,10 +2616,10 @@ impl Storage {
                     .optional()
                     .map_err(Into::into)
                 })?;
-                if matches!(status.as_deref(), Some("downloaded") | Some("processing")) {
-                    if self.delete_attachment(&owner_id, &attachment_id)? {
-                        removed += 1;
-                    }
+                if matches!(status.as_deref(), Some("downloaded") | Some("processing"))
+                    && self.delete_attachment(&owner_id, &attachment_id)?
+                {
+                    removed += 1;
                 }
             }
         }
