@@ -15,125 +15,22 @@ jobs:
         with:
           ref: feat/v0.2.7-control-plane-unification
           fetch-depth: 0
-      - name: Patch CLI contract and integration formatting
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      - name: Apply architecture CLI JSON contract
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('src/bin_cli.rs')
-          t = p.read_text()
-          if 'fn cli_success_json(' not in t:
-              t = t.replace(
-                  'type CliResult<T> = std::result::Result<T, CliFailure>;\n\nstruct CliPresenter {',
-                  '''type CliResult<T> = std::result::Result<T, CliFailure>;
-
-fn cli_success_json(data: Value) -> Value {
-    json!({"status": "ok", "data": data})
-}
-
-fn cli_error_code(failure: &CliFailure) -> &'static str {
-    if failure.code == EXIT_USAGE && failure.message.starts_with("unknown command `") {
-        return "unknown_command";
-    }
-    match failure.code {
-        EXIT_USAGE => "usage",
-        EXIT_DAEMON_UNAVAILABLE => "daemon_unavailable",
-        EXIT_REJECTED => "rejected",
-        EXIT_NOT_FOUND => "not_found",
-        EXIT_LOCAL_IO => "local_io",
-        _ => "operation_failed",
-    }
-}
-
-fn cli_error_json(failure: &CliFailure, message: &str) -> Value {
-    json!({"status":"error","error":{"code":cli_error_code(failure),"message":message,"details":{}}})
-}
-
-struct CliPresenter {''', 1)
-
-              start = t.index('    fn success(&self, command: &str, data: Value) -> CliResult<()> {')
-              end = t.index('\n    fn line(&self, value:', start)
-              t = t[:start] + '''    fn success(&self, _command: &str, data: Value) -> CliResult<()> {
-        if self.options.quiet {
-            return Ok(());
-        }
-        if self.options.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&cli_success_json(data))
-                    .map_err(anyhow::Error::from)?
-            );
-            return Ok(());
-        }
-        render_human(&data);
-        Ok(())
-    }
-''' + t[end:]
-
-              start = t.index('        if self.options.json && !self.options.quiet {')
-              end = t.index('        } else {\n            eprintln!("xiao: {message}");', start)
-              t = t[:start] + '''        if self.options.json && !self.options.quiet {
-            eprintln!(
-                "{}",
-                serde_json::to_string(&cli_error_json(failure, &message)).unwrap_or_else(|_| {
-                    r#"{"status":"error","error":{"code":"serialization_error","message":"unable to serialize CLI error","details":{}}}"#.into()
-                })
-            );
-''' + t[end:]
-
-              marker = '    #[test]\n    fn app_json_schema_does_not_expose_view_buttons() {'
-              contract = '''    #[test]
-    fn cli_json_contract_matches_architecture_schema() {
-        let success = cli_success_json(json!({"answer": "hello"}));
-        assert_eq!(success.get("status").and_then(Value::as_str), Some("ok"));
-        assert_eq!(success.pointer("/data/answer").and_then(Value::as_str), Some("hello"));
-        assert!(success.get("ok").is_none());
-        assert!(success.get("command").is_none());
-        let failure = unknown_command("stats");
-        let error = cli_error_json(&failure, &failure.message);
-        assert_eq!(error.get("status").and_then(Value::as_str), Some("error"));
-        assert_eq!(error.pointer("/error/code").and_then(Value::as_str), Some("unknown_command"));
-        assert!(error.pointer("/error/details").is_some_and(Value::is_object));
-        assert!(error.get("ok").is_none());
-    }
-
-'''
-              if marker not in t:
-                  raise SystemExit('CLI JSON test marker missing')
-              t = t.replace(marker, contract + marker, 1)
-              p.write_text(t)
-
-          q = Path('tests/cli_integration.rs')
-          s = q.read_text()
-          s = s.replace('assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(false));', 'assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("error"));')
-          s = s.replace('Some("usage")', 'Some("unknown_command")')
-          if 'error/details' not in s:
-              needle = '    assert!(message.contains("unknown command `stats`"));\n'
-              s = s.replace(needle, '    assert!(value.pointer("/error/details").is_some_and(|v| v.is_object()));\n    assert!(value.get("ok").is_none());\n' + needle, 1)
-          # rustfmt-compatible layout for the two long command builders.
-          s = s.replace('let output = xiao().args(["stats", "--json"]).output().expect("run json typo");', '''let output = xiao()
-        .args(["stats", "--json"])
-        .output()
-        .expect("run json typo");''')
-          s = s.replace('let output = xiao().args(["model", "custom", "--help"]).output().expect("run subcommand help");', '''let output = xiao()
-        .args(["model", "custom", "--help"])
-        .output()
-        .expect("run subcommand help");''')
-          s = s.replace('assert_eq!(value.pointer("/error/code").and_then(|v| v.as_str()), Some("unknown_command"));', '''assert_eq!(
-        value.pointer("/error/code").and_then(|v| v.as_str()),
-        Some("unknown_command")
-    );''')
-          s = s.replace('let message = value.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or_default();', '''let message = value
-        .pointer("/error/message")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();''')
-          q.write_text(s)
-          PY
+          echo 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCnA9UGF0aCgnc3JjL2Jpbl9jbGkucnMnKQp0PXAucmVhZF90ZXh0KCkKaWYgJ2ZuIGNsaV9zdWNjZXNzX2pzb24oJyBub3QgaW4gdDoKICAgIGFuY2hvcj0ndHlwZSBDbGlSZXN1bHQ8VD4gPSBzdGQ6OnJlc3VsdDo6UmVzdWx0PFQsIENsaUZhaWx1cmU+O1xuXG5zdHJ1Y3QgQ2xpUHJlc2VudGVyIHsnCiAgICBpbnNlcnQ9JycndHlwZSBDbGlSZXN1bHQ8VD4gPSBzdGQ6OnJlc3VsdDo6UmVzdWx0PFQsIENsaUZhaWx1cmU+OwoKZm4gY2xpX3N1Y2Nlc3NfanNvbihkYXRhOiBWYWx1ZSkgLT4gVmFsdWUgewogICAganNvbiEoeyJzdGF0dXMiOiAib2siLCAiZGF0YSI6IGRhdGF9KQp9CgpmbiBjbGlfZXJyb3JfY29kZShmYWlsdXJlOiAmQ2xpRmFpbHVyZSkgLT4gJidzdGF0aWMgc3RyIHsKICAgIGlmIGZhaWx1cmUuY29kZSA9PSBFWElUX1VTQUdFICYmIGZhaWx1cmUubWVzc2FnZS5zdGFydHNfd2l0aCgidW5rbm93biBjb21tYW5kIGAiKSB7CiAgICAgICAgcmV0dXJuICJ1bmtub3duX2NvbW1hbmQiOwogICAgfQogICAgbWF0Y2ggZmFpbHVyZS5jb2RlIHsKICAgICAgICBFWElUX1VTQUdFID0+ICJ1c2FnZSIsCiAgICAgICAgRVhJVF9EQUVNT05fVU5BVkFJTEFCTEUgPT4gImRhZW1vbl91bmF2YWlsYWJsZSIsCiAgICAgICAgRVhJVF9SRUpFQ1RFRCA9PiAicmVqZWN0ZWQiLAogICAgICAgIEVYSVRfTk9UX0ZPVU5EID0+ICJub3RfZm91bmQiLAogICAgICAgIEVYSVRfTE9DQUxfSU8gPT4gImxvY2FsX2lvIiwKICAgICAgICBfID0+ICJvcGVyYXRpb25fZmFpbGVkIiwKICAgIH0KfQoKZm4gY2xpX2Vycm9yX2pzb24oZmFpbHVyZTogJkNsaUZhaWx1cmUsIG1lc3NhZ2U6ICZzdHIpIC0+IFZhbHVlIHsKICAgIGpzb24hKHsKICAgICAgICAic3RhdHVzIjogImVycm9yIiwKICAgICAgICAiZXJyb3IiOiB7CiAgICAgICAgICAgICJjb2RlIjogY2xpX2Vycm9yX2NvZGUoZmFpbHVyZSksCiAgICAgICAgICAgICJtZXNzYWdlIjogbWVzc2FnZSwKICAgICAgICAgICAgImRldGFpbHMiOiB7fSwKICAgICAgICB9CiAgICB9KQp9CgpzdHJ1Y3QgQ2xpUHJlc2VudGVyIHsnJycKICAgIGlmIGFuY2hvciBub3QgaW4gdDogcmFpc2UgU3lzdGVtRXhpdCgnQ2xpUmVzdWx0IGFuY2hvciBtaXNzaW5nJykKICAgIHQ9dC5yZXBsYWNlKGFuY2hvcixpbnNlcnQsMSkKICAgIHN0YXJ0PXQuaW5kZXgoJyAgICBmbiBzdWNjZXNzKCZzZWxmLCBjb21tYW5kOiAmc3RyLCBkYXRhOiBWYWx1ZSkgLT4gQ2xpUmVzdWx0PCgpPiB7JykKICAgIGVuZD10LmluZGV4KCdcbiAgICBmbiBsaW5lKCZzZWxmLCB2YWx1ZTonLHN0YXJ0KQogICAgdD10WzpzdGFydF0rJycnICAgIGZuIHN1Y2Nlc3MoJnNlbGYsIF9jb21tYW5kOiAmc3RyLCBkYXRhOiBWYWx1ZSkgLT4gQ2xpUmVzdWx0PCgpPiB7CiAgICAgICAgaWYgc2VsZi5vcHRpb25zLnF1aWV0IHsKICAgICAgICAgICAgcmV0dXJuIE9rKCgpKTsKICAgICAgICB9CiAgICAgICAgaWYgc2VsZi5vcHRpb25zLmpzb24gewogICAgICAgICAgICBwcmludGxuISgKICAgICAgICAgICAgICAgICJ7fSIsCiAgICAgICAgICAgICAgICBzZXJkZV9qc29uOjp0b19zdHJpbmdfcHJldHR5KCZjbGlfc3VjY2Vzc19qc29uKGRhdGEpKQogICAgICAgICAgICAgICAgICAgIC5tYXBfZXJyKGFueWhvdzo6RXJyb3I6OmZyb20pPwogICAgICAgICAgICApOwogICAgICAgICAgICByZXR1cm4gT2soKCkpOwogICAgICAgIH0KICAgICAgICByZW5kZXJfaHVtYW4oJmRhdGEpOwogICAgICAgIE9rKCgpKQogICAgfQonJycrdFtlbmQ6XQogICAgc3RhcnQ9dC5pbmRleCgnICAgICAgICBpZiBzZWxmLm9wdGlvbnMuanNvbiAmJiAhc2VsZi5vcHRpb25zLnF1aWV0IHsnKQogICAgZW5kPXQuaW5kZXgoJyAgICAgICAgfSBlbHNlIHtcbiAgICAgICAgICAgIGVwcmludGxuISgieGlhbzoge21lc3NhZ2V9Iik7JyxzdGFydCkKICAgIHQ9dFs6c3RhcnRdKycnICAgICAgICBpZiBzZWxmLm9wdGlvbnMuanNvbiAmJiAhc2VsZi5vcHRpb25zLnF1aWV0IHsKICAgICAgICAgICAgZXByaW50bG4hKAogICAgICAgICAgICAgICAgInt9IiwKICAgICAgICAgICAgICAgIHNlcmRlX2pzb246OnRvX3N0cmluZygmY2xpX2Vycm9yX2pzb24oZmFpbHVyZSwgJm1lc3NhZ2UpKS51bndyYXBfb3JfZWxzZSh8X3wgewogICAgICAgICAgICAgICAgICAgIHIjInsic3RhdHVzIjoiZXJyb3IiLCJlcnJvciI6eyJjb2RlIjoic2VyaWFsaXphdGlvbl9lcnJvciIsIm1lc3NhZ2UiOiJ1bmFibGUgdG8gc2VyaWFsaXplIENMSSBlcnJvciIsImRldGFpbHMiOnt9fX0iIy5pbnRvKCkKICAgICAgICAgICAgICAgIH0pCiAgICAgICAgICAgICk7CicnJyt0W2VuZDpdCiAgICBtYXJrZXI9JyAgICAjW3Rlc3RdXG4gICAgZm4gYXBwX2pzb25fc2NoZW1hX2RvZXNfbm90X2V4cG9zZV92aWV3X2J1dHRvbnMoKSB7JwogICAgY29udHJhY3Q9JycnICAgICNbdGVzdF0KICAgIGZuIGNsaV9qc29uX2NvbnRyYWN0X21hdGNoZXNfYXJjaGl0ZWN0dXJlX3NjaGVtYSgpIHsKICAgICAgICBsZXQgc3VjY2VzcyA9IGNsaV9zdWNjZXNzX2pzb24oanNvbiEoeyJhbnN3ZXIiOiAiaGVsbG8ifSkpOwogICAgICAgIGFzc2VydF9lcSEoc3VjY2Vzcy5nZXQoInN0YXR1cyIpLmFuZF90aGVuKFZhbHVlOjphc19zdHIpLCBTb21lKCJvayIpKTsKICAgICAgICBhc3NlcnRfZXEhKAogICAgICAgICAgICBzdWNjZXNzLnBvaW50ZXIoIi9kYXRhL2Fuc3dlciIpLmFuZF90aGVuKFZhbHVlOjphc19zdHIpLAogICAgICAgICAgICBTb21lKCJoZWxsbyIpCiAgICAgICAgKTsKICAgICAgICBhc3NlcnQhKHN1Y2Nlc3MuZ2V0KCJvayIpLmlzX25vbmUoKSk7CiAgICAgICAgYXNzZXJ0IShzdWNjZXNzLmdldCgiY29tbWFuZCIpLmlzX25vbmUoKSk7CgogICAgICAgIGxldCBmYWlsdXJlID0gdW5rbm93bl9jb21tYW5kKCJzdGF0cyIpOwogICAgICAgIGxldCBlcnJvciA9IGNsaV9lcnJvcl9qc29uKCZmYWlsdXJlLCAmZmFpbHVyZS5tZXNzYWdlKTsKICAgICAgICBhc3NlcnRfZXEhKGVycm9yLmdldCgic3RhdHVzIikuYW5kX3RoZW4oVmFsdWU6OmFzX3N0ciksIFNvbWUoImVycm9yIikpOwogICAgICAgIGFzc2VydF9lcSEoCiAgICAgICAgICAgIGVycm9yLnBvaW50ZXIoIi9lcnJvci9jb2RlIikuYW5kX3RoZW4oVmFsdWU6OmFzX3N0ciksCiAgICAgICAgICAgIFNvbWUoInVua25vd25fY29tbWFuZCIpCiAgICAgICAgKTsKICAgICAgICBhc3NlcnQhKGVycm9yCiAgICAgICAgICAgIC5wb2ludGVyKCIvZXJyb3IvZGV0YWlscyIpCiAgICAgICAgICAgIC5pc19zb21lX2FuZChWYWx1ZTo6aXNfb2JqZWN0KSk7CiAgICAgICAgYXNzZXJ0IShlcnJvci5nZXQoIm9rIikuaXNfbm9uZSgpKTsKICAgIH0KCicnJwogICAgaWYgbWFya2VyIG5vdCBpbiB0OiByYWlzZSBTeXN0ZW1FeGl0KCd0ZXN0IG1hcmtlciBtaXNzaW5nJykKICAgIHQ9dC5yZXBsYWNlKG1hcmtlcixjb250cmFjdCttYXJrZXIsMSkKcC53cml0ZV90ZXh0KHQpCg==' | base64 -d > /tmp/fix_cli_json.py
+          python3 /tmp/fix_cli_json.py
+          cargo fmt --all
+          cargo fmt --all -- --check
           git diff --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/bin_cli.rs tests/cli_integration.rs
+          git add src/bin_cli.rs
           if ! git diff --cached --quiet; then
             git commit -m 'fix: align CLI JSON with v0.2.7 application schema'
             git push origin HEAD:feat/v0.2.7-control-plane-unification
