@@ -1,14 +1,20 @@
 use std::{env, fs, process::Command};
 
 fn run(program: &str, args: &[&str]) {
-    let status = Command::new(program).args(args).status().expect("spawn command");
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .expect("spawn command");
     assert!(status.success(), "{program} {args:?} failed");
 }
 
 fn replace_once(path: &str, from: &str, to: &str) {
     let text = fs::read_to_string(path).unwrap_or_else(|_| panic!("read {path}"));
     let count = text.matches(from).count();
-    assert_eq!(count, 1, "{path}: expected one match, got {count}: {from:?}");
+    assert_eq!(
+        count, 1,
+        "{path}: expected one match, got {count}: {from:?}"
+    );
     fs::write(path, text.replacen(from, to, 1)).unwrap_or_else(|_| panic!("write {path}"));
 }
 
@@ -92,8 +98,39 @@ fn main() {
     run("node", &["--check", "module/webroot/assets/app.js"]);
     run("git", &["diff", "--check"]);
     run("git", &["config", "user.name", "github-actions[bot]"]);
-    run("git", &["config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"]);
-    run("git", &["add", "src/command/mod.rs", "src/ipc/mod.rs", "src/telegram/mod.rs", "module/webroot/assets/app.js", "build.rs"]);
-    run("git", &["commit", "-m", "fix: align parity regressions with v0.2.7 invariants"]);
-    run("git", &["push", "origin", "HEAD:feat/v0.2.7-control-plane-unification"]);
+    run(
+        "git",
+        &[
+            "config",
+            "user.email",
+            "41898282+github-actions[bot]@users.noreply.github.com",
+        ],
+    );
+    run(
+        "git",
+        &[
+            "add",
+            "src/command/mod.rs",
+            "src/ipc/mod.rs",
+            "src/telegram/mod.rs",
+            "module/webroot/assets/app.js",
+            "build.rs",
+        ],
+    );
+    run(
+        "git",
+        &[
+            "commit",
+            "-m",
+            "fix: align parity regressions with v0.2.7 invariants",
+        ],
+    );
+    run(
+        "git",
+        &[
+            "push",
+            "origin",
+            "HEAD:feat/v0.2.7-control-plane-unification",
+        ],
+    );
 }
