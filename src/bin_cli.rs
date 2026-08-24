@@ -113,10 +113,7 @@ impl CliPresenter {
                 "command": command,
                 "data": data,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&value).map_err(anyhow::Error::from)?
-            );
+            println!("{}", serde_json::to_string_pretty(&value)?);
             return Ok(());
         }
         render_human(&data);
@@ -183,8 +180,7 @@ impl DaemonClient {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(timeout)
-            .build()
-            .map_err(anyhow::Error::from)?;
+            .build()?;
         Ok(Self {
             http,
             endpoint: client.endpoint.trim_end_matches('/').to_owned(),
@@ -370,7 +366,7 @@ async fn run(options: GlobalOptions, args: Vec<String>, presenter: &CliPresenter
     if command.starts_with('/') || !TOP_LEVEL.contains(&command) {
         return Err(unknown_command(command));
     }
-    let paths = CliPaths::from_env().map_err(anyhow::Error::from)?;
+    let paths = CliPaths::from_env()?;
     match command {
         "setup" => setup(&paths, &options, presenter).await,
         "quickstart" => quickstart(&paths, &args[1..], presenter).await,
@@ -1464,14 +1460,10 @@ async fn setup(
             "xiao setup requires an interactive TTY; automation should use `xiao telegram set-token-file` and `xiao telegram set-owner`",
         ));
     }
-    let init = standalone::initialize(paths).map_err(anyhow::Error::from)?;
-    let status = standalone::daemon_status(paths, &init)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let init = standalone::initialize(paths)?;
+    let status = standalone::daemon_status(paths, &init).await?;
     if !status.reachable {
-        standalone::start_daemon(paths, &init)
-            .await
-            .map_err(anyhow::Error::from)?;
+        standalone::start_daemon(paths, &init).await?;
     }
     let client = DaemonClient::load(paths, options)?;
     presenter.line("Xiao secure setup");
@@ -1545,7 +1537,7 @@ async fn quickstart(paths: &CliPaths, args: &[String], presenter: &CliPresenter)
         [arg] if arg == "--no-start" => true,
         _ => return Err(CliFailure::usage("usage: xiao quickstart [--no-start]")),
     };
-    let init = standalone::initialize(paths).map_err(anyhow::Error::from)?;
+    let init = standalone::initialize(paths)?;
     if no_start {
         return presenter.success(
             "quickstart",
@@ -1556,9 +1548,7 @@ async fn quickstart(paths: &CliPaths, args: &[String], presenter: &CliPresenter)
             }),
         );
     }
-    let started = standalone::start_daemon(paths, &init)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let started = standalone::start_daemon(paths, &init).await?;
     presenter.success(
         "quickstart",
         json!({
@@ -1574,16 +1564,13 @@ async fn quickstart(paths: &CliPaths, args: &[String], presenter: &CliPresenter)
 async fn daemon(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -> CliResult<()> {
     match args.first().map(String::as_str) {
         Some("start") if args.len() == 1 => {
-            let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            let result = standalone::start_daemon(paths, &init)
-                .await
-                .map_err(anyhow::Error::from)?;
+            let init = standalone::load_existing(paths)?;
+            let result = standalone::start_daemon(paths, &init).await?;
             presenter.success("daemon start", start_value(result))
         }
         Some("foreground") if args.len() == 1 => {
-            let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            let status =
-                standalone::run_daemon_foreground(paths, &init).map_err(anyhow::Error::from)?;
+            let init = standalone::load_existing(paths)?;
+            let status = standalone::run_daemon_foreground(paths, &init)?;
             if !status.success() {
                 return Err(CliFailure {
                     code: EXIT_ERROR,
@@ -1596,10 +1583,8 @@ async fn daemon(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -> 
             )
         }
         Some("status") if args.len() == 1 => {
-            let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            let status = standalone::daemon_status(paths, &init)
-                .await
-                .map_err(anyhow::Error::from)?;
+            let init = standalone::load_existing(paths)?;
+            let status = standalone::daemon_status(paths, &init).await?;
             let value = json!({
                 "managed_pid":status.managed_pid,
                 "reachable":status.reachable,
@@ -1620,36 +1605,27 @@ async fn daemon(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -> 
             if args.len() > 2 {
                 return Err(CliFailure::usage("usage: xiao daemon logs [N]"));
             }
-            let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            let rows =
-                standalone::tail_daemon_log(&init.runtime, lines).map_err(anyhow::Error::from)?;
+            let init = standalone::load_existing(paths)?;
+            let rows = standalone::tail_daemon_log(&init.runtime, lines)?;
             presenter.success("daemon logs", json!({"lines":rows}))
         }
         Some("stop") if args.len() == 1 => {
-            let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
+            let init = standalone::load_existing(paths)?;
             presenter.success(
                 "daemon stop",
-                stop_value(
-                    standalone::stop_daemon(paths, &init)
-                        .await
-                        .map_err(anyhow::Error::from)?,
-                ),
+                stop_value(standalone::stop_daemon(paths, &init).await?),
             )
         }
         Some("restart") if args.len() == 1 => {
-            let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            let stop = standalone::stop_daemon(paths, &init)
-                .await
-                .map_err(anyhow::Error::from)?;
+            let init = standalone::load_existing(paths)?;
+            let stop = standalone::stop_daemon(paths, &init).await?;
             if matches!(stop, StopResult::UnmanagedRunning) {
                 return Err(CliFailure {
                     code: EXIT_REJECTED,
                     message: "xiaod is running outside this lifecycle".into(),
                 });
             }
-            let start = standalone::start_daemon(paths, &init)
-                .await
-                .map_err(anyhow::Error::from)?;
+            let start = standalone::start_daemon(paths, &init).await?;
             presenter.success(
                 "daemon restart",
                 json!({"stop":stop_value(stop),"start":start_value(start)}),
@@ -1672,19 +1648,22 @@ fn config_command(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -
             }),
         ),
         Some("check") if args.len() == 1 => {
-            let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
+            let init = standalone::load_existing(paths)?;
             if paths.client_config.exists() {
-                ClientConfig::load(&paths.client_config).map_err(anyhow::Error::from)?;
+                ClientConfig::load(&paths.client_config)?;
             }
-            presenter.success("config check", json!({
-                "valid":true,
-                "ipc_bind":init.config.ipc.bind,
-                "loopback":init.config.ipc.socket_addr().map_err(anyhow::Error::from)?.ip().is_loopback(),
-            }))
+            presenter.success(
+                "config check",
+                json!({
+                    "valid":true,
+                    "ipc_bind":init.config.ipc.bind,
+                    "loopback":init.config.ipc.socket_addr()?.ip().is_loopback(),
+                }),
+            )
         }
         Some("show") if args.len() == 1 => {
-            let config = AppConfig::load(&paths.config).map_err(anyhow::Error::from)?;
-            let value = serde_json::to_value(config).map_err(anyhow::Error::from)?;
+            let config = AppConfig::load(&paths.config)?;
+            let value = serde_json::to_value(config)?;
             presenter.success("config show", value)
         }
         _ => Err(CliFailure::usage("usage: xiao config <path|check|show>")),
@@ -1746,12 +1725,7 @@ async fn admin(
             )
         }
         Some("test-token-base64") if args.len() == 2 => {
-            let token = String::from_utf8(
-                URL_SAFE_NO_PAD
-                    .decode(&args[1])
-                    .map_err(anyhow::Error::from)?,
-            )
-            .map_err(anyhow::Error::from)?;
+            let token = String::from_utf8(URL_SAFE_NO_PAD.decode(&args[1])?)?;
             raw_success(
                 client
                     .post_admin("/v1/admin/telegram/test", &json!({"token":token}))
@@ -1769,8 +1743,7 @@ async fn admin(
                 .and_then(Value::as_str)
                 .ok_or_else(|| CliFailure::usage("manager resource is required"))?;
             let path = manager_resource_path(resource)?;
-            let mut url = reqwest::Url::parse(&format!("{}{}", client.endpoint, path))
-                .map_err(anyhow::Error::from)?;
+            let mut url = reqwest::Url::parse(&format!("{}{}", client.endpoint, path))?;
             if let Some(query) = request.get("query").and_then(Value::as_object) {
                 let mut pairs = url.query_pairs_mut();
                 for (key, value) in query {
@@ -1829,10 +1802,7 @@ async fn admin(
 }
 
 fn raw_success(value: Value) -> CliResult<()> {
-    println!(
-        "{}",
-        serde_json::to_string(&value).map_err(anyhow::Error::from)?
-    );
+    println!("{}", serde_json::to_string(&value)?);
     Ok(())
 }
 
@@ -2240,10 +2210,8 @@ fn exact_arity(args: &[String], count: usize, usage: &str) -> CliResult<()> {
 }
 
 fn decode_payload(encoded: &str) -> CliResult<Value> {
-    let decoded = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(anyhow::Error::from)?;
-    let raw = String::from_utf8(decoded).map_err(anyhow::Error::from)?;
+    let decoded = URL_SAFE_NO_PAD.decode(encoded)?;
+    let raw = String::from_utf8(decoded)?;
     serde_json::from_str(&raw)
         .map_err(|error| CliFailure::usage(format!("invalid JSON payload: {error}")))
 }
@@ -2495,7 +2463,7 @@ mod cli_tests {
     }
     #[test]
     fn subcommand_help_is_resolved_before_daemon_access() {
-        let path = vec!["model".to_string(), "custom".to_string()];
+        let path = ["model".to_string(), "custom".to_string()];
         assert_eq!(
             path.iter().map(String::as_str).collect::<Vec<_>>(),
             vec!["model", "custom"]
