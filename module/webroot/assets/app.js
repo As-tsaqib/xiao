@@ -374,12 +374,30 @@ async function changeSessionAi(session) {
   $('sessionAiDialog').showModal();
 }
 
+function modelReadinessLabel(model) {
+  if (!model || typeof model === 'string') return String(model);
+  const id = model.model_id;
+  if (!model.probed_at || (model.evidence && (model.evidence.includes('budget not spent') || model.evidence.includes('not been probed') || model.evidence.includes('discovered;')))) {
+    return `${id} (probe required)`;
+  }
+  if (model.native_tools_state === 'supported' && model.continuation_state === 'supported') {
+    return `${id} (Native Agent)`;
+  }
+  if (model.native_tools_state === 'unsupported' && model.structured_output_state === 'supported' && model.continuation_state === 'supported') {
+    return `${id} (Structured Agent)`;
+  }
+  if (model.native_tools_state === 'unsupported' && model.structured_output_state === 'unsupported' && model.continuation_state === 'unsupported') {
+    return `${id} (ChatOnly)`;
+  }
+  return `${id} (Indeterminate)`;
+}
+
 function populateSessionBindings(preferredBinding = null, preferredModel = null) {
   const provider = $('sessionAiProvider').value;
   const data = state.cache.providers || { accounts: [], custom_profiles: [] };
   const bindings = provider === 'custom'
-    ? (data.custom_profiles || []).map(profile => ({ id: profile.id, label: profile.alias, models: (profile.models || []).map(model => model.model_id) }))
-    : (data.accounts || []).filter(account => account.provider === provider).map(account => ({ id: account.id, label: account.label, models: account.models || [] }));
+    ? (data.custom_profiles || []).map(profile => ({ id: profile.id, label: profile.alias, models: profile.models || [] }))
+    : (data.accounts || []).filter(account => account.provider === provider).map(account => ({ id: account.id, label: account.label, models: (account.models || []).map(m => ({ model_id: m })) }));
   const select = $('sessionAiBinding'); clear(select);
   bindings.forEach(binding => { const option = document.createElement('option'); option.value = binding.id; option.textContent = binding.label; option.dataset.models = JSON.stringify(binding.models); select.append(option); });
   if (preferredBinding && bindings.some(binding => binding.id === preferredBinding)) select.value = preferredBinding;
@@ -390,8 +408,16 @@ function populateSessionModels(preferredModel = null) {
   const binding = $('sessionAiBinding').selectedOptions[0];
   const models = binding ? JSON.parse(binding.dataset.models || '[]') : [];
   const select = $('sessionAiModel'); clear(select);
-  models.forEach(model => { const option = document.createElement('option'); option.value = model; option.textContent = model; select.append(option); });
-  if (preferredModel && models.includes(preferredModel)) select.value = preferredModel;
+  models.forEach(modelObj => {
+    const id = typeof modelObj === 'string' ? modelObj : modelObj.model_id;
+    const label = typeof modelObj === 'string' ? modelObj : modelReadinessLabel(modelObj);
+    const option = document.createElement('option');
+    option.value = id;
+    option.textContent = label;
+    if (typeof modelObj !== 'string') option.dataset.model = JSON.stringify(modelObj);
+    select.append(option);
+  });
+  if (preferredModel && models.some(m => (typeof m === 'string' ? m : m.model_id) === preferredModel)) select.value = preferredModel;
 }
 
 async function setSessionYolo(session, enabled) { await mutateSession({ action: 'yolo', session_id: session.id, value: String(enabled) }, `YOLO ${enabled ? 'enabled' : 'disabled'} for this session only.`); }
@@ -510,6 +536,19 @@ $('sessionAiForm').onsubmit = async event => {
   const account_or_profile_id = $('sessionAiBinding').value;
   const model = $('sessionAiModel').value;
   if (!account_or_profile_id || !model) { notice('Select an account/profile and model first.', 'bad'); return; }
+  const selectedOpt = $('sessionAiModel').selectedOptions[0];
+  const modelData = selectedOpt && selectedOpt.dataset.model ? JSON.parse(selectedOpt.dataset.model) : null;
+  const isUnprobed = modelData && (!modelData.probed_at || (modelData.evidence && (modelData.evidence.includes('budget not spent') || modelData.evidence.includes('not been probed') || modelData.evidence.includes('discovered;'))));
+  if (provider === 'custom' && isUnprobed) {
+    notice(`Probing model ${model} capabilities before activation…`);
+    try {
+      await managerPost('provider-custom', { action: 'probe', profile_id: account_or_profile_id, model });
+      state.cache.providers = null;
+    } catch (err) {
+      notice(`Capability probe failed: ${err.message}`, 'bad');
+      return;
+    }
+  }
   $('sessionAiDialog').close();
   await mutateSession({ action: 'ai_config', session_id: session.id, provider, account_or_profile_id, model }, `AI configuration updated for ${session.name} only.`);
 };

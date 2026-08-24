@@ -125,6 +125,9 @@ struct CallbackQuery {
 }
 
 impl AuthManager {
+    pub fn secrets(&self) -> &SecretStore {
+        &self.secrets
+    }
     pub(crate) fn storage(&self) -> Arc<Storage> {
         self.storage.clone()
     }

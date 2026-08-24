@@ -657,7 +657,7 @@ async fn telegram_command(
                     "usage: xiao telegram set-owner USER_ID [--confirm-owner-change]",
                 ));
             }
-            let owner = parse_i64(&args[1], "owner user id")?;
+            let owner = parse_owner_user_id(&args[1])?;
             let confirm = args
                 .get(2)
                 .is_some_and(|value| value == "--confirm-owner-change");
@@ -712,10 +712,9 @@ async fn telegram_configure(
         match args[index].as_str() {
             "--owner" => {
                 index += 1;
-                owner = Some(parse_i64(
+                owner = Some(parse_owner_user_id(
                     args.get(index)
                         .ok_or_else(|| CliFailure::usage("--owner requires USER_ID"))?,
-                    "owner user id",
                 )?);
             }
             "--allowed-chat" => {
@@ -1055,6 +1054,7 @@ async fn custom_add(
     let mut protocol = "openai_chat_completions".to_owned();
     let mut key_file = None::<PathBuf>;
     let mut headers = BTreeMap::new();
+    let mut secret_headers = None::<BTreeMap<String, String>>;
     let mut index = 2usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -1082,6 +1082,16 @@ async fn custom_add(
                     .ok_or_else(|| CliFailure::usage("--header requires NAME=VALUE"))?;
                 headers.insert(name.to_owned(), value.to_owned());
             }
+            "--secret-headers-file" => {
+                index += 1;
+                let path = Path::new(required_arg(args, index, "--secret-headers-file")?);
+                let raw = fs::read_to_string(path).map_err(|error| {
+                    CliFailure::local(format!("read {}: {error}", path.display()))
+                })?;
+                secret_headers = Some(serde_json::from_str(&raw).map_err(|error| {
+                    CliFailure::usage(format!("invalid secret headers JSON: {error}"))
+                })?);
+            }
             other => {
                 return Err(CliFailure::usage(format!(
                     "unknown custom add option `{other}`"
@@ -1106,6 +1116,7 @@ async fn custom_add(
                     "protocol":protocol,
                     "api_key":api_key,
                     "headers":headers,
+                    "secret_headers":secret_headers,
                 }),
             )
             .await?,
@@ -1162,6 +1173,8 @@ async fn custom_edit(
     let mut remove_api_key = false;
     let mut keep_credential = false;
     let mut headers = None::<BTreeMap<String, String>>;
+    let mut secret_headers = None::<BTreeMap<String, String>>;
+    let mut clear_secret_headers = false;
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -1186,6 +1199,7 @@ async fn custom_edit(
             }
             "--remove-key" => remove_api_key = true,
             "--keep-credential" => keep_credential = true,
+            "--clear-secret-headers" => clear_secret_headers = true,
             "--headers-file" => {
                 index += 1;
                 let path = Path::new(required_arg(args, index, "--headers-file")?);
@@ -1194,6 +1208,16 @@ async fn custom_edit(
                 })?;
                 headers = Some(serde_json::from_str(&raw).map_err(|error| {
                     CliFailure::usage(format!("invalid headers JSON: {error}"))
+                })?);
+            }
+            "--secret-headers-file" => {
+                index += 1;
+                let path = Path::new(required_arg(args, index, "--secret-headers-file")?);
+                let raw = fs::read_to_string(path).map_err(|error| {
+                    CliFailure::local(format!("read {}: {error}", path.display()))
+                })?;
+                secret_headers = Some(serde_json::from_str(&raw).map_err(|error| {
+                    CliFailure::usage(format!("invalid secret headers JSON: {error}"))
                 })?);
             }
             other => {
@@ -1210,6 +1234,8 @@ async fn custom_edit(
         && api_key.is_none()
         && !remove_api_key
         && headers.is_none()
+        && secret_headers.is_none()
+        && !clear_secret_headers
     {
         return Err(CliFailure::usage(
             "custom edit requires at least one change",
@@ -1230,6 +1256,8 @@ async fn custom_edit(
                     "remove_api_key":remove_api_key,
                     "keep_credential":keep_credential,
                     "headers":headers,
+                    "secret_headers":secret_headers,
+                    "clear_secret_headers":clear_secret_headers,
                 }),
             )
             .await?,
@@ -2412,6 +2440,19 @@ fn confirm_owner_change(old: i64, new: i64) -> CliResult<bool> {
     } else {
         Err(CliFailure::usage("owner change was not confirmed"))
     }
+}
+
+fn parse_owner_user_id(value: &str) -> CliResult<i64> {
+    let id = value
+        .parse::<i64>()
+        .ok()
+        .ok_or_else(|| CliFailure::usage("owner user id must be a positive integer"))?;
+    if id <= 0 {
+        return Err(CliFailure::usage(format!(
+            "owner user id must be a positive integer (got {id})"
+        )));
+    }
+    Ok(id)
 }
 
 fn parse_i64(value: &str, label: &str) -> CliResult<i64> {

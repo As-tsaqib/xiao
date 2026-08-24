@@ -2033,7 +2033,7 @@ impl CommandCore {
             .transpose()?
             .flatten()
             .and_then(|credential| credential.api_key);
-        let headers = profile.safe_headers()?;
+        let headers = profile.merged_headers(self.auth.secrets())?;
         let discovered =
             match crate::ipc::fetch_custom_models(&profile.endpoint, &headers, api_key.as_deref())
                 .await
@@ -2154,7 +2154,7 @@ impl CommandCore {
             .as_deref()
             .and_then(|reference| self.auth.credential(reference).ok().flatten())
             .and_then(|credential| credential.api_key);
-        let headers = profile.safe_headers()?;
+        let headers = profile.merged_headers(self.auth.secrets())?;
         let probe = crate::providers::probe_custom_capabilities(
             &profile.endpoint,
             &headers,

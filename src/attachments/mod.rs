@@ -160,7 +160,7 @@ fn extract_via_termux(
             }
         }
     }
-    let workspace_root = scratch_root.to_path_buf();
+    let workspace_root = termux_env.home.clone();
     let executor = Arc::new(TermuxExecutor::new(
         termux_env.clone(),
         workspace_root.clone(),
@@ -214,11 +214,39 @@ fn extract_via_termux(
         }
     }
 
-    let work = scratch_root.join(format!("ocr-{}", Uuid::new_v4().simple()));
+    // P0-3: Dedicated bounded OCR execution workspace accessible to Termux UID.
+    // If running as root, set ownership to Termux UID/GID so privilege-dropped
+    // child process can chdir into work, read source.pdf, write PNGs and text.
+    let base_scratch = if termux_env.home.exists() {
+        termux_env.home.join(".cache").join("xiao").join("ocr")
+    } else {
+        scratch_root.join("ocr-scratch")
+    };
+    let _ = fs::create_dir_all(&base_scratch);
+    let work = base_scratch.join(format!("ocr-{}", Uuid::new_v4().simple()));
     create_private_dir(&work)?;
+
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } == 0 {
+            if let (Some(uid), Some(gid)) = (termux_env.uid, termux_env.gid) {
+                let _ = std::os::unix::fs::chown(&base_scratch, Some(uid), Some(gid));
+                let _ = std::os::unix::fs::chown(&work, Some(uid), Some(gid));
+            }
+        }
+    }
+
     let result: Result<Vec<ScannedPdfPage>> = (|| {
         let pdf_path = work.join("source.pdf");
         atomic_private_write(&pdf_path, pdf)?;
+        #[cfg(unix)]
+        {
+            if unsafe { libc::geteuid() } == 0 {
+                if let (Some(uid), Some(gid)) = (termux_env.uid, termux_env.gid) {
+                    let _ = std::os::unix::fs::chown(&pdf_path, Some(uid), Some(gid));
+                }
+            }
+        }
         let prefix = work.join("page");
         let cancellation = CancellationToken::new();
         let run_cmd = |program: &str,

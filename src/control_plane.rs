@@ -171,45 +171,92 @@ impl TelegramSetupService {
         // P0-5: staging/compensation across config file, SecretStore and SQLite.
         // No partial commit is published; ConfigReloaded only after coherent commit.
         // Snapshot old config for rollback if later step fails.
+        let secrets = SecretStore::new(next.paths.secrets_dir.clone());
         let staged_secret = supplied_token.is_some();
-        // Commit durable non-secret config first; if this fails nothing else ran.
-        if let Err(e) = next.save_atomic(&self.config_path) {
-            return Err(anyhow!("persist config: {e}"));
-        }
-        // Stage write-only secret.
+
+        // 1. If new token supplied, stage it via put_staged (preserving old live token untouched!)
         if let Some(token) = supplied_token {
-            if let Err(e) =
-                SecretStore::new(next.paths.secrets_dir.clone()).put(TELEGRAM_TOKEN_KEY, token)
-            {
-                // Roll back config file to old state; staged secret was not fully written yet.
-                let _ = old.save_atomic(&self.config_path);
-                let _ = SecretStore::new(old.paths.secrets_dir.clone()).remove(TELEGRAM_TOKEN_KEY);
-                return Err(anyhow!("persist telegram token: {e}"));
+            if let Err(e) = secrets.put_staged(TELEGRAM_TOKEN_KEY, token) {
+                return Err(anyhow!("stage telegram token: {e}"));
             }
         }
-        // Persist bot identity if probed.
+
+        // 2. Perform test_connection if requested
+        let bot = if input.test_connection {
+            match self.test_connection(supplied_token).await {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    if staged_secret {
+                        let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
+        // 3. Fault injection check: secret_stage
+        if let Ok(inj) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
+            if inj.contains("secret_stage") || inj == "all" {
+                if staged_secret {
+                    let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+                }
+                return Err(anyhow!("injected failure: secret_stage"));
+            }
+        }
+
+        // 4. Save durable config to disk atomically
+        if let Err(e) = next.save_atomic(&self.config_path) {
+            if staged_secret {
+                let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+            }
+            return Err(anyhow!("persist config: {e}"));
+        }
+
+        // 5. Fault injection check: config
+        if let Ok(inj) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
+            if inj.contains("config") || inj == "all" {
+                if staged_secret {
+                    let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+                }
+                let _ = old.save_atomic(&self.config_path);
+                return Err(anyhow!("injected failure: config"));
+            }
+        }
+
+        // 6. Persist bot identity if probed
         if let Some(bot) = bot.as_ref() {
             if let Err(e) = self.app.storage.put_setting(
                 TELEGRAM_IDENTITY_KEY,
                 &serde_json::to_string(bot).unwrap_or_default(),
             ) {
                 if staged_secret {
-                    let _ =
-                        SecretStore::new(next.paths.secrets_dir.clone()).remove(TELEGRAM_TOKEN_KEY);
+                    let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
                 }
                 let _ = old.save_atomic(&self.config_path);
                 return Err(anyhow!("persist bot identity: {e}"));
             }
         }
 
-        // Reconcile owner migration transactionally.
+        // 7. Fault injection check: db
+        if let Ok(inj) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
+            if inj.contains("db") || inj == "all" {
+                if staged_secret {
+                    let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+                }
+                let _ = old.save_atomic(&self.config_path);
+                return Err(anyhow!("injected failure: db"));
+            }
+        }
+
+        // 8. Reconcile owner migration transactionally
         if let Some(owner_user_id) = next.telegram.access.owner_user_id {
             let migration = match self.app.storage.ensure_telegram_owner(owner_user_id) {
                 Ok(m) => m,
                 Err(e) => {
                     if staged_secret {
-                        let _ = SecretStore::new(next.paths.secrets_dir.clone())
-                            .remove(TELEGRAM_TOKEN_KEY);
+                        let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
                     }
                     let _ = old.save_atomic(&self.config_path);
                     return Err(anyhow!("ensure telegram owner: {e}"));
@@ -229,12 +276,36 @@ impl TelegramSetupService {
                     .reconcile(&migration.owner_id)?;
                     Ok(())
                 })() {
-                    // DB owner already created; file reconcile failure is not rolled back fully
-                    // but we avoid publishing ConfigReloaded and surface error for operator retry.
+                    if staged_secret {
+                        let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+                    }
+                    let _ = old.save_atomic(&self.config_path);
                     return Err(anyhow!("reconcile owner files: {e}"));
                 }
             }
         }
+
+        // 9. Fault injection check: reconcile
+        if let Ok(inj) = std::env::var("XIAO_INJECT_TELEGRAM_FAILURE") {
+            if inj.contains("reconcile") || inj == "all" {
+                if staged_secret {
+                    let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+                }
+                let _ = old.save_atomic(&self.config_path);
+                return Err(anyhow!("injected failure: reconcile"));
+            }
+        }
+
+        // 10. Commit staged secret
+        if staged_secret {
+            if let Err(e) = secrets.commit_staged(TELEGRAM_TOKEN_KEY) {
+                let _ = secrets.rollback_staged(TELEGRAM_TOKEN_KEY);
+                let _ = old.save_atomic(&self.config_path);
+                return Err(anyhow!("commit telegram token: {e}"));
+            }
+        }
+
+        // 11. Update in-memory config & publish ConfigReloaded
         *self.app.config.write().await = next;
         self.app.events.publish(AppEvent::ConfigReloaded);
 
@@ -254,6 +325,15 @@ pub struct SessionAiConfigInput {
     pub model: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomModelReadiness {
+    Unprobed,
+    AgentNative,
+    AgentStructured,
+    ChatOnly,
+    Indeterminate,
+}
+
 #[derive(Clone)]
 pub struct SessionAiService {
     storage: Arc<Storage>,
@@ -267,6 +347,44 @@ impl SessionAiService {
 
     pub fn from_app(app: &AppState) -> Self {
         Self::new(app.storage.clone(), app.providers.clone())
+    }
+
+    /// P0-1 helper: separate exact probe completeness from optional capabilities.
+    /// Vision and file_input Unknown are NOT blockers for agent activation.
+    pub fn model_readiness(
+        record: &crate::storage::ProviderProfileModelRecord,
+    ) -> CustomModelReadiness {
+        if record.probed_at.trim().is_empty()
+            || record.evidence.contains("probe budget not spent")
+            || record.evidence.contains("not been probed")
+            || record.evidence.contains("discovered;")
+        {
+            return CustomModelReadiness::Unprobed;
+        }
+        if record.native_tools_state == "supported" && record.continuation_state == "supported" {
+            return CustomModelReadiness::AgentNative;
+        }
+        if record.native_tools_state == "unsupported"
+            && record.structured_output_state == "supported"
+            && record.continuation_state == "supported"
+        {
+            return CustomModelReadiness::AgentStructured;
+        }
+        if record.native_tools_state == "unsupported"
+            && record.structured_output_state == "unsupported"
+            && record.continuation_state == "unsupported"
+        {
+            return CustomModelReadiness::ChatOnly;
+        }
+        CustomModelReadiness::Indeterminate
+    }
+
+    /// P0-4 helper: whether the stored model record has not been capability-probed.
+    pub fn is_unprobed(record: &crate::storage::ProviderProfileModelRecord) -> bool {
+        matches!(
+            Self::model_readiness(record),
+            CustomModelReadiness::Unprobed | CustomModelReadiness::Indeterminate
+        )
     }
 
     /// Apply AI selection to exactly one owner session. No frontend active
@@ -307,25 +425,32 @@ impl SessionAiService {
             let record = profiles
                 .model(&profile.profile_id, model)?
                 .ok_or_else(|| anyhow!("model has not been discovered for this Custom profile"))?;
-            // P0-4: never silently activate an unprobed model as ChatOnly.
-            // Unknown means probe budget was not spent or probed_at empty; require exact-model probe first.
-            if Self::is_unprobed(&record) {
-                return Err(anyhow!(
-                    "capability_probe_required: model '{model}' has not been probed for this Custom profile; run Test for this exact model first"
-                ));
+            // P0-1 / P0-4: enforce readiness semantics.
+            // Vision/file Unknown is NOT a blocker.
+            // Unprobed or Indeterminate requires exact-model probe.
+            match Self::model_readiness(&record) {
+                CustomModelReadiness::AgentNative
+                | CustomModelReadiness::AgentStructured
+                | CustomModelReadiness::ChatOnly => {
+                    self.storage.set_session_provider(
+                        owner,
+                        &input.session_id,
+                        provider,
+                        Some(&profile.profile_id),
+                        model,
+                    )?;
+                }
+                CustomModelReadiness::Unprobed => {
+                    return Err(anyhow!(
+                        "capability_probe_required: model '{model}' has not been probed for this Custom profile; run exact-model probe first"
+                    ));
+                }
+                CustomModelReadiness::Indeterminate => {
+                    return Err(anyhow!(
+                        "capability_probe_required: model '{model}' agent protocol capability is Indeterminate; probe exact model before activation"
+                    ));
+                }
             }
-            if record.tool_protocol == "chat_only" && record.native_tools_state == "unknown" {
-                return Err(anyhow!(
-                    "capability_probe_required: model '{model}' capability is Unknown, probe exact model before activation"
-                ));
-            }
-            self.storage.set_session_provider(
-                owner,
-                &input.session_id,
-                provider,
-                Some(&profile.profile_id),
-                model,
-            )?;
         } else {
             let account = self
                 .storage
@@ -351,30 +476,7 @@ impl SessionAiService {
             .ok_or_else(|| anyhow!("updated session disappeared"))
     }
 
-    /// P0-4 helper: whether the stored model record has not been capability-probed.
-    pub fn is_unprobed(record: &crate::storage::ProviderProfileModelRecord) -> bool {
-        if record.probed_at.is_empty() {
-            return true;
-        }
-        if record.native_tools_state == "unknown"
-            || record.structured_output_state == "unknown"
-            || record.continuation_state == "unknown"
-            || record.vision_state == "unknown"
-            || record.file_input_state == "unknown"
-        {
-            if record.evidence.contains("probe budget not spent")
-                || record.evidence.contains("not been probed")
-                || record.evidence.contains("capability probe required")
-                || record.evidence.contains("discovered;")
-            {
-                return true;
-            }
-            return true;
-        }
-        false
-    }
-
-    /// P0-4 bounded exact-model probe: inspect -> unknown? probe exactly that model -> persist.
+    /// P0-4 / P1-1 bounded exact-model probe: uses selected profile's merged headers and API key.
     pub async fn probe_exact_model(
         &self,
         owner: &str,
@@ -385,11 +487,20 @@ impl SessionAiService {
         let profile = profiles
             .get(owner, profile_id)?
             .ok_or_else(|| anyhow!("Custom profile not found for owner"))?;
-        let headers = profile.safe_headers().unwrap_or_default();
+        let api_key = match profile.credential_ref.as_deref() {
+            Some(reference) => self
+                .providers
+                .auth()
+                .credential(reference)?
+                .and_then(|credential| credential.api_key)
+                .filter(|key| !key.trim().is_empty()),
+            None => None,
+        };
+        let headers = profile.merged_headers(self.providers.auth().secrets())?;
         let probe = crate::providers::probe_custom_capabilities(
             &profile.endpoint,
             &headers,
-            None,
+            api_key.as_deref(),
             &profile.protocol,
             model,
         )
@@ -465,5 +576,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(service.status().await.unwrap().owner_user_id, Some(43));
+    }
+
+    #[test]
+    fn custom_model_readiness_semantics_handles_optional_vision_and_file_capabilities() {
+        use crate::storage::ProviderProfileModelRecord;
+
+        let make_record = |native: &str, structured: &str, cont: &str, vis: &str, file: &str, probed: &str, ev: &str| -> ProviderProfileModelRecord {
+            ProviderProfileModelRecord {
+                profile_id: "p1".into(),
+                model_id: "m1".into(),
+                text_capable: true,
+                vision_capable: vis == "supported",
+                file_input_capable: file == "supported",
+                native_tools: native == "supported",
+                structured_output: structured == "supported",
+                continuation: cont == "supported",
+                native_tools_state: native.into(),
+                structured_output_state: structured.into(),
+                continuation_state: cont.into(),
+                vision_state: vis.into(),
+                file_input_state: file.into(),
+                model_discovery: true,
+                tool_protocol: if native == "supported" { "native".into() } else if structured == "supported" { "structured_json_fallback".into() } else { "chat_only".into() },
+                evidence: ev.into(),
+                probed_at: probed.into(),
+            }
+        };
+
+        // A. native=Supported, structured=Supported, continuation=Supported, vision=Unknown, file=Unknown => AgentNative
+        let rec_a = make_record("supported", "supported", "supported", "unknown", "unknown", "2026-01-01T00:00:00Z", "bounded custom probe");
+        assert_eq!(SessionAiService::model_readiness(&rec_a), CustomModelReadiness::AgentNative);
+        assert!(!SessionAiService::is_unprobed(&rec_a));
+
+        // B. native=Unsupported, structured=Supported, continuation=Supported, vision=Unknown, file=Unknown => AgentStructured
+        let rec_b = make_record("unsupported", "supported", "supported", "unknown", "unknown", "2026-01-01T00:00:00Z", "bounded custom probe");
+        assert_eq!(SessionAiService::model_readiness(&rec_b), CustomModelReadiness::AgentStructured);
+        assert!(!SessionAiService::is_unprobed(&rec_b));
+
+        // C. native=Unsupported, structured=Unsupported, continuation=Unsupported, completed probe => ChatOnly
+        let rec_c = make_record("unsupported", "unsupported", "unsupported", "unsupported", "unsupported", "2026-01-01T00:00:00Z", "bounded custom probe");
+        assert_eq!(SessionAiService::model_readiness(&rec_c), CustomModelReadiness::ChatOnly);
+        assert!(!SessionAiService::is_unprobed(&rec_c));
+
+        // D. native=Unknown, structured=Unknown, continuation=Unknown => Indeterminate
+        let rec_d = make_record("unknown", "unknown", "unknown", "unknown", "unknown", "2026-01-01T00:00:00Z", "bounded custom probe");
+        assert_eq!(SessionAiService::model_readiness(&rec_d), CustomModelReadiness::Indeterminate);
+        assert!(SessionAiService::is_unprobed(&rec_d));
+
+        // E. catalog discovery without exact capability probe => Unprobed
+        let rec_e = make_record("unknown", "unknown", "unknown", "unknown", "unknown", "", "model discovered; active capability probe budget not spent");
+        assert_eq!(SessionAiService::model_readiness(&rec_e), CustomModelReadiness::Unprobed);
+        assert!(SessionAiService::is_unprobed(&rec_e));
+    }
+
+    #[tokio::test]
+    async fn telegram_setup_rollback_preserves_old_token_on_injected_failure() {
+        let (service, _directory) = test_service().await;
+        service
+            .configure(TelegramConfigureInput {
+                enabled: Some(true),
+                bot_token: Some("123456:INITIAL_VALID_TOKEN".into()),
+                owner_user_id: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Inject failure during config write
+        std::env::set_var("XIAO_INJECT_TELEGRAM_FAILURE", "config");
+        let failed = service
+            .configure(TelegramConfigureInput {
+                bot_token: Some("123456:NEW_CANDIDATE_TOKEN_THAT_FAILS".into()),
+                owner_user_id: Some(101),
+                confirm_owner_change: true,
+                ..Default::default()
+            })
+            .await;
+        std::env::remove_var("XIAO_INJECT_TELEGRAM_FAILURE");
+        assert!(failed.is_err());
+
+        // Old state must be preserved
+        let status = service.status().await.unwrap();
+        assert_eq!(status.owner_user_id, Some(100));
+        assert!(status.token_configured);
     }
 }

@@ -1,50 +1,37 @@
 # Xiao v0.2.7 Validation Record
 
 GitHub Actions is the authoritative Rust/Android validation environment for this release candidate.
-Head `207832b5a7b5069ce8899d3b8938b32eec85d281` is the exact shipped candidate.
+Authoritative release validation is the latest successful required CI run whose `head_sha` exactly equals the release candidate commit.
 
-## Last green run — `32721509247`
+## Authoritative Validation Methodology
 
-Run `32721509247`, event `pull_request` on branch `feat/v0.2.7-control-plane-unification`,
-conclusion `success` at `2026-08-24T11:40:42Z`. Both required jobs passed:
+Release validation requires both `rust` and `android-arm64` jobs in `.github/workflows/ci.yml` to succeed on the exact commit without waivers or skipped checks.
 
-| Job | Conclusion | Notable steps |
-|-----|------------|---------------|
-| `rust` (`97413731206`) | `success` | Checkout, Rust 1.98.0, ShellCheck POSIX + Bash, `cargo fmt`, `cargo check`, `cargo test`, `cargo clippy -D warnings`, `cargo build --release`, `node --check` ×2, `acceptance.sh --static-only` (10m 36s) |
-| `android-arm64` (`97416446474`) | `success` | Rust 1.98.0 `aarch64-linux-android`, pinned `cargo-ndk 4.1.2`, `cargo ndk -t arm64-v8a build --release --bin xiaod --bin xiao`, deterministic ZIP verification, artifact upload (7m 40s) |
+Workflow configuration:
+- Triggers: `pull_request`, `push: branches: [main]`, `workflow_dispatch`
+- Permissions: `contents: read`
+- Pinned SHA actions (`actions/checkout@3d3c4`, `dtolnay/rust-toolchain@4360b5`, `actions/upload-artifact@043fb4`)
+- No `pull_request_target`, no secret consumption, no self-push.
 
-Artifact: `xiao-v0.2.7-kernelsu-arm64` containing exactly:
+## Validation Gates (Executed in CI)
 
-```text
-xiao-v0.2.7-kernelsu-arm64.zip
-xiao-v0.2.7-kernelsu-arm64.zip.sha256
-```
+All gates run on `ubuntu-24.04` with `Rust 1.98.0`, `CARGO_TERM_COLOR=always`, `CARGO_INCREMENTAL=0`.
 
-Workflow: `.github/workflows/ci.yml` — `on: pull_request | push[main] | workflow_dispatch`, `permissions: contents: read`,
-`concurrency: ci-${workflow}-${pr_number||ref}`, `persist-credentials: false`, pinned SHA actions
-(`actions/checkout@3d3c4`, `dtolnay/rust-toolchain@4360b5`, `actions/upload-artifact@043fb4`), no `pull_request_target`,
-no secret consumption, no self-push.
-
-## Validation gates — exact commands and observed results (run 32721509247)
-
-All commands are the literal `ci.yml` steps on `ubuntu-24.04` with `RUST toolchain 1.98.0`,
-`CARGO_TERM_COLOR=always`, `CARGO_INCREMENTAL=0`.
-
-| # | Gate | Exact command | Result on 32721509247 |
+| # | Gate | Exact Command | Required Outcome |
 |---|---|---|---|
 | 1 | POSIX shell syntax | `shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh` | PASS (exit 0, no findings) |
 | 2 | Bash shell syntax | `shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh` | PASS |
 | 3 | Rust formatting | `cargo fmt --all -- --check` | PASS (no diff) |
 | 4 | Type check | `cargo check --locked --all-targets --all-features` | PASS |
-| 5 | Tests | `cargo test --locked --all-targets --all-features` | PASS — 254 tests total, 0 failed (lib: 241 ok in 10.27s, bins: 8 ok, doc-tests 5 ok) |
-| 6 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | PASS (no warnings) |
-| 7 | Release build (host) | `cargo build --locked --release --all-features` | PASS — `Finished release [optimized]` |
+| 5 | Tests | `cargo test --locked --all-targets --all-features` | PASS (all tests pass, 0 failed) |
+| 6 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | PASS (0 warnings) |
+| 7 | Release build (host) | `cargo build --locked --release --all-features` | PASS |
 | 8 | WebUI syntax app.js | `node --check module/webroot/assets/app.js` | PASS |
 | 9 | WebUI syntax ksu-bridge.js | `node --check module/webroot/assets/ksu-bridge.js` | PASS |
-| 10 | Static acceptance | `./scripts/acceptance.sh --static-only` | PASS — all 60+ checks including deterministic tri-state Custom capability, exact-approval, bounded semantic runtime, CLI structured-command, and no-unrestricted-shell guards |
-| 11 | Android arm64 cross-compile | `cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao` | PASS — `Finished release [optimized] target(s) in 6m 13s` |
-| 12 | Deterministic module ZIP | `packaging/build-module.sh` (twice) → `sha256 equality`, `sha256sum -c dist/*.sha256`, `unzip -t`, `find dist -maxdepth 1 -type f | wc -l == 2` | PASS — two identical builds, checksum verified, ZIP integrity ok, exactly 2 files uploaded |
-| 13 | Whitespace hygiene | `git diff --check` (via acceptance.sh) | PASS |
+| 10 | Static acceptance | `./scripts/acceptance.sh --static-only` | PASS (60+ static invariants) |
+| 11 | Android arm64 cross-compile | `cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao` | PASS (`aarch64-linux-android`) |
+| 12 | Deterministic module ZIP | `packaging/build-module.sh` (twice) → `sha256 equality`, `sha256sum -c dist/*.sha256`, `unzip -t` | PASS (identical checksums) |
+| 13 | Whitespace hygiene | `git diff --check` | PASS |
 
 Historical pre-release gate (informational, not the v0.2.7 artifact):
 candidate `d6f8edd7f56efc472fca8fac7d493a4026e26ddd` passed run #134 (`32686544237`) on the same toolchain with

@@ -1069,7 +1069,7 @@ impl CustomProvider {
                     .filter(|key| !key.trim().is_empty()),
                 None => None,
             };
-            let headers = profile.safe_headers()?;
+            let headers = profile.merged_headers(self.auth.secrets())?;
             return Ok(CustomTarget {
                 base_url: profile.endpoint,
                 protocol: profile.protocol,
