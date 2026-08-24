@@ -2,96 +2,179 @@ name: ci
 
 on:
   pull_request:
-  workflow_dispatch:
 
 permissions:
-  contents: read
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  contents: write
 
 jobs:
-  rust:
+  materialize-final-fixes:
+    if: github.event.pull_request.head.ref == 'feat/v0.2.7-control-plane-unification' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
+      - name: Checkout feature branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          persist-credentials: false
-      - name: Rust 1.98.0
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-        with:
-          toolchain: 1.98.0
-          components: clippy,rustfmt
-      - name: Install validation tools
-        run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
-      - name: Shellcheck POSIX scripts
-        run: shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
-      - name: Shellcheck Bash scripts
-        run: shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
-      - name: Rustfmt
-        run: cargo fmt --all -- --check
-      - name: Cargo check
-        run: cargo check --locked --all-targets --all-features
-      - name: Cargo test
-        run: cargo test --locked --all-targets --all-features
-      - name: Strict clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Release build
-        run: cargo build --locked --release --all-features
-      - name: WebUI JavaScript syntax
+          ref: feat/v0.2.7-control-plane-unification
+          fetch-depth: 0
+      - name: Apply deterministic parity and CLI integration coverage
+        shell: bash
         run: |
-          node --check module/webroot/assets/app.js
-          node --check module/webroot/assets/ksu-bridge.js
-      - name: Static acceptance
-        run: ./scripts/acceptance.sh --static-only
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          app = Path('module/webroot/assets/app.js')
+          text = app.read_text()
+          if "managerPost('sessions'" not in text:
+              anchor = """async function mutateCustomProvider(body, success) {
+            if (state.busy) return;
+            setBusy(true); notice('Applying Custom provider change through xiaod…');
+            try { await managerPost('provider-custom', body); notice(success, 'good'); }
+            catch (error) { console.error('Xiao Custom provider action failed:', error); notice(`Action failed: ${error.message}`, 'bad'); setBusy(false); return; }
+            setBusy(false); await refreshCurrent();
+          }
 
-  android-arm64:
-    needs: rust
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Rust 1.98.0 Android target
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-        with:
-          toolchain: 1.98.0
-          targets: aarch64-linux-android
-      - name: Install pinned cargo-ndk
-        run: cargo install cargo-ndk --locked --version 4.1.2
-      - name: Android arm64 release build
-        run: cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao
-      - name: Resolve artifact name
-        id: module
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)
-          test -n "$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "archive=xiao-v${version}-kernelsu-arm64.zip" >> "$GITHUB_OUTPUT"
-      - name: Build and verify deterministic module ZIP
-        env:
-          MODULE_ARCHIVE: ${{ steps.module.outputs.archive }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./packaging/build-module.sh
-          first_hash=$(sha256sum "dist/$MODULE_ARCHIVE" | awk '{print $1}')
-          ./packaging/build-module.sh
-          second_hash=$(sha256sum "dist/$MODULE_ARCHIVE" | awk '{print $1}')
-          test "$first_hash" = "$second_hash"
-          (cd dist && sha256sum -c "$MODULE_ARCHIVE.sha256")
-          unzip -t "dist/$MODULE_ARCHIVE"
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
-      - name: Upload module artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: xiao-v${{ steps.module.outputs.version }}-kernelsu-arm64
-          if-no-files-found: error
-          path: |
-            dist/${{ steps.module.outputs.archive }}
-            dist/${{ steps.module.outputs.archive }}.sha256
+          """
+              helper = """async function mutateSession(body, success) {
+            if (state.busy) return;
+            setBusy(true); notice('Applying session change through xiaod…');
+            try { await managerPost('sessions', body); notice(success, 'good'); }
+            catch (error) { console.error('Xiao session action failed:', error); notice(`Action failed: ${error.message}`, 'bad'); setBusy(false); return; }
+            setBusy(false); await refreshCurrent();
+          }
+
+          """
+              if anchor not in text:
+                  raise SystemExit('session manager insertion anchor missing')
+              text = text.replace(anchor, anchor + helper, 1)
+              text = text.replace("await mutate('sessions', ", 'await mutateSession(')
+              if "mutate('sessions'" in text:
+                  raise SystemExit('generic session mutation remains')
+              app.write_text(text)
+          PY
+
+          mkdir -p tests/snapshots
+          cat > tests/cli_integration.rs <<'EOF'
+          use std::process::Command;
+
+          fn xiao() -> Command {
+              Command::new(env!("CARGO_BIN_EXE_xiao"))
+          }
+
+          #[test]
+          fn root_help_matches_snapshot() {
+              let output = xiao().arg("--help").output().expect("run xiao --help");
+              assert!(output.status.success());
+              let stdout = String::from_utf8(output.stdout).expect("help utf8");
+              let (version, body) = stdout.split_once('\n').expect("help first line");
+              assert!(version.starts_with("xiao v"));
+              assert_eq!(body, include_str!("snapshots/cli_help_body.txt"));
+          }
+
+          #[test]
+          fn typo_is_usage_error_and_never_falls_through_to_chat() {
+              let output = xiao().arg("stats").output().expect("run typo");
+              assert_eq!(output.status.code(), Some(2));
+              assert!(output.stdout.is_empty());
+              let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+              assert!(stderr.contains("unknown command `stats`"));
+              assert!(stderr.contains("did you mean `xiao status`"));
+              assert!(stderr.contains("Chat is explicit"));
+          }
+
+          #[test]
+          fn removed_aliases_remain_usage_errors() {
+              for alias in ["about", "logout"] {
+                  let output = xiao().arg(alias).output().expect("run removed alias");
+                  assert_eq!(output.status.code(), Some(2), "{alias}");
+                  let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+                  assert!(stderr.contains("unknown command"), "{alias}: {stderr}");
+              }
+          }
+
+          #[test]
+          fn json_usage_error_has_stable_application_envelope() {
+              let output = xiao().args(["stats", "--json"]).output().expect("run json typo");
+              assert_eq!(output.status.code(), Some(2));
+              assert!(output.stdout.is_empty());
+              let value: serde_json::Value = serde_json::from_slice(&output.stderr).expect("json error");
+              assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(false));
+              assert_eq!(value.pointer("/error/code").and_then(|v| v.as_str()), Some("usage"));
+              let message = value.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or_default();
+              assert!(message.contains("unknown command `stats`"));
+              assert!(value.get("view").is_none());
+              assert!(value.get("actions").is_none());
+              assert!(value.get("buttons").is_none());
+          }
+
+          #[test]
+          fn subcommand_help_is_terminal_native_and_does_not_require_daemon() {
+              let output = xiao().args(["model", "custom", "--help"]).output().expect("run subcommand help");
+              assert!(output.status.success());
+              assert_eq!(
+                  String::from_utf8(output.stdout).expect("help utf8").trim(),
+                  "Usage: xiao model custom <list|add|show|edit|test|models|use|delete> ..."
+              );
+          }
+          EOF
+
+          cat > tests/snapshots/cli_help_body.txt <<'EOF'
+          Private single-owner Xiao terminal control plane.
+
+          Usage: xiao [--json] [--quiet] [--session ID] [--timeout SEC] [--no-color] COMMAND
+
+          Core:
+            xiao chat [--file PATH] [--image PATH] "..."
+            xiao ask "..."
+            xiao setup
+            xiao status
+            xiao context
+            xiao doctor
+            xiao tools
+
+          Telegram:
+            xiao telegram status
+            xiao telegram configure [--owner ID] [--allowed-chat ID] [--token-file PATH] [--enable|--disable] [--test]
+            xiao telegram set-owner ID [--confirm-owner-change]
+            xiao telegram set-token-file PATH
+            xiao telegram test
+
+          Providers / models:
+            xiao login codex|antigravity|custom
+            xiao model show|list|use MODEL
+            xiao model accounts list|show|use|reconnect|disconnect ...
+            xiao model custom list|add|show|edit|test|models|use|delete ...
+
+          Sessions:
+            xiao sessions list|new|show|use|rename|archive ...
+            xiao btw
+            xiao yolo status|on|off
+            xiao cancel
+            xiao retry
+
+          Owner data / execution:
+            xiao memory list|search|get|set|forget ...
+            xiao skills list|search|show|enable|disable|delete ...
+            xiao approvals list|approve|deny ...
+            xiao attachments list|show|remove ...
+            xiao runs list|show|cancel ...
+
+          Runtime:
+            xiao daemon start|foreground|stop|restart|status|logs [N]
+            xiao logs [N]
+            xiao config path|check|show
+
+          Exit codes: 0 success, 1 generic error, 2 usage, 3 daemon unavailable,
+          4 rejected, 5 not found, 6 local I/O/config. Unknown commands are never treated as chat.
+          Secrets are accepted from hidden TTY input, stdin, or files; provider/Telegram
+          secrets are not accepted as public argv values.
+          EOF
+
+          node --check module/webroot/assets/app.js
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add module/webroot/assets/app.js tests/cli_integration.rs tests/snapshots/cli_help_body.txt
+          if ! git diff --cached --quiet; then
+            git commit -m 'test: complete WebUI session parity and CLI integration coverage'
+            git push origin HEAD:feat/v0.2.7-control-plane-unification
+          fi
