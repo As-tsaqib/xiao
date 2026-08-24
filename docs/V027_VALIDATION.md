@@ -6,10 +6,10 @@ The implementation is validated in GitHub Actions because the local artifact env
 
 ## Pre-release evidence
 
-- `cargo fmt --all -- --check`: PASS.
-- `cargo check --locked --all-targets --all-features`: PASS.
-- `cargo clippy --locked --all-targets --all-features -- -D warnings`: PASS with Rust 1.98.0.
-- The prior `cargo test --locked --all-targets --all-features` diagnostic reached 225/226 library tests. Its sole failure was the WebUI typed Custom-provider boundary assertion; that production UI fix is now persisted on the branch and awaits the clean full-suite rerun recorded below.
+- `cargo fmt --all -- --check`: PASS on the implementation before the final CLI integration additions; the complete tree is rerun below.
+- `cargo check --locked --all-targets --all-features`: PASS on Rust 1.98.0 before the final CLI integration additions; the complete tree is rerun below.
 - ShellCheck for module, Termux wrapper, device test, packaging and acceptance scripts: PASS.
+- The Rust library suite reached 225/226 before the explicit WebUI session-manager parity helper was added. That sole parity assertion is fixed in the current tree.
+- CLI binary integration tests, help snapshot, and architecture-aligned `status: ok|error` JSON envelope tests are now part of the current tree and must pass in the clean rerun.
 
-Release version metadata remains at 0.2.6 until the full Rust suite, host release build, JavaScript/static acceptance, Android arm64 cross-build, deterministic package verification, and workflow/governance audit all pass.
+Release version metadata remains at 0.2.6 until the complete Rust suite, strict clippy, host release build, JavaScript/static acceptance, Android arm64 cross-build, deterministic package verification, and workflow/governance audit all pass.
