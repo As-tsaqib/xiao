@@ -3208,13 +3208,15 @@ fn aggregate_capability_state(
     models: &[crate::storage::ProviderProfileModelRecord],
     field: &str,
 ) -> &'static str {
-    let state = |model: &crate::storage::ProviderProfileModelRecord| match field {
-        "native_tools" => model.native_tools_state.as_str(),
-        "structured_output" => model.structured_output_state.as_str(),
-        "continuation" => model.continuation_state.as_str(),
-        "vision" => model.vision_state.as_str(),
-        "file_input" => model.file_input_state.as_str(),
-        _ => "unknown",
+    let state = |model: &crate::storage::ProviderProfileModelRecord| -> String {
+        match field {
+            "native_tools" => model.native_tools_state.clone(),
+            "structured_output" => model.structured_output_state.clone(),
+            "continuation" => model.continuation_state.clone(),
+            "vision" => model.vision_state.clone(),
+            "file_input" => model.file_input_state.clone(),
+            _ => "unknown".into(),
+        }
     };
     if models.iter().any(|model| state(model) == "supported") {
         "Supported"

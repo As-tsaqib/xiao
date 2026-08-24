@@ -2882,9 +2882,14 @@ mod tests {
             state.alias = "rollback-profile".into();
             state.models = vec!["model-a".into()];
             state.selected_index = Some(0);
-            state.capability = Some(crate::providers::ProviderCapabilities::native(
-                "rollback fixture",
-            ));
+            state.capability = Some(crate::providers::CustomCapabilityProbe {
+                capabilities: crate::providers::ProviderCapabilities::native("rollback fixture"),
+                native_tools: crate::providers::CapabilityState::Supported,
+                structured_output: crate::providers::CapabilityState::Supported,
+                continuation: crate::providers::CapabilityState::Supported,
+                vision: crate::providers::CapabilityState::Unsupported,
+                file_input: crate::providers::CapabilityState::Unsupported,
+            });
             state.id.clone()
         };
         let adapter = TelegramAdapter {

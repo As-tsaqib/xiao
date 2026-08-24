@@ -80,6 +80,7 @@ impl TelegramSetupService {
         let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
         let token_configured = secrets.get(TELEGRAM_TOKEN_KEY)?.is_some();
         let bot = self
+            .app
             .storage
             .setting(TELEGRAM_IDENTITY_KEY)?
             .and_then(|raw| serde_json::from_str::<BotIdentity>(&raw).ok());

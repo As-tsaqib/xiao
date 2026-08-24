@@ -2817,6 +2817,8 @@ mod tests {
                 query: None,
                 scope: None,
                 include_archived: None,
+                session_id: None,
+                id: None,
             }),
         )
         .await

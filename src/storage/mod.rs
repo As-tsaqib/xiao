@@ -1166,9 +1166,10 @@ impl Storage {
                 let mut statement = connection.prepare(
                     "SELECT owner_id FROM owners ORDER BY CASE WHEN telegram_user_id IS NULL THEN 1 ELSE 0 END,created_at,owner_id",
                 )?;
-                statement
+                let rows = statement
                     .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
             };
             if owners.len() > 1 {
                 return Err(anyhow::anyhow!(
