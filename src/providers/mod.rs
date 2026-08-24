@@ -1,7 +1,9 @@
 mod payload;
 mod profiles;
 
-pub use profiles::ProviderProfileStore;
+pub use profiles::{
+    secret_headers_ref_for, CustomProfileEdit, CustomProfileService, ProviderProfileStore,
+};
 
 use std::{
     collections::HashMap,

@@ -169,6 +169,10 @@ struct CustomProfileActionRequest {
     keep_credential: bool,
     #[serde(default)]
     headers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    secret_headers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    clear_secret_headers: bool,
     session_id: Option<String>,
     model: Option<String>,
 }
@@ -850,7 +854,10 @@ async fn custom_models(
                 .flatten()
                 .and_then(|credential| credential.api_key),
         };
-        let profile_headers = profile.safe_headers().map_err(bad)?;
+        // P1-4: request merges only selected profile's safe+secret headers, no cross-profile fallback.
+        let cfg = state.app.config.read().await.clone();
+        let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
+        let profile_headers = profile.merged_headers(&secrets).map_err(bad)?;
         (profile.endpoint, profile_headers, key)
     } else {
         // Legacy explicit discovery remains available for onboarding, but an
@@ -985,12 +992,28 @@ async fn manager_providers(
         })
         .collect::<Vec<_>>();
     let profiles_store = ProviderProfileStore::new(state.app.storage.clone());
+    let cfg = state.app.config.read().await.clone();
+    let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
     let profiles = profiles_store
         .list(&owner)
         .map_err(bad)?
         .into_iter()
         .map(|profile| {
-            let models = profiles_store.models(&profile.profile_id).unwrap_or_default();
+            let models = profiles_store
+                .models(&profile.profile_id)
+                .unwrap_or_default();
+            // Header values are write-only just like API keys. The manager may expose
+            // names for inspection, but never returns stored values to a frontend.
+            // P1-4: safe_headers -> DB, secret_headers -> SecretStore, only names in JSON.
+            let header_names = profile.all_header_names(&secrets).unwrap_or_else(|_| {
+                profile
+                    .safe_headers()
+                    .unwrap_or_default()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            // Redacted: never include header values in serialized JSON.
             json!({
                 "id": profile.profile_id,
                 "alias": profile.alias,
@@ -999,9 +1022,7 @@ async fn manager_providers(
                 "enabled": profile.enabled,
                 "reachability": profile.reachability,
                 "api_key_configured": profile.credential_ref.is_some(),
-                // Header values are write-only just like API keys. The manager may expose
-                // names for inspection, but never returns stored values to a frontend.
-                "header_names": profile.safe_headers().unwrap_or_default().keys().cloned().collect::<Vec<_>>(),
+                "header_names": header_names,
                 "model_count": models.len(),
                 "models": models,
                 "last_probe_at": profile.last_probe_at,
@@ -1025,6 +1046,8 @@ async fn manager_custom_profile_action(
     }
     let owner = management_owner(&state).await.map_err(bad)?;
     let profiles = ProviderProfileStore::new(state.app.storage.clone());
+    let cfg = state.app.config.read().await.clone();
+    let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
     match req.action.as_str() {
         "create" => {
             let alias = req
@@ -1036,6 +1059,8 @@ async fn manager_custom_profile_action(
                 .as_deref()
                 .ok_or_else(|| bad("endpoint is required"))?;
             let protocol = req.protocol.as_deref().unwrap_or("openai_chat_completions");
+            let safe_headers = req.headers.clone().unwrap_or_default();
+            let safe_json = serde_json::to_string(&safe_headers).map_err(bad)?;
             let mut profile = profiles
                 .create(ProviderProfileInput {
                     profile_id: None,
@@ -1044,12 +1069,45 @@ async fn manager_custom_profile_action(
                     endpoint: endpoint.to_owned(),
                     protocol: protocol.to_owned(),
                     credential_ref: None,
-                    safe_headers_json: serde_json::to_string(
-                        &req.headers.clone().unwrap_or_default(),
-                    )
-                    .map_err(bad)?,
+                    safe_headers_json: safe_json,
                 })
-                .map_err(bad)?;
+                .map_err(|error| bad(redact_text(&error.to_string())))?;
+            // P1-4: secret_headers -> SecretStore write-only, only names ever in JSON.
+            if let Some(secret_map) = req.secret_headers.clone() {
+                if !secret_map.is_empty() {
+                    let secret_ref = crate::providers::secret_headers_ref_for(&profile.profile_id);
+                    let json = serde_json::to_string(&secret_map).map_err(bad)?;
+                    if let Err(error) = secrets.put(&secret_ref, &json) {
+                        let _ = profiles.delete_with_secrets(&owner, &profile.profile_id, &secrets);
+                        return Err(bad(redact_text(&error.to_string())));
+                    }
+                    if let Err(error) = state.app.storage.with_conn(|connection| {
+                        connection.execute(
+                            "UPDATE provider_profiles SET secret_headers_ref=? WHERE profile_id=?",
+                            rusqlite::params![secret_ref, profile.profile_id],
+                        )?;
+                        Ok(())
+                    }) {
+                        let _ = secrets.remove(&secret_ref);
+                        let _ = profiles.delete_with_secrets(&owner, &profile.profile_id, &secrets);
+                        return Err(bad(error));
+                    }
+                    let names = secret_map.keys().cloned().collect::<Vec<_>>().join(",");
+                    let _ = state.app.storage.audit(
+                        &owner,
+                        "custom_profile_secret_headers_set",
+                        &redact_text(&format!(
+                            "profile_id={} headers={}",
+                            profile.profile_id, names
+                        )),
+                    );
+                }
+            }
+            if req.clear_secret_headers {
+                let secret_ref = crate::providers::secret_headers_ref_for(&profile.profile_id);
+                let _ = secrets.remove(&secret_ref);
+                let _ = secrets.rollback_staged(&secret_ref);
+            }
             if let Some(key) = req
                 .api_key
                 .as_deref()
@@ -1063,20 +1121,20 @@ async fn manager_custom_profile_action(
                 {
                     Ok(credential) => credential,
                     Err(error) => {
-                        let _ = profiles.delete(&owner, &profile.profile_id);
+                        let _ = profiles.delete_with_secrets(&owner, &profile.profile_id, &secrets);
                         return Err(bad(error));
                     }
                 };
                 if let Err(error) = state.app.storage.set_account_owner(&owner, &credential.id) {
                     let _ = state.app.auth.logout(&credential.id);
-                    let _ = profiles.delete(&owner, &profile.profile_id);
+                    let _ = profiles.delete_with_secrets(&owner, &profile.profile_id, &secrets);
                     return Err(bad(error));
                 }
                 if let Err(error) =
                     profiles.set_credential(&owner, &profile.profile_id, Some(&credential.id))
                 {
                     let _ = state.app.auth.logout(&credential.id);
-                    let _ = profiles.delete(&owner, &profile.profile_id);
+                    let _ = profiles.delete_with_secrets(&owner, &profile.profile_id, &secrets);
                     return Err(bad(error));
                 }
                 profile.credential_ref = Some(credential.id);
@@ -1087,7 +1145,7 @@ async fn manager_custom_profile_action(
                 .audit(
                     &owner,
                     "custom_profile_created",
-                    &format!("profile_id={}", profile.profile_id),
+                    &redact_text(&format!("profile_id={}", profile.profile_id)),
                 )
                 .map_err(bad)?;
             Ok(Json(json!({"ok":true,"profile_id":profile.profile_id})))
@@ -1107,33 +1165,27 @@ async fn manager_custom_profile_action(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .is_some_and(|value| value != prior.endpoint);
-            let prior_credential = prior.credential_ref.clone();
-            if endpoint_changed {
-                profiles
-                    .change_endpoint(
-                        &owner,
-                        profile_id,
-                        req.endpoint.as_deref().expect("checked endpoint"),
-                    )
-                    .map_err(bad)?;
-                if req.keep_credential {
-                    profiles
-                        .set_credential(&owner, profile_id, prior_credential.as_deref())
-                        .map_err(bad)?;
-                } else if let Some(reference) = prior_credential.as_deref() {
+            // P1-5: atomic edit via CustomProfileService (validate -> stage secret -> DB txn -> commit -> delete old -> rollback on fail -> invalidate models on endpoint change)
+            let service = crate::providers::CustomProfileService::new(
+                state.app.storage.clone(),
+                secrets.clone(),
+            );
+            let edit = crate::providers::CustomProfileEdit {
+                alias: req.alias.clone(),
+                endpoint: req.endpoint.clone(),
+                protocol: req.protocol.clone(),
+                safe_headers: req.headers.clone(),
+                secret_headers: req.secret_headers.clone(),
+                clear_secret_headers: req.clear_secret_headers,
+                keep_credential_on_endpoint_change: req.keep_credential,
+            };
+            let mut profile = service.edit(&owner, profile_id, edit).map_err(bad)?;
+            // Credential handling remains after atomic profile edit; endpoint change already cleared credential in DB if not kept.
+            if endpoint_changed && !req.keep_credential {
+                if let Some(reference) = prior.credential_ref.as_deref() {
                     let _ = state.app.auth.logout(reference);
                 }
             }
-            profiles
-                .edit_metadata(
-                    &owner,
-                    profile_id,
-                    req.alias.as_deref(),
-                    req.protocol.as_deref(),
-                    req.headers.as_ref(),
-                )
-                .map_err(bad)?;
-
             if req.remove_api_key {
                 if let Some(reference) = profiles
                     .get(&owner, profile_id)
@@ -1152,15 +1204,15 @@ async fn manager_custom_profile_action(
                 .map(str::trim)
                 .filter(|key| !key.is_empty())
             {
-                let profile = profiles
+                let current = profiles
                     .get(&owner, profile_id)
                     .map_err(bad)?
                     .ok_or_else(|| bad("Custom profile not found"))?;
-                let old = profile.credential_ref.clone();
+                let old = current.credential_ref.clone();
                 let credential = state
                     .app
                     .auth
-                    .create_api_key_credential("custom", &profile.alias, key)
+                    .create_api_key_credential("custom", &current.alias, key)
                     .map_err(bad)?;
                 if let Err(error) = state.app.storage.set_account_owner(&owner, &credential.id) {
                     let _ = state.app.auth.logout(&credential.id);
@@ -1177,6 +1229,10 @@ async fn manager_custom_profile_action(
                         let _ = state.app.auth.logout(&reference);
                     }
                 }
+                profile = profiles
+                    .get(&owner, profile_id)
+                    .map_err(bad)?
+                    .ok_or_else(|| bad("Custom profile not found"))?;
             }
             state
                 .app
@@ -1184,16 +1240,20 @@ async fn manager_custom_profile_action(
                 .audit(
                     &owner,
                     "custom_profile_edited",
-                    &format!(
+                    &redact_text(&format!(
                         "profile_id={profile_id};endpoint_changed={endpoint_changed};credential_kept={}",
                         endpoint_changed && req.keep_credential
-                    ),
+                    )),
                 )
                 .map_err(bad)?;
-            let profile = profiles
-                .get(&owner, profile_id)
-                .map_err(bad)?
-                .ok_or_else(|| bad("Custom profile not found"))?;
+            let header_names = profile.all_header_names(&secrets).unwrap_or_else(|_| {
+                profile
+                    .safe_headers()
+                    .unwrap_or_default()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
             Ok(Json(json!({
                 "ok": true,
                 "profile": {
@@ -1202,7 +1262,7 @@ async fn manager_custom_profile_action(
                     "endpoint": profile.endpoint,
                     "protocol": profile.protocol,
                     "api_key_configured": profile.credential_ref.is_some(),
-                    "header_names": profile.safe_headers().map_err(bad)?.keys().cloned().collect::<Vec<_>>(),
+                    "header_names": header_names,
                 },
                 "credential_cleared_on_endpoint_change": endpoint_changed && !req.keep_credential,
             })))
@@ -1221,7 +1281,7 @@ async fn manager_custom_profile_action(
                 .map_err(bad)?
                 .ok_or_else(|| bad("Custom profile not found"))?;
             profiles
-                .change_endpoint(&owner, profile_id, endpoint)
+                .change_endpoint_with_secrets(&owner, profile_id, endpoint, &secrets)
                 .map_err(bad)?;
             if let Some(reference) = prior.credential_ref {
                 let _ = state.app.auth.logout(&reference);
@@ -1232,7 +1292,7 @@ async fn manager_custom_profile_action(
                 .audit(
                     &owner,
                     "custom_profile_endpoint_changed",
-                    &format!("profile_id={profile_id};credential_cleared=true"),
+                    &redact_text(&format!("profile_id={profile_id};credential_cleared=true")),
                 )
                 .map_err(bad)?;
             Ok(Json(
@@ -1256,23 +1316,21 @@ async fn manager_custom_profile_action(
                 .map_err(bad)?
                 .flatten()
                 .and_then(|credential| credential.api_key);
-            let ids = fetch_custom_models(
-                &profile.endpoint,
-                &profile.safe_headers().map_err(bad)?,
-                api_key.as_deref(),
-            )
-            .await
-            .map_err(|error| {
-                let _ = profiles.set_reachability(&owner, profile_id, "unreachable");
-                bad(error)
-            })?;
+            // P1-4: request merges only selected profile's headers, no cross-profile fallback.
+            let headers = profile.merged_headers(&secrets).map_err(bad)?;
+            let ids = fetch_custom_models(&profile.endpoint, &headers, api_key.as_deref())
+                .await
+                .map_err(|error| {
+                    let _ = profiles.set_reachability(&owner, profile_id, "unreachable");
+                    bad(error)
+                })?;
             let prior = profiles
                 .models(profile_id)
                 .map_err(bad)?
                 .into_iter()
                 .map(|model| (model.model_id.clone(), model))
                 .collect::<BTreeMap<_, _>>();
-            let headers = profile.safe_headers().map_err(bad)?;
+
             let mut models = Vec::with_capacity(ids.len());
             // Keep a hard network budget for a catalog with many models. The
             // selected/requested model is probed first; at most eight models
@@ -1380,7 +1438,9 @@ async fn manager_custom_profile_action(
                 .profile_id
                 .as_deref()
                 .ok_or_else(|| bad("profile_id is required"))?;
-            let credential = profiles.delete(&owner, profile_id).map_err(bad)?;
+            let credential = profiles
+                .delete_with_secrets(&owner, profile_id, &secrets)
+                .map_err(bad)?;
             if let Some(reference) = credential {
                 let _ = state.app.auth.logout(&reference);
             }
@@ -1390,7 +1450,7 @@ async fn manager_custom_profile_action(
                 .audit(
                     &owner,
                     "custom_profile_deleted",
-                    &format!("profile_id={profile_id}"),
+                    &redact_text(&format!("profile_id={profile_id}")),
                 )
                 .map_err(bad)?;
             Ok(Json(json!({"ok":true})))

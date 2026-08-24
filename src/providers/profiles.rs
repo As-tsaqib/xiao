@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     config::CustomProviderConfig,
+    security::{redact::redact_text, secrets::SecretStore},
     storage::{ProviderProfileInput, ProviderProfileModelRecord, ProviderProfileRecord, Storage},
 };
 
@@ -207,6 +208,52 @@ impl ProviderProfileStore {
         })
     }
 
+    /// Trust-boundary endpoint change that also removes write-only secret headers
+    /// from SecretStore. Used by CustomProfileService and IPC edit_endpoint.
+    pub fn change_endpoint_with_secrets(
+        &self,
+        owner_id: &str,
+        profile_id: &str,
+        endpoint: &str,
+        secrets: &SecretStore,
+    ) -> Result<()> {
+        let endpoint = validate_endpoint(endpoint)?;
+        let secret_ref = secret_headers_ref_for(profile_id);
+        let old_secret_ref: Option<String> = self.storage.with_conn(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT secret_headers_ref FROM provider_profiles WHERE owner_id=? AND profile_id=?",
+                    params![owner_id, profile_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        })?;
+        self.storage.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let changed = transaction.execute(
+                "UPDATE provider_profiles SET endpoint=?,credential_ref=NULL,safe_headers_json='{}',secret_headers_ref=NULL,reachability='unknown',last_probe_at=NULL,updated_at=? WHERE owner_id=? AND profile_id=?",
+                params![endpoint, Utc::now().to_rfc3339(), owner_id, profile_id],
+            )?;
+            if changed != 1 {
+                return Err(anyhow!("Custom profile not found for owner"));
+            }
+            transaction.execute(
+                "DELETE FROM provider_profile_models WHERE profile_id=?",
+                params![profile_id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })?;
+        // Best-effort secret cleanup after DB commit; redacted on failure.
+        if let Some(reference) = old_secret_ref {
+            let _ = secrets.remove(&reference);
+        }
+        let _ = secrets.remove(&secret_ref);
+        let _ = secrets.rollback_staged(&secret_ref);
+        Ok(())
+    }
+
     pub fn replace_models(
         &self,
         owner_id: &str,
@@ -317,6 +364,19 @@ impl ProviderProfileStore {
         })
     }
 
+    pub fn delete_with_secrets(
+        &self,
+        owner_id: &str,
+        profile_id: &str,
+        secrets: &SecretStore,
+    ) -> Result<Option<String>> {
+        let credential = self.delete(owner_id, profile_id)?;
+        let secret_ref = secret_headers_ref_for(profile_id);
+        let _ = secrets.remove(&secret_ref);
+        let _ = secrets.rollback_staged(&secret_ref);
+        Ok(credential)
+    }
+
     pub fn migrate_singleton(
         &self,
         owner_id: &str,
@@ -420,6 +480,243 @@ impl ProviderProfileStore {
 impl ProviderProfileRecord {
     pub fn safe_headers(&self) -> Result<BTreeMap<String, String>> {
         parse_safe_headers(&self.safe_headers_json)
+    }
+
+    pub fn secret_headers(&self, secrets: &SecretStore) -> Result<BTreeMap<String, String>> {
+        load_secret_headers(secrets, self.secret_headers_ref.as_deref())
+    }
+
+    pub fn secret_header_names(&self, secrets: &SecretStore) -> Result<Vec<String>> {
+        Ok(self.secret_headers(secrets)?.keys().cloned().collect())
+    }
+
+    pub fn all_header_names(&self, secrets: &SecretStore) -> Result<Vec<String>> {
+        let mut names: Vec<String> = self.safe_headers()?.keys().cloned().collect();
+        names.extend(self.secret_headers(secrets)?.keys().cloned());
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    pub fn merged_headers(&self, secrets: &SecretStore) -> Result<BTreeMap<String, String>> {
+        let mut merged = self.safe_headers()?;
+        merged.extend(self.secret_headers(secrets)?);
+        Ok(merged)
+    }
+}
+
+/// P1-5 atomic edit service: validate -> stage secret -> DB txn -> commit -> delete old secret -> rollback on fail -> invalidate models on endpoint change.
+#[derive(Debug, Clone, Default)]
+pub struct CustomProfileEdit {
+    pub alias: Option<String>,
+    pub endpoint: Option<String>,
+    pub protocol: Option<String>,
+    pub safe_headers: Option<BTreeMap<String, String>>,
+    pub secret_headers: Option<BTreeMap<String, String>>,
+    pub clear_secret_headers: bool,
+    pub keep_credential_on_endpoint_change: bool,
+}
+
+pub struct CustomProfileService {
+    storage: Arc<Storage>,
+    secrets: SecretStore,
+}
+
+impl CustomProfileService {
+    pub fn new(storage: Arc<Storage>, secrets: SecretStore) -> Self {
+        Self { storage, secrets }
+    }
+
+    pub fn edit(
+        &self,
+        owner_id: &str,
+        profile_id: &str,
+        edit: CustomProfileEdit,
+    ) -> Result<ProviderProfileRecord> {
+        // 1. Validate inputs upfront; redacted on error.
+        let alias = edit
+            .alias
+            .as_deref()
+            .map(canonical_alias)
+            .transpose()
+            .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
+        let endpoint = edit
+            .endpoint
+            .as_deref()
+            .map(validate_endpoint)
+            .transpose()
+            .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
+        if let Some(protocol) = edit.protocol.as_deref() {
+            validate_protocol(protocol)
+                .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
+        }
+        let safe_headers_json = if let Some(headers) = edit.safe_headers.as_ref() {
+            let normalized = parse_safe_headers(&serde_json::to_string(headers)?)
+                .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
+            Some(serde_json::to_string(&normalized)?)
+        } else {
+            None
+        };
+        let secret_headers_json = if let Some(headers) = edit.secret_headers.as_ref() {
+            validate_secret_headers(headers)
+                .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
+            Some(serde_json::to_string(headers)?)
+        } else {
+            None
+        };
+        if edit.secret_headers.is_some() && edit.clear_secret_headers {
+            return Err(anyhow!("cannot set and clear secret headers in one edit"));
+        }
+
+        // 2. Load current profile to determine deltas.
+        let current = self
+            .storage
+            .with_conn(|connection| {
+                connection
+                    .query_row(
+                        "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
+                        params![owner_id, profile_id],
+                        row_profile,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })?
+            .ok_or_else(|| anyhow!("Custom profile not found for owner"))?;
+
+        let endpoint_changed = endpoint
+            .as_deref()
+            .is_some_and(|value| value != current.endpoint);
+        let protocol_changed = edit
+            .protocol
+            .as_deref()
+            .is_some_and(|value| value != current.protocol);
+
+        // 3. Stage secret write-only headers before DB commit.
+        let secret_ref = secret_headers_ref_for(profile_id);
+        let staged = secret_headers_json.is_some();
+        let mut old_secret_json: Option<String> = None;
+        if let Some(reference) = current.secret_headers_ref.as_deref() {
+            old_secret_json = self.secrets.get(reference)?;
+        }
+        if let Some(json) = secret_headers_json.as_deref() {
+            self.secrets
+                .put_staged(&secret_ref, json)
+                .map_err(|error| anyhow!(redact_text(&error.to_string())))?;
+        }
+
+        // Determine next secret ref/value for DB.
+        let next_secret_ref: Option<String> = if endpoint_changed {
+            None
+        } else if edit.clear_secret_headers {
+            None
+        } else if secret_headers_json.is_some() {
+            Some(secret_ref.clone())
+        } else {
+            current.secret_headers_ref.clone()
+        };
+
+        // 4. DB transaction: update profile and invalidate models on endpoint/protocol change.
+        let db_result: Result<()> = self.storage.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_profiles WHERE owner_id=? AND profile_id=?)",
+                params![owner_id, profile_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(anyhow!("Custom profile not found for owner"));
+            }
+            let next_alias = alias.as_deref().unwrap_or(&current.alias);
+            let next_endpoint = endpoint.as_deref().unwrap_or(&current.endpoint);
+            let next_protocol = edit.protocol.as_deref().unwrap_or(&current.protocol);
+            let next_safe = safe_headers_json.as_deref().unwrap_or(&current.safe_headers_json);
+            // Validate alias uniqueness via DB constraint will surface as rusqlite error; map to redacted.
+            // Endpoint change clears credential by default unless keep_credential is true.
+            let next_credential: Option<String> = if endpoint_changed
+                && !edit.keep_credential_on_endpoint_change
+            {
+                None
+            } else {
+                current.credential_ref.clone()
+            };
+            let updated = transaction.execute(
+                "UPDATE provider_profiles SET alias=?,endpoint=?,protocol=?,safe_headers_json=?,secret_headers_ref=?,credential_ref=?,reachability='unknown',last_probe_at=NULL,updated_at=? WHERE owner_id=? AND profile_id=?",
+                params![next_alias, next_endpoint, next_protocol, next_safe, next_secret_ref, next_credential, Utc::now().to_rfc3339(), owner_id, profile_id],
+            )?;
+            if updated != 1 {
+                return Err(anyhow!("Custom profile not found for owner"));
+            }
+            if endpoint_changed || protocol_changed {
+                transaction.execute(
+                    "DELETE FROM provider_profile_models WHERE profile_id=?",
+                    params![profile_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        });
+
+        // 5. Commit or rollback staged secret.
+        match db_result {
+            Ok(()) => {
+                if staged {
+                    if let Err(error) = self.secrets.commit_staged(&secret_ref) {
+                        // DB already committed; surface redacted error but profile is updated.
+                        return Err(anyhow!(redact_text(&error.to_string())));
+                    }
+                }
+                if endpoint_changed || edit.clear_secret_headers {
+                    // Delete old secret after successful endpoint/clear.
+                    if let Some(reference) = current.secret_headers_ref.as_deref() {
+                        let _ = self.secrets.remove(reference);
+                    }
+                    if endpoint_changed {
+                        let _ = self.secrets.remove(&secret_ref);
+                        let _ = self.secrets.rollback_staged(&secret_ref);
+                    }
+                    if edit.clear_secret_headers && !endpoint_changed {
+                        let _ = self.secrets.remove(&secret_ref);
+                        let _ = self.secrets.rollback_staged(&secret_ref);
+                    }
+                } else if staged {
+                    // On secret update, old value is overwritten by staged commit; if old ref differed, clean.
+                    if let Some(old_ref) = current.secret_headers_ref.as_deref() {
+                        if old_ref != secret_ref {
+                            let _ = self.secrets.remove(old_ref);
+                        }
+                    }
+                }
+                // Ensure no leftover staged file.
+                let _ = self.secrets.rollback_staged(&secret_ref);
+                // Return updated profile; invalidate models already handled.
+                self.storage
+                    .with_conn(|connection| {
+                        connection
+                            .query_row(
+                                "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
+                                params![owner_id, profile_id],
+                                row_profile,
+                            )
+                            .optional()
+                            .map_err(Into::into)
+                    })?
+                    .ok_or_else(|| anyhow!("edited Custom profile is missing"))
+            }
+            Err(error) => {
+                // Roll back staged secret so old remains.
+                let _ = self.secrets.rollback_staged(&secret_ref);
+                // If we staged a new secret that overwrote old file name, restore old if existed.
+                if staged {
+                    if let Some(old_json) = old_secret_json.as_deref() {
+                        let _ = self.secrets.put(&secret_ref, old_json);
+                    } else if current.secret_headers_ref.is_none() {
+                        // No prior secret; ensure no final file left from staged commit attempt.
+                        let _ = self.secrets.remove(&secret_ref);
+                    }
+                }
+                Err(anyhow!(redact_text(&error.to_string())))
+            }
+        }
     }
 }
 
@@ -532,6 +829,43 @@ fn parse_safe_headers(value: &str) -> Result<BTreeMap<String, String>> {
         }
     }
     Ok(headers)
+}
+
+fn validate_secret_headers(headers: &BTreeMap<String, String>) -> Result<()> {
+    for (name, value) in headers {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.chars().count() > 128 || value.chars().count() > 4_096 {
+            return Err(anyhow!("Custom secret header name or value is invalid"));
+        }
+    }
+    if headers.is_empty() {
+        return Err(anyhow!("secret headers must not be empty when provided"));
+    }
+    Ok(())
+}
+
+fn parse_secret_headers(value: &str) -> Result<BTreeMap<String, String>> {
+    let headers = serde_json::from_str::<BTreeMap<String, String>>(value)
+        .context("Custom secret headers must be a JSON object")?;
+    validate_secret_headers(&headers)?;
+    Ok(headers)
+}
+
+fn load_secret_headers(
+    secrets: &SecretStore,
+    secret_ref: Option<&str>,
+) -> Result<BTreeMap<String, String>> {
+    let Some(reference) = secret_ref else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(json) = secrets.get(reference)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(parse_secret_headers(&json)?)
+}
+
+pub fn secret_headers_ref_for(profile_id: &str) -> String {
+    format!("custom_secret_headers:{profile_id}")
 }
 
 fn short_owner(owner_id: &str) -> String {

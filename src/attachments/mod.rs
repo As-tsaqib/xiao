@@ -18,8 +18,8 @@ use zip::ZipArchive;
 use crate::{
     config::AttachmentConfig,
     runtime::{
-        CapabilityRegistry, CapabilityStatus, DependencyResolver, ExecutionPurpose, TermuxCommand,
-        TermuxExecutor, TermuxPackageBackend,
+        CapabilityRegistry, CapabilityStatus, DependencyResolver, ExecutionPurpose,
+        ProcessExecutor, TermuxCommand, TermuxExecutor, TermuxPackageBackend,
     },
     security::redact::redact_text,
     storage::{AttachmentChunkRecord, AttachmentRecord, NewAttachmentRecord, Storage},
@@ -800,35 +800,6 @@ impl AttachmentManager {
             Ok(())
         })?;
         Ok(format!("store={} FTS5 readable", self.root.display()))
-    }
-}
-
-fn command_available(command: &str) -> bool {
-    Command::new(command)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-fn run_command_bounded(command: &mut Command, timeout: Duration, label: &str) -> Result<()> {
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    let mut child = command.spawn().with_context(|| format!("start {label}"))?;
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if status.success() {
-                return Ok(());
-            }
-            return Err(anyhow!("{label} failed with status {status}"));
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(anyhow!("{label} exceeded its bounded timeout"));
-        }
-        thread::sleep(Duration::from_millis(25));
     }
 }
 

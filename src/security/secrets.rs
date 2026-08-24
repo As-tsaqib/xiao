@@ -39,6 +39,33 @@ impl SecretStore {
         }
         Ok(())
     }
+    pub fn exists(&self, key: &str) -> Result<bool> {
+        Ok(self.path(key).exists())
+    }
+    pub fn staged_key(key: &str) -> String {
+        format!("{key}:staged")
+    }
+    pub fn put_staged(&self, key: &str, value: &str) -> Result<()> {
+        self.put(&Self::staged_key(key), value)
+    }
+    pub fn commit_staged(&self, key: &str) -> Result<()> {
+        let staged = self.path(&Self::staged_key(key));
+        if staged.exists() {
+            let dest = self.path(key);
+            fs::create_dir_all(&self.root)?;
+            fs::rename(&staged, &dest)
+                .with_context(|| format!("commit staged {}", dest.display()))?;
+            set_0600(&dest)?;
+        }
+        Ok(())
+    }
+    pub fn rollback_staged(&self, key: &str) -> Result<()> {
+        let staged = self.path(&Self::staged_key(key));
+        if staged.exists() {
+            fs::remove_file(staged)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
