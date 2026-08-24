@@ -176,7 +176,6 @@ impl TelegramSetupService {
         if let Err(e) = next.save_atomic(&self.config_path) {
             return Err(anyhow!("persist config: {e}"));
         }
-        let mut committed_config = true;
         // Stage write-only secret.
         if let Some(token) = supplied_token {
             if let Err(e) =
@@ -185,7 +184,6 @@ impl TelegramSetupService {
                 // Roll back config file to old state; staged secret was not fully written yet.
                 let _ = old.save_atomic(&self.config_path);
                 let _ = SecretStore::new(old.paths.secrets_dir.clone()).remove(TELEGRAM_TOKEN_KEY);
-                let _ = committed_config;
                 return Err(anyhow!("persist telegram token: {e}"));
             }
         }

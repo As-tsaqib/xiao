@@ -22,7 +22,6 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     app::AppState,
-    config::parse_id_list,
     control_plane::{TelegramConfigureInput, TelegramSetupService},
     event::AppEvent,
     memory::{MemoryScope, MemoryStore},
