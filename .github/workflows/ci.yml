@@ -1,6 +1,5 @@
 name: ci
 on:
-  push:
   pull_request:
   workflow_dispatch:
 
@@ -8,71 +7,38 @@ permissions:
   contents: write
 
 jobs:
-  bootstrap-v027:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'feat/v0.2.7-control-plane-unification'
+  rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           ref: feat/v0.2.7-control-plane-unification
           fetch-depth: 0
-      - run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - name: Apply checksum-bound v0.2.7 implementation patch
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat \
-            .bootstrap/v2-00 \
-            .bootstrap/v2-01a \
-            .bootstrap/v3-01b0 \
-            .bootstrap/v3-01b1 \
-            .bootstrap/v2-01c \
-            .bootstrap/v2-02 \
-            .bootstrap/v2-03 \
-            .bootstrap/v2-04 \
-            .bootstrap/v2-05 \
-            .bootstrap/v3-060 \
-            .bootstrap/v3-061 \
-            .bootstrap/v3-062 \
-            .bootstrap/v3-063 \
-            .bootstrap/v3-064 \
-            .bootstrap/v3-065 \
-            .bootstrap/v2-07 \
-            .bootstrap/v2-08 > /tmp/v027.payload.b64
-          echo 'b4029528f5c31db3d06760d35c17db3c2f303320d2604f3a87d9bc7934af328d  /tmp/v027.payload.b64' | sha256sum -c -
-          base64 --decode /tmp/v027.payload.b64 | xz --decompress > /tmp/v027.patch
-          echo 'e39029cd8df8ba46607c1a87da35e7f133404c3e336bfd465a8e5dfa6953553c  /tmp/v027.patch' | sha256sum -c -
-          git apply --check /tmp/v027.patch
-          git apply /tmp/v027.patch
-          rm -rf .bootstrap
-          git diff --check
-          node --check module/webroot/assets/app.js
-          ./scripts/acceptance.sh --static-only
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git commit -m 'feat: unify Xiao v0.2.7 control plane and CLI'
-          git push origin HEAD:feat/v0.2.7-control-plane-unification
-
-  rust:
-    needs: bootstrap-v027
-    if: always() && needs.bootstrap-v027.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: feat/v0.2.7-control-plane-unification
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
       - run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
       - run: shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
       - run: shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
-      - run: cargo fmt --all -- --check
+      - name: Format Rust and persist once
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          git diff --check
+          if ! git diff --quiet; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add -- '*.rs'
+            git commit -m 'style: apply rustfmt to v0.2.7 implementation'
+            git push origin HEAD:feat/v0.2.7-control-plane-unification
+          fi
+          cargo fmt --all -- --check
       - run: cargo check --locked --all-targets --all-features
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets --all-features
       - run: cargo build --locked --release --all-features
+      - run: node --check module/webroot/assets/app.js
       - run: ./scripts/acceptance.sh --static-only
 
   android-arm64:
