@@ -957,7 +957,7 @@ async fn custom_command(
         }
         Some("add") => custom_add(client, &args[1..], presenter).await,
         Some("edit") => custom_edit(client, &args[1..], presenter).await,
-        Some("test") if args.len() == 2 || args.len() == 3 => presenter.success(
+        Some("test") if args.len() == 2 => presenter.success(
             "model custom test",
             client
                 .post_admin(
@@ -965,7 +965,32 @@ async fn custom_command(
                     &json!({
                         "action":"test",
                         "profile_id":args[1],
-                        "model":args.get(2),
+                    }),
+                )
+                .await?,
+        ),
+        Some("test") if args.len() == 3 => presenter.success(
+            "model custom test",
+            client
+                .post_admin(
+                    "/v1/admin/providers/custom",
+                    &json!({
+                        "action":"probe",
+                        "profile_id":args[1],
+                        "model":args[2],
+                    }),
+                )
+                .await?,
+        ),
+        Some("probe") if args.len() == 3 => presenter.success(
+            "model custom probe",
+            client
+                .post_admin(
+                    "/v1/admin/providers/custom",
+                    &json!({
+                        "action":"probe",
+                        "profile_id":args[1],
+                        "model":args[2],
                     }),
                 )
                 .await?,
@@ -1005,7 +1030,7 @@ async fn custom_command(
                 .await?,
         ),
         _ => Err(CliFailure::usage(
-            "usage: xiao model custom <list|add|show|edit|test|models|use|delete> ...",
+            "usage: xiao model custom <list|add|show|edit|test|probe|models|use|delete> ...",
         )),
     }
 }
@@ -2600,7 +2625,7 @@ fn print_subcommand_help(path: &[String]) {
         ["telegram", "configure"] => "Usage: xiao telegram configure [--owner ID] [--allowed-chat ID] [--token-file PATH] [--enable|--disable] [--test]",
         ["model"] => "Usage: xiao model <show|list|use|accounts|custom> ...",
         ["model", "accounts"] => "Usage: xiao model accounts <list|show|use|reconnect|disconnect> ...",
-        ["model", "custom"] => "Usage: xiao model custom <list|add|show|edit|test|models|use|delete> ...",
+        ["model", "custom"] => "Usage: xiao model custom <list|add|show|edit|test|probe|models|use|delete> ...",
         ["sessions"] => "Usage: xiao sessions <list|new|show|use|rename|archive> ...",
         ["yolo"] => "Usage: xiao yolo <status|on|off> [--session ID]",
         ["memory"] => "Usage: xiao memory <list|search|get|set|forget> ...",
@@ -2655,7 +2680,7 @@ Providers / models:
   xiao login codex|antigravity|custom
   xiao model show|list|use MODEL
   xiao model accounts list|show|use|reconnect|disconnect ...
-  xiao model custom list|add|show|edit|test|models|use|delete ...
+  xiao model custom list|add|show|edit|test|probe|models|use|delete ...
 
 Sessions:
   xiao sessions list|new|show|use|rename|archive ...

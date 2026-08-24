@@ -308,22 +308,13 @@ impl SessionAiService {
                 .model(&profile.profile_id, model)?
                 .ok_or_else(|| anyhow!("model has not been discovered for this Custom profile"))?;
             // P0-4: never silently activate an unprobed model as ChatOnly.
-            // Unknown means probe budget was not spent; require exact probe first.
-            if record.native_tools_state == "unknown"
-                && record.structured_output_state == "unknown"
-                && record.vision_state == "unknown"
-                && record.file_input_state == "unknown"
-                && record.evidence.contains("probe budget not spent")
-                || record.probed_at.is_empty()
-            {
+            // Unknown means probe budget was not spent or probed_at empty; require exact-model probe first.
+            if Self::is_unprobed(&record) {
                 return Err(anyhow!(
                     "capability_probe_required: model '{model}' has not been probed for this Custom profile; run Test for this exact model first"
                 ));
             }
-            if record.tool_protocol == "chat_only"
-                && record.native_tools_state == "unknown"
-                && record.evidence.contains("not been probed")
-            {
+            if record.tool_protocol == "chat_only" && record.native_tools_state == "unknown" {
                 return Err(anyhow!(
                     "capability_probe_required: model '{model}' capability is Unknown, probe exact model before activation"
                 ));
@@ -358,6 +349,60 @@ impl SessionAiService {
         self.storage
             .session(owner, &input.session_id)?
             .ok_or_else(|| anyhow!("updated session disappeared"))
+    }
+
+    /// P0-4 helper: whether the stored model record has not been capability-probed.
+    pub fn is_unprobed(record: &crate::storage::ProviderProfileModelRecord) -> bool {
+        if record.probed_at.is_empty() {
+            return true;
+        }
+        if record.native_tools_state == "unknown"
+            || record.structured_output_state == "unknown"
+            || record.continuation_state == "unknown"
+            || record.vision_state == "unknown"
+            || record.file_input_state == "unknown"
+        {
+            if record.evidence.contains("probe budget not spent")
+                || record.evidence.contains("not been probed")
+                || record.evidence.contains("capability probe required")
+                || record.evidence.contains("discovered;")
+            {
+                return true;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// P0-4 bounded exact-model probe: inspect -> unknown? probe exactly that model -> persist.
+    pub async fn probe_exact_model(
+        &self,
+        owner: &str,
+        profile_id: &str,
+        model: &str,
+    ) -> Result<crate::storage::ProviderProfileModelRecord> {
+        let profiles = ProviderProfileStore::new(self.storage.clone());
+        let profile = profiles
+            .get(owner, profile_id)?
+            .ok_or_else(|| anyhow!("Custom profile not found for owner"))?;
+        let headers = profile.safe_headers().unwrap_or_default();
+        let probe = crate::providers::probe_custom_capabilities(
+            &profile.endpoint,
+            &headers,
+            None,
+            &profile.protocol,
+            model,
+        )
+        .await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut models = profiles.models(profile_id)?;
+        let pos = models
+            .iter()
+            .position(|m| m.model_id == model)
+            .ok_or_else(|| anyhow!("model has not been discovered for this Custom profile"))?;
+        models[pos] = crate::providers::profile_model_from_probe(profile_id, model, &probe, &now);
+        profiles.replace_models(owner, profile_id, &models)?;
+        Ok(models[pos].clone())
     }
 }
 

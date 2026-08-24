@@ -976,7 +976,7 @@ impl TelegramAdapter {
             .capability
             .as_ref()
             .ok_or_else(|| anyhow!("selected model capability was not probed"))?;
-        let capability = &probe.capabilities;
+        let probed_at = chrono::Utc::now().to_rfc3339();
         let context = self
             .app
             .sessions
@@ -1003,59 +1003,33 @@ impl TelegramAdapter {
             .models
             .iter()
             .map(|candidate| {
-                let selected = candidate == &model;
-                crate::storage::ProviderProfileModelRecord {
-                    profile_id: profile.profile_id.clone(),
-                    model_id: candidate.clone(),
-                    text_capable: true,
-                    vision_capable: false,
-                    file_input_capable: false,
-                    native_tools: selected
-                        && capability.tool_protocol == crate::providers::ToolProtocol::Native,
-                    structured_output: selected && capability.structured_output,
-                    continuation: selected && capability.continuation,
-                    native_tools_state: if selected {
-                        probe.native_tools.as_str()
-                    } else {
-                        "unknown"
+                if candidate == &model {
+                    crate::providers::profile_model_from_probe(
+                        &profile.profile_id,
+                        candidate,
+                        probe,
+                        &probed_at,
+                    )
+                } else {
+                    crate::storage::ProviderProfileModelRecord {
+                        profile_id: profile.profile_id.clone(),
+                        model_id: candidate.clone(),
+                        text_capable: true,
+                        vision_capable: false,
+                        file_input_capable: false,
+                        native_tools: false,
+                        structured_output: false,
+                        continuation: false,
+                        native_tools_state: "unknown".into(),
+                        structured_output_state: "unknown".into(),
+                        continuation_state: "unknown".into(),
+                        vision_state: "unknown".into(),
+                        file_input_state: "unknown".into(),
+                        model_discovery: true,
+                        tool_protocol: "chat_only".into(),
+                        evidence: "discovered but not capability-probed".into(),
+                        probed_at: probed_at.clone(),
                     }
-                    .into(),
-                    structured_output_state: if selected {
-                        probe.structured_output.as_str()
-                    } else {
-                        "unknown"
-                    }
-                    .into(),
-                    continuation_state: if selected {
-                        probe.continuation.as_str()
-                    } else {
-                        "unknown"
-                    }
-                    .into(),
-                    vision_state: if selected {
-                        probe.vision.as_str()
-                    } else {
-                        "unknown"
-                    }
-                    .into(),
-                    file_input_state: if selected {
-                        probe.file_input.as_str()
-                    } else {
-                        "unknown"
-                    }
-                    .into(),
-                    model_discovery: true,
-                    tool_protocol: if selected {
-                        capability.tool_protocol.as_str().into()
-                    } else {
-                        "chat_only".into()
-                    },
-                    evidence: if selected {
-                        capability.evidence.clone()
-                    } else {
-                        "discovered but not capability-probed".into()
-                    },
-                    probed_at: chrono::Utc::now().to_rfc3339(),
                 }
             })
             .collect::<Vec<_>>();

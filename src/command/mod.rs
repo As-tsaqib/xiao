@@ -1037,13 +1037,23 @@ impl CommandCore {
             )),
             UseCustomProfile { profile } => {
                 let selected = self.resolve_custom_profile(principal, &profile)?;
-                let model = ProviderProfileStore::new(self.storage.clone())
+                let mut model = ProviderProfileStore::new(self.storage.clone())
                     .models(&selected.profile_id)?
                     .into_iter()
                     .find(|model| model.text_capable)
                     .ok_or_else(|| anyhow!("Custom profile has no usable text model"))?
                     .model_id;
                 let context = self.session_context(principal, scope)?;
+                // P0-4: ensure exact selected model is probed before activation.
+                let profiles = ProviderProfileStore::new(self.storage.clone());
+                if let Some(rec) = profiles.model(&selected.profile_id, &model)? {
+                    if crate::control_plane::SessionAiService::is_unprobed(&rec) {
+                        self.probe_custom_model(principal, scope, &model).await?;
+                        if let Some(updated) = profiles.model(&selected.profile_id, &model)? {
+                            model = updated.model_id;
+                        }
+                    }
+                }
                 self.management_set_session_ai(
                     principal,
                     &context.active.id,
@@ -1064,6 +1074,15 @@ impl CommandCore {
                 }
                 let selected = self.resolve_custom_profile(principal, &profile)?;
                 let context = self.session_context(principal, scope)?;
+                // P0-4: probe exact selected model BEFORE activation; never silently activate unprobed as ChatOnly.
+                let profiles = ProviderProfileStore::new(self.storage.clone());
+                let needs_probe = profiles
+                    .model(&selected.profile_id, &model)?
+                    .map(|r| crate::control_plane::SessionAiService::is_unprobed(&r))
+                    .unwrap_or(true);
+                if needs_probe {
+                    self.probe_custom_model(principal, scope, &model).await?;
+                }
                 self.management_set_session_ai(
                     principal,
                     &context.active.id,
@@ -1071,7 +1090,6 @@ impl CommandCore {
                     Some(selected.profile_id.clone()),
                     &model,
                 )?;
-                self.probe_custom_model(principal, scope, &model).await?;
                 Ok(CommandResult::ManagerView(
                     self.model_view(principal, scope)?,
                 ))
@@ -2145,22 +2163,8 @@ impl CommandCore {
             model,
         )
         .await;
-        let capability = probe.capabilities;
-        selected.text_capable = capability.text;
-        selected.vision_capable = capability.vision;
-        selected.file_input_capable = capability.file_input;
-        selected.native_tools = capability.native_tools;
-        selected.structured_output = capability.structured_output;
-        selected.continuation = capability.continuation;
-        selected.native_tools_state = probe.native_tools.as_str().into();
-        selected.structured_output_state = probe.structured_output.as_str().into();
-        selected.continuation_state = probe.continuation.as_str().into();
-        selected.vision_state = probe.vision.as_str().into();
-        selected.file_input_state = probe.file_input.as_str().into();
-        selected.model_discovery = capability.model_discovery;
-        selected.tool_protocol = capability.tool_protocol.as_str().into();
-        selected.evidence = capability.evidence;
-        selected.probed_at = chrono::Utc::now().to_rfc3339();
+        let probed_at = chrono::Utc::now().to_rfc3339();
+        *selected = crate::providers::profile_model_from_probe(profile_id, model, &probe, &probed_at);
         profiles.replace_models(principal, profile_id, &models)?;
         Ok(())
     }

@@ -1357,26 +1357,12 @@ async fn manager_custom_profile_action(
                         &model_id,
                     )
                     .await;
-                    let capability = probe.capabilities;
-                    models.push(ProviderProfileModelRecord {
-                        profile_id: profile_id.to_owned(),
-                        model_id,
-                        text_capable: capability.text,
-                        vision_capable: capability.vision,
-                        file_input_capable: capability.file_input,
-                        native_tools: capability.native_tools,
-                        structured_output: capability.structured_output,
-                        continuation: capability.continuation,
-                        native_tools_state: probe.native_tools.as_str().into(),
-                        structured_output_state: probe.structured_output.as_str().into(),
-                        continuation_state: probe.continuation.as_str().into(),
-                        vision_state: probe.vision.as_str().into(),
-                        file_input_state: probe.file_input.as_str().into(),
-                        model_discovery: true,
-                        tool_protocol: capability.tool_protocol.as_str().into(),
-                        evidence: capability.evidence,
-                        probed_at: now.clone(),
-                    });
+                    models.push(crate::providers::profile_model_from_probe(
+                        profile_id,
+                        &model_id,
+                        &probe,
+                        &now,
+                    ));
                 } else {
                     models.push(prior.get(&model_id).cloned().unwrap_or(
                         ProviderProfileModelRecord {
@@ -1406,6 +1392,54 @@ async fn manager_custom_profile_action(
                 .replace_models(&owner, profile_id, &models)
                 .map_err(bad)?;
             Ok(Json(json!({"ok":true,"models":models})))
+        }
+        "probe" => {
+            // P0-4 WebUI exact-model probe: bounded single-model probe -> persist, no catalog discovery.
+            let profile_id = req
+                .profile_id
+                .as_deref()
+                .ok_or_else(|| bad("profile_id is required"))?;
+            let model = req
+                .model
+                .as_deref()
+                .ok_or_else(|| bad("model is required"))?;
+            let profile = profiles
+                .get(&owner, profile_id)
+                .map_err(bad)?
+                .ok_or_else(|| bad("Custom profile not found"))?;
+            if profiles
+                .model(profile_id, model)
+                .map_err(bad)?
+                .is_none()
+            {
+                return Err(bad("model has not been discovered for this Custom profile"));
+            }
+            let headers = profile.merged_headers(&secrets).map_err(bad)?;
+            let api_key = profile
+                .credential_ref
+                .as_deref()
+                .map(|ref_id| state.app.auth.credential(ref_id))
+                .transpose()
+                .map_err(bad)?
+                .flatten()
+                .and_then(|c| c.api_key);
+            let probe = crate::providers::probe_custom_capabilities(
+                &profile.endpoint,
+                &headers,
+                api_key.as_deref(),
+                &profile.protocol,
+                model,
+            )
+            .await;
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut models = profiles.models(profile_id).map_err(bad)?;
+            if let Some(pos) = models.iter().position(|m| m.model_id == model) {
+                models[pos] = crate::providers::profile_model_from_probe(profile_id, model, &probe, &now);
+                profiles.replace_models(&owner, profile_id, &models).map_err(bad)?;
+                Ok(Json(json!({"ok":true,"model":models[pos]})))
+            } else {
+                Err(bad("model has not been discovered for this Custom profile"))
+            }
         }
         "use" => {
             let profile_id = req
@@ -2652,6 +2686,8 @@ mod tests {
                 remove_api_key: false,
                 keep_credential: false,
                 headers: Some(safe_headers),
+                secret_headers: None,
+                clear_secret_headers: false,
                 session_id: None,
                 model: None,
             }),
@@ -2683,6 +2719,8 @@ mod tests {
                 remove_api_key: false,
                 keep_credential: false,
                 headers: Some(BTreeMap::new()),
+                secret_headers: None,
+                clear_secret_headers: false,
                 session_id: None,
                 model: None,
             }),
