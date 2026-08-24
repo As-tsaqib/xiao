@@ -12,6 +12,7 @@ pub mod ipc;
 pub mod learning;
 pub mod memory;
 pub mod owner;
+#[allow(dead_code)]
 pub mod providers;
 pub mod runtime;
 pub mod security;
