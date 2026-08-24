@@ -605,9 +605,7 @@ impl CustomProfileService {
         }
 
         // Determine next secret ref/value for DB.
-        let next_secret_ref: Option<String> = if endpoint_changed {
-            None
-        } else if edit.clear_secret_headers {
+        let next_secret_ref: Option<String> = if endpoint_changed || edit.clear_secret_headers {
             None
         } else if secret_headers_json.is_some() {
             Some(secret_ref.clone())
@@ -861,7 +859,7 @@ fn load_secret_headers(
     let Some(json) = secrets.get(reference)? else {
         return Ok(BTreeMap::new());
     };
-    Ok(parse_secret_headers(&json)?)
+    parse_secret_headers(&json)
 }
 
 pub fn secret_headers_ref_for(profile_id: &str) -> String {

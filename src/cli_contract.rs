@@ -126,7 +126,7 @@ pub fn project_status(raw: Value) -> Value {
     let raw = sanitize(raw);
     // dashboard shape may contain extra keys; pick only stable ones
     let allowed = ["owner_id", "health", "counts", "current_ai", "runtime"];
-    let mut out = pick_object(&raw, &allowed);
+    let out = pick_object(&raw, &allowed);
     // Ensure health.counts etc don't leak secrets even if nested
     // health may contain provider_states – keep as-is (no secrets)
     Value::Object(out)
@@ -496,7 +496,7 @@ pub fn project_doctor(raw: Value) -> Value {
 /// tools listing
 pub fn project_tools(raw: Value) -> Value {
     let raw = sanitize(raw);
-    let mut out = pick_object(&raw, &["items"]);
+    let out = pick_object(&raw, &["items"]);
     if out.is_empty() {
         // raw may already be {items:[...]} or bare array
         if let Some(arr) = raw.as_array() {

@@ -199,7 +199,7 @@ fn extract_via_termux(
     };
     // Safe dependency install/reprobe for required binaries
     for binary in ["pdftoppm", "tesseract"] {
-        if let Err(_) = ensure(binary) {
+        if ensure(binary).is_err() {
             // Install failed or still missing -> vision fallback, not error
             return Ok(None);
         }
