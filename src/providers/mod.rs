@@ -94,6 +94,38 @@ pub struct CustomCapabilityProbe {
     pub file_input: CapabilityState,
 }
 
+/// Canonical conversion from probe tri-state to runtime record. Ensures:
+///
+/// Supported   -> runtime bool true
+/// Unsupported -> runtime bool false
+/// Unknown     -> runtime bool false, metadata remains Unknown
+pub fn profile_model_from_probe(
+    profile_id: &str,
+    model_id: &str,
+    probe: &CustomCapabilityProbe,
+    probed_at: &str,
+) -> crate::storage::ProviderProfileModelRecord {
+    crate::storage::ProviderProfileModelRecord {
+        profile_id: profile_id.to_owned(),
+        model_id: model_id.to_owned(),
+        text_capable: probe.capabilities.text,
+        vision_capable: matches!(probe.vision, CapabilityState::Supported),
+        file_input_capable: matches!(probe.file_input, CapabilityState::Supported),
+        native_tools: matches!(probe.native_tools, CapabilityState::Supported),
+        structured_output: matches!(probe.structured_output, CapabilityState::Supported),
+        continuation: matches!(probe.continuation, CapabilityState::Supported),
+        native_tools_state: probe.native_tools.as_str().into(),
+        structured_output_state: probe.structured_output.as_str().into(),
+        continuation_state: probe.continuation.as_str().into(),
+        vision_state: probe.vision.as_str().into(),
+        file_input_state: probe.file_input.as_str().into(),
+        model_discovery: probe.capabilities.model_discovery,
+        tool_protocol: probe.capabilities.tool_protocol.as_str().into(),
+        evidence: probe.capabilities.evidence.clone(),
+        probed_at: probed_at.to_owned(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     pub text: bool,
@@ -1814,9 +1846,13 @@ async fn custom_vision_probe(
     model: &str,
     nonce: &str,
 ) -> Result<bool> {
-    // 1x1 transparent PNG. The request is bounded and carries no user data.
-    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
-    let prompt = format!("Capability probe. Reply exactly VISION-{nonce}.");
+    // Hidden challenge: render nonce into a tiny PNG so the text prompt
+    // never contains the expected token. A text-only model that echoes the
+    // prompt will not see the challenge.
+    let challenge = format!("VISION-{nonce}");
+    let png_base64 = render_probe_png_base64(&challenge);
+    // Prompt must not contain challenge; ask model to read image.
+    let prompt = "Read the code visible in the attached image and reply exactly with that code. No other text.";
     let (suffix, body) = if protocol == "openai_responses" {
         (
             "/responses",
@@ -1824,7 +1860,7 @@ async fn custom_vision_probe(
                 "model": model,
                 "input": [{"role":"user","content":[
                     {"type":"input_text","text":prompt},
-                    {"type":"input_image","image_url":format!("data:image/png;base64,{PNG}")}
+                    {"type":"input_image","image_url":format!("data:image/png;base64,{png_base64}")}
                 ]}],
                 "stream": false
             }),
@@ -1836,7 +1872,7 @@ async fn custom_vision_probe(
                 "model": model,
                 "messages": [{"role":"user","content":[
                     {"type":"text","text":prompt},
-                    {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{PNG}")}}
+                    {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{png_base64}")}}
                 ]}],
                 "stream": false
             }),
@@ -1848,7 +1884,89 @@ async fn custom_vision_probe(
     } else {
         extract_chat_content(&value)
     };
-    Ok(output.is_some_and(|text| text.contains(&format!("VISION-{nonce}"))))
+    Ok(output.is_some_and(|text| text.contains(&challenge)))
+}
+
+/// Minimal 5x7 bitmap font rasterizer for probe images. No external
+/// font dependency; uses a compact table for A-Z,0-9,'-'.
+fn render_probe_png_base64(challenge: &str) -> String {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use image::{ImageBuffer, Rgb};
+    // Layout: each char 6px wide (5 + 1 gap), 7px tall, with margins.
+    let char_w: u32 = 6;
+    let char_h: u32 = 9;
+    let margin: u32 = 4;
+    let width = (challenge.len() as u32) * char_w + margin * 2;
+    let height = char_h + margin * 2;
+    let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(width, height, Rgb([255, 255, 255]));
+    for (idx, ch) in challenge.chars().enumerate() {
+        let bitmap = font_bitmap(ch);
+        let ox = margin + (idx as u32) * char_w;
+        let oy = margin + 1;
+        for row in 0..7u32 {
+            for col in 0..5u32 {
+                if (bitmap[row as usize] >> (4 - col)) & 1 == 1 {
+                    img.put_pixel(ox + col, oy + row, Rgb([0, 0, 0]));
+                }
+            }
+        }
+    }
+    let mut buf = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut buf);
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap_or_default();
+    }
+    if buf.is_empty() {
+        // Fallback 1x1 transparent
+        return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".into();
+    }
+    B64.encode(&buf)
+}
+
+fn font_bitmap(ch: char) -> [u8; 7] {
+    let c = ch.to_ascii_uppercase();
+    match c {
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
+        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100],
+        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'S' => [0b01110, 0b10001, 0b10000, 0b01110, 0b00001, 0b10001, 0b01110],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'V' => [0b10001, 0b10001, 0b10001, 0b01010, 0b01010, 0b00100, 0b00100],
+        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
+        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+        '3' => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
+        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+        '6' => [0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
+        '-' => [0b00000, 0b00000, 0b00000, 0b01110, 0b00000, 0b00000, 0b00000],
+        _ => [0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110, 0b00000],
+    }
 }
 
 async fn custom_file_input_probe(
@@ -1866,17 +1984,18 @@ async fn custom_file_input_probe(
             "portable file-input probe unavailable for this protocol"
         ));
     }
-    let data = STANDARD.encode(format!("Xiao file capability probe {nonce}"));
+    let challenge = format!("FILE-{nonce}");
+    let data = STANDARD.encode(&challenge);
     let body = serde_json::json!({
         "model": model,
         "input": [{"role":"user","content":[
-            {"type":"input_text","text":format!("Read the attached probe and reply exactly FILE-{nonce}.")},
+            {"type":"input_text","text":"Read the attached file and reply exactly with the challenge stored in the file. No other text."},
             {"type":"input_file","filename":"xiao-capability.txt","file_data":format!("data:text/plain;base64,{data}")}
         ]}],
         "stream": false
     });
     let value = send_custom_probe(base, "/responses", headers, api_key, body).await?;
-    Ok(extract_output_text(&value).is_some_and(|text| text.contains(&format!("FILE-{nonce}"))))
+    Ok(extract_output_text(&value).is_some_and(|text| text.contains(&challenge)))
 }
 
 async fn custom_native_probe(

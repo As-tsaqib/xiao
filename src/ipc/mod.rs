@@ -44,12 +44,17 @@ struct ApiState {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecuteRequest {
+    /// Legacy caller-supplied principal. The server ignores this value and
+    /// always derives the canonical OwnerIdentity from trusted runtime state.
+    #[serde(default)]
     pub principal: String,
     pub input: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionExecuteRequest {
+    /// Legacy field retained for wire compatibility; server ignores it.
+    #[serde(default)]
     pub principal: String,
     pub session_id: String,
     #[serde(default)]
@@ -60,6 +65,8 @@ pub struct SessionExecuteRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttachmentIngestRequest {
+    /// Legacy field retained for wire compatibility; server ignores it.
+    #[serde(default)]
     pub principal: String,
     pub session_id: String,
     pub name: String,
@@ -357,10 +364,11 @@ async fn execute(
     if !authorized_client(&headers, &state) {
         return Err(deny());
     }
+    let owner = management_owner(&state).await.map_err(bad)?;
     let result = state
         .app
         .commands
-        .execute_text(&req.principal, &req.input)
+        .execute_text(&owner, &req.input)
         .await
         .map_err(bad)?;
     Ok(Json(serde_json::to_value(result).map_err(bad)?))
@@ -374,11 +382,12 @@ async fn execute_session(
     if !authorized_client(&headers, &state) {
         return Err(deny());
     }
+    let owner = management_owner(&state).await.map_err(bad)?;
     let result = if req.retry {
         state
             .app
             .commands
-            .retry_in_session(&req.principal, &req.session_id, None)
+            .retry_in_session(&owner, &req.session_id, None)
             .await
     } else {
         let input = req.input.trim();
@@ -388,7 +397,7 @@ async fn execute_session(
         state
             .app
             .commands
-            .chat_in_session(&req.principal, &req.session_id, input, None)
+            .chat_in_session(&owner, &req.session_id, input, None)
             .await
     }
     .map_err(bad)?;
@@ -403,6 +412,7 @@ async fn ingest_attachment(
     if !authorized_client(&headers, &state) {
         return Err(deny());
     }
+    let owner = management_owner(&state).await.map_err(bad)?;
     let kind = match req.kind.as_str() {
         "file" | "document" => crate::attachments::AttachmentKind::Document,
         "image" => crate::attachments::AttachmentKind::Image,
@@ -422,7 +432,7 @@ async fn ingest_attachment(
         .app
         .attachments
         .ingest(crate::attachments::AttachmentIngest {
-            owner_id: req.principal,
+            owner_id: owner,
             session_id: req.session_id,
             telegram_file_id: None,
             telegram_unique_id: None,
