@@ -1,7 +1,10 @@
 use std::{env, fs, process::Command};
 
 fn run(program: &str, args: &[&str]) {
-    let status = Command::new(program).args(args).status().expect("spawn command");
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .expect("spawn command");
     assert!(status.success(), "{program} {args:?} failed");
 }
 
@@ -76,7 +79,11 @@ fn main() {
     run("git", &["add", "src/bin_cli.rs", "build.rs"]);
     run(
         "git",
-        &["commit", "-m", "fix(cli): preserve required error conversions"],
+        &[
+            "commit",
+            "-m",
+            "fix(cli): preserve required error conversions",
+        ],
     );
     run(
         "git",
