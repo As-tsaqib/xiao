@@ -2128,35 +2128,6 @@ fn dto_session_item(value: Value) -> Value {
     xiao::cli_contract::project_session_item(value)
 }
 
-// Legacy pick helper retained for ad-hoc call sites that haven't migrated to
-// typed projections; delegates to sanitizer.
-fn dto_pick(value: Value, allowed: &[&str]) -> Value {
-    let sanitized = xiao::cli_contract::project_generic(value);
-    if let Value::Object(map) = sanitized {
-        let mut out = serde_json::Map::new();
-        for key in allowed {
-            if let Some(v) = map.get(*key) {
-                out.insert((*key).to_string(), v.clone());
-            }
-        }
-        for extra in [
-            "items",
-            "page",
-            "pages",
-            "page_size",
-            "active_cli_session_id",
-            "models",
-            "session",
-        ] {
-            if let Some(v) = map.get(extra) {
-                out.entry(extra.to_string()).or_insert_with(|| v.clone());
-            }
-        }
-        return Value::Object(out);
-    }
-    sanitized
-}
-
 fn render_status_human(value: &Value) {
     for line in xiao::cli_contract::human_status(value).lines() {
         println!("{line}");
