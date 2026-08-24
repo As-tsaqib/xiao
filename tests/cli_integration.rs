@@ -37,13 +37,29 @@ fn removed_aliases_remain_usage_errors() {
 
 #[test]
 fn json_usage_error_has_stable_application_envelope() {
-    let output = xiao().args(["stats", "--json"]).output().expect("run json typo");
+    let output = xiao()
+        .args(["stats", "--json"])
+        .output()
+        .expect("run json typo");
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let value: serde_json::Value = serde_json::from_slice(&output.stderr).expect("json error");
-    assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(false));
-    assert_eq!(value.pointer("/error/code").and_then(|v| v.as_str()), Some("usage"));
-    let message = value.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or_default();
+    assert_eq!(
+        value.get("status").and_then(|v| v.as_str()),
+        Some("error")
+    );
+    assert_eq!(
+        value.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("unknown_command")
+    );
+    assert!(value
+        .pointer("/error/details")
+        .is_some_and(|v| v.is_object()));
+    assert!(value.get("ok").is_none());
+    let message = value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     assert!(message.contains("unknown command `stats`"));
     assert!(value.get("view").is_none());
     assert!(value.get("actions").is_none());
@@ -52,7 +68,10 @@ fn json_usage_error_has_stable_application_envelope() {
 
 #[test]
 fn subcommand_help_is_terminal_native_and_does_not_require_daemon() {
-    let output = xiao().args(["model", "custom", "--help"]).output().expect("run subcommand help");
+    let output = xiao()
+        .args(["model", "custom", "--help"])
+        .output()
+        .expect("run subcommand help");
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("help utf8").trim(),
