@@ -3,6 +3,7 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Temporary validation workflow; hardened to read-only after pre-release gates pass.
 permissions:
   contents: write
 
