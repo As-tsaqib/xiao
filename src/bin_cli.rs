@@ -2073,7 +2073,7 @@ fn dto_pick(value: Value, allowed: &[&str]) -> Value {
 
 fn dto_status(value: Value) -> Value {
     // Stable projection for dashboard: owner, health summary, counts, current_ai, runtime
-    if let Value::Object(mut map) = value.clone() {
+    if let Value::Object(map) = value.clone() {
         // Dashboard already is stable; ensure we expose only documented keys and strip internals
         let allowed = ["owner_id", "health", "counts", "current_ai", "runtime"];
         let mut out = serde_json::Map::new();
@@ -2169,10 +2169,12 @@ fn dto_tools(value: Value) -> Value {
     value
 }
 
+#[allow(dead_code)]
 fn dto_model_accounts(value: Value) -> Value {
     dto_pick(value, &["items"])
 }
 
+#[allow(dead_code)]
 fn dto_model_custom(value: Value) -> Value {
     dto_pick(value, &["items"])
 }
