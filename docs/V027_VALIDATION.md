@@ -1,19 +1,19 @@
 # Xiao v0.2.7 Validation Record
 
 GitHub Actions is the authoritative Rust/Android validation environment for this release candidate.
-Head `b9240c97fc23bed9e008eb85e77542b3558c5c4a` is the exact shipped candidate.
+Head `207832b5a7b5069ce8899d3b8938b32eec85d281` is the exact shipped candidate.
 
-## Last green run — `32701638246`
+## Last green run — `32721509247`
 
-Run #153 (`32701638246`), event `pull_request` on branch `feat/v0.2.7-control-plane-unification`,
-conclusion `success` at `2026-08-24T07:46:10Z`. Both required jobs passed:
+Run `32721509247`, event `pull_request` on branch `feat/v0.2.7-control-plane-unification`,
+conclusion `success` at `2026-08-24T11:40:42Z`. Both required jobs passed:
 
 | Job | Conclusion | Notable steps |
 |-----|------------|---------------|
-| `rust` (`97354206787`) | `success` | Checkout, Rust 1.98.0, ShellCheck POSIX + Bash, `cargo fmt`, `cargo check`, `cargo test`, `cargo clippy -D warnings`, `cargo build --release`, `node --check` ×2, `acceptance.sh --static-only` |
-| `android-arm64` (`97356488096`) | `success` | Rust 1.98.0 `aarch64-linux-android`, pinned `cargo-ndk 4.1.2`, `cargo ndk -t arm64-v8a build --release --bin xiaod --bin xiao`, deterministic ZIP verification, artifact upload |
+| `rust` (`97413731206`) | `success` | Checkout, Rust 1.98.0, ShellCheck POSIX + Bash, `cargo fmt`, `cargo check`, `cargo test`, `cargo clippy -D warnings`, `cargo build --release`, `node --check` ×2, `acceptance.sh --static-only` (10m 36s) |
+| `android-arm64` (`97416446474`) | `success` | Rust 1.98.0 `aarch64-linux-android`, pinned `cargo-ndk 4.1.2`, `cargo ndk -t arm64-v8a build --release --bin xiaod --bin xiao`, deterministic ZIP verification, artifact upload (7m 40s) |
 
-Artifact: `xiao-v0.2.7-kernelsu-arm64` (11 415 927 bytes) containing exactly:
+Artifact: `xiao-v0.2.7-kernelsu-arm64` containing exactly:
 
 ```text
 xiao-v0.2.7-kernelsu-arm64.zip
@@ -25,18 +25,18 @@ Workflow: `.github/workflows/ci.yml` — `on: pull_request | push[main] | workfl
 (`actions/checkout@3d3c4`, `dtolnay/rust-toolchain@4360b5`, `actions/upload-artifact@043fb4`), no `pull_request_target`,
 no secret consumption, no self-push.
 
-## Validation gates — exact commands and observed results (run 32701638246)
+## Validation gates — exact commands and observed results (run 32721509247)
 
 All commands are the literal `ci.yml` steps on `ubuntu-24.04` with `RUST toolchain 1.98.0`,
 `CARGO_TERM_COLOR=always`, `CARGO_INCREMENTAL=0`.
 
-| # | Gate | Exact command | Result on 32701638246 |
-|---|------|---------------|------------------------|
+| # | Gate | Exact command | Result on 32721509247 |
+|---|---|---|---|
 | 1 | POSIX shell syntax | `shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh` | PASS (exit 0, no findings) |
 | 2 | Bash shell syntax | `shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh` | PASS |
 | 3 | Rust formatting | `cargo fmt --all -- --check` | PASS (no diff) |
 | 4 | Type check | `cargo check --locked --all-targets --all-features` | PASS |
-| 5 | Tests | `cargo test --locked --all-targets --all-features` | PASS — 242 tests total, 0 failed (lib: 226 ok in 4.80s, bins: 8 ok, doc-tests 5 ok, integration 3 ok) |
+| 5 | Tests | `cargo test --locked --all-targets --all-features` | PASS — 254 tests total, 0 failed (lib: 241 ok in 10.27s, bins: 8 ok, doc-tests 5 ok) |
 | 6 | Lints | `cargo clippy --locked --all-targets --all-features -- -D warnings` | PASS (no warnings) |
 | 7 | Release build (host) | `cargo build --locked --release --all-features` | PASS — `Finished release [optimized]` |
 | 8 | WebUI syntax app.js | `node --check module/webroot/assets/app.js` | PASS |
@@ -135,13 +135,13 @@ Real-device: 7 checklist items — OPEN / PASS with device evidence where comple
 Example for this head:
 
 ```text
-Head: b9240c97fc23bed9e008eb85e77542b3558c5c4a
-Run:  https://github.com/As-tsaqib/xiao/actions/runs/32701638246 (153)
-Jobs: rust https://github.com/As-tsaqib/xiao/actions/runs/32701638246/job/97354206787 success
-      android-arm64 https://github.com/As-tsaqib/xiao/actions/runs/32701638246/job/97356488096 success
-Tests: 242 passed, 0 failed (226 + 8 + 5 + 3)
-Artifact: xiao-v0.2.7-kernelsu-arm64 (11415927 B) — deterministic, SHA + unzip verified
-P0: 7/7 PASS  P1: 9/9 PASS  P2: 4/4 PASS
+Head: 207832b5a7b5069ce8899d3b8938b32eec85d281
+Run:  https://github.com/As-tsaqib/xiao/actions/runs/32721509247
+Jobs: rust https://github.com/As-tsaqib/xiao/actions/runs/32721509247/job/97413731206 success
+      android-arm64 https://github.com/As-tsaqib/xiao/actions/runs/32721509247/job/97416446474 success
+Tests: 254 passed, 0 failed (241 lib + 8 bin + 5 doc-tests)
+Artifact: xiao-v0.2.7-kernelsu-arm64 — deterministic, SHA + unzip verified
+P0: 5/5 PASS  P1: 9/9 PASS  P2: 2/2 PASS
 Real-device: 7 items OPEN (host-only validation)
 ```
 
