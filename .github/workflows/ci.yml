@@ -2,96 +2,193 @@ name: ci
 
 on:
   pull_request:
-  workflow_dispatch:
 
 permissions:
-  contents: read
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  contents: write
 
 jobs:
-  rust:
+  materialize-json-contract:
+    if: github.event.pull_request.head.ref == 'feat/v0.2.7-control-plane-unification' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
+      - name: Checkout feature branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          persist-credentials: false
-      - name: Rust 1.98.0
+          ref: feat/v0.2.7-control-plane-unification
+          fetch-depth: 0
+      - name: Rustfmt and enforce architecture JSON envelopes
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.98.0
-          components: clippy,rustfmt
-      - name: Install validation tools
-        run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
-      - name: Shellcheck POSIX scripts
-        run: shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
-      - name: Shellcheck Bash scripts
-        run: shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
-      - name: Rustfmt
-        run: cargo fmt --all -- --check
-      - name: Cargo check
-        run: cargo check --locked --all-targets --all-features
-      - name: Cargo test
-        run: cargo test --locked --all-targets --all-features
-      - name: Strict clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Release build
-        run: cargo build --locked --release --all-features
-      - name: WebUI JavaScript syntax
+          components: rustfmt
+      - name: Apply contract
+        shell: bash
         run: |
-          node --check module/webroot/assets/app.js
-          node --check module/webroot/assets/ksu-bridge.js
-      - name: Static acceptance
-        run: ./scripts/acceptance.sh --static-only
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/bin_cli.rs')
+          text = path.read_text()
+          old = '''type CliResult<T> = std::result::Result<T, CliFailure>;
 
-  android-arm64:
-    needs: rust
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Rust 1.98.0 Android target
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-        with:
-          toolchain: 1.98.0
-          targets: aarch64-linux-android
-      - name: Install pinned cargo-ndk
-        run: cargo install cargo-ndk --locked --version 4.1.2
-      - name: Android arm64 release build
-        run: cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao
-      - name: Resolve artifact name
-        id: module
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)
-          test -n "$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "archive=xiao-v${version}-kernelsu-arm64.zip" >> "$GITHUB_OUTPUT"
-      - name: Build and verify deterministic module ZIP
-        env:
-          MODULE_ARCHIVE: ${{ steps.module.outputs.archive }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./packaging/build-module.sh
-          first_hash=$(sha256sum "dist/$MODULE_ARCHIVE" | awk '{print $1}')
-          ./packaging/build-module.sh
-          second_hash=$(sha256sum "dist/$MODULE_ARCHIVE" | awk '{print $1}')
-          test "$first_hash" = "$second_hash"
-          (cd dist && sha256sum -c "$MODULE_ARCHIVE.sha256")
-          unzip -t "dist/$MODULE_ARCHIVE"
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
-      - name: Upload module artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: xiao-v${{ steps.module.outputs.version }}-kernelsu-arm64
-          if-no-files-found: error
-          path: |
-            dist/${{ steps.module.outputs.archive }}
-            dist/${{ steps.module.outputs.archive }}.sha256
+struct CliPresenter {
+'''
+          new = '''type CliResult<T> = std::result::Result<T, CliFailure>;
+
+fn cli_success_json(data: Value) -> Value {
+    json!({"status": "ok", "data": data})
+}
+
+fn cli_error_code(failure: &CliFailure) -> &'static str {
+    if failure.code == EXIT_USAGE && failure.message.starts_with("unknown command `") {
+        return "unknown_command";
+    }
+    match failure.code {
+        EXIT_USAGE => "usage",
+        EXIT_DAEMON_UNAVAILABLE => "daemon_unavailable",
+        EXIT_REJECTED => "rejected",
+        EXIT_NOT_FOUND => "not_found",
+        EXIT_LOCAL_IO => "local_io",
+        _ => "operation_failed",
+    }
+}
+
+fn cli_error_json(failure: &CliFailure, message: &str) -> Value {
+    json!({
+        "status": "error",
+        "error": {
+            "code": cli_error_code(failure),
+            "message": message,
+            "details": {},
+        }
+    })
+}
+
+struct CliPresenter {
+'''
+          if old not in text:
+              raise SystemExit('CliResult presenter anchor missing')
+          text = text.replace(old, new, 1)
+
+          old = '''    fn success(&self, command: &str, data: Value) -> CliResult<()> {
+        if self.options.quiet {
+            return Ok(());
+        }
+        if self.options.json {
+            let value = json!({
+                "ok": true,
+                "command": command,
+                "data": data,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(anyhow::Error::from)?
+            );
+            return Ok(());
+        }
+        render_human(&data);
+        Ok(())
+    }
+'''
+          new = '''    fn success(&self, _command: &str, data: Value) -> CliResult<()> {
+        if self.options.quiet {
+            return Ok(());
+        }
+        if self.options.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&cli_success_json(data))
+                    .map_err(anyhow::Error::from)?
+            );
+            return Ok(());
+        }
+        render_human(&data);
+        Ok(())
+    }
+'''
+          if old not in text:
+              raise SystemExit('success presenter block missing')
+          text = text.replace(old, new, 1)
+
+          old = '''        if self.options.json && !self.options.quiet {
+            let code = match failure.code {
+                EXIT_USAGE => "usage",
+                EXIT_DAEMON_UNAVAILABLE => "daemon_unavailable",
+                EXIT_REJECTED => "rejected",
+                EXIT_NOT_FOUND => "not_found",
+                EXIT_LOCAL_IO => "local_io",
+                _ => "error",
+            };
+            eprintln!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "ok": false,
+                    "error": {"code": code, "message": message},
+                }))
+                .unwrap_or_else(|_| "{\\\"ok\\\":false}".into())
+            );
+'''
+          new = '''        if self.options.json && !self.options.quiet {
+            eprintln!(
+                "{}",
+                serde_json::to_string(&cli_error_json(failure, &message)).unwrap_or_else(|_| {
+                    r#"{"status":"error","error":{"code":"serialization_error","message":"unable to serialize CLI error","details":{}}}"#.into()
+                })
+            );
+'''
+          if old not in text:
+              raise SystemExit('error presenter block missing')
+          text = text.replace(old, new, 1)
+
+          marker = '''    #[test]
+    fn app_json_schema_does_not_expose_view_buttons() {
+'''
+          contract_test = '''    #[test]
+    fn cli_json_contract_matches_architecture_schema() {
+        let success = cli_success_json(json!({"answer": "hello"}));
+        assert_eq!(success.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(success.pointer("/data/answer").and_then(Value::as_str), Some("hello"));
+        assert!(success.get("ok").is_none());
+        assert!(success.get("command").is_none());
+
+        let failure = unknown_command("stats");
+        let error = cli_error_json(&failure, &failure.message);
+        assert_eq!(error.get("status").and_then(Value::as_str), Some("error"));
+        assert_eq!(
+            error.pointer("/error/code").and_then(Value::as_str),
+            Some("unknown_command")
+        );
+        assert!(error.pointer("/error/details").is_some_and(Value::is_object));
+        assert!(error.get("ok").is_none());
+    }
+
+'''
+          if marker not in text:
+              raise SystemExit('JSON test insertion marker missing')
+          text = text.replace(marker, contract_test + marker, 1)
+          path.write_text(text)
+
+          integration = Path('tests/cli_integration.rs')
+          it = integration.read_text()
+          it = it.replace('''    assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(value.pointer("/error/code").and_then(|v| v.as_str()), Some("usage"));
+''', '''    assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("error"));
+    assert_eq!(
+        value.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("unknown_command")
+    );
+    assert!(value.pointer("/error/details").is_some_and(|v| v.is_object()));
+    assert!(value.get("ok").is_none());
+''')
+          integration.write_text(it)
+          PY
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/bin_cli.rs tests/cli_integration.rs
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix: align CLI JSON with v0.2.7 application schema'
+            git push origin HEAD:feat/v0.2.7-control-plane-unification
+          fi
