@@ -1,4 +1,4 @@
-# xiao v0.2.6
+# xiao v0.2.7
 
 xiao is a private, single-owner, persistent Rust AI agent designed primarily
 for a rooted Android device. Telegram is its primary interaction surface and
@@ -8,7 +8,7 @@ living identity/memory files, filesystem skills, and the bounded agent loop.
 The `xiao` CLI and KernelSU WebUI remain administrative adapters over the same
 semantic Command Core.
 
-v0.2.6 preserves those foundations while separating stable owner identity from
+v0.2.7 preserves those foundations while separating stable owner identity from
 Telegram chat/topic scope, binding every approval to one exact run/tool call,
 supporting isolated Custom provider profiles, and retaining bounded multi-turn
 structured-tool continuation. Telegram now ingests validated images and
@@ -23,7 +23,7 @@ wrappers together. Mutable state stays outside the replaceable module payload.
 
 ## Install
 
-1. Download `xiao-v0.2.6-kernelsu-arm64.zip`.
+1. Download `xiao-v0.2.7-kernelsu-arm64.zip`.
 2. Flash the ZIP in KernelSU Next (or a compatible module manager).
 3. Reboot Android.
 4. Open Termux and run:
@@ -122,7 +122,7 @@ KernelSU WebUI -> admin IPC ─────┘                              │ 
   shell-quoted module binary; model output never reaches this root shell path.
 - Secrets are outside normal config, private where supported, and redacted
   from surfaced logs/errors.
-- `/compact` remains absent in v0.2.6; bounded summary creation is an internal
+- `/compact` remains absent in v0.2.7; bounded summary creation is an internal
   ContextEngine responsibility.
 
 The public Telegram command registry is exactly `/start`, `/help`, `/login`,
@@ -176,12 +176,12 @@ requires byte-identical ZIP hashes, verifies the checksum and ZIP integrity,
 and uploads exactly these two files:
 
 ```text
-xiao-v0.2.6-kernelsu-arm64.zip
-xiao-v0.2.6-kernelsu-arm64.zip.sha256
+xiao-v0.2.7-kernelsu-arm64.zip
+xiao-v0.2.7-kernelsu-arm64.zip.sha256
 ```
 
 Run the workflow from a push/pull request or `workflow_dispatch`, then download
-the `xiao-v0.2.6-kernelsu-arm64` artifact. Do not use an older local `dist/`
+the `xiao-v0.2.7-kernelsu-arm64` artifact. Do not use an older local `dist/`
 archive after changing source. A local source-only check is available and never
 invokes Cargo:
 

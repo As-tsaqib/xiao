@@ -1,6 +1,6 @@
-# Xiao v0.2.6 Reliability, Multimodal, and Management Acceptance Coverage
+# Xiao v0.2.7 Control-Plane Unification, Reliability, Multimodal, and Management Acceptance Coverage
 
-This maps the final v0.2.6 acceptance criteria to implementation and
+This maps retained v0.2.6 regressions plus final v0.2.7 acceptance criteria to implementation and
 deterministic tests. Xiao is a private single-owner agent; stable
 `OwnerIdentity` owns global durable state while `TelegramScope` and
 `XiaoSession` isolate conversation state. Legacy principal values remain only
@@ -173,7 +173,7 @@ rooted-Android validation.
   identity and isolated Custom profiles/models; version 16 adds attachment
   metadata/chunks/FTS.
 - `v020_migration_is_fresh_and_idempotent_with_consistent_fts` expects version
-  16 and every new object/column; representative v0.2.5 and WebUI-first tests
+  17 and every new object/column; representative v0.2.5 and WebUI-first tests
   verify stable-owner rekey preservation/idempotency; v0.1.0 upgrade and reopen
   tests preserve history and quarantine uncertain side effects.
 - Static acceptance rejects an unrestricted model root-shell path and checks
@@ -221,3 +221,7 @@ this checklist as evidence that a command ran.
 
 Real credentials, Telegram delivery, Android init/root/SELinux behavior, and
 device package repositories are intentionally not impersonated by host tests.
+
+## v0.2.7 acceptance addendum
+
+Release acceptance additionally covers canonical single-owner migration/enforcement; shared Telegram setup; explicit structured CLI with stable JSON/error/exit semantics and exact CLI sessions; CLI file/image chat; WebUI Telegram setup and exact-session AI configuration; tri-state Custom tools/structured/continuation/vision/file capabilities; scanned-PDF OCR/vision fallback after embedded extraction; attachment quota/retention/orphan/active-run protection; full Custom profile editing with credential safety; bounded live-or-CACHED Doctor probes; and Telegram/CLI/WebUI parity for provider, memory, skill, approval, diagnostics, and session AI operations. Deterministic host tests and Android arm64 cross-build/package verification are authoritative where supported; physical rooted-device/live-provider success is not inferred.
