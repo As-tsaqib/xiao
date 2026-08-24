@@ -20,21 +20,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -f .bootstrap/READY ]]; then
-            echo "No ready patch; nothing to apply."
-            exit 0
-          fi
-          test -f .bootstrap/SHA256
-          mapfile -t parts < <(find .bootstrap -maxdepth 1 -type f -name 'current-v027.patch.xz.b64.*' -print | sort)
-          (( ${#parts[@]} == 4 ))
-          {
-            # Chunk 0 was transported with exactly three trailing sentinel bytes ("Had").
-            # Strip only those bytes; SHA-256 below fail-closes on any other corruption.
-            test "$(tail -c 3 "${parts[0]}")" = "Had"
-            head -c -3 "${parts[0]}"
-            cat "${parts[@]:1}"
-          } | tr -d '\n\r' | base64 --decode | xz --decompress > /tmp/v027.patch
-          sha256sum --check .bootstrap/SHA256
+          test -f .bootstrap/v2-marker
+          cat \
+            .bootstrap/v2-00 \
+            .bootstrap/v2-01a \
+            .bootstrap/v2-01b \
+            .bootstrap/v2-01c \
+            .bootstrap/v2-02 \
+            .bootstrap/v2-03 \
+            .bootstrap/v2-04 \
+            .bootstrap/v2-05 \
+            .bootstrap/v2-06 \
+            .bootstrap/v2-07 \
+            .bootstrap/v2-08 > /tmp/v027.payload.b64
+          echo 'b4029528f5c31db3d06760d35c17db3c2f303320d2604f3a87d9bc7934af328d  /tmp/v027.payload.b64' | sha256sum -c -
+          base64 --decode /tmp/v027.payload.b64 | xz --decompress > /tmp/v027.patch
+          echo 'e39029cd8df8ba46607c1a87da35e7f133404c3e336bfd465a8e5dfa6953553c  /tmp/v027.patch' | sha256sum -c -
           git apply --check /tmp/v027.patch
           git apply /tmp/v027.patch
           rm -rf .bootstrap
@@ -44,19 +45,17 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m 'feat: unify Xiao v0.2.7 control plane and CLI'
-            git push origin HEAD:feat/v0.2.7-control-plane-unification
-          fi
+          git commit -m 'feat: unify Xiao v0.2.7 control plane and CLI'
+          git push origin HEAD:feat/v0.2.7-control-plane-unification
 
   rust:
     needs: bootstrap-v027
-    if: always() && (needs.bootstrap-v027.result == 'success' || needs.bootstrap-v027.result == 'skipped')
+    if: always() && needs.bootstrap-v027.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref }}
+          ref: feat/v0.2.7-control-plane-unification
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
@@ -76,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref }}
+          ref: feat/v0.2.7-control-plane-unification
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
