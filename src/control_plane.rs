@@ -124,7 +124,9 @@ impl TelegramSetupService {
         }
         if let Some(owner_user_id) = input.owner_user_id {
             if owner_user_id <= 0 {
-                return Err(anyhow!("Telegram owner user id must be positive (got {owner_user_id})"));
+                return Err(anyhow!(
+                    "Telegram owner user id must be positive (got {owner_user_id})"
+                ));
             }
             if old
                 .telegram
@@ -177,7 +179,9 @@ impl TelegramSetupService {
         let mut committed_config = true;
         // Stage write-only secret.
         if let Some(token) = supplied_token {
-            if let Err(e) = SecretStore::new(next.paths.secrets_dir.clone()).put(TELEGRAM_TOKEN_KEY, token) {
+            if let Err(e) =
+                SecretStore::new(next.paths.secrets_dir.clone()).put(TELEGRAM_TOKEN_KEY, token)
+            {
                 // Roll back config file to old state; staged secret was not fully written yet.
                 let _ = old.save_atomic(&self.config_path);
                 let _ = SecretStore::new(old.paths.secrets_dir.clone()).remove(TELEGRAM_TOKEN_KEY);
@@ -187,13 +191,13 @@ impl TelegramSetupService {
         }
         // Persist bot identity if probed.
         if let Some(bot) = bot.as_ref() {
-            if let Err(e) = self
-                .app
-                .storage
-                .put_setting(TELEGRAM_IDENTITY_KEY, &serde_json::to_string(bot).unwrap_or_default())
-            {
+            if let Err(e) = self.app.storage.put_setting(
+                TELEGRAM_IDENTITY_KEY,
+                &serde_json::to_string(bot).unwrap_or_default(),
+            ) {
                 if staged_secret {
-                    let _ = SecretStore::new(next.paths.secrets_dir.clone()).remove(TELEGRAM_TOKEN_KEY);
+                    let _ =
+                        SecretStore::new(next.paths.secrets_dir.clone()).remove(TELEGRAM_TOKEN_KEY);
                 }
                 let _ = old.save_atomic(&self.config_path);
                 return Err(anyhow!("persist bot identity: {e}"));
@@ -206,7 +210,8 @@ impl TelegramSetupService {
                 Ok(m) => m,
                 Err(e) => {
                     if staged_secret {
-                        let _ = SecretStore::new(next.paths.secrets_dir.clone()).remove(TELEGRAM_TOKEN_KEY);
+                        let _ = SecretStore::new(next.paths.secrets_dir.clone())
+                            .remove(TELEGRAM_TOKEN_KEY);
                     }
                     let _ = old.save_atomic(&self.config_path);
                     return Err(anyhow!("ensure telegram owner: {e}"));
@@ -214,8 +219,11 @@ impl TelegramSetupService {
             };
             if migration.requires_file_reconcile {
                 if let Err(e) = (|| -> Result<()> {
-                    MemoryStore::with_workspace(self.app.storage.clone(), self.app.identity.clone())
-                        .reconcile(&migration.owner_id)?;
+                    MemoryStore::with_workspace(
+                        self.app.storage.clone(),
+                        self.app.identity.clone(),
+                    )
+                    .reconcile(&migration.owner_id)?;
                     FilesystemSkills::new(
                         self.app.identity.clone(),
                         std::sync::Arc::new(SkillStore::new(self.app.storage.clone())),

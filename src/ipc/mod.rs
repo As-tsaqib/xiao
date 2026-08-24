@@ -442,7 +442,7 @@ async fn ingest_attachment(
             bytes,
         })
         .map_err(bad)?;
-    Ok(Json(json!({"attachment":record})))
+    Ok(Json(json!({ "attachment": record })))
 }
 
 async fn logs(
@@ -466,7 +466,7 @@ async fn logs(
         .rev()
         .map(redact_text)
         .collect::<Vec<_>>();
-    Ok(Json(json!({"lines":lines})))
+    Ok(Json(json!({ "lines": lines })))
 }
 
 async fn admin_snapshot(

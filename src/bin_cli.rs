@@ -1625,7 +1625,7 @@ async fn daemon(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -> 
             }
             let init = standalone::load_existing(paths)?;
             let rows = standalone::tail_daemon_log(&init.runtime, lines)?;
-            presenter.success("daemon logs", json!({"lines":rows}))
+            presenter.success("daemon logs", json!({ "lines": rows }))
         }
         Some("stop") if args.len() == 1 => {
             let init = standalone::load_existing(paths)?;
@@ -1738,7 +1738,7 @@ async fn admin(
             let token = read_secret_file(Path::new(&args[1]), "Telegram Bot Token")?;
             raw_success(
                 client
-                    .post_admin("/v1/admin/telegram/test", &json!({"token":token}))
+                    .post_admin("/v1/admin/telegram/test", &json!({ "token": token }))
                     .await?,
             )
         }
@@ -1751,7 +1751,7 @@ async fn admin(
             .map_err(anyhow::Error::from)?;
             raw_success(
                 client
-                    .post_admin("/v1/admin/telegram/test", &json!({"token":token}))
+                    .post_admin("/v1/admin/telegram/test", &json!({ "token": token }))
                     .await?,
             )
         }

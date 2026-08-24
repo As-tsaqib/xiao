@@ -706,7 +706,7 @@ impl Provider for CodexProvider {
             next_input.extend(streamed.function_items);
             return Ok(ProviderTurn {
                 step: ProviderStep::ToolCalls(streamed.tool_calls),
-                continuation: Some(serde_json::json!({"input":next_input})),
+                continuation: Some(serde_json::json!({ "input": next_input })),
                 events: vec![AgentEvent::Status(
                     "Codex requested an internal tool".into(),
                 )],
@@ -991,7 +991,7 @@ impl Provider for AntigravityProvider {
             }));
             return Ok(ProviderTurn {
                 step: ProviderStep::ToolCalls(streamed.tool_calls),
-                continuation: Some(serde_json::json!({"contents": contents})),
+                continuation: Some(serde_json::json!({ "contents": contents })),
                 events: vec![AgentEvent::Status(
                     "Antigravity requested an internal tool".into(),
                 )],
@@ -1523,7 +1523,7 @@ fn parse_custom_chat_turn(
         messages.push(message.clone());
         return Ok((
             ProviderStep::ToolCalls(calls),
-            Some(serde_json::json!({"messages": messages})),
+            Some(serde_json::json!({ "messages": messages })),
         ));
     }
     let answer = extract_chat_content(value)
@@ -1571,7 +1571,7 @@ fn parse_custom_responses_turn(
         input.extend(output);
         return Ok((
             ProviderStep::ToolCalls(calls),
-            Some(serde_json::json!({"input": input})),
+            Some(serde_json::json!({ "input": input })),
         ));
     }
     let answer = extract_output_text(value)
