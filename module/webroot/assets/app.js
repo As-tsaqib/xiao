@@ -284,6 +284,14 @@ async function mutateCustomProvider(body, success) {
   setBusy(false); await refreshCurrent();
 }
 
+async function mutateSession(body, success) {
+  if (state.busy) return;
+  setBusy(true); notice('Applying session change through xiaod…');
+  try { await managerPost('sessions', body); notice(success, 'good'); }
+  catch (error) { console.error('Xiao session action failed:', error); notice(`Action failed: ${error.message}`, 'bad'); setBusy(false); return; }
+  setBusy(false); await refreshCurrent();
+}
+
 async function disconnectAccount(account) {
   if (!confirm(`Disconnect ${account.label}? Active sessions using it will be detached.`)) return;
   await mutate('provider-accounts', { action: 'disconnect', account_id: account.id }, 'Account disconnected.');
@@ -386,9 +394,9 @@ function populateSessionModels(preferredModel = null) {
   if (preferredModel && models.includes(preferredModel)) select.value = preferredModel;
 }
 
-async function setSessionYolo(session, enabled) { await mutate('sessions', { action: 'yolo', session_id: session.id, value: String(enabled) }, `YOLO ${enabled ? 'enabled' : 'disabled'} for this session only.`); }
-async function renameSession(session) { const value = prompt('Session name', session.name); if (value && value !== session.name) await mutate('sessions', { action: 'rename', session_id: session.id, value }, 'Session renamed.'); }
-async function archiveSession(session) { if (confirm(`Archive “${session.name}”? History will be preserved.`)) await mutate('sessions', { action: 'archive', session_id: session.id }, 'Session archived.'); }
+async function setSessionYolo(session, enabled) { await mutateSession({ action: 'yolo', session_id: session.id, value: String(enabled) }, `YOLO ${enabled ? 'enabled' : 'disabled'} for this session only.`); }
+async function renameSession(session) { const value = prompt('Session name', session.name); if (value && value !== session.name) await mutateSession({ action: 'rename', session_id: session.id, value }, 'Session renamed.'); }
+async function archiveSession(session) { if (confirm(`Archive “${session.name}”? History will be preserved.`)) await mutateSession({ action: 'archive', session_id: session.id }, 'Session archived.'); }
 
 async function loadTasks() {
   const data = await managerGet('runs', { page: state.pages.tasks, limit: 5 }); const root = $('tasksList'); clear(root);
@@ -503,7 +511,7 @@ $('sessionAiForm').onsubmit = async event => {
   const model = $('sessionAiModel').value;
   if (!account_or_profile_id || !model) { notice('Select an account/profile and model first.', 'bad'); return; }
   $('sessionAiDialog').close();
-  await mutate('sessions', { action: 'ai_config', session_id: session.id, provider, account_or_profile_id, model }, `AI configuration updated for ${session.name} only.`);
+  await mutateSession({ action: 'ai_config', session_id: session.id, provider, account_or_profile_id, model }, `AI configuration updated for ${session.name} only.`);
 };
 $('closeProfileEditDialog').onclick = () => $('profileEditDialog').close();
 $('profileCredentialAction').onchange = () => $('profileReplacementKeyRow').classList.toggle('hidden', $('profileCredentialAction').value !== 'replace');
