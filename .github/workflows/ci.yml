@@ -6,13 +6,14 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Temporary pre-release validation workflow. This write permission and the
-# autofix/persist step are removed after the source gates pass.
+# Temporary pre-release validation workflow. Write permission, source
+# normalization, push trigger, and the status report are removed after all
+# supported release gates pass.
 permissions:
   contents: write
 
 jobs:
-  rust:
+  pre-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -22,10 +23,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
+          targets: aarch64-linux-android
       - run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
-      - run: shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
-      - run: shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
-      - name: Apply mechanical Rust fixes and persist once
+
+      - name: Normalize compiler-suggested source fixes
+        id: normalize
         shell: bash
         run: |
           set -euo pipefail
@@ -33,27 +35,11 @@ jobs:
           from pathlib import Path
           path = Path("src/providers/mod.rs")
           text = path.read_text()
-          anchor = "\nfn result_state(result: &Result<bool>) -> CapabilityState {"
-          helper = '''
-#[cfg(test)]
-async fn probe_custom_tool_capability(
-    base: &str,
-    headers: &std::collections::BTreeMap<String, String>,
-    api_key: Option<&str>,
-    protocol: &str,
-    model: &str,
-) -> ProviderCapabilities {
-    probe_custom_capabilities(base, headers, api_key, protocol, model)
-        .await
-        .capabilities
-}
-'''
-          if "fn probe_custom_tool_capability(" not in text:
-              if anchor not in text:
-                  raise SystemExit("test-helper insertion anchor missing")
-              path.write_text(text.replace(anchor, helper + anchor, 1))
+          signature = "pub(crate) async fn probe_custom_tool_capability("
+          if signature in text and "#[cfg(test)]\n" + signature not in text:
+              text = text.replace(signature, "#[cfg(test)]\n" + signature, 1)
+              path.write_text(text)
           PY
-          # Only machine-applicable compiler suggestions are accepted here.
           cargo clippy --fix --locked --all-targets --all-features --allow-dirty --allow-staged -- -D warnings || true
           cargo fmt --all
           git diff --check
@@ -61,53 +47,122 @@ async fn probe_custom_tool_capability(
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -- '*.rs'
           if ! git diff --cached --quiet; then
-            git commit -m 'style: apply compiler-suggested v0.2.7 fixes'
+            git commit -m 'style: finalize compiler-suggested Rust cleanup'
             git push origin HEAD:feat/v0.2.7-control-plane-unification
           fi
-          cargo fmt --all -- --check
-      - run: cargo check --locked --all-targets --all-features
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --all-targets --all-features
-      - run: cargo build --locked --release --all-features
-      - run: node --check module/webroot/assets/app.js
-      - run: node --check module/webroot/assets/ksu-bridge.js
-      - run: ./scripts/acceptance.sh --static-only
 
-  android-arm64:
-    needs: rust
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: feat/v0.2.7-control-plane-unification
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
-      - run: cargo install cargo-ndk --locked
-      - run: cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao
-      - name: Resolve artifact name
-        id: module
+      - name: Shellcheck POSIX scripts
+        id: shell_posix
+        continue-on-error: true
+        run: shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
+      - name: Shellcheck Bash scripts
+        id: shell_bash
+        continue-on-error: true
+        run: shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
+      - name: Rustfmt
+        id: rustfmt
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+      - name: Cargo check
+        id: check
+        continue-on-error: true
+        run: cargo check --locked --all-targets --all-features
+      - name: Cargo clippy strict
+        id: clippy
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Cargo test
+        id: test
+        continue-on-error: true
+        run: cargo test --locked --all-targets --all-features
+      - name: Cargo release build
+        id: release
+        continue-on-error: true
+        run: cargo build --locked --release --all-features
+      - name: Check WebUI JavaScript
+        id: node_app
+        continue-on-error: true
+        run: node --check module/webroot/assets/app.js
+      - name: Check KernelSU bridge JavaScript
+        id: node_ksu
+        continue-on-error: true
+        run: node --check module/webroot/assets/ksu-bridge.js
+      - name: Static acceptance
+        id: acceptance
+        continue-on-error: true
+        run: ./scripts/acceptance.sh --static-only
+      - name: Install cargo-ndk
+        id: ndk_install
+        continue-on-error: true
+        run: cargo install cargo-ndk --locked
+      - name: Android arm64 cross-build
+        id: android
+        continue-on-error: true
+        run: cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao
+      - name: Build deterministic KernelSU module
+        id: package
+        continue-on-error: true
+        shell: bash
         run: |
+          set -euo pipefail
           version=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)
-          test -n "$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "archive=xiao-v${version}-kernelsu-arm64.zip" >> "$GITHUB_OUTPUT"
-      - name: Build and verify deterministic module ZIP
-        env:
-          MODULE_ARCHIVE: ${{ steps.module.outputs.archive }}
-        run: |
+          archive="xiao-v${version}-kernelsu-arm64.zip"
           ./packaging/build-module.sh
-          first_hash=$(sha256sum "dist/$MODULE_ARCHIVE" | awk '{print $1}')
+          first_hash=$(sha256sum "dist/$archive" | awk '{print $1}')
           ./packaging/build-module.sh
-          second_hash=$(sha256sum "dist/$MODULE_ARCHIVE" | awk '{print $1}')
+          second_hash=$(sha256sum "dist/$archive" | awk '{print $1}')
           test "$first_hash" = "$second_hash"
-          (cd dist && sha256sum -c "$MODULE_ARCHIVE.sha256")
-          unzip -t "dist/$MODULE_ARCHIVE"
+          (cd dist && sha256sum -c "$archive.sha256")
+          unzip -t "dist/$archive"
           test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
-      - uses: actions/upload-artifact@v7
-        with:
-          name: xiao-v${{ steps.module.outputs.version }}-kernelsu-arm64
-          if-no-files-found: error
-          path: |
-            dist/${{ steps.module.outputs.archive }}
-            dist/${{ steps.module.outputs.archive }}.sha256
+
+      - name: Persist deterministic pre-release status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci
+          cat > .ci/pre-release-status.txt <<'EOF'
+          shell_posix=${{ steps.shell_posix.outcome }}
+          shell_bash=${{ steps.shell_bash.outcome }}
+          rustfmt=${{ steps.rustfmt.outcome }}
+          check=${{ steps.check.outcome }}
+          clippy=${{ steps.clippy.outcome }}
+          test=${{ steps.test.outcome }}
+          release=${{ steps.release.outcome }}
+          node_app=${{ steps.node_app.outcome }}
+          node_ksu=${{ steps.node_ksu.outcome }}
+          acceptance=${{ steps.acceptance.outcome }}
+          ndk_install=${{ steps.ndk_install.outcome }}
+          android=${{ steps.android.outcome }}
+          package=${{ steps.package.outcome }}
+          EOF
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .ci/pre-release-status.txt
+          if ! git diff --cached --quiet; then
+            git commit -m 'ci: record pre-release gate outcomes'
+            git push origin HEAD:feat/v0.2.7-control-plane-unification
+          fi
+
+      - name: Enforce pre-release gate result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for outcome in \
+            '${{ steps.shell_posix.outcome }}' \
+            '${{ steps.shell_bash.outcome }}' \
+            '${{ steps.rustfmt.outcome }}' \
+            '${{ steps.check.outcome }}' \
+            '${{ steps.clippy.outcome }}' \
+            '${{ steps.test.outcome }}' \
+            '${{ steps.release.outcome }}' \
+            '${{ steps.node_app.outcome }}' \
+            '${{ steps.node_ksu.outcome }}' \
+            '${{ steps.acceptance.outcome }}' \
+            '${{ steps.ndk_install.outcome }}' \
+            '${{ steps.android.outcome }}' \
+            '${{ steps.package.outcome }}'; do
+            test "$outcome" = success
+          done
