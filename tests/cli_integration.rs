@@ -72,6 +72,6 @@ fn subcommand_help_is_terminal_native_and_does_not_require_daemon() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("help utf8").trim(),
-        "Usage: xiao model custom <list|add|show|edit|test|models|use|delete> ..."
+        "Usage: xiao model custom <list|add|show|edit|test|probe|models|use|delete> ..."
     );
 }
