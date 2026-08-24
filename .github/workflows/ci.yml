@@ -26,28 +26,53 @@ jobs:
           targets: aarch64-linux-android
       - run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
 
-      - name: Normalize compiler-suggested source fixes
+      - name: Normalize compiler and WebUI contract fixes
         id: normalize
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          path = Path("src/providers/mod.rs")
-          text = path.read_text()
+
+          providers = Path("src/providers/mod.rs")
+          text = providers.read_text()
           signature = "pub(crate) async fn probe_custom_tool_capability("
           if signature in text and "#[cfg(test)]\n" + signature not in text:
               text = text.replace(signature, "#[cfg(test)]\n" + signature, 1)
-              path.write_text(text)
+              providers.write_text(text)
+
+          app = Path("module/webroot/assets/app.js")
+          text = app.read_text()
+          if "managerPost('provider-custom'" not in text:
+              anchor = "function showProviderError(error) { notice(`Could not load providers: ${error.message}`, 'bad'); }\n\n"
+              helper = """async function mutateCustomProvider(body, success) {
+            if (state.busy) return;
+            setBusy(true); notice('Applying Custom provider change through xiaod…');
+            try { await managerPost('provider-custom', body); notice(success, 'good'); }
+            catch (error) { console.error('Xiao Custom provider action failed:', error); notice(`Action failed: ${error.message}`, 'bad'); setBusy(false); return; }
+            setBusy(false); await refreshCurrent();
+          }
+
+          """
+              if anchor not in text:
+                  raise SystemExit("Custom provider helper insertion anchor missing")
+              text = text.replace(anchor, anchor + helper, 1)
+              expected = text.count("await mutate('provider-custom', ")
+              if expected != 4:
+                  raise SystemExit(f"expected four Custom mutate callsites, found {expected}")
+              text = text.replace("await mutate('provider-custom', ", "await mutateCustomProvider(")
+              if "mutate('provider-custom'" in text:
+                  raise SystemExit("generic Custom mutation call remains")
+              app.write_text(text)
           PY
           cargo clippy --fix --locked --all-targets --all-features --allow-dirty --allow-staged -- -D warnings || true
           cargo fmt --all
           git diff --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- '*.rs'
+          git add -- '*.rs' module/webroot/assets/app.js
           if ! git diff --cached --quiet; then
-            git commit -m 'style: finalize compiler-suggested Rust cleanup'
+            git commit -m 'fix: use explicit Custom WebUI manager action'
             git push origin HEAD:feat/v0.2.7-control-plane-unification
           fi
 
