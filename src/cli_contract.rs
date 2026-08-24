@@ -525,15 +525,15 @@ pub fn project_accounts(raw: Value) -> Value {
     for item in items {
         if let Some(obj) = item.as_object() {
             let allowed = [
-                "id",
-                "provider",
-                "label",
-                "email",
-                "status",
-                "access_expires_at",
-                "credential_configured",
-                "models",
-            ];
+        "id",
+        "provider",
+        "label",
+        "email",
+        "status",
+        "access_expires_at",
+        "credential_configured",
+        "models",
+    ];
             let filtered = pick_object(&Value::Object(obj.clone()), &allowed);
             sanitized.push(Value::Object(filtered));
         }
@@ -545,15 +545,15 @@ pub fn project_accounts(raw: Value) -> Value {
 pub fn project_account(raw: Value) -> Value {
     let raw = sanitize(raw);
     let allowed = [
-                "id",
-                "provider",
-                "label",
-                "email",
-                "status",
-                "access_expires_at",
-                "credential_configured",
-                "models",
-            ];
+        "id",
+        "provider",
+        "label",
+        "email",
+        "status",
+        "access_expires_at",
+        "credential_configured",
+        "models",
+    ];
     let m = pick_object(&raw, &allowed);
     if m.is_empty() {
         sanitize(raw)

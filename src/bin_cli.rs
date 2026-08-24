@@ -947,14 +947,14 @@ async fn custom_command(
     match args.first().map(String::as_str) {
         Some("list") if args.len() == 1 => {
             let providers = client.get_admin("/v1/admin/providers").await?;
-            presenter.success(
-                "model custom list",
-                dto_model_custom(providers),
-            )
+            presenter.success("model custom list", dto_model_custom(providers))
         }
         Some("show") if args.len() == 2 => {
             let raw = custom_by_id(client, &args[1]).await?;
-            presenter.success("model custom show", xiao::cli_contract::project_custom_profile(raw))
+            presenter.success(
+                "model custom show",
+                xiao::cli_contract::project_custom_profile(raw),
+            )
         }
         Some("add") => custom_add(client, &args[1..], presenter).await,
         Some("edit") => custom_edit(client, &args[1..], presenter).await,
@@ -1246,9 +1246,10 @@ async fn sessions_command(
                 .post_admin("/v1/admin/sessions", &json!({"action":"new"}))
                 .await?,
         ),
-        Some("show") if args.len() == 2 => {
-            presenter.success("sessions show", dto_session_item(session_by_id(client, &args[1]).await?))
-        }
+        Some("show") if args.len() == 2 => presenter.success(
+            "sessions show",
+            dto_session_item(session_by_id(client, &args[1]).await?),
+        ),
         Some("use") if args.len() == 2 => presenter.success(
             "sessions use",
             dto_session_item(
@@ -2132,7 +2133,15 @@ fn dto_pick(value: Value, allowed: &[&str]) -> Value {
                 out.insert((*key).to_string(), v.clone());
             }
         }
-        for extra in ["items", "page", "pages", "page_size", "active_cli_session_id", "models", "session"] {
+        for extra in [
+            "items",
+            "page",
+            "pages",
+            "page_size",
+            "active_cli_session_id",
+            "models",
+            "session",
+        ] {
             if let Some(v) = map.get(extra) {
                 out.entry(extra.to_string()).or_insert_with(|| v.clone());
             }
@@ -2180,7 +2189,9 @@ fn render_human(value: &Value) {
         return;
     }
     // model surfaces: accounts list, custom list, or session model list
-    if value.get("models").is_some() && (value.get("session_id").is_some() || value.get("provider").is_some()) {
+    if value.get("models").is_some()
+        && (value.get("session_id").is_some() || value.get("provider").is_some())
+    {
         render_model_human(value);
         return;
     }
@@ -2191,12 +2202,15 @@ fn render_human(value: &Value) {
             if first.get("status").is_some() || first.get("state").is_some() {
                 // could be runs or doctor; doctor has checks-style, runs have id+session_id
                 // prefer doctor if no session_id/provider combo
-                if first.get("session_id").is_none() && value.get("active_cli_session_id").is_none() {
+                if first.get("session_id").is_none() && value.get("active_cli_session_id").is_none()
+                {
                     // peek if looks like account/custom vs doctor: account has provider+label, custom has alias
-                    let is_account_or_custom = first.get("provider").is_some() || first.get("alias").is_some() || first.get("attachment_id").is_some();
+                    let is_account_or_custom = first.get("provider").is_some()
+                        || first.get("alias").is_some()
+                        || first.get("attachment_id").is_some();
                     if !is_account_or_custom {
                         // treat single-key items as doctor fallback
-                        if value.as_object().map(|m| m.len()==1).unwrap_or(false) {
+                        if value.as_object().map(|m| m.len() == 1).unwrap_or(false) {
                             render_doctor_human(value);
                             return;
                         }
