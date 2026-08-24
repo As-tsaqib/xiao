@@ -20,7 +20,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
       - run: shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
       - run: shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
-      - name: Apply compiler fixes and persist
+      - name: Apply strict-clippy fixes and persist
         shell: bash
         run: |
           set -euo pipefail
@@ -31,42 +31,52 @@ jobs:
               p = Path(path)
               text = p.read_text()
               if old not in text:
-                  raise SystemExit(f"expected compiler-fix anchor missing in {path}")
+                  raise SystemExit(f"expected clippy-fix anchor missing in {path}")
               p.write_text(text.replace(old, new, 1))
 
           replace(
-              "src/control_plane.rs",
-              "        let bot = self\n            .storage\n            .setting(TELEGRAM_IDENTITY_KEY)?",
-              "        let bot = self\n            .app\n            .storage\n            .setting(TELEGRAM_IDENTITY_KEY)?",
+              "src/providers/mod.rs",
+              '''pub(crate) async fn probe_custom_tool_capability(\n    base: &str,\n    headers: &std::collections::BTreeMap<String, String>,\n    api_key: Option<&str>,\n    protocol: &str,\n    model: &str,\n) -> ProviderCapabilities {\n    probe_custom_capabilities(base, headers, api_key, protocol, model)\n        .await\n        .capabilities\n}\n\n''',
+              "",
           )
           replace(
-              "src/ipc/mod.rs",
-              "                include_archived: None,\n            }),",
-              "                include_archived: None,\n                session_id: None,\n                id: None,\n            }),",
+              "src/config/mod.rs",
+              '''        if self\n            .telegram\n            .access\n            .allowed_chat_ids\n            .iter()\n            .any(|id| *id == 0)\n        {''',
+              '''        if self.telegram.access.allowed_chat_ids.contains(&0) {''',
+          )
+          replace(
+              "src/control_plane.rs",
+              "            if allowed_chat_ids.iter().any(|id| *id == 0) {",
+              "            if allowed_chat_ids.contains(&0) {",
+          )
+          replace(
+              "src/providers/profiles.rs",
+              '''        let headers_json = headers\n            .map(|headers| serde_json::to_string(headers))\n            .transpose()?;''',
+              '''        let headers_json = headers.map(serde_json::to_string).transpose()?;''',
+          )
+          replace(
+              "src/attachments/mod.rs",
+              '''        let mut config = AttachmentConfig::default();\n        config.max_owner_bytes = 70;\n        config.max_global_bytes = 80;\n        config.max_session_bytes = 80;''',
+              '''        let config = AttachmentConfig {\n            max_owner_bytes: 70,\n            max_global_bytes: 80,\n            max_session_bytes: 80,\n            ..AttachmentConfig::default()\n        };''',
           )
           replace(
               "src/command/mod.rs",
-              '''    let state = |model: &crate::storage::ProviderProfileModelRecord| match field {\n        "native_tools" => model.native_tools_state.as_str(),\n        "structured_output" => model.structured_output_state.as_str(),\n        "continuation" => model.continuation_state.as_str(),\n        "vision" => model.vision_state.as_str(),\n        "file_input" => model.file_input_state.as_str(),\n        _ => "unknown",\n    };''',
-              '''    let state = |model: &crate::storage::ProviderProfileModelRecord| -> String {\n        match field {\n            "native_tools" => model.native_tools_state.clone(),\n            "structured_output" => model.structured_output_state.clone(),\n            "continuation" => model.continuation_state.clone(),\n            "vision" => model.vision_state.clone(),\n            "file_input" => model.file_input_state.clone(),\n            _ => "unknown".into(),\n        }\n    };''',
+              "                binding: binding.clone(),",
+              "                binding,",
           )
           replace(
-              "src/telegram/mod.rs",
-              '''            state.capability = Some(crate::providers::ProviderCapabilities::native(\n                "rollback fixture",\n            ));''',
-              '''            state.capability = Some(crate::providers::CustomCapabilityProbe {\n                capabilities: crate::providers::ProviderCapabilities::native("rollback fixture"),\n                native_tools: crate::providers::CapabilityState::Supported,\n                structured_output: crate::providers::CapabilityState::Supported,\n                continuation: crate::providers::CapabilityState::Supported,\n                vision: crate::providers::CapabilityState::Unsupported,\n                file_input: crate::providers::CapabilityState::Unsupported,\n            });''',
-          )
-          replace(
-              "src/storage/mod.rs",
-              '''                statement\n                    .query_map([], |row| row.get::<_, String>(0))?\n                    .collect::<rusqlite::Result<Vec<_>>>()?''',
-              '''                let rows = statement\n                    .query_map([], |row| row.get::<_, String>(0))?\n                    .collect::<rusqlite::Result<Vec<_>>>()?;\n                rows''',
+              "src/bin_cli.rs",
+              "use anyhow::{anyhow, bail, Context, Result};\n",
+              "",
           )
           PY
           cargo fmt --all
           git diff --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/control_plane.rs src/ipc/mod.rs src/command/mod.rs src/telegram/mod.rs src/storage/mod.rs
+          git add src/providers/mod.rs src/config/mod.rs src/control_plane.rs src/providers/profiles.rs src/attachments/mod.rs src/command/mod.rs src/bin_cli.rs
           if ! git diff --cached --quiet; then
-            git commit -m 'fix: resolve v0.2.7 compiler integration errors'
+            git commit -m 'fix: satisfy strict clippy for v0.2.7'
             git push origin HEAD:feat/v0.2.7-control-plane-unification
           fi
           cargo fmt --all -- --check
