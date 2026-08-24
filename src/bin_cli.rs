@@ -712,10 +712,10 @@ async fn telegram_configure(
         match args[index].as_str() {
             "--owner" => {
                 index += 1;
-                owner = Some(parse_owner_user_id(
-                    args.get(index)
-                        .ok_or_else(|| CliFailure::usage("--owner requires USER_ID"))?,
-                )?);
+                owner =
+                    Some(parse_owner_user_id(args.get(index).ok_or_else(|| {
+                        CliFailure::usage("--owner requires USER_ID")
+                    })?)?);
             }
             "--allowed-chat" => {
                 index += 1;
