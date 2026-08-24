@@ -113,7 +113,10 @@ impl CliPresenter {
                 "command": command,
                 "data": data,
             });
-            println!("{}", serde_json::to_string_pretty(&value)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(anyhow::Error::from)?
+            );
             return Ok(());
         }
         render_human(&data);
@@ -180,7 +183,8 @@ impl DaemonClient {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(timeout)
-            .build()?;
+            .build()
+            .map_err(anyhow::Error::from)?;
         Ok(Self {
             http,
             endpoint: client.endpoint.trim_end_matches('/').to_owned(),
@@ -1663,7 +1667,7 @@ fn config_command(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -
         }
         Some("show") if args.len() == 1 => {
             let config = AppConfig::load(&paths.config)?;
-            let value = serde_json::to_value(config)?;
+            let value = serde_json::to_value(config).map_err(anyhow::Error::from)?;
             presenter.success("config show", value)
         }
         _ => Err(CliFailure::usage("usage: xiao config <path|check|show>")),
@@ -1725,7 +1729,12 @@ async fn admin(
             )
         }
         Some("test-token-base64") if args.len() == 2 => {
-            let token = String::from_utf8(URL_SAFE_NO_PAD.decode(&args[1])?)?;
+            let token = String::from_utf8(
+                URL_SAFE_NO_PAD
+                    .decode(&args[1])
+                    .map_err(anyhow::Error::from)?,
+            )
+            .map_err(anyhow::Error::from)?;
             raw_success(
                 client
                     .post_admin("/v1/admin/telegram/test", &json!({"token":token}))
@@ -1743,7 +1752,8 @@ async fn admin(
                 .and_then(Value::as_str)
                 .ok_or_else(|| CliFailure::usage("manager resource is required"))?;
             let path = manager_resource_path(resource)?;
-            let mut url = reqwest::Url::parse(&format!("{}{}", client.endpoint, path))?;
+            let mut url = reqwest::Url::parse(&format!("{}{}", client.endpoint, path))
+                .map_err(anyhow::Error::from)?;
             if let Some(query) = request.get("query").and_then(Value::as_object) {
                 let mut pairs = url.query_pairs_mut();
                 for (key, value) in query {
@@ -1802,7 +1812,10 @@ async fn admin(
 }
 
 fn raw_success(value: Value) -> CliResult<()> {
-    println!("{}", serde_json::to_string(&value)?);
+    println!(
+        "{}",
+        serde_json::to_string(&value).map_err(anyhow::Error::from)?
+    );
     Ok(())
 }
 
@@ -2210,8 +2223,10 @@ fn exact_arity(args: &[String], count: usize, usage: &str) -> CliResult<()> {
 }
 
 fn decode_payload(encoded: &str) -> CliResult<Value> {
-    let decoded = URL_SAFE_NO_PAD.decode(encoded)?;
-    let raw = String::from_utf8(decoded)?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(anyhow::Error::from)?;
+    let raw = String::from_utf8(decoded).map_err(anyhow::Error::from)?;
     serde_json::from_str(&raw)
         .map_err(|error| CliFailure::usage(format!("invalid JSON payload: {error}")))
 }
