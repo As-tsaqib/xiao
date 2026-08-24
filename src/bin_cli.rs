@@ -103,14 +103,13 @@ impl CliPresenter {
         Self { options }
     }
 
-    fn success(&self, command: &str, data: Value) -> CliResult<()> {
+    fn success(&self, _command: &str, data: Value) -> CliResult<()> {
         if self.options.quiet {
             return Ok(());
         }
         if self.options.json {
             let value = json!({
-                "ok": true,
-                "command": command,
+                "status": "ok",
                 "data": data,
             });
             println!(
@@ -132,21 +131,32 @@ impl CliPresenter {
     fn error(&self, failure: &CliFailure) {
         let message = redact_text(&failure.message);
         if self.options.json && !self.options.quiet {
-            let code = match failure.code {
-                EXIT_USAGE => "usage",
-                EXIT_DAEMON_UNAVAILABLE => "daemon_unavailable",
-                EXIT_REJECTED => "rejected",
-                EXIT_NOT_FOUND => "not_found",
-                EXIT_LOCAL_IO => "local_io",
-                _ => "error",
-            };
+            let code =
+                if failure.code == EXIT_USAGE && failure.message.starts_with("unknown command `") {
+                    "unknown_command"
+                } else {
+                    match failure.code {
+                        EXIT_USAGE => "usage",
+                        EXIT_DAEMON_UNAVAILABLE => "daemon_unavailable",
+                        EXIT_REJECTED => "rejected",
+                        EXIT_NOT_FOUND => "not_found",
+                        EXIT_LOCAL_IO => "local_io",
+                        _ => "operation_failed",
+                    }
+                };
             eprintln!(
                 "{}",
                 serde_json::to_string(&json!({
-                    "ok": false,
-                    "error": {"code": code, "message": message},
+                    "status": "error",
+                    "error": {
+                        "code": code,
+                        "message": message,
+                        "details": {},
+                    },
                 }))
-                .unwrap_or_else(|_| "{\"ok\":false}".into())
+                .unwrap_or_else(|_| {
+                    "{\"status\":\"error\",\"error\":{\"code\":\"serialization_error\",\"message\":\"unable to serialize CLI error\",\"details\":{}}}".into()
+                })
             );
         } else {
             eprintln!("xiao: {message}");
