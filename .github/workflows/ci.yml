@@ -20,17 +20,53 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
       - run: shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
       - run: shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
-      - name: Format Rust and persist once
+      - name: Apply compiler fixes and persist
         shell: bash
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if old not in text:
+                  raise SystemExit(f"expected compiler-fix anchor missing in {path}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace(
+              "src/control_plane.rs",
+              "        let bot = self\n            .storage\n            .setting(TELEGRAM_IDENTITY_KEY)?",
+              "        let bot = self\n            .app\n            .storage\n            .setting(TELEGRAM_IDENTITY_KEY)?",
+          )
+          replace(
+              "src/ipc/mod.rs",
+              "                include_archived: None,\n            }),",
+              "                include_archived: None,\n                session_id: None,\n                id: None,\n            }),",
+          )
+          replace(
+              "src/command/mod.rs",
+              '''    let state = |model: &crate::storage::ProviderProfileModelRecord| match field {\n        "native_tools" => model.native_tools_state.as_str(),\n        "structured_output" => model.structured_output_state.as_str(),\n        "continuation" => model.continuation_state.as_str(),\n        "vision" => model.vision_state.as_str(),\n        "file_input" => model.file_input_state.as_str(),\n        _ => "unknown",\n    };''',
+              '''    let state = |model: &crate::storage::ProviderProfileModelRecord| -> String {\n        match field {\n            "native_tools" => model.native_tools_state.clone(),\n            "structured_output" => model.structured_output_state.clone(),\n            "continuation" => model.continuation_state.clone(),\n            "vision" => model.vision_state.clone(),\n            "file_input" => model.file_input_state.clone(),\n            _ => "unknown".into(),\n        }\n    };''',
+          )
+          replace(
+              "src/telegram/mod.rs",
+              '''            state.capability = Some(crate::providers::ProviderCapabilities::native(\n                "rollback fixture",\n            ));''',
+              '''            state.capability = Some(crate::providers::CustomCapabilityProbe {\n                capabilities: crate::providers::ProviderCapabilities::native("rollback fixture"),\n                native_tools: crate::providers::CapabilityState::Supported,\n                structured_output: crate::providers::CapabilityState::Supported,\n                continuation: crate::providers::CapabilityState::Supported,\n                vision: crate::providers::CapabilityState::Unsupported,\n                file_input: crate::providers::CapabilityState::Unsupported,\n            });''',
+          )
+          replace(
+              "src/storage/mod.rs",
+              '''                statement\n                    .query_map([], |row| row.get::<_, String>(0))?\n                    .collect::<rusqlite::Result<Vec<_>>>()?''',
+              '''                let rows = statement\n                    .query_map([], |row| row.get::<_, String>(0))?\n                    .collect::<rusqlite::Result<Vec<_>>>()?;\n                rows''',
+          )
+          PY
           cargo fmt --all
           git diff --check
-          if ! git diff --quiet; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add -- '*.rs'
-            git commit -m 'style: apply rustfmt to v0.2.7 implementation'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/control_plane.rs src/ipc/mod.rs src/command/mod.rs src/telegram/mod.rs src/storage/mod.rs
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix: resolve v0.2.7 compiler integration errors'
             git push origin HEAD:feat/v0.2.7-control-plane-unification
           fi
           cargo fmt --all -- --check
