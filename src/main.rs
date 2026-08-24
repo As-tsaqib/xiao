@@ -39,25 +39,52 @@ async fn main() -> Result<()> {
     let ipc_path = config_path.clone();
     let mut ipc_task = tokio::spawn(async move { xiao::ipc::serve(ipc_app, ipc_path).await });
 
-    let mut telegram_task = if cfg.gateway.enabled && cfg.telegram.enabled {
-        let tg = xiao::telegram::TelegramAdapter::from_app(app.clone()).await?;
-        Some(tokio::spawn(async move { tg.run().await }))
-    } else {
-        None
-    };
+    let mut telegram_task = spawn_telegram(&app).await;
+    let mut events = app.events.subscribe();
 
     tracing::info!(version = xiao::VERSION, "xiao daemon started");
 
-    if let Some(tg) = telegram_task.as_mut() {
-        tokio::select! {
-            _ = shutdown_signal() => tracing::info!("shutdown signal received"),
-            r = &mut ipc_task => log_task_exit("IPC", r),
-            r = tg => log_task_exit("Telegram", r),
-        }
-    } else {
-        tokio::select! {
-            _ = shutdown_signal() => tracing::info!("shutdown signal received"),
-            r = &mut ipc_task => log_task_exit("IPC", r),
+    loop {
+        if let Some(mut tg) = telegram_task.take() {
+            tokio::select! {
+                _ = shutdown_signal() => {
+                    tg.abort();
+                    tracing::info!("shutdown signal received");
+                    break;
+                },
+                r = &mut ipc_task => {
+                    tg.abort();
+                    log_task_exit("IPC", r);
+                    break;
+                },
+                r = &mut tg => {
+                    log_task_exit("Telegram", r);
+                },
+                event = events.recv() => {
+                    if matches!(event, Ok(xiao::event::AppEvent::ConfigReloaded)) {
+                        tg.abort();
+                        telegram_task = spawn_telegram(&app).await;
+                    } else {
+                        telegram_task = Some(tg);
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = shutdown_signal() => {
+                    tracing::info!("shutdown signal received");
+                    break;
+                },
+                r = &mut ipc_task => {
+                    log_task_exit("IPC", r);
+                    break;
+                },
+                event = events.recv() => {
+                    if matches!(event, Ok(xiao::event::AppEvent::ConfigReloaded)) {
+                        telegram_task = spawn_telegram(&app).await;
+                    }
+                }
+            }
         }
     }
 
@@ -69,6 +96,24 @@ async fn main() -> Result<()> {
         tracing::warn!(%error, "SQLite WAL checkpoint failed during shutdown");
     }
     Ok(())
+}
+
+async fn spawn_telegram(
+    app: &AppState,
+) -> Option<tokio::task::JoinHandle<Result<()>>> {
+    let cfg = app.config.read().await.clone();
+    if !cfg.gateway.enabled || !cfg.telegram.enabled {
+        app.health.set_telegram_polling(false).await;
+        return None;
+    }
+    match xiao::telegram::TelegramAdapter::from_app(app.clone()).await {
+        Ok(adapter) => Some(tokio::spawn(async move { adapter.run().await })),
+        Err(error) => {
+            app.health.set_telegram_polling(false).await;
+            tracing::error!(%error, "Telegram adapter apply failed; daemon remains available for setup");
+            None
+        }
+    }
 }
 
 fn log_task_exit(name: &str, result: Result<Result<()>, tokio::task::JoinError>) {

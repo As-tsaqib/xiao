@@ -4,6 +4,7 @@ pub mod attachments;
 pub mod auth;
 pub mod command;
 pub mod config;
+pub mod control_plane;
 pub mod context;
 pub mod event;
 pub mod identity;

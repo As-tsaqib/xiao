@@ -148,9 +148,10 @@ impl AppState {
     }
 
     async fn build_inner(
-        config: AppConfig,
+        mut config: AppConfig,
         config_path: Option<Arc<std::path::PathBuf>>,
     ) -> Result<Self> {
+        config.telegram.access.migrate_legacy_owner();
         config.validate()?;
         let config = Arc::new(RwLock::new(config));
         let cfg = config.read().await.clone();
@@ -171,14 +172,26 @@ impl AppState {
             cfg.paths.data_dir.clone(),
             cfg.attachments.clone(),
         )?);
+        // Startup reconciliation is safe after Storage::open has quarantined any
+        // interrupted runs. Retention/orphan cleanup never crosses the private
+        // attachment root and protects sessions with live runs.
+        if let Err(error) = attachments.cleanup_retention(None) {
+            tracing::warn!(error = %error, "attachment retention cleanup failed");
+        }
+        if let Err(error) = attachments.cleanup_orphans() {
+            tracing::warn!(error = %error, "attachment orphan cleanup failed");
+        }
         let auth = Arc::new(AuthManager::with_config(
             storage.clone(),
             cfg.paths.secrets_dir.clone(),
             config.clone(),
         ));
         let profiles = ProviderProfileStore::new(storage.clone());
-        for telegram_user_id in &cfg.telegram.access.allowed_user_ids {
-            let migration = storage.ensure_telegram_owner(*telegram_user_id)?;
+        // v0.2.7 is single-owner. A multi-entry legacy allowed_user_ids list is
+        // deliberately not resolved here: setup must explicitly choose the
+        // canonical owner. A single legacy entry is normalized by AppConfig.
+        if let Some(telegram_user_id) = cfg.telegram.access.owner_user_id {
+            let migration = storage.ensure_telegram_owner(telegram_user_id)?;
             let legacy_credential = auth
                 .accounts(Some("custom"))?
                 .into_iter()

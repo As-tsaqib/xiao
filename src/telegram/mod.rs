@@ -712,7 +712,9 @@ impl TelegramAdapter {
                 menu.current_view = login::alias_view(&wizard.id);
             }
             "alias" if wizard.phase == CustomLoginPhase::Alias => {
-                wizard.alias = validate_custom_alias(text)?;
+                let alias = validate_custom_alias(text)?;
+                self.ensure_custom_alias_available(context.principal, &alias)?;
+                wizard.alias = alias;
                 menu.current_view = View::info(
                     "CUSTOM LOGIN",
                     "Validating endpoint and discovering models…",
@@ -722,6 +724,17 @@ impl TelegramAdapter {
                 menu.current_view = login::model_view(&wizard);
             }
             _ => return Err(anyhow!("custom login input is stale or out of sequence")),
+        }
+        Ok(())
+    }
+
+
+    fn ensure_custom_alias_available(&self, principal: &str, alias: &str) -> Result<()> {
+        let store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
+        if store.get_by_alias(principal, alias)?.is_some() {
+            return Err(anyhow!(
+                "Custom profile alias `{alias}` already exists. Choose a different alias."
+            ));
         }
         Ok(())
     }
@@ -798,6 +811,7 @@ impl TelegramAdapter {
                 menu.current_view = login::alias_view(wizard_id);
             }
             "default_alias" if wizard.phase == CustomLoginPhase::Alias => {
+                self.ensure_custom_alias_available(principal, "custom")?;
                 wizard.alias = "custom".into();
                 self.discover_custom_models(&mut wizard).await?;
                 menu.pending_input = None;
@@ -830,7 +844,7 @@ impl TelegramAdapter {
                     None => None,
                 };
                 wizard.capability = Some(
-                    crate::providers::probe_custom_tool_capability(
+                    crate::providers::probe_custom_capabilities(
                         endpoint,
                         &headers,
                         api_key.as_deref(),
@@ -946,10 +960,11 @@ impl TelegramAdapter {
             .and_then(|index| wizard.models.get(index))
             .cloned()
             .ok_or_else(|| anyhow!("select a model before confirmation"))?;
-        let capability = wizard
+        let probe = wizard
             .capability
             .as_ref()
             .ok_or_else(|| anyhow!("selected model capability was not probed"))?;
+        let capability = &probe.capabilities;
         let context = self
             .app
             .sessions
@@ -987,6 +1002,11 @@ impl TelegramAdapter {
                         && capability.tool_protocol == crate::providers::ToolProtocol::Native,
                     structured_output: selected && capability.structured_output,
                     continuation: selected && capability.continuation,
+                    native_tools_state: if selected { probe.native_tools.as_str() } else { "unknown" }.into(),
+                    structured_output_state: if selected { probe.structured_output.as_str() } else { "unknown" }.into(),
+                    continuation_state: if selected { probe.continuation.as_str() } else { "unknown" }.into(),
+                    vision_state: if selected { probe.vision.as_str() } else { "unknown" }.into(),
+                    file_input_state: if selected { probe.file_input.as_str() } else { "unknown" }.into(),
                     model_discovery: true,
                     tool_protocol: if selected {
                         capability.tool_protocol.as_str().into()

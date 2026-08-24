@@ -211,6 +211,13 @@ pub struct ProviderProfileModelRecord {
     pub native_tools: bool,
     pub structured_output: bool,
     pub continuation: bool,
+    /// Tri-state probe results. Boolean fields above are runtime-compatible
+    /// "supported" projections and must never be used to represent Unknown.
+    pub native_tools_state: String,
+    pub structured_output_state: String,
+    pub continuation_state: String,
+    pub vision_state: String,
+    pub file_input_state: String,
     pub model_discovery: bool,
     pub tool_protocol: String,
     pub evidence: String,
@@ -870,6 +877,24 @@ impl Storage {
                 INSERT OR IGNORE INTO schema_migrations(version) VALUES(16);
                 "#,
             )?;
+            // v0.2.7 preserves Unknown independently from Unsupported. Older
+            // false booleans did not carry enough evidence, so migrate them to
+            // unknown; only prior true values can safely become supported.
+            ensure_column(conn, "provider_profile_models", "native_tools_state", "TEXT NOT NULL DEFAULT 'unknown'")?;
+            ensure_column(conn, "provider_profile_models", "structured_output_state", "TEXT NOT NULL DEFAULT 'unknown'")?;
+            ensure_column(conn, "provider_profile_models", "continuation_state", "TEXT NOT NULL DEFAULT 'unknown'")?;
+            ensure_column(conn, "provider_profile_models", "vision_state", "TEXT NOT NULL DEFAULT 'unknown'")?;
+            ensure_column(conn, "provider_profile_models", "file_input_state", "TEXT NOT NULL DEFAULT 'unknown'")?;
+            conn.execute_batch(
+                r#"
+                UPDATE provider_profile_models SET native_tools_state='supported' WHERE native_tools=1 AND native_tools_state='unknown';
+                UPDATE provider_profile_models SET structured_output_state='supported' WHERE structured_output=1 AND structured_output_state='unknown';
+                UPDATE provider_profile_models SET continuation_state='supported' WHERE continuation=1 AND continuation_state='unknown';
+                UPDATE provider_profile_models SET vision_state='supported' WHERE vision_capable=1 AND vision_state='unknown';
+                UPDATE provider_profile_models SET file_input_state='supported' WHERE file_input_capable=1 AND file_input_state='unknown';
+                INSERT OR IGNORE INTO schema_migrations(version) VALUES(17);
+                "#,
+            )?;
             Ok(())
         })
     }
@@ -916,14 +941,19 @@ impl Storage {
             // installation owner before Telegram was configured. That row is
             // the same single human, not a second tenant, so claim all of its
             // durable state when the configured Telegram identity appears.
-            let local_owner = "owner:local";
-            let local_exists: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM owners WHERE owner_id=?)",
-                params![local_owner],
-                |row| row.get(0),
-            )?;
-            if local_exists && local_owner != owner_id {
-                legacy.insert(local_owner.to_owned());
+            // v0.2.6 could materialize more than one Telegram owner from
+            // allowed_user_ids. Once v0.2.7 has an explicitly selected owner,
+            // every other owner row is legacy state belonging to the same
+            // installation and is transactionally folded into the canonical
+            // owner. This also covers the headless owner:local case.
+            {
+                let mut statement = transaction.prepare(
+                    "SELECT owner_id FROM owners WHERE owner_id<>? ORDER BY created_at,owner_id",
+                )?;
+                let values = statement
+                    .query_map(params![owner_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                legacy.extend(values);
             }
             transaction.execute(
                 "INSERT OR IGNORE INTO access_principals(principal,role,created_at,updated_at) VALUES(?,'owner',?,?)",
@@ -1132,14 +1162,20 @@ impl Storage {
     /// stable local owner row; once a Telegram owner exists it takes priority.
     pub fn management_owner_id(&self) -> Result<String> {
         self.with_conn(|connection| {
-            if let Some(owner) = connection
-                .query_row(
-                    "SELECT owner_id FROM owners ORDER BY CASE WHEN telegram_user_id IS NULL THEN 1 ELSE 0 END,created_at LIMIT 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-            {
+            let owners = {
+                let mut statement = connection.prepare(
+                    "SELECT owner_id FROM owners ORDER BY CASE WHEN telegram_user_id IS NULL THEN 1 ELSE 0 END,created_at,owner_id",
+                )?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if owners.len() > 1 {
+                return Err(anyhow::anyhow!(
+                    "multiple legacy owners require explicit owner resolution"
+                ));
+            }
+            if let Some(owner) = owners.into_iter().next() {
                 return Ok(owner);
             }
             let owner = "owner:local".to_owned();
@@ -2386,6 +2422,83 @@ impl Storage {
         })
     }
 
+    /// Raw bytes accounted to an owner. Failed/rejected rows remain counted when
+    /// an explicit retention policy kept their files. Rows are removed when raw
+    /// files are purged, so there is no unaccounted retained garbage.
+    pub fn owner_attachment_bytes(&self, owner: &str) -> Result<u64> {
+        self.with_conn(|connection| {
+            let value: i64 = connection.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM attachments WHERE owner_id=?",
+                params![owner],
+                |row| row.get(0),
+            )?;
+            Ok(value.max(0) as u64)
+        })
+    }
+
+    pub fn global_attachment_bytes(&self) -> Result<u64> {
+        self.with_conn(|connection| {
+            let value: i64 = connection.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM attachments",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(value.max(0) as u64)
+        })
+    }
+
+    pub fn all_attachment_paths(&self) -> Result<Vec<(String, String, String, String)>> {
+        self.with_conn(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT attachment_id,owner_id,session_id,local_path FROM attachments ORDER BY created_at",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn attachments_older_than(&self, owner: Option<&str>, cutoff: &str) -> Result<Vec<AttachmentRecord>> {
+        self.with_conn(|connection| {
+            let sql = if owner.is_some() {
+                ATTACHMENT_SELECT.to_owned() + " WHERE owner_id=? AND created_at<? ORDER BY created_at"
+            } else {
+                ATTACHMENT_SELECT.to_owned() + " WHERE created_at<? ORDER BY created_at"
+            };
+            let mut statement = connection.prepare(&sql)?;
+            let rows = if let Some(owner) = owner {
+                statement.query_map(params![owner, cutoff], row_attachment)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                statement.query_map(params![cutoff], row_attachment)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            Ok(rows)
+        })
+    }
+
+    pub fn session_has_active_run(&self, owner: &str, session_id: &str) -> Result<bool> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE owner_principal=? AND session_id=? AND status IN ('received','context_build','running','awaiting_approval','verifying'))",
+                    params![owner, session_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn delete_attachment(&self, owner: &str, attachment_id: &str) -> Result<bool> {
+        self.with_conn(|connection| {
+            Ok(connection.execute(
+                "DELETE FROM attachments WHERE owner_id=? AND attachment_id=?",
+                params![owner, attachment_id],
+            )? == 1)
+        })
+    }
+
     pub fn insert_attachment(&self, record: NewAttachmentRecord<'_>) -> Result<()> {
         if !matches!(record.kind, "image" | "document")
             || record.size_bytes > i64::MAX as u64
@@ -2508,6 +2621,35 @@ impl Storage {
                 )
                 .optional()
                 .map_err(Into::into)
+        })
+    }
+
+    pub fn list_attachments(
+        &self,
+        owner: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AttachmentRecord>> {
+        self.with_conn(|connection| {
+            let (sql, bind_session) = if session_id.is_some() {
+                (ATTACHMENT_SELECT.to_owned() + " WHERE owner_id=? AND session_id=? ORDER BY created_at DESC LIMIT ?", true)
+            } else {
+                (ATTACHMENT_SELECT.to_owned() + " WHERE owner_id=? ORDER BY created_at DESC LIMIT ?", false)
+            };
+            let mut statement = connection.prepare(&sql)?;
+            let rows = if bind_session {
+                statement
+                    .query_map(
+                        params![owner, session_id.unwrap_or_default(), limit.clamp(1, 500) as i64],
+                        row_attachment,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                statement
+                    .query_map(params![owner, limit.clamp(1, 500) as i64], row_attachment)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            Ok(rows)
         })
     }
 
@@ -3059,7 +3201,7 @@ mod tests {
                 connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                     row.get(0)
                 })?;
-            assert_eq!(latest, 16);
+            assert_eq!(latest, 17);
             for table in [
                 "agent_runs",
                 "tool_runs",
@@ -3108,6 +3250,11 @@ mod tests {
                 ("tool_runs", "policy_original"),
                 ("dependency_installs", "source"),
                 ("dependency_installs", "validated"),
+                ("provider_profile_models", "native_tools_state"),
+                ("provider_profile_models", "structured_output_state"),
+                ("provider_profile_models", "continuation_state"),
+                ("provider_profile_models", "vision_state"),
+                ("provider_profile_models", "file_input_state"),
             ] {
                 let present: bool = connection.query_row(
                     &format!(
@@ -3208,6 +3355,37 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].id, tool_id);
         assert_eq!(tools[0].status, "interrupted");
+    }
+
+    #[test]
+    fn multiple_legacy_owner_rows_fail_closed_until_explicit_telegram_resolution() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_conn(|connection| {
+                connection.execute(
+                    "INSERT INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES('owner:telegram:41',41,'a','a')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES('owner:telegram:42',42,'b','b')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let error = storage.management_owner_id().unwrap_err().to_string();
+        assert!(error.contains("multiple legacy owners require explicit owner resolution"));
+
+        let migration = storage.ensure_telegram_owner(42).unwrap();
+        assert_eq!(migration.owner_id, "owner:telegram:42");
+        assert_eq!(storage.management_owner_id().unwrap(), "owner:telegram:42");
+        storage
+            .with_conn(|connection| {
+                let count: i64 = connection.query_row("SELECT COUNT(*) FROM owners", [], |row| row.get(0))?;
+                assert_eq!(count, 1);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

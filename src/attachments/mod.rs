@@ -1,11 +1,16 @@
 use std::{
+    collections::HashSet,
     fs,
     io::{Cursor, Read},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::Arc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{Duration as ChronoDuration, Utc};
 use image::GenericImageView;
 use quick_xml::{events::Event, Reader};
 use serde::{Deserialize, Serialize};
@@ -60,11 +65,124 @@ pub struct NormalizedImage {
     pub caption: String,
 }
 
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentUsage {
+    pub owner_bytes: u64,
+    pub owner_quota_bytes: u64,
+    pub global_bytes: u64,
+    pub global_quota_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedPdfPage {
+    pub page_no: usize,
+    pub text: String,
+}
+
+pub trait ScannedPdfProcessor: Send + Sync {
+    /// Returns `Ok(None)` when no bounded OCR implementation is available on
+    /// this host. Tests inject a deterministic fake; production uses local
+    /// `pdftoppm` + `tesseract` only and never downloads executables/scripts.
+    fn extract(
+        &self,
+        pdf: &[u8],
+        scratch_root: &Path,
+        config: &AttachmentConfig,
+    ) -> Result<Option<Vec<ScannedPdfPage>>>;
+}
+
+#[derive(Default)]
+struct LocalScannedPdfProcessor;
+
+impl ScannedPdfProcessor for LocalScannedPdfProcessor {
+    fn extract(
+        &self,
+        pdf: &[u8],
+        scratch_root: &Path,
+        config: &AttachmentConfig,
+    ) -> Result<Option<Vec<ScannedPdfPage>>> {
+        if !command_available("pdftoppm") || !command_available("tesseract") {
+            return Ok(None);
+        }
+        let work = scratch_root.join(format!("ocr-{}", Uuid::new_v4().simple()));
+        create_private_dir(&work)?;
+        let result = (|| -> Result<Vec<ScannedPdfPage>> {
+            let pdf_path = work.join("source.pdf");
+            atomic_private_write(&pdf_path, pdf)?;
+            let prefix = work.join("page");
+            let mut render = Command::new("pdftoppm");
+            render
+                .arg("-png")
+                .arg("-r")
+                .arg("150")
+                .arg("-f")
+                .arg("1")
+                .arg("-l")
+                .arg((config.max_pdf_pages + 1).to_string())
+                .arg(&pdf_path)
+                .arg(&prefix);
+            run_command_bounded(
+                &mut render,
+                Duration::from_secs(config.processing_timeout_seconds),
+                "PDF renderer",
+            )?;
+
+            let mut pages = fs::read_dir(&work)?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("page-") && name.ends_with(".png"))
+                })
+                .collect::<Vec<_>>();
+            pages.sort();
+            if pages.is_empty() {
+                return Err(anyhow!("PDF renderer produced no pages"));
+            }
+            if pages.len() > config.max_pdf_pages {
+                return Err(anyhow!("PDF exceeds the configured page limit"));
+            }
+            let mut output = Vec::with_capacity(pages.len());
+            let mut total_chars = 0usize;
+            for (index, page) in pages.iter().enumerate() {
+                let bytes = fs::read(page)?;
+                validate_image(&bytes, config.max_pdf_page_pixels)
+                    .with_context(|| format!("validate rendered PDF page {}", index + 1))?;
+                let outbase = work.join(format!("ocr-{}", index + 1));
+                let mut ocr = Command::new("tesseract");
+                ocr.arg(page).arg(&outbase).arg("txt");
+                run_command_bounded(
+                    &mut ocr,
+                    Duration::from_secs(config.ocr_page_timeout_seconds),
+                    "PDF OCR",
+                )?;
+                let text_path = outbase.with_extension("txt");
+                let text = fs::read_to_string(&text_path)
+                    .with_context(|| format!("read OCR page {}", index + 1))?;
+                total_chars = total_chars.saturating_add(text.chars().count());
+                if total_chars > config.max_extracted_text_chars {
+                    return Err(anyhow!("OCR text exceeds configured extraction limit"));
+                }
+                output.push(ScannedPdfPage {
+                    page_no: index + 1,
+                    text: normalize_text(&text),
+                });
+            }
+            Ok(output)
+        })();
+        let _ = fs::remove_dir_all(&work);
+        result.map(Some)
+    }
+}
+
 #[derive(Clone)]
 pub struct AttachmentManager {
     storage: Arc<Storage>,
     root: Arc<PathBuf>,
     config: AttachmentConfig,
+    scanned_pdf: Arc<dyn ScannedPdfProcessor>,
 }
 
 impl AttachmentManager {
@@ -79,11 +197,27 @@ impl AttachmentManager {
             storage,
             root: Arc::new(root),
             config,
+            scanned_pdf: Arc::new(LocalScannedPdfProcessor),
         })
+    }
+
+    #[cfg(test)]
+    fn with_scanned_pdf_processor(mut self, processor: Arc<dyn ScannedPdfProcessor>) -> Self {
+        self.scanned_pdf = processor;
+        self
     }
 
     pub fn root(&self) -> &Path {
         self.root.as_path()
+    }
+
+    pub fn usage(&self, owner: &str) -> Result<AttachmentUsage> {
+        Ok(AttachmentUsage {
+            owner_bytes: self.storage.owner_attachment_bytes(owner)?,
+            owner_quota_bytes: self.config.max_owner_bytes,
+            global_bytes: self.storage.global_attachment_bytes()?,
+            global_quota_bytes: self.config.max_global_bytes,
+        })
     }
 
     pub fn max_download_bytes(&self, kind: AttachmentKind) -> u64 {
@@ -114,11 +248,28 @@ impl AttachmentManager {
         if input.bytes.len() as u64 > byte_limit {
             return Err(anyhow!("attachment exceeds the {} byte limit", byte_limit));
         }
+        let incoming = input.bytes.len() as u64;
         let current = self
             .storage
             .session_attachment_bytes(&input.owner_id, &input.session_id)?;
-        if current.saturating_add(input.bytes.len() as u64) > self.config.max_session_bytes {
+        if current.saturating_add(incoming) > self.config.max_session_bytes {
             return Err(anyhow!("attachment would exceed the session storage quota"));
+        }
+        if self
+            .storage
+            .owner_attachment_bytes(&input.owner_id)?
+            .saturating_add(incoming)
+            > self.config.max_owner_bytes
+        {
+            return Err(anyhow!("attachment would exceed the owner storage quota"));
+        }
+        if self
+            .storage
+            .global_attachment_bytes()?
+            .saturating_add(incoming)
+            > self.config.max_global_bytes
+        {
+            return Err(anyhow!("attachment would exceed the global storage quota"));
         }
 
         let detection = detect_content(&input.bytes, &input.original_name)?;
@@ -191,6 +342,9 @@ impl AttachmentManager {
                 None,
                 Some(&safe),
             )?;
+            if !self.config.retain_failed {
+                self.delete_raw_and_record(&input.owner_id, &attachment_id, &final_path)?;
+            }
             return Err(anyhow!(safe));
         }
         self.storage
@@ -235,13 +389,42 @@ impl AttachmentManager {
             < 8
         {
             if detection.mime == "application/pdf" {
-                return self.storage.set_attachment_status(
-                    owner,
-                    attachment_id,
-                    "needs_ocr",
-                    Some("PDF has no meaningful embedded text; OCR or a vision-capable model is required"),
-                    None,
-                );
+                match self
+                    .scanned_pdf
+                    .extract(bytes, self.root(), &self.config)?
+                {
+                    Some(pages) => {
+                        let chunks = chunk_scanned_pages(attachment_id, &pages, self.config.chunk_chars);
+                        let useful = chunks
+                            .iter()
+                            .map(|chunk| chunk.text.chars().filter(|c| !c.is_whitespace()).count())
+                            .sum::<usize>();
+                        if useful < 8 {
+                            return Err(anyhow!("OCR produced no meaningful PDF text"));
+                        }
+                        self.storage.replace_attachment_chunks(owner, attachment_id, &chunks)?;
+                        return self.storage.set_attachment_status(
+                            owner,
+                            attachment_id,
+                            "ready",
+                            Some(&format!(
+                                "Scanned PDF; OCR indexed {} pages in {} chunks",
+                                pages.len(),
+                                chunks.len()
+                            )),
+                            None,
+                        );
+                    }
+                    None => {
+                        return self.storage.set_attachment_status(
+                            owner,
+                            attachment_id,
+                            "needs_ocr",
+                            Some("PDF has no meaningful embedded text; local bounded OCR is unavailable"),
+                            None,
+                        );
+                    }
+                }
             }
             return Err(anyhow!("document contains no meaningful extractable text"));
         }
@@ -257,6 +440,74 @@ impl AttachmentManager {
         );
         self.storage
             .set_attachment_status(owner, attachment_id, "ready", Some(&summary), None)
+    }
+
+    fn delete_raw_and_record(&self, owner: &str, attachment_id: &str, raw: &Path) -> Result<()> {
+        if !raw.starts_with(self.root()) {
+            return Err(anyhow!("refusing to remove attachment outside private store"));
+        }
+        match fs::remove_file(raw) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.storage.delete_attachment(owner, attachment_id)?;
+        Ok(())
+    }
+
+    pub fn remove(&self, owner: &str, attachment_id: &str) -> Result<bool> {
+        let Some(record) = self.storage.attachment(owner, attachment_id)? else {
+            return Ok(false);
+        };
+        if self.storage.session_has_active_run(owner, &record.session_id)? {
+            return Err(anyhow!("attachment is protected by an active run"));
+        }
+        self.delete_raw_and_record(owner, attachment_id, Path::new(&record.local_path))?;
+        Ok(true)
+    }
+
+    pub fn cleanup_retention(&self, owner: Option<&str>) -> Result<usize> {
+        let cutoff = (Utc::now() - ChronoDuration::days(self.config.retention_days as i64))
+            .to_rfc3339();
+        let mut removed = 0usize;
+        for record in self.storage.attachments_older_than(owner, &cutoff)? {
+            if self
+                .storage
+                .session_has_active_run(&record.owner_id, &record.session_id)?
+            {
+                continue;
+            }
+            self.delete_raw_and_record(
+                &record.owner_id,
+                &record.attachment_id,
+                Path::new(&record.local_path),
+            )?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Reconcile the private store against DB references. Only regular `.bin`
+    /// files under Xiao's attachment root can be removed; active-run referenced
+    /// files are never touched.
+    pub fn cleanup_orphans(&self) -> Result<usize> {
+        let records = self.storage.all_attachment_paths()?;
+        let referenced = records
+            .iter()
+            .map(|(_, _, _, path)| PathBuf::from(path))
+            .collect::<HashSet<_>>();
+        let mut removed = 0usize;
+        for path in attachment_files(self.root())? {
+            if referenced.contains(&path) {
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("bin") {
+                continue;
+            }
+            fs::remove_file(&path)?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     pub fn recent_for_prompt(
@@ -379,6 +630,60 @@ impl AttachmentManager {
         })?;
         Ok(format!("store={} FTS5 readable", self.root.display()))
     }
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn run_command_bounded(command: &mut Command, timeout: Duration, label: &str) -> Result<()> {
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = command.spawn().with_context(|| format!("start {label}"))?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(anyhow!("{label} failed with status {status}"));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("{label} exceeded its bounded timeout"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn attachment_files(root: &Path) -> Result<Vec<PathBuf>> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.starts_with(root) {
+                continue;
+            }
+            let ty = entry.file_type()?;
+            if ty.is_symlink() {
+                continue;
+            }
+            if ty.is_dir() {
+                walk(&path, root, out)?;
+            } else if ty.is_file() {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out)?;
+    Ok(out)
 }
 
 #[derive(Debug)]
@@ -550,6 +855,22 @@ fn chunk_text(attachment_id: &str, text: &str, max_chars: usize) -> Vec<Attachme
         start = end.saturating_sub(overlap).max(start + 1);
     }
     chunks
+}
+
+fn chunk_scanned_pages(
+    attachment_id: &str,
+    pages: &[ScannedPdfPage],
+    max_chars: usize,
+) -> Vec<AttachmentChunkRecord> {
+    let mut output = Vec::new();
+    for page in pages {
+        for mut chunk in chunk_text(attachment_id, &normalize_text(&page.text), max_chars) {
+            chunk.chunk_no = output.len();
+            chunk.page_no = Some(page.page_no);
+            output.push(chunk);
+        }
+    }
+    output
 }
 
 fn normalize_text(value: &str) -> String {
@@ -743,6 +1064,158 @@ mod tests {
         )
         .unwrap();
         (manager, directory, storage, session.id)
+    }
+
+    #[derive(Default)]
+    struct FakeScannedPdf;
+
+    impl ScannedPdfProcessor for FakeScannedPdf {
+        fn extract(
+            &self,
+            _pdf: &[u8],
+            _scratch_root: &Path,
+            _config: &AttachmentConfig,
+        ) -> Result<Option<Vec<ScannedPdfPage>>> {
+            Ok(Some(vec![
+                ScannedPdfPage { page_no: 1, text: "Invoice alpha marker cedar-summit".into() },
+                ScannedPdfPage { page_no: 2, text: "Second page contains verified OCR evidence".into() },
+            ]))
+        }
+    }
+
+    #[test]
+    fn scanned_pdf_uses_bounded_processor_and_indexes_page_chunks() {
+        let (manager, _directory, storage, session) = manager();
+        let manager = manager.with_scanned_pdf_processor(Arc::new(FakeScannedPdf));
+        let record = manager
+            .ingest(AttachmentIngest {
+                owner_id: "owner:test".into(),
+                session_id: session.clone(),
+                telegram_file_id: None,
+                telegram_unique_id: Some("scan-1".into()),
+                original_name: "scan.pdf".into(),
+                declared_mime: Some("application/pdf".into()),
+                expected_kind: AttachmentKind::Document,
+                bytes: text_pdf(""),
+            })
+            .unwrap();
+        assert_eq!(record.processing_status, "ready");
+        let hits = storage
+            .search_attachment_chunks("owner:test", &session, "cedar summit", 5)
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].page_no, Some(1));
+        assert!(hits[0].text.contains("cedar-summit"));
+    }
+
+    #[test]
+    fn malformed_failed_attachment_is_deleted_when_failed_retention_is_off() {
+        let (manager, _directory, storage, session) = manager();
+        let result = manager.ingest(AttachmentIngest {
+            owner_id: "owner:test".into(),
+            session_id: session.clone(),
+            telegram_file_id: None,
+            telegram_unique_id: None,
+            original_name: "broken.pdf".into(),
+            declared_mime: Some("application/pdf".into()),
+            expected_kind: AttachmentKind::Document,
+            bytes: b"%PDF-1.7 definitely not a valid pdf body".to_vec(),
+        });
+        assert!(result.is_err());
+        assert!(storage
+            .recent_attachments("owner:test", &session, 10)
+            .unwrap()
+            .is_empty());
+        assert!(attachment_files(manager.root()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn owner_and_global_quota_are_accounted_from_durable_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let session_a = storage
+            .create_session("owner:test", "A", "custom", None, "m", false, None)
+            .unwrap();
+        let session_b = storage
+            .create_session("owner:test", "B", "custom", None, "m", false, None)
+            .unwrap();
+        let mut config = AttachmentConfig::default();
+        config.max_owner_bytes = 70;
+        config.max_global_bytes = 80;
+        config.max_session_bytes = 80;
+        let manager = AttachmentManager::new(storage.clone(), directory.path(), config).unwrap();
+        let first = b"first durable attachment has enough meaningful text".to_vec();
+        manager
+            .ingest(AttachmentIngest {
+                owner_id: "owner:test".into(),
+                session_id: session_a.id,
+                telegram_file_id: None,
+                telegram_unique_id: None,
+                original_name: "a.txt".into(),
+                declared_mime: Some("text/plain".into()),
+                expected_kind: AttachmentKind::Document,
+                bytes: first.clone(),
+            })
+            .unwrap();
+        let usage = manager.usage("owner:test").unwrap();
+        assert_eq!(usage.owner_bytes, first.len() as u64);
+        assert_eq!(usage.global_bytes, first.len() as u64);
+        let second = manager.ingest(AttachmentIngest {
+            owner_id: "owner:test".into(),
+            session_id: session_b.id,
+            telegram_file_id: None,
+            telegram_unique_id: None,
+            original_name: "b.txt".into(),
+            declared_mime: Some("text/plain".into()),
+            expected_kind: AttachmentKind::Document,
+            bytes: b"second attachment pushes owner storage over quota".to_vec(),
+        });
+        assert!(second.unwrap_err().to_string().contains("owner storage quota"));
+    }
+
+    #[test]
+    fn orphan_cleanup_only_removes_unreferenced_bin_files() {
+        let (manager, _directory, _storage, _session) = manager();
+        let orphan = manager.root().join("orphan.bin");
+        let keep = manager.root().join("note.txt");
+        fs::write(&orphan, b"orphan").unwrap();
+        fs::write(&keep, b"not managed raw attachment").unwrap();
+        assert_eq!(manager.cleanup_orphans().unwrap(), 1);
+        assert!(!orphan.exists());
+        assert!(keep.exists());
+    }
+
+    #[test]
+    fn active_run_protects_attachment_from_manual_and_retention_cleanup() {
+        let (mut manager, _directory, storage, session) = manager();
+        manager.config.retention_days = 1;
+        let record = manager
+            .ingest(AttachmentIngest {
+                owner_id: "owner:test".into(),
+                session_id: session.clone(),
+                telegram_file_id: None,
+                telegram_unique_id: None,
+                original_name: "protected.txt".into(),
+                declared_mime: Some("text/plain".into()),
+                expected_kind: AttachmentKind::Document,
+                bytes: b"active run attachment protection sentinel".to_vec(),
+            })
+            .unwrap();
+        storage
+            .with_conn(|connection| {
+                connection.execute(
+                    "UPDATE attachments SET created_at='2000-01-01T00:00:00Z' WHERE attachment_id=?",
+                    rusqlite::params![record.attachment_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .create_agent_run("owner:test", &session, "custom", "m", Some("protect attachment"))
+            .unwrap();
+        assert!(manager.remove("owner:test", &record.attachment_id).is_err());
+        assert_eq!(manager.cleanup_retention(Some("owner:test")).unwrap(), 0);
+        assert!(Path::new(&record.local_path).exists());
     }
 
     #[test]

@@ -14,16 +14,17 @@
       <div class="brand"><span class="brand-mark" aria-hidden="true">肖</span><div><span class="kicker">PRIVATE AGENT</span><strong>Xiao Manager</strong></div></div>
       <nav id="nav" aria-label="Management sections">
         <button class="nav-item active" data-view="dashboard"><i>01</i><span>Dashboard</span></button>
-        <button class="nav-item" data-view="providers"><i>02</i><span>Providers</span></button>
-        <button class="nav-item" data-view="runtime"><i>03</i><span>Runtime</span></button>
-        <button class="nav-item" data-view="sessions"><i>04</i><span>Sessions</span></button>
-        <button class="nav-item" data-view="tasks"><i>05</i><span>Tasks</span></button>
-        <button class="nav-item" data-view="memory"><i>06</i><span>Memory</span></button>
-        <button class="nav-item" data-view="skills"><i>07</i><span>Skills</span></button>
-        <button class="nav-item" data-view="tools"><i>08</i><span>Tools</span></button>
-        <button class="nav-item" data-view="security"><i>09</i><span>Security</span></button>
-        <button class="nav-item" data-view="diagnostics"><i>10</i><span>Diagnostics</span></button>
-        <button class="nav-item" data-view="logs"><i>11</i><span>Logs</span></button>
+        <button class="nav-item" data-view="setup"><i>02</i><span>Setup</span></button>
+        <button class="nav-item" data-view="providers"><i>03</i><span>Providers</span></button>
+        <button class="nav-item" data-view="runtime"><i>04</i><span>Runtime</span></button>
+        <button class="nav-item" data-view="sessions"><i>05</i><span>Sessions</span></button>
+        <button class="nav-item" data-view="tasks"><i>06</i><span>Tasks</span></button>
+        <button class="nav-item" data-view="memory"><i>07</i><span>Memory</span></button>
+        <button class="nav-item" data-view="skills"><i>08</i><span>Skills</span></button>
+        <button class="nav-item" data-view="tools"><i>09</i><span>Tools</span></button>
+        <button class="nav-item" data-view="security"><i>10</i><span>Security</span></button>
+        <button class="nav-item" data-view="diagnostics"><i>11</i><span>Diagnostics</span></button>
+        <button class="nav-item" data-view="logs"><i>12</i><span>Logs</span></button>
       </nav>
       <div class="spine-health"><span id="liveDot" class="pulse"></span><div><b id="liveText">CHECKING</b><small>local xiaod</small></div></div>
     </aside>
@@ -38,9 +39,22 @@
         <div class="two-column"><article class="panel"><div class="panel-head"><h2>Active AI</h2><span class="tag">SESSION</span></div><div id="activeAi" class="data-list"></div></article><article class="panel"><div class="panel-head"><h2>Service health</h2><span class="tag">LIVE</span></div><div id="serviceHealth" class="data-list"></div></article></div>
       </section>
 
+      <section id="view-setup" class="view" aria-labelledby="sectionTitle">
+        <div class="section-intro"><p>Configure the single Telegram owner and bot transport through xiaod. The bot token is write-only and is never returned to this page.</p></div>
+        <form id="telegramForm" class="panel form-grid" autocomplete="off">
+          <div class="panel-head full"><h2>Telegram setup</h2><span id="telegramOwnerState" class="tag">CHECKING</span></div>
+          <label class="full">Bot Token <small>write-only; leave blank to keep the stored token</small><input id="telegramToken" type="password" autocomplete="new-password" placeholder="••••••••••••••••"></label>
+          <label>Owner User ID<input id="telegramOwnerId" type="number" step="1" required placeholder="123456789"></label>
+          <label>Allowed Chat IDs <small>optional, comma-separated location restriction</small><input id="telegramAllowedChats" placeholder="-1001234567890, -1009876543210"></label>
+          <label class="toggle-row"><input id="telegramEnabled" type="checkbox"> Enable Telegram adapter</label>
+          <div id="telegramStatus" class="data-list full"></div>
+          <div class="button-row full"><button id="telegramSave" class="secondary" type="button">Save</button><button id="telegramSaveTest" class="primary" type="button">Save &amp; Test</button><button id="telegramTest" class="quiet" type="button">Test Connection</button></div>
+        </form>
+      </section>
+
       <section id="view-providers" class="view" aria-labelledby="sectionTitle">
         <div class="section-intro"><p>Manage accounts and isolated OpenAI-compatible profiles. Credentials are write-only and never returned here.</p><div class="button-row"><button id="addCodex" class="secondary" type="button">Add Codex</button><button id="addAgy" class="secondary" type="button">Add AGY</button><button id="showAddProvider" class="primary" type="button">Add Custom profile</button></div></div>
-        <form id="providerForm" class="panel form-grid hidden" autocomplete="off"><div class="panel-head full"><h2>New Custom profile</h2><button id="closeProviderForm" class="quiet" type="button">Close</button></div><label>Alias<input id="profileAlias" required maxlength="80" placeholder="studio-local"></label><label>Endpoint<input id="profileEndpoint" required type="url" placeholder="https://api.example.com/v1"></label><label>Protocol<select id="profileProtocol"><option value="openai_chat_completions">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option></select></label><label>API key <small>optional, write-only</small><input id="profileKey" type="password" autocomplete="new-password" placeholder="Leave empty for no Authorization"></label><button class="primary full" type="submit">Create isolated profile</button></form>
+        <form id="providerForm" class="panel form-grid hidden" autocomplete="off"><div class="panel-head full"><h2>New Custom profile</h2><button id="closeProviderForm" class="quiet" type="button">Close</button></div><label>Alias<input id="profileAlias" required maxlength="80" placeholder="studio-local"></label><label>Endpoint<input id="profileEndpoint" required type="url" placeholder="https://api.example.com/v1"></label><label>Protocol<select id="profileProtocol"><option value="openai_chat_completions">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option></select></label><label class="full">Safe headers <small>JSON object; Authorization is forbidden here</small><textarea id="profileHeaders" rows="3" placeholder='{"X-Workspace":"personal"}'></textarea></label><label>API key <small>optional, write-only</small><input id="profileKey" type="password" autocomplete="new-password" placeholder="Leave empty for no Authorization"></label><button class="primary full" type="submit">Create isolated profile</button></form>
         <article class="panel"><div class="panel-head"><h2>Codex &amp; Antigravity accounts</h2><span id="accountCount" class="tag"></span></div><div id="accountsList" class="card-list"></div><div id="accountsPager" class="pager"></div></article>
         <article class="panel"><div class="panel-head"><h2>Custom profiles</h2><span id="profileCount" class="tag"></span></div><div id="profilesList" class="card-list"></div><div id="profilesPager" class="pager"></div></article>
       </section>
@@ -69,7 +83,30 @@
       <section id="view-logs" class="view" aria-labelledby="sectionTitle"><div class="section-intro"><p>Bounded daemon logs are redacted by xiaod before they reach the browser.</p><div class="button-row"><select id="logLines" aria-label="Log line count"><option>100</option><option>250</option><option>500</option></select><button id="exportLogs" class="secondary" type="button">Export safe text</button></div></div><article class="log-panel"><pre id="logsOutput">No logs loaded.</pre></article></section>
     </main>
   </div>
-  <dialog id="modelDialog" aria-labelledby="modelDialogTitle"><div class="dialog-head"><div><span class="kicker">SESSION MODEL</span><h2 id="modelDialogTitle">Models</h2></div><button id="closeModelDialog" class="quiet" type="button">Close</button></div><p id="modelDialogMeta" class="muted"></p><div id="modelPickerList" class="model-picker"></div><div id="modelPickerPager" class="pager"></div></dialog>
+  <dialog id="sessionAiDialog" aria-labelledby="sessionAiDialogTitle">
+    <form id="sessionAiForm" class="form-grid" autocomplete="off">
+      <div class="dialog-head full"><div><span class="kicker">SESSION AI</span><h2 id="sessionAiDialogTitle">Change AI Configuration</h2></div><button id="closeSessionAiDialog" class="quiet" type="button">Close</button></div>
+      <p id="sessionAiMeta" class="muted full"></p>
+      <label>Provider<select id="sessionAiProvider"><option value="codex">Codex</option><option value="antigravity">Antigravity</option><option value="custom">Custom</option></select></label>
+      <label>Account / Profile<select id="sessionAiBinding"></select></label>
+      <label class="full">Model<select id="sessionAiModel"></select></label>
+      <button class="primary full" type="submit">Apply to this session</button>
+    </form>
+  </dialog>
+  <dialog id="profileEditDialog" aria-labelledby="profileEditDialogTitle">
+    <form id="profileEditForm" class="form-grid" autocomplete="off">
+      <div class="dialog-head full"><div><span class="kicker">CUSTOM PROFILE</span><h2 id="profileEditDialogTitle">Edit profile</h2></div><button id="closeProfileEditDialog" class="quiet" type="button">Close</button></div>
+      <input id="profileEditId" type="hidden">
+      <label>Alias<input id="profileEditAlias" required maxlength="80"></label>
+      <label>Endpoint<input id="profileEditEndpoint" required type="url"></label>
+      <label>Protocol<select id="profileEditProtocol"><option value="openai_chat_completions">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option></select></label>
+      <label>Credential action<select id="profileCredentialAction"><option value="keep">Keep current credential</option><option value="replace">Replace API key</option><option value="remove">Remove API key</option></select></label>
+      <label id="profileReplacementKeyRow" class="full hidden">Replacement API key<input id="profileEditKey" type="password" autocomplete="new-password"></label>
+      <label class="full">Safe headers <small>JSON object; secret headers are not accepted</small><textarea id="profileEditHeaders" rows="4"></textarea></label>
+      <p class="muted full">Changing endpoint clears the stored credential unless “Keep current credential” is explicitly selected. Xiao will never reuse it silently.</p>
+      <button class="primary full" type="submit">Save profile</button>
+    </form>
+  </dialog>
   <script type="module" src="assets/app.js"></script>
 </body>
 </html>

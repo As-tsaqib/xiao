@@ -66,6 +66,34 @@ impl ToolProtocol {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityState {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+impl CapabilityState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomCapabilityProbe {
+    pub capabilities: ProviderCapabilities,
+    pub native_tools: CapabilityState,
+    pub structured_output: CapabilityState,
+    pub continuation: CapabilityState,
+    pub vision: CapabilityState,
+    pub file_input: CapabilityState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     pub text: bool,
@@ -1684,6 +1712,71 @@ fn endpoint_with_suffix(base: &str, suffix: &str) -> String {
 /// Probe a selected Custom model without exposing Xiao's real tools. The
 /// synthetic function has no side effect, and every response is bounded and
 /// schema-checked before capability metadata is persisted.
+pub(crate) async fn probe_custom_capabilities(
+    base: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    api_key: Option<&str>,
+    protocol: &str,
+    model: &str,
+) -> CustomCapabilityProbe {
+    let nonce = Uuid::new_v4().simple().to_string();
+    let native_result = custom_native_probe(base, headers, api_key, protocol, model, &nonce).await;
+    let structured_result =
+        custom_structured_probe(base, headers, api_key, protocol, model, &nonce).await;
+    let vision_result = custom_vision_probe(base, headers, api_key, protocol, model, &nonce).await;
+    let file_result = custom_file_input_probe(base, headers, api_key, protocol, model, &nonce).await;
+
+    let native_tools = result_state(&native_result);
+    let structured_output = result_state(&structured_result);
+    let vision = positive_or_unknown(&vision_result);
+    let file_input = positive_or_unknown(&file_result);
+    let continuation = if matches!(native_tools, CapabilityState::Supported)
+        || matches!(structured_output, CapabilityState::Supported)
+    {
+        CapabilityState::Supported
+    } else if matches!(native_tools, CapabilityState::Unsupported)
+        && matches!(structured_output, CapabilityState::Unsupported)
+    {
+        CapabilityState::Unsupported
+    } else {
+        CapabilityState::Unknown
+    };
+
+    let tool_protocol = if matches!(native_tools, CapabilityState::Supported) {
+        ToolProtocol::Native
+    } else if matches!(structured_output, CapabilityState::Supported) {
+        ToolProtocol::StructuredJsonFallback
+    } else {
+        ToolProtocol::ChatOnly
+    };
+    let capabilities = ProviderCapabilities {
+        text: true,
+        vision: matches!(vision, CapabilityState::Supported),
+        file_input: matches!(file_input, CapabilityState::Supported),
+        native_tools: matches!(native_tools, CapabilityState::Supported),
+        tool_protocol,
+        model_discovery: true,
+        structured_output: matches!(structured_output, CapabilityState::Supported),
+        continuation: matches!(continuation, CapabilityState::Supported),
+        evidence: format!(
+            "bounded custom probe: native={}; structured={}; continuation={}; vision={}; file_input={}",
+            native_tools.as_str(),
+            structured_output.as_str(),
+            continuation.as_str(),
+            vision.as_str(),
+            file_input.as_str(),
+        ),
+    };
+    CustomCapabilityProbe {
+        capabilities,
+        native_tools,
+        structured_output,
+        continuation,
+        vision,
+        file_input,
+    }
+}
+
 pub(crate) async fn probe_custom_tool_capability(
     base: &str,
     headers: &std::collections::BTreeMap<String, String>,
@@ -1691,40 +1784,95 @@ pub(crate) async fn probe_custom_tool_capability(
     protocol: &str,
     model: &str,
 ) -> ProviderCapabilities {
-    let nonce = Uuid::new_v4().simple().to_string();
-    if custom_native_probe(base, headers, api_key, protocol, model, &nonce)
+    probe_custom_capabilities(base, headers, api_key, protocol, model)
         .await
-        .unwrap_or(false)
-    {
-        return ProviderCapabilities {
-            model_discovery: true,
-            ..ProviderCapabilities::native(
-                "validated synthetic OpenAI-compatible function call; no Xiao tool executed",
-            )
-        };
+        .capabilities
+}
+
+fn result_state(result: &Result<bool>) -> CapabilityState {
+    match result {
+        Ok(true) => CapabilityState::Supported,
+        Ok(false) => CapabilityState::Unsupported,
+        Err(_) => CapabilityState::Unknown,
     }
-    if custom_structured_probe(base, headers, api_key, protocol, model, &nonce)
-        .await
-        .unwrap_or(false)
-    {
-        return ProviderCapabilities {
-            text: true,
-            vision: false,
-            file_input: false,
-            native_tools: false,
-            tool_protocol: ToolProtocol::StructuredJsonFallback,
-            model_discovery: true,
-            structured_output: true,
-            continuation: true,
-            evidence: "validated strict bounded JSON final envelope without tools".into(),
-        };
+}
+
+fn positive_or_unknown(result: &Result<bool>) -> CapabilityState {
+    match result {
+        Ok(true) => CapabilityState::Supported,
+        Ok(false) | Err(_) => CapabilityState::Unknown,
     }
-    ProviderCapabilities {
-        model_discovery: true,
-        ..ProviderCapabilities::chat_only(
-            "model discovery succeeded, but native tools and strict structured JSON probes failed",
+}
+
+async fn custom_vision_probe(
+    base: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    api_key: Option<&str>,
+    protocol: &str,
+    model: &str,
+    nonce: &str,
+) -> Result<bool> {
+    // 1x1 transparent PNG. The request is bounded and carries no user data.
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    let prompt = format!("Capability probe. Reply exactly VISION-{nonce}.");
+    let (suffix, body) = if protocol == "openai_responses" {
+        (
+            "/responses",
+            serde_json::json!({
+                "model": model,
+                "input": [{"role":"user","content":[
+                    {"type":"input_text","text":prompt},
+                    {"type":"input_image","image_url":format!("data:image/png;base64,{PNG}")}
+                ]}],
+                "stream": false
+            }),
         )
+    } else {
+        (
+            "/chat/completions",
+            serde_json::json!({
+                "model": model,
+                "messages": [{"role":"user","content":[
+                    {"type":"text","text":prompt},
+                    {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{PNG}")}}
+                ]}],
+                "stream": false
+            }),
+        )
+    };
+    let value = send_custom_probe(base, suffix, headers, api_key, body).await?;
+    let output = if protocol == "openai_responses" {
+        extract_output_text(&value)
+    } else {
+        extract_chat_content(&value)
+    };
+    Ok(output.is_some_and(|text| text.contains(&format!("VISION-{nonce}"))))
+}
+
+async fn custom_file_input_probe(
+    base: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    api_key: Option<&str>,
+    protocol: &str,
+    model: &str,
+    nonce: &str,
+) -> Result<bool> {
+    // Chat Completions has no portable first-class file-input contract. Keep
+    // this Unknown rather than manufacturing an Unsupported result.
+    if protocol != "openai_responses" {
+        return Err(anyhow!("portable file-input probe unavailable for this protocol"));
     }
+    let data = STANDARD.encode(format!("Xiao file capability probe {nonce}"));
+    let body = serde_json::json!({
+        "model": model,
+        "input": [{"role":"user","content":[
+            {"type":"input_text","text":format!("Read the attached probe and reply exactly FILE-{nonce}.")},
+            {"type":"input_file","filename":"xiao-capability.txt","file_data":format!("data:text/plain;base64,{data}")}
+        ]}],
+        "stream": false
+    });
+    let value = send_custom_probe(base, "/responses", headers, api_key, body).await?;
+    Ok(extract_output_text(&value).is_some_and(|text| text.contains(&format!("FILE-{nonce}"))))
 }
 
 async fn custom_native_probe(
@@ -2324,6 +2472,11 @@ mod tests {
             native_tools: tool_protocol == ToolProtocol::Native,
             structured_output: tool_protocol != ToolProtocol::ChatOnly,
             continuation: tool_protocol != ToolProtocol::ChatOnly,
+            native_tools_state: if tool_protocol == ToolProtocol::Native { "supported" } else { "unsupported" }.into(),
+            structured_output_state: if tool_protocol != ToolProtocol::ChatOnly { "supported" } else { "unsupported" }.into(),
+            continuation_state: if tool_protocol != ToolProtocol::ChatOnly { "supported" } else { "unsupported" }.into(),
+            vision_state: "unknown".into(),
+            file_input_state: "unknown".into(),
             model_discovery: true,
             tool_protocol: tool_protocol.as_str().into(),
             evidence: "deterministic production-path test".into(),

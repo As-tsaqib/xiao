@@ -12,16 +12,17 @@ const state = {
 
 const sections = {
   dashboard: ['01 / OVERVIEW', 'Dashboard'],
-  providers: ['02 / AI ACCESS', 'Providers'],
-  runtime: ['03 / DEVICE TRUTH', 'Runtime'],
-  sessions: ['04 / CONVERSATIONS', 'Sessions'],
-  tasks: ['05 / OBSERVABLE WORK', 'Tasks'],
-  memory: ['06 / LIVING STATE', 'Memory'],
-  skills: ['07 / PROCEDURES', 'Skills'],
-  tools: ['08 / CAPABILITIES', 'Tools'],
-  security: ['09 / POLICY BOUNDARY', 'Security'],
-  diagnostics: ['10 / INDEPENDENT PROBES', 'Diagnostics'],
-  logs: ['11 / REDACTED TRACE', 'Logs']
+  setup: ['02 / OWNER CONTROL', 'Setup'],
+  providers: ['03 / AI ACCESS', 'Providers'],
+  runtime: ['04 / DEVICE TRUTH', 'Runtime'],
+  sessions: ['05 / CONVERSATIONS', 'Sessions'],
+  tasks: ['06 / OBSERVABLE WORK', 'Tasks'],
+  memory: ['07 / LIVING STATE', 'Memory'],
+  skills: ['08 / PROCEDURES', 'Skills'],
+  tools: ['09 / CAPABILITIES', 'Tools'],
+  security: ['10 / POLICY BOUNDARY', 'Security'],
+  diagnostics: ['11 / INDEPENDENT PROBES', 'Diagnostics'],
+  logs: ['12 / REDACTED TRACE', 'Logs']
 };
 
 const encode = value => {
@@ -83,6 +84,34 @@ function formatBytes(value) {
   if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KiB`;
   return `${(bytes / 1048576).toFixed(1)} MiB`;
 }
+
+function parseIdList(value) {
+  const text = String(value || '').trim();
+  if (!text) return [];
+  const values = text.split(',').map(item => item.trim()).filter(Boolean).map(item => Number(item));
+  if (values.some(value => !Number.isSafeInteger(value) || value === 0)) throw new Error('Chat IDs must be non-zero integers.');
+  return [...new Set(values)];
+}
+
+function parseHeaders(value) {
+  const text = String(value || '').trim();
+  if (!text) return {};
+  const parsed = JSON.parse(text);
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('Safe headers must be a JSON object.');
+  for (const [name, headerValue] of Object.entries(parsed)) {
+    if (!name.trim() || typeof headerValue !== 'string') throw new Error('Every safe header must have a string value.');
+    if (/^(authorization|proxy-authorization|cookie|set-cookie)$/i.test(name.trim())) throw new Error(`${name} is a secret header and cannot be stored as a safe header.`);
+  }
+  return parsed;
+}
+
+function triState(value) {
+  const normalized = String(value || 'unknown').toLowerCase();
+  if (normalized === 'supported') return 'SUPPORTED';
+  if (normalized === 'unsupported') return 'UNSUPPORTED';
+  return 'UNKNOWN';
+}
+
 function formatDuration(value) {
   let seconds = Number(value || 0);
   const days = Math.floor(seconds / 86400); seconds %= 86400;
@@ -160,6 +189,70 @@ async function loadDashboard() {
   setRows($('serviceHealth'), [['Gateway', health.gateway, health.gateway], ['Database', health.db_healthy ? 'healthy' : 'failed', health.db_healthy ? 'ready' : 'failed'], ['Telegram', health.telegram_polling ? 'polling' : (health.telegram_enabled ? 'waiting' : 'disabled'), health.telegram_polling ? 'ready' : 'warn'], ['Providers ready', health.providers_ready], ['Uptime', formatDuration(health.uptime_seconds)], ['Memory RSS', formatBytes(health.memory_bytes)]]);
 }
 
+async function loadSetup() {
+  const data = await managerGet('telegram');
+  const telegram = data.telegram || {};
+  state.cache.telegram = telegram;
+  $('telegramEnabled').checked = Boolean(telegram.enabled);
+  $('telegramOwnerId').value = telegram.owner_user_id ?? '';
+  $('telegramAllowedChats').value = (telegram.allowed_chat_ids || []).join(', ');
+  $('telegramToken').value = '';
+  $('telegramOwnerState').textContent = String(telegram.owner_state || 'setup_required').replaceAll('_', ' ').toUpperCase();
+  setRows($('telegramStatus'), [
+    ['Bot token', telegram.token_configured ? 'configured (write-only)' : 'not configured', telegram.token_configured ? 'ready' : 'warn'],
+    ['Bot identity', telegram.bot?.username ? `@${telegram.bot.username} · ${telegram.bot.id}` : (telegram.bot?.id || 'not tested')],
+    ['Owner state', telegram.owner_state || 'setup_required', telegram.owner_state === 'configured' ? 'ready' : 'warn'],
+    ['Legacy candidates', telegram.legacy_candidate_count || 0],
+    ['Allowed chats', (telegram.allowed_chat_ids || []).length || 'all chats for owner']
+  ]);
+}
+
+function telegramPayload(action) {
+  const owner = Number($('telegramOwnerId').value);
+  if (!Number.isSafeInteger(owner) || owner === 0) throw new Error('Owner User ID must be a non-zero integer.');
+  const previous = state.cache.telegram?.owner_user_id;
+  const changed = previous != null && Number(previous) !== owner;
+  if (changed && !confirm(`Change Xiao owner from ${previous} to ${owner}? This is a security-sensitive identity change.`)) {
+    throw new Error('Owner change was not confirmed.');
+  }
+  const token = $('telegramToken').value.trim();
+  return {
+    action,
+    enabled: $('telegramEnabled').checked,
+    owner_user_id: owner,
+    confirm_owner_change: changed,
+    allowed_chat_ids: parseIdList($('telegramAllowedChats').value),
+    ...(token ? { token } : {})
+  };
+}
+
+async function saveTelegram(action) {
+  if (state.busy) return;
+  let payload;
+  try { payload = telegramPayload(action); } catch (error) { notice(error.message, 'bad'); return; }
+  setBusy(true); notice(action === 'save_and_test' ? 'Saving and testing Telegram…' : 'Saving Telegram configuration…');
+  try {
+    const data = await managerPost('telegram', payload);
+    $('telegramToken').value = '';
+    const bot = data.result?.status?.bot;
+    notice(bot?.username ? `Telegram configured and tested as @${bot.username}.` : 'Telegram configuration saved.', 'good');
+  } catch (error) { notice(`Telegram setup failed: ${error.message}`, 'bad'); }
+  finally { setBusy(false); }
+  await refreshCurrent();
+}
+
+async function testTelegram() {
+  if (state.busy) return;
+  const token = $('telegramToken').value.trim();
+  setBusy(true); notice('Testing Telegram getMe…');
+  try {
+    const data = await managerPost('telegram', { action: 'test', ...(token ? { token } : {}) });
+    const bot = data.bot || {};
+    notice(`Telegram getMe succeeded${bot.username ? ` for @${bot.username}` : ''}.`, 'good');
+  } catch (error) { notice(`Telegram test failed: ${error.message}`, 'bad'); }
+  finally { setBusy(false); }
+}
+
 async function loadProviders() {
   const data = await managerGet('providers'); state.cache.providers = data;
   $('accountCount').textContent = `${data.accounts.length} ACCOUNTS`;
@@ -170,13 +263,13 @@ async function loadProviders() {
   state.pages.profiles = profilePage.page;
   const accounts = $('accountsList'); clear(accounts);
   if (!data.accounts.length) empty(accounts, 'No connected Codex or Antigravity account. Add one through Telegram /login.');
-  accountPage.items.forEach(account => accounts.append(itemCard({ title: account.label, code: account.id, description: account.email || `${account.provider} account`, status: account.status, meta: [account.provider.toUpperCase(), `${(account.models || []).length} models`, `credential ${account.credential_configured ? 'configured' : 'missing'}`, account.access_expires_at ? `expires ${safeDate(account.access_expires_at)}` : 'no reported expiry'], actions: [{ label: 'Models / Use', run: () => useAccount(account) }, { label: 'Test', run: () => testAccount(account) }, { label: 'Reconnect', run: () => beginProviderLogin(account.provider, account) }, { label: 'Disconnect', className: 'danger', run: () => disconnectAccount(account) }] })));
+  accountPage.items.forEach(account => accounts.append(itemCard({ title: account.label, code: account.id, description: account.email || `${account.provider} account`, status: account.status, meta: [account.provider.toUpperCase(), `${(account.models || []).length} models`, `credential ${account.credential_configured ? 'configured' : 'missing'}`, account.access_expires_at ? `expires ${safeDate(account.access_expires_at)}` : 'no reported expiry'], actions: [{ label: 'Test', run: () => testAccount(account) }, { label: 'Reconnect', run: () => beginProviderLogin(account.provider, account) }, { label: 'Disconnect', className: 'danger', run: () => disconnectAccount(account) }] })));
   renderPager($('accountsPager'), accountPage.page, accountPage.pages, page => { state.pages.accounts = page; loadProviders().catch(showProviderError); });
   const profiles = $('profilesList'); clear(profiles);
   if (!data.custom_profiles.length) empty(profiles, 'No Custom profile. Each new profile begins without inherited credentials or headers.');
   profilePage.items.forEach(profile => {
     const caps = (profile.models || []).filter(model => model.vision_capable).length;
-    profiles.append(itemCard({ title: profile.alias, code: profile.id, description: profile.endpoint, status: profile.reachability, meta: [profile.protocol, `${profile.model_count} models`, `API key ${profile.api_key_configured ? 'configured' : 'none'}`, `${profile.header_names.length} safe headers`, `${caps} vision models`], actions: [{ label: 'Models / Use', run: () => useProfile(profile) }, { label: 'Test', run: () => testProfile(profile) }, { label: 'Edit endpoint', run: () => editProfileEndpoint(profile) }, { label: 'Delete', className: 'danger', run: () => deleteProfile(profile) }] }));
+    profiles.append(itemCard({ title: profile.alias, code: profile.id, description: profile.endpoint, status: profile.reachability, meta: [profile.protocol, `${profile.model_count} models`, `API key ${profile.api_key_configured ? 'configured' : 'none'}`, `${profile.header_names.length} safe headers`, `${caps} vision models`, profile.last_probe_at ? `probe ${safeDate(profile.last_probe_at)}` : 'capabilities not probed'], actions: [{ label: 'Capabilities', run: () => showProfileCapabilities(profile) }, { label: 'Test', run: () => testProfile(profile) }, { label: 'Edit', run: () => editProfile(profile) }, { label: 'Delete', className: 'danger', run: () => deleteProfile(profile) }] }));
   });
   renderPager($('profilesPager'), profilePage.page, profilePage.pages, page => { state.pages.profiles = page; loadProviders().catch(showProviderError); });
 }
@@ -200,54 +293,34 @@ async function beginProviderLogin(provider, account = null) {
   } catch (error) { notice(`Provider login failed: ${error.message}`, 'bad'); }
   finally { setBusy(false); }
 }
-function useAccount(account) {
-  const models = account.models || [];
-  if (!models.length) { notice('No models are configured for this provider.', 'bad'); return; }
-  const session = state.cache.dashboard?.current_ai?.session_id;
-  if (!session) { notice('No active session is available. Start a conversation first.', 'bad'); return; }
-  state.modelPicker = { kind: 'account', id: account.id, label: account.label, models, session, page: 1 };
-  renderModelPicker();
-  $('modelDialog').showModal();
-}
-async function testProfile(profile) { await mutate('provider-custom', { action: 'test', profile_id: profile.id }, `Profile ${profile.alias} is reachable and its model catalog was refreshed.`); }
-async function useProfile(profile) {
-  const models = (profile.models || []).map(model => model.model_id);
-  if (!models.length) { notice('Test this profile first to discover its model catalog.', 'bad'); return; }
-  const session = state.cache.dashboard?.current_ai?.session_id;
-  if (!session) { notice('No active session is available. Start a conversation first.', 'bad'); return; }
-  state.modelPicker = { kind: 'custom', id: profile.id, label: profile.alias, models, session, page: 1 };
-  renderModelPicker();
-  $('modelDialog').showModal();
+function showProfileCapabilities(profile) {
+  const models = profile.models || [];
+  if (!models.length) { alert('No discovered models. Test the profile first.'); return; }
+  const lines = models.map(model => [
+    model.model_id,
+    `tools=${triState(model.native_tools_state)}`,
+    `structured=${triState(model.structured_output_state)}`,
+    `continuation=${triState(model.continuation_state)}`,
+    `vision=${triState(model.vision_state)}`,
+    `file=${triState(model.file_input_state)}`,
+    model.probed_at ? `probed=${safeDate(model.probed_at)}` : 'probed=never'
+  ].join(' · '));
+  alert(lines.join('\n\n'));
 }
 
-function renderModelPicker() {
-  const picker = state.modelPicker;
-  if (!picker) return;
-  const page = paginate(picker.models, picker.page);
-  picker.page = page.page;
-  $('modelDialogTitle').textContent = `Models · ${picker.label}`;
-  $('modelDialogMeta').textContent = `${picker.models.length} discovered models · selecting changes only session ${picker.session}`;
-  const root = $('modelPickerList'); clear(root);
-  page.items.forEach(model => root.append(button(model, () => selectProfileModel(model), 'model-choice')));
-  renderPager($('modelPickerPager'), page.page, page.pages, next => { picker.page = next; renderModelPicker(); });
-}
+async function testProfile(profile) { await mutate('provider-custom', { action: 'test', profile_id: profile.id }, `Profile ${profile.alias} is reachable and its capability catalog was refreshed.`); }
 
-async function selectProfileModel(model) {
-  const picker = state.modelPicker;
-  if (!picker || !picker.models.includes(model)) return;
-  $('modelDialog').close();
-  state.modelPicker = null;
-  if (picker.kind === 'custom') {
-    await mutate('provider-custom', { action: 'use', profile_id: picker.id, session_id: picker.session, model }, `${picker.label} / ${model} selected for the active session.`);
-  } else {
-    await mutate('provider-accounts', { action: 'use', account_id: picker.id, session_id: picker.session, model }, `${picker.label} / ${model} selected for the active session.`);
-  }
-}
-async function editProfileEndpoint(profile) {
-  const endpoint = prompt('New endpoint. Changing trust boundary clears the API key and all headers.', profile.endpoint);
-  if (!endpoint || endpoint === profile.endpoint) return;
-  if (!confirm('Clear this profile’s credential and headers, then change endpoint?')) return;
-  await mutate('provider-custom', { action: 'edit_endpoint', profile_id: profile.id, endpoint }, 'Endpoint changed; credential and headers were cleared.');
+function editProfile(profile) {
+  $('profileEditId').value = profile.id;
+  $('profileEditAlias').value = profile.alias;
+  $('profileEditEndpoint').value = profile.endpoint;
+  $('profileEditProtocol').value = profile.protocol;
+  $('profileEditHeaders').value = JSON.stringify(profile.safe_headers || {}, null, 2);
+  $('profileCredentialAction').value = 'keep';
+  $('profileEditKey').value = '';
+  $('profileReplacementKeyRow').classList.add('hidden');
+  $('profileEditDialogTitle').textContent = `Edit · ${profile.alias}`;
+  $('profileEditDialog').showModal();
 }
 async function deleteProfile(profile) {
   if (!confirm(`Delete Custom profile “${profile.alias}”? It must not be selected by an active session.`)) return;
@@ -269,10 +342,40 @@ async function loadSessions() {
   if (!data.items.length) empty(root, 'No sessions yet. Conversation sessions are created from Telegram or the Xiao CLI.');
   data.items.forEach(session => {
     const scope = session.telegram_scope ? `${session.telegram_scope.chat_id} / topic ${session.telegram_scope.message_thread_id ?? 'default'}` : 'local session';
-    root.append(itemCard({ title: session.name, code: session.id, description: `${session.provider} · ${session.model}`, status: session.archived ? 'archived' : 'ready', meta: [scope, `${session.message_count} messages`, `YOLO ${session.yolo ? 'ON' : 'OFF'}`, safeDate(session.last_active_at)], actions: session.archived ? [] : [{ label: session.yolo ? 'Disable YOLO' : 'Enable YOLO', run: () => setSessionYolo(session, !session.yolo) }, { label: 'Rename', run: () => renameSession(session) }, { label: 'Archive', className: 'danger', run: () => archiveSession(session) }] }));
+    root.append(itemCard({ title: session.name, code: session.id, description: `${session.provider} · ${session.model}`, status: session.archived ? 'archived' : 'ready', meta: [scope, `${session.message_count} messages`, `YOLO ${session.yolo ? 'ON' : 'OFF'}`, safeDate(session.last_active_at)], actions: session.archived ? [] : [{ label: 'Change AI Configuration', run: () => changeSessionAi(session) }, { label: session.yolo ? 'Disable YOLO' : 'Enable YOLO', run: () => setSessionYolo(session, !session.yolo) }, { label: 'Rename', run: () => renameSession(session) }, { label: 'Archive', className: 'danger', run: () => archiveSession(session) }] }));
   });
   renderPager($('sessionsPager'), data.page, data.pages, page => { state.pages.sessions = page; refreshCurrent(); });
 }
+async function changeSessionAi(session) {
+  if (!state.cache.providers) state.cache.providers = await managerGet('providers');
+  state.sessionAiSession = session;
+  $('sessionAiDialogTitle').textContent = `Change AI · ${session.name}`;
+  $('sessionAiMeta').textContent = `Changes apply only to session ${session.id}. Provider management never changes a session implicitly.`;
+  $('sessionAiProvider').value = ['codex', 'antigravity', 'custom'].includes(session.provider) ? session.provider : 'codex';
+  populateSessionBindings(session.account_or_profile_id, session.model);
+  $('sessionAiDialog').showModal();
+}
+
+function populateSessionBindings(preferredBinding = null, preferredModel = null) {
+  const provider = $('sessionAiProvider').value;
+  const data = state.cache.providers || { accounts: [], custom_profiles: [] };
+  const bindings = provider === 'custom'
+    ? (data.custom_profiles || []).map(profile => ({ id: profile.id, label: profile.alias, models: (profile.models || []).map(model => model.model_id) }))
+    : (data.accounts || []).filter(account => account.provider === provider).map(account => ({ id: account.id, label: account.label, models: account.models || [] }));
+  const select = $('sessionAiBinding'); clear(select);
+  bindings.forEach(binding => { const option = document.createElement('option'); option.value = binding.id; option.textContent = binding.label; option.dataset.models = JSON.stringify(binding.models); select.append(option); });
+  if (preferredBinding && bindings.some(binding => binding.id === preferredBinding)) select.value = preferredBinding;
+  populateSessionModels(preferredModel);
+}
+
+function populateSessionModels(preferredModel = null) {
+  const binding = $('sessionAiBinding').selectedOptions[0];
+  const models = binding ? JSON.parse(binding.dataset.models || '[]') : [];
+  const select = $('sessionAiModel'); clear(select);
+  models.forEach(model => { const option = document.createElement('option'); option.value = model; option.textContent = model; select.append(option); });
+  if (preferredModel && models.includes(preferredModel)) select.value = preferredModel;
+}
+
 async function setSessionYolo(session, enabled) { await mutate('sessions', { action: 'yolo', session_id: session.id, value: String(enabled) }, `YOLO ${enabled ? 'enabled' : 'disabled'} for this session only.`); }
 async function renameSession(session) { const value = prompt('Session name', session.name); if (value && value !== session.name) await mutate('sessions', { action: 'rename', session_id: session.id, value }, 'Session renamed.'); }
 async function archiveSession(session) { if (confirm(`Archive “${session.name}”? History will be preserved.`)) await mutate('sessions', { action: 'archive', session_id: session.id }, 'Session archived.'); }
@@ -329,14 +432,14 @@ async function decideApproval(approval, approve) { await mutate('security', { ac
 
 async function loadDiagnostics() {
   const data = await managerGet('diagnostics'); $('doctorTime').textContent = safeDate(data.ran_at); const root = $('doctorReport'); clear(root);
-  const items = (data.report?.blocks || []).find(block => block.kind === 'list')?.items || [];
-  if (!items.length) return empty(root, 'No doctor checks returned.');
-  items.forEach(item => { const [result = 'WARN', name = 'Unknown probe', ...evidence] = item.split(' · '); const check = document.createElement('div'); check.className = 'doctor-check'; check.append(textElement('b', `${result} · ${name}`, statusClass(result)), textElement('p', evidence.join(' · '))); root.append(check); });
+  const checks = data.checks || [];
+  if (!checks.length) return empty(root, 'No doctor checks returned.');
+  checks.forEach(item => { const result = item.status || 'WARN'; const check = document.createElement('div'); check.className = 'doctor-check'; check.append(textElement('b', `${result} · ${item.name || 'Unknown probe'}`, statusClass(result)), textElement('p', `${String(item.source || 'probe').toUpperCase()} · ${item.evidence || ''}`)); root.append(check); });
 }
 
 async function loadLogs() { const data = await managerGet('logs', { lines: Number($('logLines').value) }); $('logsOutput').textContent = (data.lines || []).join('\n') || 'No daemon log entries.'; }
 
-const loaders = { dashboard: loadDashboard, providers: loadProviders, runtime: loadRuntime, sessions: loadSessions, tasks: loadTasks, memory: loadMemory, skills: loadSkills, tools: loadTools, security: loadSecurity, diagnostics: loadDiagnostics, logs: loadLogs };
+const loaders = { dashboard: loadDashboard, setup: loadSetup, providers: loadProviders, runtime: loadRuntime, sessions: loadSessions, tasks: loadTasks, memory: loadMemory, skills: loadSkills, tools: loadTools, security: loadSecurity, diagnostics: loadDiagnostics, logs: loadLogs };
 
 async function refreshCurrent() {
   if (state.busy) return;
@@ -375,11 +478,45 @@ $('showAddProvider').onclick = () => { $('providerForm').classList.remove('hidde
 $('addCodex').onclick = () => beginProviderLogin('codex');
 $('addAgy').onclick = () => beginProviderLogin('antigravity');
 $('closeProviderForm').onclick = () => $('providerForm').classList.add('hidden');
-$('closeModelDialog').onclick = () => { $('modelDialog').close(); state.modelPicker = null; };
-$('modelDialog').addEventListener('cancel', () => { state.modelPicker = null; });
+$('telegramSave').onclick = () => saveTelegram('save');
+$('telegramSaveTest').onclick = () => saveTelegram('save_and_test');
+$('telegramTest').onclick = testTelegram;
+$('closeSessionAiDialog').onclick = () => $('sessionAiDialog').close();
+$('sessionAiProvider').onchange = () => populateSessionBindings();
+$('sessionAiBinding').onchange = () => populateSessionModels();
+$('sessionAiForm').onsubmit = async event => {
+  event.preventDefault();
+  const session = state.sessionAiSession;
+  if (!session) return;
+  const provider = $('sessionAiProvider').value;
+  const account_or_profile_id = $('sessionAiBinding').value;
+  const model = $('sessionAiModel').value;
+  if (!account_or_profile_id || !model) { notice('Select an account/profile and model first.', 'bad'); return; }
+  $('sessionAiDialog').close();
+  await mutate('sessions', { action: 'ai_config', session_id: session.id, provider, account_or_profile_id, model }, `AI configuration updated for ${session.name} only.`);
+};
+$('closeProfileEditDialog').onclick = () => $('profileEditDialog').close();
+$('profileCredentialAction').onchange = () => $('profileReplacementKeyRow').classList.toggle('hidden', $('profileCredentialAction').value !== 'replace');
+$('profileEditForm').onsubmit = async event => {
+  event.preventDefault();
+  let headers;
+  try { headers = parseHeaders($('profileEditHeaders').value); } catch (error) { notice(error.message, 'bad'); return; }
+  const action = $('profileCredentialAction').value;
+  const replacement = $('profileEditKey').value.trim();
+  if (action === 'replace' && !replacement) { notice('Enter the replacement API key.', 'bad'); return; }
+  const profileId = $('profileEditId').value;
+  const prior = (state.cache.providers?.custom_profiles || []).find(profile => profile.id === profileId);
+  const endpoint = $('profileEditEndpoint').value.trim();
+  const endpointChanged = prior && prior.endpoint !== endpoint;
+  const body = { action: 'edit', profile_id: profileId, alias: $('profileEditAlias').value.trim(), endpoint, protocol: $('profileEditProtocol').value, headers, remove_api_key: action === 'remove', keep_credential: endpointChanged && action === 'keep', ...(action === 'replace' ? { api_key: replacement } : {}) };
+  if (endpointChanged && action === 'keep' && !confirm('The endpoint changes trust boundary. Explicitly keep the current credential for the new endpoint?')) return;
+  $('profileEditDialog').close(); $('profileEditKey').value = '';
+  await mutate('provider-custom', body, endpointChanged && action !== 'keep' ? 'Profile updated; endpoint change cleared/replaced credential as requested.' : 'Custom profile updated.');
+};
 $('providerForm').onsubmit = async event => {
   event.preventDefault();
-  await mutate('provider-custom', { action: 'create', alias: $('profileAlias').value.trim(), endpoint: $('profileEndpoint').value.trim(), protocol: $('profileProtocol').value, api_key: $('profileKey').value || null, headers: {} }, 'Isolated Custom profile created.');
+  let headers; try { headers = parseHeaders($('profileHeaders').value); } catch (error) { notice(error.message, 'bad'); return; }
+  await mutate('provider-custom', { action: 'create', alias: $('profileAlias').value.trim(), endpoint: $('profileEndpoint').value.trim(), protocol: $('profileProtocol').value, api_key: $('profileKey').value || null, headers }, 'Isolated Custom profile created.');
   $('profileKey').value = ''; event.target.reset(); event.target.classList.add('hidden');
 };
 $('memorySearchButton').onclick = () => { state.pages.memory = 1; refreshCurrent(); };

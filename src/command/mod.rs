@@ -10,6 +10,7 @@ use crate::{
     attachments::AttachmentManager,
     auth::{AuthChallenge, AuthManager},
     config::AppConfig,
+    control_plane::{SessionAiConfigInput, SessionAiService},
     event::{AppEvent, EventBus},
     memory::{MemoryScope, MemoryStore},
     presentation::{Action, Block, View},
@@ -619,6 +620,39 @@ impl CommandCore {
         }
     }
 
+    pub async fn chat_in_session(
+        &self,
+        principal: &str,
+        session_id: &str,
+        prompt: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<CommandResult> {
+        if !self.config.read().await.gateway.enabled {
+            return Err(anyhow!("gateway is disabled"));
+        }
+        Ok(CommandResult::Agent(
+            self.agent
+                .submit_to_session_with_progress(principal, session_id, prompt, progress)
+                .await?,
+        ))
+    }
+
+    pub async fn retry_in_session(
+        &self,
+        principal: &str,
+        session_id: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<CommandResult> {
+        if !self.config.read().await.gateway.enabled {
+            return Err(anyhow!("gateway is disabled"));
+        }
+        Ok(CommandResult::Agent(
+            self.agent
+                .retry_to_session_with_progress(principal, session_id, progress)
+                .await?,
+        ))
+    }
+
     pub async fn retry_with_progress(
         &self,
         principal: &str,
@@ -663,6 +697,9 @@ impl CommandCore {
         if session.archived {
             return Ok(false);
         }
+        if self.agent.cancel_session(principal, session_id) {
+            return Ok(true);
+        }
         let scope = self
             .storage
             .telegram_scope_for_session(principal, session_id)?
@@ -672,6 +709,110 @@ impl CommandCore {
 
     pub async fn management_doctor(&self, principal: &str) -> View {
         self.doctor_view(principal, None).await
+    }
+
+    /// Shared memory mutation used by Telegram command handling and by the
+    /// typed admin API consumed by CLI/WebUI. Presentation layers must not
+    /// implement memory semantics independently.
+    pub fn management_memory_set(
+        &self,
+        principal: &str,
+        scope: MemoryScope,
+        category: &str,
+        key: &str,
+        value: &str,
+        source: &str,
+    ) -> Result<()> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(anyhow!("memory value is required"));
+        }
+        self.memory_store().upsert(
+            principal,
+            scope,
+            category,
+            key,
+            value,
+            1.0,
+            source,
+            None,
+        )?;
+        Ok(())
+    }
+
+    pub fn management_memory_forget(
+        &self,
+        principal: &str,
+        scope: MemoryScope,
+        category: &str,
+        key: &str,
+    ) -> Result<bool> {
+        self.memory_store()
+            .delete(principal, scope, category, key, None)
+    }
+
+    pub fn management_skill_set_enabled(
+        &self,
+        principal: &str,
+        skill: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        SkillStore::new(self.storage.clone()).set_enabled(principal, skill, enabled)?;
+        self.storage.audit(
+            principal,
+            if enabled { "skill_enabled" } else { "skill_disabled" },
+            &format!("skill_id={skill}"),
+        )
+    }
+
+    pub fn management_skill_delete(&self, principal: &str, skill: &str) -> Result<()> {
+        let store = SkillStore::new(self.storage.clone());
+        let record = store
+            .view(principal, skill)?
+            .ok_or_else(|| anyhow!("skill not found"))?;
+        if record.source_kind != "learned" {
+            return Err(anyhow!("only learned owner-created skills can be deleted"));
+        }
+        if let Some(runtime) = &self.runtime {
+            runtime.workspace().delete_learned_skill(&record.name)?;
+        }
+        store.delete_learned(principal, &record.id)?;
+        self.storage.audit(
+            principal,
+            "learned_skill_deleted",
+            &format!("skill_id={};name={}", record.id, record.name),
+        )
+    }
+
+    pub fn management_approval_decide(
+        &self,
+        principal: &str,
+        request: &str,
+        approve: bool,
+    ) -> Result<bool> {
+        self.storage.decide_approval(principal, request, approve)
+    }
+
+    /// Shared exact-session AI mutation used by Telegram command handling and
+    /// the typed admin API consumed by CLI/WebUI. No active frontend pointer
+    /// is read or changed by this operation.
+    pub fn management_set_session_ai(
+        &self,
+        principal: &str,
+        session_id: &str,
+        provider: &str,
+        account_or_profile_id: Option<String>,
+        model: &str,
+    ) -> Result<crate::storage::SessionRecord> {
+        SessionAiService::new(self.storage.clone(), self.providers.clone()).apply(
+            principal,
+            SessionAiConfigInput {
+                session_id: session_id.to_owned(),
+                provider: provider.to_owned(),
+                account_or_profile_id,
+                model: model.to_owned(),
+            },
+        )
     }
 
     pub async fn execute_in_scope(
@@ -907,11 +1048,11 @@ impl CommandCore {
                     .ok_or_else(|| anyhow!("Custom profile has no usable text model"))?
                     .model_id;
                 let context = self.session_context(principal, scope)?;
-                self.storage.set_session_provider(
+                self.management_set_session_ai(
                     principal,
                     &context.active.id,
                     "custom",
-                    Some(&selected.profile_id),
+                    Some(selected.profile_id.clone()),
                     &model,
                 )?;
                 Ok(CommandResult::ManagerView(
@@ -927,11 +1068,11 @@ impl CommandCore {
                 }
                 let selected = self.resolve_custom_profile(principal, &profile)?;
                 let context = self.session_context(principal, scope)?;
-                self.storage.set_session_provider(
+                self.management_set_session_ai(
                     principal,
                     &context.active.id,
                     "custom",
-                    Some(&selected.profile_id),
+                    Some(selected.profile_id.clone()),
                     &model,
                 )?;
                 self.probe_custom_model(principal, scope, &model).await?;
@@ -1122,20 +1263,14 @@ impl CommandCore {
                 key,
                 value,
             } => {
-                let value = value.trim();
-                if value.is_empty() {
-                    return Err(anyhow!("memory value is required"));
-                }
                 let scope = MemoryScope::try_from(memory_scope.as_str())?;
-                self.memory_store().upsert(
+                self.management_memory_set(
                     principal,
                     scope,
                     &category,
                     &key,
-                    value,
-                    1.0,
+                    &value,
                     "owner_telegram_edit",
-                    None,
                 )?;
                 Ok(CommandResult::ManagerView(
                     self.memory_view(principal, Some(scope.as_str()))?,
@@ -1147,8 +1282,7 @@ impl CommandCore {
                 key,
             } => {
                 let memory_scope = MemoryScope::try_from(memory_scope.as_str())?;
-                self.memory_store()
-                    .delete(principal, memory_scope, &category, &key, None)?;
+                self.management_memory_forget(principal, memory_scope, &category, &key)?;
                 Ok(CommandResult::ManagerView(
                     self.memory_view(principal, Some(memory_scope.as_str()))?,
                 ))
@@ -1166,16 +1300,7 @@ impl CommandCore {
                 self.skill_detail_view(principal, &skill)?,
             )),
             SetSkillEnabled { skill, enabled } => {
-                SkillStore::new(self.storage.clone()).set_enabled(principal, &skill, enabled)?;
-                self.storage.audit(
-                    principal,
-                    if enabled {
-                        "skill_enabled"
-                    } else {
-                        "skill_disabled"
-                    },
-                    &format!("skill_id={skill}"),
-                )?;
+                self.management_skill_set_enabled(principal, &skill, enabled)?;
                 Ok(CommandResult::ManagerView(
                     self.skill_detail_view(principal, &skill)?,
                 ))
@@ -1204,22 +1329,7 @@ impl CommandCore {
                 Ok(CommandResult::ManagerView(view))
             }
             DeleteSkill { skill } => {
-                let store = SkillStore::new(self.storage.clone());
-                let record = store
-                    .view(principal, &skill)?
-                    .ok_or_else(|| anyhow!("skill not found"))?;
-                if record.source_kind != "learned" {
-                    return Err(anyhow!("only learned owner-created skills can be deleted"));
-                }
-                if let Some(runtime) = &self.runtime {
-                    runtime.workspace().delete_learned_skill(&record.name)?;
-                }
-                store.delete_learned(principal, &record.id)?;
-                self.storage.audit(
-                    principal,
-                    "learned_skill_deleted",
-                    &format!("skill_id={};name={}", record.id, record.name),
-                )?;
+                self.management_skill_delete(principal, &skill)?;
                 Ok(CommandResult::ManagerView(
                     self.skills_view(principal, Some("learned"))?,
                 ))
@@ -1261,7 +1371,7 @@ impl CommandCore {
                 Ok(CommandResult::ManagerView(view))
             }
             Approve { request } => {
-                if !self.storage.decide_approval(principal, &request, true)? {
+                if !self.management_approval_decide(principal, &request, true)? {
                     return Err(anyhow!("pending approval request not found or expired"));
                 }
                 Ok(CommandResult::Confirmation(View::info(
@@ -1270,7 +1380,7 @@ impl CommandCore {
                 )))
             }
             DenyApproval { request } => {
-                if !self.storage.decide_approval(principal, &request, false)? {
+                if !self.management_approval_decide(principal, &request, false)? {
                     return Err(anyhow!("pending approval request not found or expired"));
                 }
                 Ok(CommandResult::Confirmation(View::info(
@@ -1744,9 +1854,7 @@ impl CommandCore {
         let profile = self.resolve_custom_profile(principal, profile_id)?;
         let models = ProviderProfileStore::new(self.storage.clone()).models(&profile.profile_id)?;
         let current = self.session_context(principal, scope)?.active;
-        let capability = |predicate: fn(&crate::storage::ProviderProfileModelRecord) -> bool| {
-            yes_no(models.iter().any(predicate))
-        };
+        let capability = |field: &str| aggregate_capability_state(&models, field).to_owned();
         Ok(View {
             title: Some("CUSTOM PROVIDER".into()),
             blocks: vec![Block::Table {
@@ -1765,12 +1873,17 @@ impl CommandCore {
                     vec!["Protocol".into(), profile.protocol.clone()],
                     vec!["Models".into(), models.len().to_string()],
                     vec!["Reachability".into(), profile.reachability.clone()],
-                    vec!["Tools".into(), capability(|model| model.native_tools)],
-                    vec!["Vision".into(), capability(|model| model.vision_capable)],
+                    vec!["Native tools".into(), capability("native_tools")],
                     vec![
-                        "File input".into(),
-                        capability(|model| model.file_input_capable),
+                        "Structured output".into(),
+                        capability("structured_output"),
                     ],
+                    vec![
+                        "Continuation".into(),
+                        capability("continuation"),
+                    ],
+                    vec!["Vision".into(), capability("vision")],
+                    vec!["File input".into(), capability("file_input")],
                     vec![
                         "Current session".into(),
                         yes_no(
@@ -1945,6 +2058,11 @@ impl CommandCore {
                         native_tools: false,
                         structured_output: false,
                         continuation: false,
+                        native_tools_state: "unknown".into(),
+                        structured_output_state: "unknown".into(),
+                        continuation_state: "unknown".into(),
+                        vision_state: "unknown".into(),
+                        file_input_state: "unknown".into(),
                         model_discovery: true,
                         tool_protocol: "chat_only".into(),
                         evidence: "discovered; capability probe required".into(),
@@ -1966,13 +2084,25 @@ impl CommandCore {
         {
             return Err(anyhow!("model is not in the provider catalog"));
         }
-        self.storage.set_session_provider(
-            principal,
-            &c.active.id,
-            &c.active.provider,
-            c.active.account_id.as_deref(),
-            model,
-        )
+        if let Some(binding) = c.active.account_id.clone() {
+            self.management_set_session_ai(
+                principal,
+                &c.active.id,
+                &c.active.provider,
+                Some(binding),
+                model,
+            )?;
+            Ok(())
+        } else {
+            // Compatibility for an inert pre-profile Custom default session.
+            self.storage.set_session_provider(
+                principal,
+                &c.active.id,
+                &c.active.provider,
+                None,
+                model,
+            )
+        }
     }
 
     async fn probe_custom_model(
@@ -2017,7 +2147,7 @@ impl CommandCore {
             .and_then(|reference| self.auth.credential(reference).ok().flatten())
             .and_then(|credential| credential.api_key);
         let headers = profile.safe_headers()?;
-        let capability = crate::providers::probe_custom_tool_capability(
+        let probe = crate::providers::probe_custom_capabilities(
             &profile.endpoint,
             &headers,
             selected_api_key.as_deref(),
@@ -2025,12 +2155,18 @@ impl CommandCore {
             model,
         )
         .await;
+        let capability = probe.capabilities;
         selected.text_capable = capability.text;
         selected.vision_capable = capability.vision;
         selected.file_input_capable = capability.file_input;
         selected.native_tools = capability.native_tools;
         selected.structured_output = capability.structured_output;
         selected.continuation = capability.continuation;
+        selected.native_tools_state = probe.native_tools.as_str().into();
+        selected.structured_output_state = probe.structured_output.as_str().into();
+        selected.continuation_state = probe.continuation.as_str().into();
+        selected.vision_state = probe.vision.as_str().into();
+        selected.file_input_state = probe.file_input.as_str().into();
         selected.model_discovery = capability.model_discovery;
         selected.tool_protocol = capability.tool_protocol.as_str().into();
         selected.evidence = capability.evidence;
@@ -2057,11 +2193,11 @@ impl CommandCore {
         let model = self.providers.preferred_model(&record.provider)?;
         let c = self.session_context(principal, scope)?;
         self.storage.set_account_owner(principal, account)?;
-        self.storage.activate_account(
+        self.management_set_session_ai(
             principal,
             &c.active.id,
-            account,
             &record.provider,
+            Some(account.to_owned()),
             &model,
         )?;
         Ok((record.provider, model))
@@ -2302,11 +2438,11 @@ impl CommandCore {
             Err(error) => check("FAIL", "DB transaction", safe_diagnostic(&error)),
         }
         match self.storage.schema_version() {
-            Ok(16) => check("PASS", "Migrations/schema", "schema version 16".into()),
+            Ok(17) => check("PASS", "Migrations/schema", "schema version 17".into()),
             Ok(version) => check(
                 "FAIL",
                 "Migrations/schema",
-                format!("expected 16, found {version}"),
+                format!("expected 17, found {version}"),
             ),
             Err(error) => check("FAIL", "Migrations/schema", safe_diagnostic(&error)),
         }
@@ -2376,10 +2512,30 @@ impl CommandCore {
             Err(error) => check("FAIL", "Session FTS", safe_diagnostic(&error)),
         }
         match &self.attachments {
-            Some(attachments) => match attachments.health() {
-                Ok(evidence) => check("PASS", "Attachment store/FTS", evidence),
-                Err(error) => check("FAIL", "Attachment store/FTS", safe_diagnostic(&error)),
-            },
+            Some(attachments) => {
+                match attachments.health() {
+                    Ok(evidence) => check("PASS", "Attachment store/FTS", evidence),
+                    Err(error) => check("FAIL", "Attachment store/FTS", safe_diagnostic(&error)),
+                }
+                match attachments.usage(principal) {
+                    Ok(usage) => check(
+                        "PASS",
+                        "Attachment storage usage",
+                        format!(
+                            "owner={}/{} bytes; global={}/{} bytes",
+                            usage.owner_bytes,
+                            usage.owner_quota_bytes,
+                            usage.global_bytes,
+                            usage.global_quota_bytes
+                        ),
+                    ),
+                    Err(error) => check(
+                        "WARN",
+                        "Attachment storage usage",
+                        safe_diagnostic(&error),
+                    ),
+                }
+            }
             None => check(
                 "SKIPPED",
                 "Attachment store/FTS",
@@ -2492,20 +2648,87 @@ impl CommandCore {
         }
 
         match self.session_context(principal, scope) {
-            Ok(context) => check(
-                if self.providers.state(&context.active.provider) == ProviderState::Ready {
-                    "PASS"
+            Ok(context) => {
+                let provider_state = self.providers.state(&context.active.provider);
+                check(
+                    if provider_state == ProviderState::Ready { "PASS" } else { "WARN" },
+                    "Active provider/auth/model",
+                    format!(
+                        "LOCAL state · {} / {} / {:?}",
+                        context.active.provider, context.active.model, provider_state
+                    ),
+                );
+                if context.active.provider == "custom" {
+                    let profiles = ProviderProfileStore::new(self.storage.clone());
+                    match context
+                        .active
+                        .account_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("active Custom session has no profile binding"))
+                        .and_then(|profile_id| {
+                            profiles
+                                .get(principal, profile_id)?
+                                .ok_or_else(|| anyhow!("active Custom profile is missing"))
+                        }) {
+                        Ok(profile) => {
+                            let headers = profile.safe_headers().unwrap_or_default();
+                            let api_key = profile
+                                .credential_ref
+                                .as_deref()
+                                .and_then(|reference| self.auth.credential(reference).ok().flatten())
+                                .and_then(|credential| credential.api_key);
+                            let live = tokio::time::timeout(
+                                std::time::Duration::from_secs(12),
+                                crate::ipc::fetch_custom_models(
+                                    &profile.endpoint,
+                                    &headers,
+                                    api_key.as_deref(),
+                                ),
+                            )
+                            .await;
+                            match live {
+                                Ok(Ok(models)) if models.iter().any(|model| model == &context.active.model) => check(
+                                    "PASS",
+                                    "Active provider live probe",
+                                    format!(
+                                        "LIVE Custom /models reached {} and confirmed model {}",
+                                        profile.endpoint, context.active.model
+                                    ),
+                                ),
+                                Ok(Ok(models)) => check(
+                                    "WARN",
+                                    "Active provider live probe",
+                                    format!(
+                                        "LIVE Custom /models succeeded but active model {} was absent from {} discovered models",
+                                        context.active.model, models.len()
+                                    ),
+                                ),
+                                Ok(Err(error)) => check(
+                                    "WARN",
+                                    "Active provider live probe",
+                                    format!("LIVE Custom probe failed: {}", safe_diagnostic(&error)),
+                                ),
+                                Err(_) => check(
+                                    "WARN",
+                                    "Active provider live probe",
+                                    "LIVE Custom probe timed out after 12s".into(),
+                                ),
+                            }
+                        }
+                        Err(error) => check(
+                            "WARN",
+                            "Active provider live probe",
+                            safe_diagnostic(&error),
+                        ),
+                    }
                 } else {
-                    "WARN"
-                },
-                "Active provider/auth/model",
-                format!(
-                    "{} / {} / {:?}",
-                    context.active.provider,
-                    context.active.model,
-                    self.providers.state(&context.active.provider)
-                ),
-            ),
+                    check(
+                        "SKIPPED",
+                        "Active provider live probe",
+                        "managed-provider completion probe skipped to avoid billable/destructive traffic; local auth/model state checked above".into(),
+                    );
+                }
+            }
             Err(error) => check(
                 "FAIL",
                 "Active provider/auth/model",
@@ -2515,7 +2738,7 @@ impl CommandCore {
         match ProviderProfileStore::new(self.storage.clone()).list(principal) {
             Ok(profiles) if profiles.is_empty() => check(
                 "SKIPPED",
-                "Custom profile reachability",
+                "Custom profile reachability cache",
                 "no Custom profiles".into(),
             ),
             Ok(profiles) => {
@@ -2523,15 +2746,24 @@ impl CommandCore {
                     .iter()
                     .filter(|profile| profile.reachability == "unreachable")
                     .count();
+                let ages = profiles
+                    .iter()
+                    .map(|profile| diagnostic_cache_age(profile.last_probe_at.as_deref()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 check(
                     if unreachable == 0 { "PASS" } else { "WARN" },
-                    "Custom profile reachability",
-                    format!("{} profiles; {unreachable} unreachable", profiles.len()),
+                    "Custom profile reachability cache",
+                    format!(
+                        "CACHED · {} profiles; {unreachable} unreachable; age={}",
+                        profiles.len(),
+                        if ages.is_empty() { "unknown" } else { ages.as_str() }
+                    ),
                 );
             }
             Err(error) => check(
                 "FAIL",
-                "Custom profile reachability",
+                "Custom profile reachability cache",
                 safe_diagnostic(&error),
             ),
         }
@@ -2974,8 +3206,51 @@ fn short_activity(value: &str) -> String {
         .unwrap_or_else(|_| value.chars().take(16).collect())
 }
 
+fn aggregate_capability_state(
+    models: &[crate::storage::ProviderProfileModelRecord],
+    field: &str,
+) -> &'static str {
+    let state = |model: &crate::storage::ProviderProfileModelRecord| match field {
+        "native_tools" => model.native_tools_state.as_str(),
+        "structured_output" => model.structured_output_state.as_str(),
+        "continuation" => model.continuation_state.as_str(),
+        "vision" => model.vision_state.as_str(),
+        "file_input" => model.file_input_state.as_str(),
+        _ => "unknown",
+    };
+    if models.iter().any(|model| state(model) == "supported") {
+        "Supported"
+    } else if !models.is_empty() && models.iter().all(|model| state(model) == "unsupported") {
+        "Unsupported"
+    } else {
+        "Unknown"
+    }
+}
+
 fn yes_no(value: bool) -> String {
     if value { "yes" } else { "no" }.into()
+}
+
+fn diagnostic_cache_age(timestamp: Option<&str>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "never".into();
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+        return "unknown".into();
+    };
+    let age = chrono::Utc::now().signed_duration_since(parsed.with_timezone(&chrono::Utc));
+    if age.num_seconds() < 0 {
+        return "clock-skew".into();
+    }
+    if age.num_minutes() < 1 {
+        format!("{}s", age.num_seconds())
+    } else if age.num_hours() < 1 {
+        format!("{}m", age.num_minutes())
+    } else if age.num_days() < 1 {
+        format!("{}h", age.num_hours())
+    } else {
+        format!("{}d", age.num_days())
+    }
 }
 
 fn safe_diagnostic(error: &impl std::fmt::Display) -> String {
@@ -3245,6 +3520,133 @@ mod tests {
             .await
             .unwrap();
         assert!(skill_store.view("p", &skill.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn telegram_and_management_paths_share_memory_skill_approval_and_diagnostics_semantics() {
+        let (core, storage, sessions, _temp) = core();
+        let session = sessions.ensure_default_session("p").unwrap();
+
+        // Telegram edit and CLI/WebUI management write hit the same canonical
+        // memory row and therefore have identical UPSERT semantics.
+        core.execute_text("p", "/memory edit user preference response_style concise")
+            .await
+            .unwrap();
+        core.management_memory_set(
+            "p",
+            MemoryScope::User,
+            "preference",
+            "response_style",
+            "detailed",
+            "owner_management_edit",
+        )
+        .unwrap();
+        let memory = MemoryStore::new(storage.clone())
+            .get("p", MemoryScope::User, "preference", "response_style")
+            .unwrap()
+            .unwrap();
+        assert_eq!(memory.value, "detailed");
+        assert_eq!(
+            MemoryStore::new(storage.clone())
+                .list("p", Some(MemoryScope::User), 20)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.key == "response_style")
+                .count(),
+            1
+        );
+
+        let skill_store = SkillStore::new(storage.clone());
+        let skill = skill_store
+            .create_or_update(
+                "p",
+                crate::skills::SkillCandidate {
+                    name: "parity-check".into(),
+                    summary: "Verify frontend parity".into(),
+                    when_to_use: "When testing Xiao frontend parity".into(),
+                    prerequisites: "A deterministic store".into(),
+                    procedure: "1. Mutate through one frontend.\n2. Read through another.".into(),
+                    pitfalls: "Do not compare presentation markup.".into(),
+                    verification: "Canonical state is identical.".into(),
+                },
+                Some(&session.id),
+            )
+            .unwrap()
+            .1;
+        core.execute_text("p", &format!("/skills disable {}", skill.id))
+            .await
+            .unwrap();
+        assert!(!skill_store.view("p", &skill.id).unwrap().unwrap().enabled);
+        core.management_skill_set_enabled("p", &skill.id, true).unwrap();
+        assert!(skill_store.view("p", &skill.id).unwrap().unwrap().enabled);
+
+        let binding = crate::storage::ApprovalBinding {
+            owner_id: "p",
+            session_id: &session.id,
+            agent_run_id: "parity-run",
+            tool_call_id: "parity-call",
+            tool_name: "android_xiao_restart",
+            arguments_hash: "parity-hash",
+        };
+        let request = storage
+            .request_approval(crate::storage::ApprovalRequest {
+                binding: binding.clone(),
+                capability: "android.service.restart",
+                risk: "privileged",
+                summary: "parity approval",
+            })
+            .unwrap();
+        assert!(core
+            .management_approval_decide("p", &request.id, true)
+            .unwrap());
+        assert!(storage.consume_approval(binding).unwrap());
+        assert!(!storage.consume_approval(binding).unwrap());
+
+        let telegram_doctor = core.execute_text("p", "/doctor").await.unwrap();
+        let management_doctor = core.management_doctor("p").await;
+        let CommandResult::InfoView(telegram_doctor) = telegram_doctor else {
+            panic!("doctor should return an info view")
+        };
+        assert_eq!(telegram_doctor.title, management_doctor.title);
+        assert_eq!(telegram_doctor.blocks.len(), management_doctor.blocks.len());
+    }
+
+    #[test]
+    fn exact_session_ai_service_matches_telegram_account_selection_without_pointer_leakage() {
+        let (core, storage, sessions, _temp) = core();
+        let first = sessions.ensure_default_session("p").unwrap();
+        let second = storage
+            .create_session(
+                "p",
+                "Second",
+                "custom",
+                None,
+                "default",
+                false,
+                None,
+            )
+            .unwrap();
+        storage.upsert_account(&account("c1", "codex")).unwrap();
+        storage.set_account_owner("p", "c1").unwrap();
+
+        let (provider, model) = core.use_account("p", None, "c1").unwrap();
+        assert_eq!((provider.as_str(), model.as_str()), ("codex", "codex-default"));
+        assert_eq!(sessions.context_for("p").unwrap().active.id, first.id);
+
+        core.management_set_session_ai(
+            "p",
+            &second.id,
+            "codex",
+            Some("c1".into()),
+            "codex-alt",
+        )
+        .unwrap();
+        let selected = storage.session("p", &second.id).unwrap().unwrap();
+        assert_eq!(selected.provider, "codex");
+        assert_eq!(selected.account_id.as_deref(), Some("c1"));
+        assert_eq!(selected.model, "codex-alt");
+        // Exact management targeting must not steal the frontend active pointer.
+        assert_eq!(sessions.context_for("p").unwrap().active.id, first.id);
     }
 
     #[tokio::test]

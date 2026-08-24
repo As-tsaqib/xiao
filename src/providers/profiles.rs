@@ -140,6 +140,52 @@ impl ProviderProfileStore {
         )
     }
 
+    pub fn edit_metadata(
+        &self,
+        owner_id: &str,
+        profile_id: &str,
+        alias: Option<&str>,
+        protocol: Option<&str>,
+        headers: Option<&BTreeMap<String, String>>,
+    ) -> Result<()> {
+        let alias = alias.map(canonical_alias).transpose()?;
+        if let Some(protocol) = protocol {
+            validate_protocol(protocol)?;
+        }
+        let headers_json = headers
+            .map(|headers| serde_json::to_string(headers))
+            .transpose()?;
+        if let Some(raw) = headers_json.as_deref() {
+            let _ = parse_safe_headers(raw)?;
+        }
+        self.storage.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let current = transaction
+                .query_row(
+                    "SELECT alias,protocol,safe_headers_json FROM provider_profiles WHERE owner_id=? AND profile_id=?",
+                    params![owner_id, profile_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow!("Custom profile not found for owner"))?;
+            let next_alias = alias.as_deref().unwrap_or(&current.0);
+            let next_protocol = protocol.unwrap_or(&current.1);
+            let next_headers = headers_json.as_deref().unwrap_or(&current.2);
+            transaction.execute(
+                "UPDATE provider_profiles SET alias=?,protocol=?,safe_headers_json=?,reachability='unknown',last_probe_at=NULL,updated_at=? WHERE owner_id=? AND profile_id=?",
+                params![next_alias, next_protocol, next_headers, Utc::now().to_rfc3339(), owner_id, profile_id],
+            )?;
+            if protocol.is_some_and(|value| value != current.1) {
+                transaction.execute(
+                    "DELETE FROM provider_profile_models WHERE profile_id=?",
+                    params![profile_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
     /// Endpoint changes cross a trust boundary. Credential and all headers
     /// are cleared by default; retaining them requires a separate explicit
     /// owner flow that v0.2.6 intentionally does not make implicit.
@@ -192,8 +238,8 @@ impl ProviderProfileStore {
                     return Err(anyhow!("Custom model id is empty or too long"));
                 }
                 transaction.execute(
-                    "INSERT INTO provider_profile_models(profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,model_discovery,tool_protocol,evidence,probed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    params![profile_id, model.model_id, model.text_capable as i32, model.vision_capable as i32, model.file_input_capable as i32, model.native_tools as i32, model.structured_output as i32, model.continuation as i32, model.model_discovery as i32, model.tool_protocol, model.evidence, model.probed_at],
+                    "INSERT INTO provider_profile_models(profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,native_tools_state,structured_output_state,continuation_state,vision_state,file_input_state,model_discovery,tool_protocol,evidence,probed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![profile_id, model.model_id, model.text_capable as i32, model.vision_capable as i32, model.file_input_capable as i32, model.native_tools as i32, model.structured_output as i32, model.continuation as i32, model.native_tools_state, model.structured_output_state, model.continuation_state, model.vision_state, model.file_input_state, model.model_discovery as i32, model.tool_protocol, model.evidence, model.probed_at],
                 )?;
             }
             transaction.execute(
@@ -208,7 +254,7 @@ impl ProviderProfileStore {
     pub fn models(&self, profile_id: &str) -> Result<Vec<ProviderProfileModelRecord>> {
         self.storage.with_conn(|connection| {
             let mut statement = connection.prepare(
-                "SELECT profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,model_discovery,tool_protocol,evidence,probed_at FROM provider_profile_models WHERE profile_id=? ORDER BY model_id",
+                "SELECT profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,native_tools_state,structured_output_state,continuation_state,vision_state,file_input_state,model_discovery,tool_protocol,evidence,probed_at FROM provider_profile_models WHERE profile_id=? ORDER BY model_id",
             )?;
             let rows = statement.query_map(params![profile_id], row_profile_model)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -233,7 +279,7 @@ impl ProviderProfileStore {
         self.storage.with_conn(|connection| {
             connection
                 .query_row(
-                    "SELECT profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,model_discovery,tool_protocol,evidence,probed_at FROM provider_profile_models WHERE profile_id=? AND model_id=?",
+                    "SELECT profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,native_tools_state,structured_output_state,continuation_state,vision_state,file_input_state,model_discovery,tool_protocol,evidence,probed_at FROM provider_profile_models WHERE profile_id=? AND model_id=?",
                     params![profile_id, model_id],
                     row_profile_model,
                 )
@@ -315,6 +361,23 @@ impl ProviderProfileStore {
                     "native" | "structured_json"
                 ),
                 continuation: matches!(config.tool_protocol.as_str(), "native" | "structured_json"),
+                native_tools_state: match config.tool_protocol.as_str() {
+                    "native" => "supported",
+                    "structured_json" | "chat_only" => "unsupported",
+                    _ => "unknown",
+                }.into(),
+                structured_output_state: match config.tool_protocol.as_str() {
+                    "native" | "structured_json" => "supported",
+                    "chat_only" => "unsupported",
+                    _ => "unknown",
+                }.into(),
+                continuation_state: match config.tool_protocol.as_str() {
+                    "native" | "structured_json" => "supported",
+                    "chat_only" => "unsupported",
+                    _ => "unknown",
+                }.into(),
+                vision_state: "unknown".into(),
+                file_input_state: "unknown".into(),
                 model_discovery: true,
                 tool_protocol: match config.tool_protocol.as_str() {
                     "native" => "native",
@@ -387,10 +450,15 @@ fn row_profile_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderProfil
         native_tools: row.get::<_, i64>(5)? != 0,
         structured_output: row.get::<_, i64>(6)? != 0,
         continuation: row.get::<_, i64>(7)? != 0,
-        model_discovery: row.get::<_, i64>(8)? != 0,
-        tool_protocol: row.get(9)?,
-        evidence: row.get(10)?,
-        probed_at: row.get(11)?,
+        native_tools_state: row.get(8)?,
+        structured_output_state: row.get(9)?,
+        continuation_state: row.get(10)?,
+        vision_state: row.get(11)?,
+        file_input_state: row.get(12)?,
+        model_discovery: row.get::<_, i64>(13)? != 0,
+        tool_protocol: row.get(14)?,
+        evidence: row.get(15)?,
+        probed_at: row.get(16)?,
     })
 }
 

@@ -8,7 +8,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::presentation::{Action, Block, View};
-use crate::providers::ProviderCapabilities;
+use crate::providers::CustomCapabilityProbe;
 
 use super::{paginator::Paginator, TelegramScope};
 
@@ -36,7 +36,7 @@ pub struct CustomLoginWizard {
     pub alias: String,
     pub models: Vec<String>,
     pub selected_index: Option<usize>,
-    pub capability: Option<ProviderCapabilities>,
+    pub capability: Option<CustomCapabilityProbe>,
     pub page: usize,
 }
 
@@ -258,7 +258,7 @@ pub fn confirmation_view(wizard: &CustomLoginWizard) -> View {
                     wizard
                         .capability
                         .as_ref()
-                        .map(|capability| capability.tool_protocol.as_str().to_owned())
+                        .map(|probe| probe.capabilities.tool_protocol.as_str().to_owned())
                         .unwrap_or_else(|| "not probed".into()),
                 ],
             ],

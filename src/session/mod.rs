@@ -97,6 +97,51 @@ impl SessionManager {
         })
     }
 
+    /// Resolve one exact non-archived session without reading or mutating any
+    /// frontend active-session pointer. This is used by CLI `--session` so a
+    /// terminal request can never silently inherit Telegram state.
+    pub fn context_for_session(&self, principal: &str, id: &str) -> Result<SessionContext> {
+        let active = self
+            .storage
+            .session(principal, id)?
+            .ok_or_else(|| anyhow!("session not found"))?;
+        if active.archived {
+            return Err(anyhow!("session is archived"));
+        }
+        if active.is_side {
+            let parent_id = active
+                .parent_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("side session is missing its parent"))?;
+            let main = self
+                .storage
+                .session(principal, parent_id)?
+                .ok_or_else(|| anyhow!("side session parent not found"))?;
+            return Ok(SessionContext {
+                main,
+                active,
+                mode: ChatMode::Side,
+            });
+        }
+        Ok(SessionContext {
+            main: active.clone(),
+            active,
+            mode: ChatMode::Main,
+        })
+    }
+
+    pub fn append_user_to_session(
+        &self,
+        principal: &str,
+        session_id: &str,
+        text: &str,
+    ) -> Result<SessionContext> {
+        let context = self.context_for_session(principal, session_id)?;
+        self.storage
+            .append_message(principal, &context.active.id, "user", text)?;
+        Ok(context)
+    }
+
     pub fn switch_main(&self, principal: &str, id: &str) -> Result<SessionRecord> {
         let s = self
             .storage

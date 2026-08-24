@@ -304,7 +304,7 @@ impl AgentEngine {
         self.active
             .lock()
             .unwrap()
-            .get(&run_key(principal, scope))
+            .get(&run_key(principal, scope, None))
             .map(|t| {
                 t.cancel();
                 true
@@ -315,7 +315,23 @@ impl AgentEngine {
     pub fn is_active_in_scope(&self, principal: &str, scope: Option<TelegramScope>) -> bool {
         self.active
             .lock()
-            .map(|active| active.contains_key(&run_key(principal, scope)))
+            .map(|active| active.contains_key(&run_key(principal, scope, None)))
+            .unwrap_or(false)
+    }
+
+    pub fn cancel_session(&self, principal: &str, session_id: &str) -> bool {
+        self.active
+            .lock()
+            .unwrap()
+            .get(&run_key(principal, None, Some(session_id)))
+            .map(|token| { token.cancel(); true })
+            .unwrap_or(false)
+    }
+
+    pub fn is_active_session(&self, principal: &str, session_id: &str) -> bool {
+        self.active
+            .lock()
+            .map(|active| active.contains_key(&run_key(principal, None, Some(session_id))))
             .unwrap_or(false)
     }
 
@@ -325,7 +341,7 @@ impl AgentEngine {
         prompt: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        self.run(principal, None, prompt, true, progress).await
+        self.run(principal, None, None, prompt, true, progress).await
     }
 
     pub async fn submit_with_progress_in_scope(
@@ -335,8 +351,32 @@ impl AgentEngine {
         prompt: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        self.run(principal, Some(scope), prompt, true, progress)
+        self.run(principal, Some(scope), None, prompt, true, progress)
             .await
+    }
+
+    pub async fn submit_to_session_with_progress(
+        &self,
+        principal: &str,
+        session_id: &str,
+        prompt: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<AgentAnswer> {
+        self.run(principal, None, Some(session_id), prompt, true, progress).await
+    }
+
+    pub async fn retry_to_session_with_progress(
+        &self,
+        principal: &str,
+        session_id: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<AgentAnswer> {
+        let ctx = self.sessions.context_for_session(principal, session_id)?;
+        let prompt = self
+            .storage
+            .latest_user_message(principal, &ctx.active.id)?
+            .ok_or_else(|| anyhow!("no user request available to retry"))?;
+        self.run(principal, None, Some(session_id), &prompt, false, progress).await
     }
 
     pub async fn retry_with_progress(
@@ -362,19 +402,20 @@ impl AgentEngine {
             .storage
             .latest_user_message(principal, &ctx.active.id)?
             .ok_or_else(|| anyhow!("no user request available to retry"))?;
-        self.run(principal, scope, &prompt, false, progress).await
+        self.run(principal, scope, None, &prompt, false, progress).await
     }
 
     async fn run(
         &self,
         principal: &str,
         scope: Option<TelegramScope>,
+        explicit_session: Option<&str>,
         prompt: &str,
         append_user: bool,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
         let token = CancellationToken::new();
-        let active_key = run_key(principal, scope);
+        let active_key = run_key(principal, scope, explicit_session);
         {
             let mut active = self.active.lock().unwrap();
             if active.contains_key(&active_key) {
@@ -384,9 +425,13 @@ impl AgentEngine {
         }
 
         if append_user {
-            let appended = match scope {
-                Some(scope) => self.sessions.append_user_telegram(principal, scope, prompt),
-                None => self.sessions.append_user(principal, prompt),
+            let appended = if let Some(session_id) = explicit_session {
+                self.sessions.append_user_to_session(principal, session_id, prompt)
+            } else {
+                match scope {
+                    Some(scope) => self.sessions.append_user_telegram(principal, scope, prompt),
+                    None => self.sessions.append_user(principal, prompt),
+                }
             };
             if let Err(error) = appended {
                 self.active.lock().unwrap().remove(&active_key);
@@ -394,9 +439,13 @@ impl AgentEngine {
             }
         }
 
-        let ctx = match scope {
-            Some(scope) => self.sessions.context_for_telegram(principal, scope),
-            None => self.sessions.context_for(principal),
+        let ctx = if let Some(session_id) = explicit_session {
+            self.sessions.context_for_session(principal, session_id)
+        } else {
+            match scope {
+                Some(scope) => self.sessions.context_for_telegram(principal, scope),
+                None => self.sessions.context_for(principal),
+            }
         };
         let ctx = match ctx {
             Ok(ctx) => ctx,
@@ -1104,7 +1153,14 @@ impl AgentEngine {
     }
 }
 
-fn run_key(principal: &str, scope: Option<TelegramScope>) -> String {
+fn run_key(
+    principal: &str,
+    scope: Option<TelegramScope>,
+    explicit_session: Option<&str>,
+) -> String {
+    if let Some(session_id) = explicit_session {
+        return format!("{principal}:cli-session:{session_id}");
+    }
     scope
         .map(|scope| {
             format!(
@@ -1113,7 +1169,7 @@ fn run_key(principal: &str, scope: Option<TelegramScope>) -> String {
                 scope.thread_key()
             )
         })
-        .unwrap_or_else(|| principal.to_owned())
+        .unwrap_or_else(|| format!("{principal}:cli-active"))
 }
 
 fn bound_text(value: String, max_chars: usize) -> String {

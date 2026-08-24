@@ -233,12 +233,16 @@ pass 'Fresh, upgrade, idempotent and crash-recovery migrations covered'
     rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(13\)' src/storage/mod.rs &&
     rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(14\),\(15\)' src/storage/mod.rs &&
     rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(16\)' src/storage/mod.rs &&
+    rg -q 'INSERT OR IGNORE INTO schema_migrations\(version\) VALUES\(17\)' src/storage/mod.rs &&
+    rg -q 'native_tools_state' src/storage/mod.rs &&
+    rg -q 'vision_state' src/storage/mod.rs &&
+    rg -q 'file_input_state' src/storage/mod.rs &&
     rg -q 'CREATE TABLE IF NOT EXISTS owners' src/storage/mod.rs &&
     rg -q 'CREATE TABLE IF NOT EXISTS provider_profiles' src/storage/mod.rs &&
     rg -q 'CREATE TABLE IF NOT EXISTS attachments' src/storage/mod.rs &&
     rg -q 'CREATE VIRTUAL TABLE IF NOT EXISTS attachment_fts' src/storage/mod.rs
-} || fail 'Final architecture migrations through version 16'
-pass 'Migrations v10-v16 preserve prior state and add owner/profile/attachment storage'
+} || fail 'Final architecture migrations through version 17'
+pass 'Migrations v10-v17 preserve prior state and add tri-state Custom capability storage'
 {
   [ -f src/owner.rs ] &&
     rg -q 'ensure_telegram_owner' src/storage/mod.rs src/app.rs &&
@@ -327,10 +331,15 @@ pass 'Termux wrapper is installed automatically and removed/restored safely'
 pass 'Snapshot exposes secret presence only and logs/errors are redacted'
 pass 'No unrestricted AI root shell'
 {
-  rg -q 'normalize_cli' src/bin_cli.rs &&
-    rg -q 'multiple_command_arguments_are_preserved' src/bin_cli.rs
-} || fail 'Termux command alias arguments'
-pass 'Termux command aliases preserve arguments before chat fallback'
+  rg -q 'const TOP_LEVEL' src/bin_cli.rs &&
+    rg -q 'unknown_command' src/bin_cli.rs &&
+    rg -q '"chat"' src/bin_cli.rs &&
+    rg -q '"ask"' src/bin_cli.rs &&
+    rg -q 'Chat is explicit' src/bin_cli.rs &&
+    rg -q 'typo_is_usage_and_never_chat' src/bin_cli.rs &&
+    ! rg -q 'normalize_cli' src/bin_cli.rs
+} || fail 'Structured CLI command tree and explicit chat'
+pass 'CLI uses structured commands; unknown commands are usage errors and chat is explicit'
 {
   rg -q 'quickstart' src/bin_cli.rs &&
     rg -q 'configure_detached' src/standalone.rs &&
@@ -358,6 +367,9 @@ pass 'No fake /compact command is exposed'
     rg -q 'manager-get-base64' module/webroot/assets/app.js module/action.sh src/bin_cli.rs &&
     rg -q 'manager-post-base64' module/webroot/assets/app.js module/action.sh src/bin_cli.rs &&
     rg -q 'id="view-dashboard"' module/webroot/index.html &&
+    rg -q 'id="view-setup"' module/webroot/index.html &&
+    rg -q 'telegramToken' module/webroot/index.html module/webroot/assets/app.js &&
+    rg -q 'telegramOwnerId' module/webroot/index.html module/webroot/assets/app.js &&
     rg -q 'id="view-providers"' module/webroot/index.html &&
     rg -q 'id="view-runtime"' module/webroot/index.html &&
     rg -q 'id="view-sessions"' module/webroot/index.html &&
@@ -368,7 +380,10 @@ pass 'No fake /compact command is exposed'
     rg -q 'id="view-security"' module/webroot/index.html &&
     rg -q 'id="view-diagnostics"' module/webroot/index.html &&
     rg -q 'id="view-logs"' module/webroot/index.html &&
-    rg -q 'modelPickerPager' module/webroot/index.html module/webroot/assets/app.js &&
+    rg -q 'sessionAiDialog' module/webroot/index.html module/webroot/assets/app.js &&
+    rg -q 'Change AI Configuration' module/webroot/assets/app.js &&
+    rg -q 'profileEditDialog' module/webroot/index.html module/webroot/assets/app.js &&
+    ! rg -q 'current_ai\?\.session_id' module/webroot/assets/app.js &&
     ! rg -q 'sqlite3|xiao\.db|/system/bin/su|raw-root' module/webroot/assets/app.js
 } || fail 'Xiao Manager WebUI surfaces'
 pass 'Xiao Manager uses only typed xiaod actions across all required sections'
@@ -387,6 +402,19 @@ pass 'Custom provider discovers models through authenticated root admin IPC'
     rg -q 'XIAO_CONFIG="\$XIAO_CONFIG" XIAO_CLIENT_CONFIG="\$XIAO_CLIENT_CONFIG"' module/watchdog.sh
 } || fail 'KernelSU watchdog hardening'
 pass 'KernelSU watchdog has boot-safe environment, graceful stop, backoff, auto-restart and bounded logs'
+{
+  rg -q 'owner_user_id' src/config/mod.rs &&
+    rg -q 'allowed_chat_ids' src/config/mod.rs src/telegram/acl.rs &&
+    rg -q 'TelegramSetupService' src/control_plane.rs src/ipc/mod.rs &&
+    rg -q 'SessionAiService' src/control_plane.rs src/ipc/mod.rs &&
+    rg -q 'ScannedPdfProcessor' src/attachments/mod.rs &&
+    rg -q 'cleanup_orphans' src/attachments/mod.rs &&
+    rg -q 'cleanup_retention' src/attachments/mod.rs &&
+    rg -q 'Attachment storage usage' src/command/mod.rs &&
+    rg -q 'CACHED' src/command/mod.rs &&
+    rg -q 'LIVE' src/command/mod.rs
+} || fail 'v0.2.7 control-plane hardening surfaces'
+pass 'v0.2.7 single-owner, shared control plane, OCR, lifecycle and diagnostics surfaces are present'
 for f in module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh; do sh -n "$f"; done
 for f in packaging/build-module.sh scripts/acceptance.sh; do bash -n "$f"; done
 pass 'Shell syntax'
