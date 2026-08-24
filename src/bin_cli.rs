@@ -2192,7 +2192,7 @@ fn read_secret_optional(prompt: &str) -> CliResult<String> {
         let result = stdin.read_line(&mut value);
         eprintln!();
         result.map_err(|error| CliFailure::local(error.to_string()))?;
-        return Ok(value.trim_end_matches(['\r', '\n']).to_owned());
+        Ok(value.trim_end_matches(['\r', '\n']).to_owned())
     }
     #[cfg(not(unix))]
     {
