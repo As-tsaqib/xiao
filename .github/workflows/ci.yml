@@ -16,6 +16,7 @@ jobs:
         with:
           ref: feat/v0.2.7-control-plane-unification
           fetch-depth: 0
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Apply checksum-bound v0.2.7 implementation patch
         shell: bash
         run: |
