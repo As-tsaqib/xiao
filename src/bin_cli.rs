@@ -2166,24 +2166,40 @@ fn read_secret_optional(prompt: &str) -> CliResult<String> {
         use std::os::fd::AsRawFd;
         let fd = stdin.as_raw_fd();
         let mut old = unsafe { std::mem::zeroed::<libc::termios>() };
-        if unsafe { libc::tcgetattr(fd, &mut old) } == 0 {
-            let mut hidden = old;
-            hidden.c_lflag &= !libc::ECHO;
-            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } == 0 {
-                let mut value = String::new();
-                let result = stdin.read_line(&mut value);
-                let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &old) };
-                eprintln!();
-                result.map_err(|error| CliFailure::local(error.to_string()))?;
-                return Ok(value.trim_end_matches(['\r', '\n']).to_owned());
+        if unsafe { libc::tcgetattr(fd, &mut old) } != 0 {
+            return Err(CliFailure::local(
+                "failed to disable terminal echo for secret input; use stdin/file instead (e.g. echo token | xiao ... or --token-file)",
+            ));
+        }
+        let mut hidden = old;
+        hidden.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+            return Err(CliFailure::local(
+                "failed to disable terminal echo for secret input; use stdin/file instead",
+            ));
+        }
+        struct EchoGuard {
+            fd: i32,
+            old: libc::termios,
+        }
+        impl Drop for EchoGuard {
+            fn drop(&mut self) {
+                let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.old) };
             }
         }
+        let _guard = EchoGuard { fd, old };
+        let mut value = String::new();
+        let result = stdin.read_line(&mut value);
+        eprintln!();
+        result.map_err(|error| CliFailure::local(error.to_string()))?;
+        return Ok(value.trim_end_matches(['\r', '\n']).to_owned());
     }
-    let mut value = String::new();
-    stdin
-        .read_line(&mut value)
-        .map_err(|error| CliFailure::local(error.to_string()))?;
-    Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+    #[cfg(not(unix))]
+    {
+        return Err(CliFailure::local(
+            "secret input requires a non-terminal stdin on this platform; pipe via stdin or --token-file",
+        ));
+    }
 }
 
 fn prompt_line(prompt: &str) -> CliResult<String> {
