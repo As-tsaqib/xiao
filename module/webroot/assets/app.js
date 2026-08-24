@@ -276,6 +276,14 @@ async function loadProviders() {
 
 function showProviderError(error) { notice(`Could not load providers: ${error.message}`, 'bad'); }
 
+async function mutateCustomProvider(body, success) {
+  if (state.busy) return;
+  setBusy(true); notice('Applying Custom provider change through xiaod…');
+  try { await managerPost('provider-custom', body); notice(success, 'good'); }
+  catch (error) { console.error('Xiao Custom provider action failed:', error); notice(`Action failed: ${error.message}`, 'bad'); setBusy(false); return; }
+  setBusy(false); await refreshCurrent();
+}
+
 async function disconnectAccount(account) {
   if (!confirm(`Disconnect ${account.label}? Active sessions using it will be detached.`)) return;
   await mutate('provider-accounts', { action: 'disconnect', account_id: account.id }, 'Account disconnected.');
@@ -308,7 +316,7 @@ function showProfileCapabilities(profile) {
   alert(lines.join('\n\n'));
 }
 
-async function testProfile(profile) { await mutate('provider-custom', { action: 'test', profile_id: profile.id }, `Profile ${profile.alias} is reachable and its capability catalog was refreshed.`); }
+async function testProfile(profile) { await mutateCustomProvider({ action: 'test', profile_id: profile.id }, `Profile ${profile.alias} is reachable and its capability catalog was refreshed.`); }
 
 function editProfile(profile) {
   $('profileEditId').value = profile.id;
@@ -326,7 +334,7 @@ function editProfile(profile) {
 }
 async function deleteProfile(profile) {
   if (!confirm(`Delete Custom profile “${profile.alias}”? It must not be selected by an active session.`)) return;
-  await mutate('provider-custom', { action: 'delete', profile_id: profile.id }, 'Custom profile deleted.');
+  await mutateCustomProvider({ action: 'delete', profile_id: profile.id }, 'Custom profile deleted.');
 }
 
 async function loadRuntime() {
@@ -516,12 +524,12 @@ $('profileEditForm').onsubmit = async event => {
   const body = { action: 'edit', profile_id: profileId, alias: $('profileEditAlias').value.trim(), endpoint, protocol: $('profileEditProtocol').value, ...(headers !== undefined ? { headers } : {}), remove_api_key: action === 'remove', keep_credential: endpointChanged && action === 'keep', ...(action === 'replace' ? { api_key: replacement } : {}) };
   if (endpointChanged && action === 'keep' && !confirm('The endpoint changes trust boundary. Explicitly keep the current credential for the new endpoint?')) return;
   $('profileEditDialog').close(); $('profileEditKey').value = '';
-  await mutate('provider-custom', body, endpointChanged && action !== 'keep' ? 'Profile updated; endpoint change cleared/replaced credential as requested.' : 'Custom profile updated.');
+  await mutateCustomProvider(body, endpointChanged && action !== 'keep' ? 'Profile updated; endpoint change cleared/replaced credential as requested.' : 'Custom profile updated.');
 };
 $('providerForm').onsubmit = async event => {
   event.preventDefault();
   let headers; try { headers = parseHeaders($('profileHeaders').value); } catch (error) { notice(error.message, 'bad'); return; }
-  await mutate('provider-custom', { action: 'create', alias: $('profileAlias').value.trim(), endpoint: $('profileEndpoint').value.trim(), protocol: $('profileProtocol').value, api_key: $('profileKey').value || null, headers }, 'Isolated Custom profile created.');
+  await mutateCustomProvider({ action: 'create', alias: $('profileAlias').value.trim(), endpoint: $('profileEndpoint').value.trim(), protocol: $('profileProtocol').value, api_key: $('profileKey').value || null, headers }, 'Isolated Custom profile created.');
   $('profileKey').value = ''; event.target.reset(); event.target.classList.add('hidden');
 };
 $('memorySearchButton').onclick = () => { state.pages.memory = 1; refreshCurrent(); };
