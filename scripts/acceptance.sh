@@ -421,7 +421,11 @@ pass 'Shell syntax'
 node --check module/webroot/assets/app.js >/dev/null
 node --check module/webroot/assets/ksu-bridge.js >/dev/null
 pass 'WebUI JavaScript syntax'
-python - <<'PY'
+PYTHON_BIN="python"
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+fi
+"$PYTHON_BIN" - <<'PY'
 import tomllib
 for p in [
     'config/config.example.toml',
