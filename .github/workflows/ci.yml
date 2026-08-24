@@ -2,55 +2,96 @@ name: ci
 
 on:
   pull_request:
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  release-bump:
-    if: github.event.pull_request.head.ref == 'feat/v0.2.7-control-plane-unification' && github.event.pull_request.head.repo.full_name == github.repository
+  rust:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout release branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: feat/v0.2.7-control-plane-unification
-          fetch-depth: 0
-      - name: Apply v0.2.7 release gate
+          persist-credentials: false
+      - name: Rust 1.98.0
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
+          components: clippy,rustfmt
+      - name: Install validation tools
+        run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
+      - name: Shellcheck POSIX scripts
+        run: shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
+      - name: Shellcheck Bash scripts
+        run: shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+      - name: Cargo check
+        run: cargo check --locked --all-targets --all-features
+      - name: Cargo test
+        run: cargo test --locked --all-targets --all-features
+      - name: Strict clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Release build
+        run: cargo build --locked --release --all-features
+      - name: WebUI JavaScript syntax
+        run: |
+          node --check module/webroot/assets/app.js
+          node --check module/webroot/assets/ksu-bridge.js
+      - name: Static acceptance
+        run: ./scripts/acceptance.sh --static-only
+
+  android-arm64:
+    needs: rust
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Rust 1.98.0 Android target
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-linux-android
+      - name: Install pinned cargo-ndk
+        run: cargo install cargo-ndk --locked --version 4.1.2
+      - name: Android arm64 release build
+        run: cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao
+      - name: Resolve artifact name
+        id: module
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          def r(path): return Path(path).read_text()
-          def w(path, text): Path(path).parent.mkdir(parents=True, exist_ok=True); Path(path).write_text(text)
-          t=r('Cargo.toml'); assert 'version = "0.2.6"' in t; w('Cargo.toml',t.replace('version = "0.2.6"','version = "0.2.7"',1))
-          t=r('Cargo.lock'); a='name = "xiao-gateway"\nversion = "0.2.6"'; assert a in t; w('Cargo.lock',t.replace(a,'name = "xiao-gateway"\nversion = "0.2.7"',1))
-          t=r('README.md'); assert '# xiao v0.2.6' in t; w('README.md',t.replace('v0.2.6','v0.2.7'))
-          t=r('docs/ARCHITECTURE.md'); assert '# Xiao v0.2.6 Architecture' in t; t=t.replace('v0.2.6','v0.2.7')
-          intro='\n## v0.2.7 control-plane unification\n\nTelegram, CLI, and KernelSU WebUI are adapters over the same `xiaod` application services. One stable `owner_user_id` is the authorization identity; chat allowlists restrict location only. CLI sessions remain independent unless explicitly targeted; provider/session, memory, skills, approvals, attachments, Custom capability probing/editing, scanned-PDF processing, and Doctor diagnostics share the same control-plane semantics. Secrets remain write-only/masked.\n'
-          if '## v0.2.7 control-plane unification' not in t: t=t.replace('# Xiao v0.2.7 Architecture\n','# Xiao v0.2.7 Architecture\n'+intro,1)
-          w('docs/ARCHITECTURE.md',t)
-          t=r('docs/ACCEPTANCE.md'); assert '# Xiao v0.2.6 Reliability' in t
-          t=t.replace('# Xiao v0.2.6 Reliability, Multimodal, and Management Acceptance Coverage','# Xiao v0.2.7 Control-Plane Unification, Reliability, Multimodal, and Management Acceptance Coverage',1)
-          t=t.replace('This maps the final v0.2.6 acceptance criteria to implementation and','This maps retained v0.2.6 regressions plus final v0.2.7 acceptance criteria to implementation and',1)
-          t=t.replace('`v020_migration_is_fresh_and_idempotent_with_consistent_fts` expects version\n  16','`v020_migration_is_fresh_and_idempotent_with_consistent_fts` expects version\n  17',1)
-          add='\n\n## v0.2.7 acceptance addendum\n\nRelease acceptance additionally covers canonical single-owner migration/enforcement; shared Telegram setup; explicit structured CLI with stable JSON/error/exit semantics and exact CLI sessions; CLI file/image chat; WebUI Telegram setup and exact-session AI configuration; tri-state Custom tools/structured/continuation/vision/file capabilities; scanned-PDF OCR/vision fallback after embedded extraction; attachment quota/retention/orphan/active-run protection; full Custom profile editing with credential safety; bounded live-or-CACHED Doctor probes; and Telegram/CLI/WebUI parity for provider, memory, skill, approval, diagnostics, and session AI operations. Deterministic host tests and Android arm64 cross-build/package verification are authoritative where supported; physical rooted-device/live-provider success is not inferred.\n'
-          if '## v0.2.7 acceptance addendum' not in t: t=t.rstrip()+add
-          w('docs/ACCEPTANCE.md',t)
-          validation='\n'.join(['# Xiao v0.2.7 Validation Record','','GitHub Actions is the authoritative Rust/Android validation environment for this release candidate.','','## Pre-release gate','','Candidate head `d6f8edd7f56efc472fca8fac7d493a4026e26ddd` passed run #134 (`32686544237`) on Rust 1.98.0: rustfmt, locked all-target/all-feature check and tests, strict clippy `-D warnings`, release build, ShellCheck, WebUI JavaScript syntax, static acceptance, Android arm64 cross-build, deterministic KernelSU ZIP/checksum verification, and artifact upload all PASS. The pre-version artifact was `xiao-v0.2.6-kernelsu-arm64` (artifact `9506162200`) and is evidence only, not the v0.2.7 release artifact.','','## Workflow / governance audit','','The final CI workflow uses `pull_request` plus `workflow_dispatch`, `contents: read`, `persist-credentials: false`, and full-SHA pinned reusable actions. It has no `pull_request_target`, secret consumption, self-push, or workflow mutation path. Source governance includes CODEOWNERS and SECURITY policy. Live repository metadata reports `main` unprotected with no required checks; the available connector exposes no branch-protection/ruleset mutation, so that external posture is recorded rather than falsely claimed fixed.','','## Environment limitation','','No rooted Android device, live Telegram account, or live provider credentials are available here. Physical-device/live-network acceptance is therefore unclaimed; deterministic fakes/regressions plus Android arm64 cross-build and deterministic packaging are used where supported.','','The exact 0.2.7 release head must pass the same full CI matrix before the PR is marked ready for review.',''])
-          w('docs/V027_VALIDATION.md',validation)
-          t=r('docs/REVISION_VALIDATION.md'); note='> Current Xiao v0.2.7 release-gate evidence: `docs/V027_VALIDATION.md`.\n'
-          if note not in t:
-              lines=t.splitlines(True); lines.insert(1,'\n'+note); w('docs/REVISION_VALIDATION.md',''.join(lines))
-          w('.github/CODEOWNERS','* @As-tsaqib\n/.github/workflows/ @As-tsaqib\n')
-          w('SECURITY.md','# Security Policy\n\nReport Xiao vulnerabilities privately to the repository owner and never include live secrets. Xiao security invariants include one canonical owner, write-only/masked credentials, no unrestricted model root shell, typed exact-approval privileged operations, provider credential isolation, and read-only full-SHA-pinned pull-request CI.\n')
-          assert 'version = "0.2.7"' in r('Cargo.toml')
-          assert 'name = "xiao-gateway"\nversion = "0.2.7"' in r('Cargo.lock')
-          PY
-          git diff --check
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.toml Cargo.lock README.md docs/ARCHITECTURE.md docs/ACCEPTANCE.md docs/V027_VALIDATION.md docs/REVISION_VALIDATION.md .github/CODEOWNERS SECURITY.md
-          git commit -m 'release: bump Xiao to 0.2.7'
-          git push origin HEAD:feat/v0.2.7-control-plane-unification
+          version=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=xiao-v${version}-kernelsu-arm64.zip" >> "$GITHUB_OUTPUT"
+      - name: Build and verify deterministic module ZIP
+        env:
+          MODULE_ARCHIVE: ${{ steps.module.outputs.archive }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./packaging/build-module.sh
+          first_hash=$(sha256sum "dist/$MODULE_ARCHIVE" | awk '{print $1}')
+          ./packaging/build-module.sh
+          second_hash=$(sha256sum "dist/$MODULE_ARCHIVE" | awk '{print $1}')
+          test "$first_hash" = "$second_hash"
+          (cd dist && sha256sum -c "$MODULE_ARCHIVE.sha256")
+          unzip -t "dist/$MODULE_ARCHIVE"
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+      - name: Upload module artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: xiao-v${{ steps.module.outputs.version }}-kernelsu-arm64
+          if-no-files-found: error
+          path: |
+            dist/${{ steps.module.outputs.archive }}
+            dist/${{ steps.module.outputs.archive }}.sha256
