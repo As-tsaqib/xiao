@@ -180,6 +180,29 @@ xiao-v0.2.7-kernelsu-arm64.zip
 xiao-v0.2.7-kernelsu-arm64.zip.sha256
 ```
 
+Authoritative green run for head `b9240c9`: **32701638246** (PR #1, run #153)
+— `rust` PASS, `android-arm64` PASS, Rust 1.98.0, `cargo test` 242 passed / 0 failed,
+deterministic `xiao-v0.2.7-kernelsu-arm64.zip` (11 415 927 B) with byte-identical
+dual build and `sha256sum -c` + `unzip -t` verification. Full gate table and
+P0/P1/P2 status: `docs/V027_VALIDATION.md`.
+
+Exact gates (as executed in CI):
+
+```sh
+cargo fmt --all -- --check                          # PASS
+cargo check --locked --all-targets --all-features   # PASS
+cargo test --locked --all-targets --all-features    # PASS 242/0
+cargo clippy --locked --all-targets --all-features -- -D warnings  # PASS
+cargo build --locked --release --all-features       # PASS
+shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh  # PASS
+shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh                        # PASS
+node --check module/webroot/assets/app.js           # PASS
+node --check module/webroot/assets/ksu-bridge.js    # PASS
+./scripts/acceptance.sh --static-only               # PASS
+cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao  # PASS
+./packaging/build-module.sh ×2; sha256sum -c; unzip -t              # PASS
+```
+
 Run the workflow from a push/pull request or `workflow_dispatch`, then download
 the `xiao-v0.2.7-kernelsu-arm64` artifact. Do not use an older local `dist/`
 archive after changing source. A local source-only check is available and never
@@ -188,6 +211,10 @@ invokes Cargo:
 ```sh
 ./scripts/acceptance.sh --static-only
 ```
+
+CLI contracts are frozen via `tests/snapshots/cli_help_body.txt` (validated in
+`tests/cli_integration.rs`); see `docs/V027_VALIDATION.md` for the snapshot
+guarantees.
 
 ## KernelSU status
 

@@ -12,8 +12,27 @@ use serde::{Deserialize, Serialize};
 use crate::{identity::IdentityWorkspace, runtime::CapabilityRegistry};
 
 const PROBED_BINARIES: &[&str] = &[
-    "bash", "cargo", "curl", "ffmpeg", "ffprobe", "file", "git", "jq", "node", "npm", "pkg",
-    "python", "python3", "rg", "sh", "su", "tar", "unzip", "zip",
+    "bash",
+    "cargo",
+    "curl",
+    "ffmpeg",
+    "ffprobe",
+    "file",
+    "git",
+    "jq",
+    "node",
+    "npm",
+    "pdftoppm",
+    "pkg",
+    "python",
+    "python3",
+    "rg",
+    "sh",
+    "su",
+    "tar",
+    "tesseract",
+    "unzip",
+    "zip",
 ];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

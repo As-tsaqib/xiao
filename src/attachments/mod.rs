@@ -3,10 +3,7 @@ use std::{
     fs,
     io::{Cursor, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::Arc,
-    thread,
-    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -20,6 +17,10 @@ use zip::ZipArchive;
 
 use crate::{
     config::AttachmentConfig,
+    runtime::{
+        CapabilityRegistry, CapabilityStatus, DependencyResolver, ExecutionPurpose, TermuxCommand,
+        TermuxExecutor, TermuxPackageBackend,
+    },
     security::redact::redact_text,
     storage::{AttachmentChunkRecord, AttachmentRecord, NewAttachmentRecord, Storage},
 };
@@ -101,78 +102,245 @@ impl ScannedPdfProcessor for LocalScannedPdfProcessor {
         scratch_root: &Path,
         config: &AttachmentConfig,
     ) -> Result<Option<Vec<ScannedPdfPage>>> {
-        if !command_available("pdftoppm") || !command_available("tesseract") {
+        // Handle blocking work off async: heavy PDF decode/render/OCR must not block the
+        // async runtime. Wrap the entire operation in spawn_blocking when a tokio runtime
+        // is present, otherwise run inline. Fallback to vision provider when bounded OCR
+        // is unavailable.
+        let pdf_owned = pdf.to_vec();
+        let scratch = scratch_root.to_path_buf();
+        let cfg = config.clone();
+        let run = move || -> Result<Option<Vec<ScannedPdfPage>>> {
+            extract_via_termux(&pdf_owned, &scratch, &cfg)
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    tokio::task::spawn_blocking(run)
+                        .await
+                        .context("spawn_blocking join for OCR")?
+                })
+            })
+        } else {
+            run()
+        }
+    }
+}
+
+/// Production OCR path: CapabilityResolver -> TermuxExecutor structured argv
+/// -> safe dependency install/reprobe -> bounded render+OCR. Never uses raw
+/// root shell; vision provider fallback is returned as Ok(None).
+fn extract_via_termux(
+    pdf: &[u8],
+    scratch_root: &Path,
+    config: &AttachmentConfig,
+) -> Result<Option<Vec<ScannedPdfPage>>> {
+    use crate::runtime::{EnvironmentProbe, TermuxRepositoryBackend};
+    use tokio_util::sync::CancellationToken;
+
+    // Probe runtime and build CapabilityResolver
+    let probe = EnvironmentProbe::real();
+    // Use scratch_root parent as data_root hint for probe; termux detection relies on env
+    let env = probe.probe(scratch_root);
+    let Some(termux_env) = env.termux.clone() else {
+        // No Termux: bounded OCR unavailable -> fallback to vision provider
+        return Ok(None);
+    };
+    let capabilities = Arc::new(CapabilityRegistry::from_environment(&env));
+    // CapabilityResolver checks for binary.pdftoppm and binary.tesseract
+    for binary in ["pdftoppm", "tesseract"] {
+        let resolution = capabilities.resolve(&format!("binary.{binary}"));
+        match resolution.status {
+            CapabilityStatus::Available => {}
+            CapabilityStatus::MissingInstallable | CapabilityStatus::Unknown => {
+                // Will be handled via safe dependency install below
+            }
+            _ => {
+                // Forbidden/Unsupported etc -> fallback to vision provider, never raw root shell
+                return Ok(None);
+            }
+        }
+    }
+    let workspace_root = scratch_root.to_path_buf();
+    let executor = Arc::new(TermuxExecutor::new(
+        termux_env.clone(),
+        workspace_root.clone(),
+    ));
+    let backend = Arc::new(TermuxPackageBackend::new(
+        executor.clone() as Arc<dyn crate::runtime::ProcessExecutor>,
+        termux_env.clone(),
+        workspace_root.clone(),
+    ));
+    let repository = Arc::new(TermuxRepositoryBackend::new(
+        executor.clone() as Arc<dyn crate::runtime::ProcessExecutor>,
+        &termux_env,
+        workspace_root.clone(),
+    ));
+    let resolver = DependencyResolver::with_trusted_repository(
+        capabilities.clone(),
+        backend.clone() as Arc<dyn crate::runtime::PackageBackend>,
+        None,
+        repository.clone() as Arc<dyn crate::runtime::TrustedPackageRepository>,
+    );
+    // Execute with timeout/cancel/output bounds via TermuxExecutor structured argv
+    let rt_handle = tokio::runtime::Handle::try_current().ok();
+    let ensure = |binary: &str| -> Result<()> {
+        let resolver = resolver.clone();
+        let binary = binary.to_owned();
+        let fut = resolver.ensure_binary(&binary, None, CancellationToken::new(), None);
+        if let Some(handle) = &rt_handle {
+            handle.block_on(fut).map(|_| ())
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(fut)
+                .map(|_| ())
+        }
+    };
+    // Safe dependency install/reprobe for required binaries
+    for binary in ["pdftoppm", "tesseract"] {
+        if let Err(_) = ensure(binary) {
+            // Install failed or still missing -> vision fallback, not error
             return Ok(None);
         }
-        let work = scratch_root.join(format!("ocr-{}", Uuid::new_v4().simple()));
-        create_private_dir(&work)?;
-        let result = (|| -> Result<Vec<ScannedPdfPage>> {
-            let pdf_path = work.join("source.pdf");
-            atomic_private_write(&pdf_path, pdf)?;
-            let prefix = work.join("page");
-            let mut render = Command::new("pdftoppm");
-            render
-                .arg("-png")
-                .arg("-r")
-                .arg("150")
-                .arg("-f")
-                .arg("1")
-                .arg("-l")
-                .arg((config.max_pdf_pages + 1).to_string())
-                .arg(&pdf_path)
-                .arg(&prefix);
-            run_command_bounded(
-                &mut render,
-                Duration::from_secs(config.processing_timeout_seconds),
-                "PDF renderer",
-            )?;
+    }
+    // Reprobe capability registry after install
+    let refreshed_env = probe.probe(scratch_root);
+    let refreshed_caps = CapabilityRegistry::from_environment(&refreshed_env);
+    for binary in ["pdftoppm", "tesseract"] {
+        if refreshed_caps.resolve(&format!("binary.{binary}")).status != CapabilityStatus::Available
+        {
+            return Ok(None);
+        }
+    }
 
-            let mut pages = fs::read_dir(&work)?
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("page-") && name.ends_with(".png"))
-                })
-                .collect::<Vec<_>>();
-            pages.sort();
-            if pages.is_empty() {
-                return Err(anyhow!("PDF renderer produced no pages"));
+    let work = scratch_root.join(format!("ocr-{}", Uuid::new_v4().simple()));
+    create_private_dir(&work)?;
+    let result: Result<Vec<ScannedPdfPage>> = (|| {
+        let pdf_path = work.join("source.pdf");
+        atomic_private_write(&pdf_path, pdf)?;
+        let prefix = work.join("page");
+        let cancellation = CancellationToken::new();
+        let run_cmd = |program: &str,
+                       args: Vec<String>,
+                       timeout_ms: u64,
+                       max_out: usize|
+         -> Result<crate::runtime::CommandOutcome> {
+            let cmd = TermuxCommand {
+                program: program.to_owned(),
+                args,
+                cwd: work.clone(),
+                environment: Default::default(),
+                timeout_ms,
+                max_output_chars: max_out,
+                purpose: ExecutionPurpose::Verification,
+            };
+            if let Some(handle) = &rt_handle {
+                handle.block_on(executor.execute(cmd, cancellation.clone()))
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(executor.execute(cmd, cancellation.clone()))
             }
-            if pages.len() > config.max_pdf_pages {
-                return Err(anyhow!("PDF exceeds the configured page limit"));
+        };
+        // Structured argv for pdftoppm, never raw shell string, via TermuxExecutor
+        let outcome = run_cmd(
+            "pdftoppm",
+            vec![
+                "-png".into(),
+                "-r".into(),
+                "150".into(),
+                "-f".into(),
+                "1".into(),
+                "-l".into(),
+                (config.max_pdf_pages + 1).to_string(),
+                pdf_path.display().to_string(),
+                prefix.display().to_string(),
+            ],
+            config.processing_timeout_seconds * 1000,
+            16_384,
+        )?;
+        if !outcome.succeeded() {
+            if outcome.timed_out || outcome.cancelled {
+                return Err(anyhow!("PDF renderer timed out or cancelled"));
             }
-            let mut output = Vec::with_capacity(pages.len());
-            let mut total_chars = 0usize;
-            for (index, page) in pages.iter().enumerate() {
-                let bytes = fs::read(page)?;
-                validate_image(&bytes, config.max_pdf_page_pixels)
-                    .with_context(|| format!("validate rendered PDF page {}", index + 1))?;
-                let outbase = work.join(format!("ocr-{}", index + 1));
-                let mut ocr = Command::new("tesseract");
-                ocr.arg(page).arg(&outbase).arg("txt");
-                run_command_bounded(
-                    &mut ocr,
-                    Duration::from_secs(config.ocr_page_timeout_seconds),
-                    "PDF OCR",
-                )?;
-                let text_path = outbase.with_extension("txt");
-                let text = fs::read_to_string(&text_path)
-                    .with_context(|| format!("read OCR page {}", index + 1))?;
-                total_chars = total_chars.saturating_add(text.chars().count());
-                if total_chars > config.max_extracted_text_chars {
-                    return Err(anyhow!("OCR text exceeds configured extraction limit"));
+            return Err(anyhow!(
+                "PDF renderer failed: {}",
+                outcome.observable_summary()
+            ));
+        }
+        let mut pages = fs::read_dir(&work)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("page-") && name.ends_with(".png"))
+            })
+            .collect::<Vec<_>>();
+        pages.sort();
+        if pages.is_empty() {
+            return Err(anyhow!("PDF renderer produced no pages"));
+        }
+        if pages.len() > config.max_pdf_pages {
+            return Err(anyhow!("PDF exceeds the configured page limit"));
+        }
+        let mut output = Vec::with_capacity(pages.len());
+        let mut total_chars = 0usize;
+        for (index, page) in pages.iter().enumerate() {
+            let bytes = fs::read(page)?;
+            // Validate rendered page bounds inside spawn_blocking style (already off async)
+            validate_image(&bytes, config.max_pdf_page_pixels)
+                .with_context(|| format!("validate rendered PDF page {}", index + 1))?;
+            let outbase = work.join(format!("ocr-{}", index + 1));
+            let ocr_outcome = run_cmd(
+                "tesseract",
+                vec![
+                    page.display().to_string(),
+                    outbase.display().to_string(),
+                    "txt".into(),
+                ],
+                config.ocr_page_timeout_seconds * 1000,
+                config.max_extracted_text_chars.min(65_536),
+            )?;
+            if !ocr_outcome.succeeded() {
+                if ocr_outcome.timed_out || ocr_outcome.cancelled {
+                    return Err(anyhow!(
+                        "PDF OCR timed out or cancelled on page {}",
+                        index + 1
+                    ));
                 }
-                output.push(ScannedPdfPage {
-                    page_no: index + 1,
-                    text: normalize_text(&text),
-                });
+                return Err(anyhow!(
+                    "PDF OCR failed: {}",
+                    ocr_outcome.observable_summary()
+                ));
             }
-            Ok(output)
-        })();
-        let _ = fs::remove_dir_all(&work);
-        result.map(Some)
+            let text_path = outbase.with_extension("txt");
+            let text = fs::read_to_string(&text_path)
+                .with_context(|| format!("read OCR page {}", index + 1))?;
+            total_chars = total_chars.saturating_add(text.chars().count());
+            if total_chars > config.max_extracted_text_chars {
+                return Err(anyhow!("OCR text exceeds configured extraction limit"));
+            }
+            output.push(ScannedPdfPage {
+                page_no: index + 1,
+                text: normalize_text(&text),
+            });
+        }
+        Ok(output)
+    })();
+    let _ = fs::remove_dir_all(&work);
+    match result {
+        Ok(pages) => Ok(Some(pages)),
+        Err(e) => {
+            // If Termux execution is unavailable in this host, fallback to vision provider
+            let msg = e.to_string();
+            if msg.contains("not installed") || msg.contains("not detected") {
+                return Ok(None);
+            }
+            Err(e)
+        }
     }
 }
 

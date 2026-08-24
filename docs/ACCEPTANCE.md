@@ -194,6 +194,23 @@ node --check module/webroot/assets/ksu-bridge.js
 git diff --check
 ```
 
+Observed results on the authoritative green run `32701638246` (head `b9240c9`):
+
+| Gate | Exact command | Result |
+|------|---------------|--------|
+| fmt | `cargo fmt --all -- --check` | PASS |
+| check | `cargo check --locked --all-targets --all-features` | PASS |
+| test | `cargo test --locked --all-targets --all-features` | PASS — 242 passed (226 + 8 + 5 + 3), 0 failed |
+| clippy | `cargo clippy --locked --all-targets --all-features -- -D warnings` | PASS |
+| release build | `cargo build --locked --release --all-features` | PASS |
+| acceptance | `./scripts/acceptance.sh --static-only` | PASS |
+| WebUI app.js | `node --check module/webroot/assets/app.js` | PASS |
+| WebUI ksu-bridge.js | `node --check module/webroot/assets/ksu-bridge.js` | PASS |
+| android arm64 cross-build | `cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao` | PASS (6m 13s) |
+| deterministic ZIP | `packaging/build-module.sh` ×2 + `sha256sum -c` + `unzip -t` (exactly 2 files) | PASS — `xiao-v0.2.7-kernelsu-arm64.zip` (11 415 927 B) byte-identical |
+
+Full evidence and P0/P1/P2 breakdown: `docs/V027_VALIDATION.md`.
+
 The final implementation report must state actual outcomes rather than treating
 this checklist as evidence that a command ran.
 
