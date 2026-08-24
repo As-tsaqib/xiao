@@ -20,17 +20,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f .bootstrap/v2-marker
           cat \
             .bootstrap/v2-00 \
             .bootstrap/v2-01a \
-            .bootstrap/v2-01b \
+            .bootstrap/v3-01b0 \
+            .bootstrap/v3-01b1 \
             .bootstrap/v2-01c \
             .bootstrap/v2-02 \
             .bootstrap/v2-03 \
             .bootstrap/v2-04 \
             .bootstrap/v2-05 \
-            .bootstrap/v2-06 \
+            .bootstrap/v3-060 \
+            .bootstrap/v3-061 \
+            .bootstrap/v3-062 \
+            .bootstrap/v3-063 \
+            .bootstrap/v3-064 \
+            .bootstrap/v3-065 \
             .bootstrap/v2-07 \
             .bootstrap/v2-08 > /tmp/v027.payload.b64
           echo 'b4029528f5c31db3d06760d35c17db3c2f303320d2604f3a87d9bc7934af328d  /tmp/v027.payload.b64' | sha256sum -c -
