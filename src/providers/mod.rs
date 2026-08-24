@@ -1778,6 +1778,7 @@ pub(crate) async fn probe_custom_capabilities(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn probe_custom_tool_capability(
     base: &str,
     headers: &std::collections::BTreeMap<String, String>,
