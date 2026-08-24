@@ -25,8 +25,8 @@ jobs:
             exit 0
           fi
           test -f .bootstrap/SHA256
-          mapfile -t parts < <(find .bootstrap -maxdepth 1 -type f -name '*.xz.b64.*' -print | sort)
-          (( ${#parts[@]} > 0 ))
+          mapfile -t parts < <(find .bootstrap -maxdepth 1 -type f -name 'current-v027.patch.xz.b64.*' -print | sort)
+          (( ${#parts[@]} == 4 ))
           cat "${parts[@]}" | tr -d '\n\r' | base64 --decode | xz --decompress > /tmp/v027.patch
           sha256sum --check .bootstrap/SHA256
           git apply --check /tmp/v027.patch
