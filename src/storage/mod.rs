@@ -4131,6 +4131,14 @@ fn rekey_owner_transaction(
         "DELETE FROM access_principals WHERE principal=?",
         params![legacy],
     )?;
+    // `legacy_owner_principals.owner_id` references `owners.owner_id`. Move
+    // that historical mapping before deleting the old owner row; otherwise
+    // a real v0.2.7 database that already recorded the v0.2.6 mapping fails
+    // the installation-owner migration with SQLITE_CONSTRAINT_FOREIGNKEY.
+    transaction.execute(
+        "UPDATE legacy_owner_principals SET owner_id=? WHERE owner_id=?",
+        params![stable, legacy],
+    )?;
     transaction.execute(
         "INSERT OR REPLACE INTO legacy_owner_principals(legacy_principal,owner_id,migrated_at) VALUES(?,?,?)",
         params![legacy, stable, Utc::now().to_rfc3339()],
@@ -4781,6 +4789,44 @@ mod tests {
                 let count: i64 =
                     connection.query_row("SELECT COUNT(*) FROM owners", [], |row| row.get(0))?;
                 assert_eq!(count, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn owner_rekey_moves_legacy_foreign_key_mapping_before_deleting_old_owner() {
+        let storage = Storage::open_memory().unwrap();
+        let stable = storage.management_owner_id().unwrap();
+        let legacy = "owner:telegram:5385399301";
+        storage
+            .with_conn(|connection| {
+                let now = Utc::now().to_rfc3339();
+                connection.execute(
+                    "INSERT INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,?,?,?)",
+                    params![legacy, 5385399301i64, now, now],
+                )?;
+                connection.execute(
+                    "INSERT INTO legacy_owner_principals(legacy_principal,owner_id,migrated_at) VALUES(?,?,?)",
+                    params!["owner:local", legacy, now],
+                )?;
+                let transaction = connection.unchecked_transaction()?;
+                rekey_owner_transaction(&transaction, legacy, &stable)?;
+                transaction.commit()?;
+                let mapped: String = connection.query_row(
+                    "SELECT owner_id FROM legacy_owner_principals WHERE legacy_principal='owner:local'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(mapped, stable);
+                let old_owner: Option<String> = connection
+                    .query_row(
+                        "SELECT owner_id FROM owners WHERE owner_id=?",
+                        params![legacy],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                assert!(old_owner.is_none());
                 Ok(())
             })
             .unwrap();
