@@ -81,8 +81,8 @@ impl AppConfig {
         if self.telegram.transport != "long_polling" {
             return Err(anyhow!("telegram.transport must be long_polling"));
         }
-        if self.telegram.access.owner_user_id == Some(0) {
-            return Err(anyhow!("telegram.access.owner_user_id must be non-zero"));
+        if self.telegram.access.owner_user_id.is_some_and(|id| id <= 0) {
+            return Err(anyhow!("telegram.access.owner_user_id must be positive"));
         }
         if self.telegram.access.allowed_chat_ids.contains(&0) {
             return Err(anyhow!(

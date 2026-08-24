@@ -652,7 +652,11 @@ async fn telegram_command(
                 return Err(CliFailure::usage("unknown set-owner option"));
             }
             let current = client.get_admin("/v1/admin/telegram").await?;
-            let old = current.get("owner_user_id").and_then(Value::as_i64);
+            let old = current
+                .pointer("/telegram/owner_user_id")
+                .or_else(|| current.get("owner_user_id"))
+                .or_else(|| current.pointer("/telegram/ownerUserId"))
+                .and_then(Value::as_i64);
             let confirmed = if old.is_some_and(|value| value != owner) && !confirm {
                 confirm_owner_change(old.unwrap_or_default(), owner)?
             } else {

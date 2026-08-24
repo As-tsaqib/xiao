@@ -526,6 +526,18 @@ async fn admin_apply(
     if !authorized_admin(&headers, &state) {
         return Err(deny());
     }
+    // P0-5 / P2-2: telegram owner/token mutation is authoritative via
+    // TelegramSetupService (/v1/admin/telegram). Legacy admin fields are
+    // thin delegates that direct callers to the canonical endpoint.
+    if req.telegram_enabled.is_some()
+        || req.owner_user_id.is_some()
+        || req.telegram_bot_token.is_some()
+        || req.allowed_chat_ids.is_some()
+    {
+        return Err(bad(
+            "telegram owner/token must be mutated via POST /v1/admin/telegram (TelegramSetupService); legacy /v1/admin/apply no longer mutates telegram identity",
+        ));
+    }
     let old = state.app.config.read().await.clone();
     let mut next = old.clone();
     if let Some(v) = req.gateway_enabled {
@@ -534,12 +546,7 @@ async fn admin_apply(
     if let Some(v) = req.gateway_auto_restart {
         next.gateway.auto_restart = v;
     }
-    if let Some(v) = req.telegram_enabled {
-        next.telegram.enabled = v;
-    }
-    if let Some(v) = req.allowed_chat_ids.as_deref() {
-        next.telegram.access.allowed_chat_ids = parse_id_list(v).map_err(bad)?;
-    }
+    // telegram fields are handled exclusively via TelegramSetupService; see reject above.
     if req
         .allowed_user_ids
         .as_deref()
@@ -549,21 +556,10 @@ async fn admin_apply(
             "allowed_user_ids is legacy-only; set one owner_user_id explicitly",
         ));
     }
-    if let Some(owner_user_id) = req.owner_user_id {
-        if owner_user_id == 0 {
-            return Err(bad("owner_user_id must be non-zero"));
-        }
-        if old
-            .telegram
-            .access
-            .owner_user_id
-            .is_some_and(|old_id| old_id != owner_user_id)
-            && !req.confirm_owner_change
-        {
-            return Err(bad("changing owner_user_id requires explicit confirmation"));
-        }
-        next.telegram.access.owner_user_id = Some(owner_user_id);
-        next.telegram.access.allowed_user_ids.clear();
+    if req.owner_user_id.is_some() {
+        return Err(bad(
+            "owner_user_id via /v1/admin/apply is deprecated; use POST /v1/admin/telegram",
+        ));
     }
     if let Some(v) = req.log_level {
         next.daemon.log_level = v;

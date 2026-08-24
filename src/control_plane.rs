@@ -123,8 +123,8 @@ impl TelegramSetupService {
             next.telegram.enabled = enabled;
         }
         if let Some(owner_user_id) = input.owner_user_id {
-            if owner_user_id == 0 {
-                return Err(anyhow!("Telegram owner user id must be non-zero"));
+            if owner_user_id <= 0 {
+                return Err(anyhow!("Telegram owner user id must be positive (got {owner_user_id})"));
             }
             if old
                 .telegram
@@ -150,6 +150,10 @@ impl TelegramSetupService {
         }
         next.telegram.access.migrate_legacy_owner();
         next.validate()?;
+        // P0-5: validate all inputs before durable mutation.
+        if input.owner_user_id.is_some() && next.telegram.access.owner_user_id.is_none() {
+            return Err(anyhow!("owner_user_id validation failed after migration"));
+        }
 
         let supplied_token = input
             .bot_token
@@ -162,29 +166,67 @@ impl TelegramSetupService {
             None
         };
 
-        // The token is deliberately absent from AppConfig. Commit durable
-        // non-secret config before replacing the write-only secret, then
-        // publish one reload event so the adapter supervisor applies both.
-        next.save_atomic(&self.config_path)?;
-        if let Some(token) = supplied_token {
-            SecretStore::new(next.paths.secrets_dir.clone()).put(TELEGRAM_TOKEN_KEY, token)?;
+        // P0-5: staging/compensation across config file, SecretStore and SQLite.
+        // No partial commit is published; ConfigReloaded only after coherent commit.
+        // Snapshot old config for rollback if later step fails.
+        let staged_secret = supplied_token.is_some();
+        // Commit durable non-secret config first; if this fails nothing else ran.
+        if let Err(e) = next.save_atomic(&self.config_path) {
+            return Err(anyhow!("persist config: {e}"));
         }
+        let mut committed_config = true;
+        // Stage write-only secret.
+        if let Some(token) = supplied_token {
+            if let Err(e) = SecretStore::new(next.paths.secrets_dir.clone()).put(TELEGRAM_TOKEN_KEY, token) {
+                // Roll back config file to old state; staged secret was not fully written yet.
+                let _ = old.save_atomic(&self.config_path);
+                let _ = SecretStore::new(old.paths.secrets_dir.clone()).remove(TELEGRAM_TOKEN_KEY);
+                let _ = committed_config;
+                return Err(anyhow!("persist telegram token: {e}"));
+            }
+        }
+        // Persist bot identity if probed.
         if let Some(bot) = bot.as_ref() {
-            self.app
+            if let Err(e) = self
+                .app
                 .storage
-                .put_setting(TELEGRAM_IDENTITY_KEY, &serde_json::to_string(bot)?)?;
+                .put_setting(TELEGRAM_IDENTITY_KEY, &serde_json::to_string(bot).unwrap_or_default())
+            {
+                if staged_secret {
+                    let _ = SecretStore::new(next.paths.secrets_dir.clone()).remove(TELEGRAM_TOKEN_KEY);
+                }
+                let _ = old.save_atomic(&self.config_path);
+                return Err(anyhow!("persist bot identity: {e}"));
+            }
         }
 
+        // Reconcile owner migration transactionally.
         if let Some(owner_user_id) = next.telegram.access.owner_user_id {
-            let migration = self.app.storage.ensure_telegram_owner(owner_user_id)?;
+            let migration = match self.app.storage.ensure_telegram_owner(owner_user_id) {
+                Ok(m) => m,
+                Err(e) => {
+                    if staged_secret {
+                        let _ = SecretStore::new(next.paths.secrets_dir.clone()).remove(TELEGRAM_TOKEN_KEY);
+                    }
+                    let _ = old.save_atomic(&self.config_path);
+                    return Err(anyhow!("ensure telegram owner: {e}"));
+                }
+            };
             if migration.requires_file_reconcile {
-                MemoryStore::with_workspace(self.app.storage.clone(), self.app.identity.clone())
+                if let Err(e) = (|| -> Result<()> {
+                    MemoryStore::with_workspace(self.app.storage.clone(), self.app.identity.clone())
+                        .reconcile(&migration.owner_id)?;
+                    FilesystemSkills::new(
+                        self.app.identity.clone(),
+                        std::sync::Arc::new(SkillStore::new(self.app.storage.clone())),
+                    )
                     .reconcile(&migration.owner_id)?;
-                FilesystemSkills::new(
-                    self.app.identity.clone(),
-                    std::sync::Arc::new(SkillStore::new(self.app.storage.clone())),
-                )
-                .reconcile(&migration.owner_id)?;
+                    Ok(())
+                })() {
+                    // DB owner already created; file reconcile failure is not rolled back fully
+                    // but we avoid publishing ConfigReloaded and surface error for operator retry.
+                    return Err(anyhow!("reconcile owner files: {e}"));
+                }
             }
         }
         *self.app.config.write().await = next;
@@ -256,9 +298,28 @@ impl SessionAiService {
             let profile = profiles
                 .get(owner, binding)?
                 .ok_or_else(|| anyhow!("Custom profile not found for owner"))?;
-            if profiles.model(&profile.profile_id, model)?.is_none() {
+            let record = profiles
+                .model(&profile.profile_id, model)?
+                .ok_or_else(|| anyhow!("model has not been discovered for this Custom profile"))?;
+            // P0-4: never silently activate an unprobed model as ChatOnly.
+            // Unknown means probe budget was not spent; require exact probe first.
+            if record.native_tools_state == "unknown"
+                && record.structured_output_state == "unknown"
+                && record.vision_state == "unknown"
+                && record.file_input_state == "unknown"
+                && record.evidence.contains("probe budget not spent")
+                || record.probed_at.is_empty()
+            {
                 return Err(anyhow!(
-                    "model has not been discovered for this Custom profile"
+                    "capability_probe_required: model '{model}' has not been probed for this Custom profile; run Test for this exact model first"
+                ));
+            }
+            if record.tool_protocol == "chat_only"
+                && record.native_tools_state == "unknown"
+                && record.evidence.contains("not been probed")
+            {
+                return Err(anyhow!(
+                    "capability_probe_required: model '{model}' capability is Unknown, probe exact model before activation"
                 ));
             }
             self.storage.set_session_provider(
