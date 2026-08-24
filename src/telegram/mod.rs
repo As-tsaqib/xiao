@@ -1289,8 +1289,7 @@ impl TelegramAdapter {
                                 if let Ok(mut state) = wizard.try_lock() {
                                     state.phase = login::CustomLoginPhase::Alias;
                                     let alias = state.alias.clone();
-                                    guard.pending_input =
-                                        Some(format!("custom:{wizard_id}:alias"));
+                                    guard.pending_input = Some(format!("custom:{wizard_id}:alias"));
                                     guard.current_view =
                                         login::alias_collision_view(wizard_id, &alias);
                                 } else {

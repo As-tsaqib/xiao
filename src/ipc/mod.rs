@@ -3031,8 +3031,12 @@ mod tests {
             json!({"allowed_chat_ids": "-100"}),
             json!({"allowed_user_ids": "1,2"}),
         ] {
-            let result =
-                admin_apply(State(state.clone()), headers.clone(), Json(serde_json::from_value(body).unwrap())).await;
+            let result = admin_apply(
+                State(state.clone()),
+                headers.clone(),
+                Json(serde_json::from_value(body).unwrap()),
+            )
+            .await;
             assert!(result.is_err(), "legacy field should be rejected");
             let (status, Json(value)) = result.unwrap_err();
             assert_eq!(status, StatusCode::BAD_REQUEST);

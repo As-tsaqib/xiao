@@ -1039,7 +1039,10 @@ mod tests {
             "blocks": []
         });
         let out = project_approvals(raw);
-        assert_eq!(out.get("items").and_then(|v| v.as_array()).unwrap().len(), 1);
+        assert_eq!(
+            out.get("items").and_then(|v| v.as_array()).unwrap().len(),
+            1
+        );
         assert!(no_view_no_secret(&out));
     }
 
@@ -1047,12 +1050,18 @@ mod tests {
     fn memory_and_skills_projections_paged() {
         let raw_mem = json!({"items": [{"id":"m1","scope":"user","category":"bio","key":"name","value":"Ada","confidence":1.0,"source_kind":"manual","created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-02T00:00:00Z","token":"S3CR3T_TOKEN_XYZ"}],"page":1,"pages":1,"page_size":10});
         let out = project_memory(raw_mem);
-        assert_eq!(out.get("items").and_then(|v| v.as_array()).unwrap().len(), 1);
+        assert_eq!(
+            out.get("items").and_then(|v| v.as_array()).unwrap().len(),
+            1
+        );
         assert!(no_view_no_secret(&out));
 
         let raw_skill = json!({"items": [{"id":"sk1","name":"my-skill","source_kind":"learned","enabled":true,"version":"1.0.0"}],"page":1,"pages":1,"page_size":10});
         let out2 = project_skills(raw_skill);
-        assert_eq!(out2.get("items").and_then(|v| v.as_array()).unwrap().len(), 1);
+        assert_eq!(
+            out2.get("items").and_then(|v| v.as_array()).unwrap().len(),
+            1
+        );
         assert!(no_view_no_secret(&out2));
     }
 
@@ -1065,7 +1074,10 @@ mod tests {
 
         let raw_runs = json!({"items": [{"id":"r1","session_id":"s1","provider":"codex","model":"gpt-5","status":"completed","goal":"do thing","started_at":"2025-01-01T00:00:00Z","verification":{"state":"verified_success","evidence":[]}}],"page":1,"pages":1,"page_size":10});
         let out2 = project_runs(raw_runs);
-        assert_eq!(out2.get("items").and_then(|v| v.as_array()).unwrap().len(), 1);
+        assert_eq!(
+            out2.get("items").and_then(|v| v.as_array()).unwrap().len(),
+            1
+        );
         assert!(no_view_no_secret(&out2));
     }
 
@@ -1095,8 +1107,14 @@ mod tests {
         // ensure api_key not emitted
         let s = serde_json::to_string(&acc).unwrap();
         assert!(!s.contains("APIKEY_SUPER_SECRET"));
-        assert_eq!(acc.get("items").and_then(|v| v.as_array()).unwrap().len(), 1);
-        assert_eq!(cust.get("items").and_then(|v| v.as_array()).unwrap().len(), 1);
+        assert_eq!(
+            acc.get("items").and_then(|v| v.as_array()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            cust.get("items").and_then(|v| v.as_array()).unwrap().len(),
+            1
+        );
         let h = human_model(&acc);
         assert!(h.contains("accounts"));
         let h2 = human_model(&cust);
@@ -1107,7 +1125,10 @@ mod tests {
     fn model_list_for_session_human() {
         let raw = json!({"session_id":"s1","provider":"codex","account_or_profile_id":"a1","current_model":"gpt-5","models":["gpt-5","gpt-4"]});
         let out = project_model_list_for_session(raw);
-        assert_eq!(out.get("current_model").and_then(|v| v.as_str()), Some("gpt-5"));
+        assert_eq!(
+            out.get("current_model").and_then(|v| v.as_str()),
+            Some("gpt-5")
+        );
         let h = human_model(&out);
         assert!(h.contains("* gpt-5"));
     }
@@ -1116,7 +1137,14 @@ mod tests {
     fn no_secret_snapshot_regression() {
         // ensure every projection strips injected secrets even if nested deeply
         let raw = json!({"items":[{"id":"x","token":"S3CR3T_TOKEN_XYZ","headers":{"X-Secret":"header_secret_value"}}]});
-        for f in [project_memory as fn(Value)->Value, project_skills, project_attachments, project_runs, project_tools, project_sessions] {
+        for f in [
+            project_memory as fn(Value) -> Value,
+            project_skills,
+            project_attachments,
+            project_runs,
+            project_tools,
+            project_sessions,
+        ] {
             let out = f(raw.clone());
             assert!(no_view_no_secret(&out), "leak in {:?}", f as *const ());
         }
