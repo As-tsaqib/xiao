@@ -2,37 +2,96 @@ name: ci
 
 on:
   pull_request:
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  materialize-cli-contract:
-    if: github.event.pull_request.head.ref == 'feat/v0.2.7-control-plane-unification' && github.event.pull_request.head.repo.full_name == github.repository
+  rust:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: feat/v0.2.7-control-plane-unification
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+          persist-credentials: false
+      - name: Rust 1.98.0
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.98.0
-          components: rustfmt
-      - name: Apply architecture CLI JSON contract
+          components: clippy,rustfmt
+      - name: Install validation tools
+        run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck
+      - name: Shellcheck POSIX scripts
+        run: shellcheck -x -s sh module/*.sh module/termux/xiao-wrapper scripts/device-custom-e2e.sh
+      - name: Shellcheck Bash scripts
+        run: shellcheck -s bash packaging/build-module.sh scripts/acceptance.sh
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+      - name: Cargo check
+        run: cargo check --locked --all-targets --all-features
+      - name: Cargo test
+        run: cargo test --locked --all-targets --all-features
+      - name: Strict clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Release build
+        run: cargo build --locked --release --all-features
+      - name: WebUI JavaScript syntax
+        run: |
+          node --check module/webroot/assets/app.js
+          node --check module/webroot/assets/ksu-bridge.js
+      - name: Static acceptance
+        run: ./scripts/acceptance.sh --static-only
+
+  android-arm64:
+    needs: rust
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Rust 1.98.0 Android target
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-linux-android
+      - name: Install pinned cargo-ndk
+        run: cargo install cargo-ndk --locked --version 4.1.2
+      - name: Android arm64 release build
+        run: cargo ndk -t arm64-v8a build --locked --release --bin xiaod --bin xiao
+      - name: Resolve artifact name
+        id: module
         shell: bash
         run: |
           set -euo pipefail
-          echo 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCnAgPSBQYXRoKCJzcmMvYmluX2NsaS5ycyIpCnQgPSBwLnJlYWRfdGV4dCgpCm9sZF9zdWNjZXNzID0gJyAgICBmbiBzdWNjZXNzKCZzZWxmLCBjb21tYW5kOiAmc3RyLCBkYXRhOiBWYWx1ZSkgLT4gQ2xpUmVzdWx0PCgpPiB7XG4gICAgICAgIGlmIHNlbGYub3B0aW9ucy5xdWlldCB7XG4gICAgICAgICAgICByZXR1cm4gT2soKCkpO1xuICAgICAgICB9XG4gICAgICAgIGlmIHNlbGYub3B0aW9ucy5qc29uIHtcbiAgICAgICAgICAgIGxldCB2YWx1ZSA9IGpzb24hKHtcbiAgICAgICAgICAgICAgICAib2siOiB0cnVlLFxuICAgICAgICAgICAgICAgICJjb21tYW5kIjogY29tbWFuZCxcbiAgICAgICAgICAgICAgICAiZGF0YSI6IGRhdGEsXG4gICAgICAgICAgICB9KTtcbiAgICAgICAgICAgIHByaW50bG4hKFxuICAgICAgICAgICAgICAgICJ7fSIsXG4gICAgICAgICAgICAgICAgc2VyZGVfanNvbjo6dG9fc3RyaW5nX3ByZXR0eSgmdmFsdWUpLm1hcF9lcnIoYW55aG93OjpFcnJvcjo6ZnJvbSk/XG4gICAgICAgICAgICApO1xuICAgICAgICAgICAgcmV0dXJuIE9rKCgpKTtcbiAgICAgICAgfVxuICAgICAgICByZW5kZXJfaHVtYW4oJmRhdGEpO1xuICAgICAgICBPaygoKSlcbiAgICB9XG4nCm5ld19zdWNjZXNzID0gJyAgICBmbiBzdWNjZXNzKCZzZWxmLCBfY29tbWFuZDogJnN0ciwgZGF0YTogVmFsdWUpIC0+IENsaVJlc3VsdDwoKT4ge1xuICAgICAgICBpZiBzZWxmLm9wdGlvbnMucXVpZXQge1xuICAgICAgICAgICAgcmV0dXJuIE9rKCgpKTtcbiAgICAgICAgfVxuICAgICAgICBpZiBzZWxmLm9wdGlvbnMuanNvbiB7XG4gICAgICAgICAgICBsZXQgdmFsdWUgPSBqc29uISh7XG4gICAgICAgICAgICAgICAgInN0YXR1cyI6ICJvayIsXG4gICAgICAgICAgICAgICAgImRhdGEiOiBkYXRhLFxuICAgICAgICAgICAgfSk7XG4gICAgICAgICAgICBwcmludGxuIShcbiAgICAgICAgICAgICAgICAie30iLFxuICAgICAgICAgICAgICAgIHNlcmRlX2pzb246OnRvX3N0cmluZ19wcmV0dHkoJnZhbHVlKS5tYXBfZXJyKGFueWhvdzo6RXJyb3I6OmZyb20pP1xuICAgICAgICAgICAgKTtcbiAgICAgICAgICAgIHJldHVybiBPaygoKSk7XG4gICAgICAgIH1cbiAgICAgICAgcmVuZGVyX2h1bWFuKCZkYXRhKTtcbiAgICAgICAgT2soKCkpXG4gICAgfVxuJwpvbGRfZXJyb3IgPSAnICAgICAgICBpZiBzZWxmLm9wdGlvbnMuanNvbiAmJiAhc2VsZi5vcHRpb25zLnF1aWV0IHtcbiAgICAgICAgICAgIGxldCBjb2RlID0gbWF0Y2ggZmFpbHVyZS5jb2RlIHtcbiAgICAgICAgICAgICAgICBFWElUX1VTQUdFID0+ICJ1c2FnZSIsXG4gICAgICAgICAgICAgICAgRVhJVF9EQUVNT05fVU5BVkFJTEFCTEUgPT4gImRhZW1vbl91bmF2YWlsYWJsZSIsXG4gICAgICAgICAgICAgICAgRVhJVF9SRUpFQ1RFRCA9PiAicmVqZWN0ZWQiLFxuICAgICAgICAgICAgICAgIEVYSVRfTk9UX0ZPVU5EID0+ICJub3RfZm91bmQiLFxuICAgICAgICAgICAgICAgIEVYSVRfTE9DQUxfSU8gPT4gImxvY2FsX2lvIixcbiAgICAgICAgICAgICAgICBfID0+ICJlcnJvciIsXG4gICAgICAgICAgICB9O1xuICAgICAgICAgICAgZXByaW50bG4hKFxuICAgICAgICAgICAgICAgICJ7fSIsXG4gICAgICAgICAgICAgICAgc2VyZGVfanNvbjo6dG9fc3RyaW5nKCZqc29uISh7XG4gICAgICAgICAgICAgICAgICAgICJvayI6IGZhbHNlLFxuICAgICAgICAgICAgICAgICAgICAiZXJyb3IiOiB7ImNvZGUiOiBjb2RlLCAibWVzc2FnZSI6IG1lc3NhZ2V9LFxuICAgICAgICAgICAgICAgIH0pKVxuICAgICAgICAgICAgICAgIC51bndyYXBfb3JfZWxzZSh8X3wgIntcXCJva1xcIjpmYWxzZX0iLmludG8oKSlcbiAgICAgICAgICAgICk7XG4nCm5ld19lcnJvciA9ICcgICAgICAgIGlmIHNlbGYub3B0aW9ucy5qc29uICYmICFzZWxmLm9wdGlvbnMucXVpZXQge1xuICAgICAgICAgICAgbGV0IGNvZGUgPSBpZiBmYWlsdXJlLmNvZGUgPT0gRVhJVF9VU0FHRVxuICAgICAgICAgICAgICAgICYmIGZhaWx1cmUubWVzc2FnZS5zdGFydHNfd2l0aCgidW5rbm93biBjb21tYW5kIGAiKVxuICAgICAgICAgICAge1xuICAgICAgICAgICAgICAgICJ1bmtub3duX2NvbW1hbmQiXG4gICAgICAgICAgICB9IGVsc2Uge1xuICAgICAgICAgICAgICAgIG1hdGNoIGZhaWx1cmUuY29kZSB7XG4gICAgICAgICAgICAgICAgICAgIEVYSVRfVVNBR0UgPT4gInVzYWdlIixcbiAgICAgICAgICAgICAgICAgICAgRVhJVF9EQUVNT05fVU5BVkFJTEFCTEUgPT4gImRhZW1vbl91bmF2YWlsYWJsZSIsXG4gICAgICAgICAgICAgICAgICAgIEVYSVRfUkVKRUNURUQgPT4gInJlamVjdGVkIixcbiAgICAgICAgICAgICAgICAgICAgRVhJVF9OT1RfRk9VTkQgPT4gIm5vdF9mb3VuZCIsXG4gICAgICAgICAgICAgICAgICAgIEVYSVRfTE9DQUxfSU8gPT4gImxvY2FsX2lvIixcbiAgICAgICAgICAgICAgICAgICAgXyA9PiAib3BlcmF0aW9uX2ZhaWxlZCIsXG4gICAgICAgICAgICAgICAgfVxuICAgICAgICAgICAgfTtcbiAgICAgICAgICAgIGVwcmludGxuIShcbiAgICAgICAgICAgICAgICAie30iLFxuICAgICAgICAgICAgICAgIHNlcmRlX2pzb246OnRvX3N0cmluZygmanNvbiEoe1xuICAgICAgICAgICAgICAgICAgICAic3RhdHVzIjogImVycm9yIixcbiAgICAgICAgICAgICAgICAgICAgImVycm9yIjoge1xuICAgICAgICAgICAgICAgICAgICAgICAgImNvZGUiOiBjb2RlLFxuICAgICAgICAgICAgICAgICAgICAgICAgIm1lc3NhZ2UiOiBtZXNzYWdlLFxuICAgICAgICAgICAgICAgICAgICAgICAgImRldGFpbHMiOiB7fSxcbiAgICAgICAgICAgICAgICAgICAgfSxcbiAgICAgICAgICAgICAgICB9KSlcbiAgICAgICAgICAgICAgICAudW53cmFwX29yX2Vsc2UofF98IHtcbiAgICAgICAgICAgICAgICAgICAgIntcXCJzdGF0dXNcXCI6XFwiZXJyb3JcXCIsXFwiZXJyb3JcXCI6e1xcImNvZGVcXCI6XFwic2VyaWFsaXphdGlvbl9lcnJvclxcIixcXCJtZXNzYWdlXFwiOlxcInVuYWJsZSB0byBzZXJpYWxpemUgQ0xJIGVycm9yXFwiLFxcImRldGFpbHNcXCI6e319fSIuaW50bygpXG4gICAgICAgICAgICAgICAgfSlcbiAgICAgICAgICAgICk7XG4nCmlmIG9sZF9zdWNjZXNzIG5vdCBpbiB0OgogICAgcmFpc2UgU3lzdGVtRXhpdCgic3VjY2VzcyBibG9jayBtaXNzaW5nIikKaWYgb2xkX2Vycm9yIG5vdCBpbiB0OgogICAgcmFpc2UgU3lzdGVtRXhpdCgiZXJyb3IgYmxvY2sgbWlzc2luZyIpCnQgPSB0LnJlcGxhY2Uob2xkX3N1Y2Nlc3MsIG5ld19zdWNjZXNzLCAxKQp0ID0gdC5yZXBsYWNlKG9sZF9lcnJvciwgbmV3X2Vycm9yLCAxKQpwLndyaXRlX3RleHQodCkK' | base64 -d > /tmp/fix_cli_json.py
-          python3 -m py_compile /tmp/fix_cli_json.py
-          python3 /tmp/fix_cli_json.py
-          cargo fmt --all
-          cargo fmt --all -- --check
-          git diff --check
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/bin_cli.rs
-          if ! git diff --cached --quiet; then
-            git commit -m 'fix: align CLI JSON with v0.2.7 application schema'
-            git push origin HEAD:feat/v0.2.7-control-plane-unification
-          fi
+          version=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=xiao-v${version}-kernelsu-arm64.zip" >> "$GITHUB_OUTPUT"
+      - name: Build and verify deterministic module ZIP
+        env:
+          MODULE_ARCHIVE: ${{ steps.module.outputs.archive }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./packaging/build-module.sh
+          first_hash=$(sha256sum "dist/$MODULE_ARCHIVE" | awk '{print $1}')
+          ./packaging/build-module.sh
+          second_hash=$(sha256sum "dist/$MODULE_ARCHIVE" | awk '{print $1}')
+          test "$first_hash" = "$second_hash"
+          (cd dist && sha256sum -c "$MODULE_ARCHIVE.sha256")
+          unzip -t "dist/$MODULE_ARCHIVE"
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+      - name: Upload module artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: xiao-v${{ steps.module.outputs.version }}-kernelsu-arm64
+          if-no-files-found: error
+          path: |
+            dist/${{ steps.module.outputs.archive }}
+            dist/${{ steps.module.outputs.archive }}.sha256
