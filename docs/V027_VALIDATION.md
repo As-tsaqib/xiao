@@ -9,7 +9,7 @@ The implementation is validated in GitHub Actions because the local artifact env
 - `cargo fmt --all -- --check`: PASS.
 - `cargo check --locked --all-targets --all-features`: PASS.
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`: PASS with Rust 1.98.0.
-- `cargo test --locked --all-targets --all-features`: 225/226 library tests passed on the latest diagnostic run; the remaining WebUI typed Custom-provider boundary regression is being corrected before the release gate is opened.
+- The prior `cargo test --locked --all-targets --all-features` diagnostic reached 225/226 library tests. Its sole failure was the WebUI typed Custom-provider boundary assertion; that production UI fix is now persisted on the branch and awaits the clean full-suite rerun recorded below.
 - ShellCheck for module, Termux wrapper, device test, packaging and acceptance scripts: PASS.
 
 Release version metadata remains at 0.2.6 until the full Rust suite, host release build, JavaScript/static acceptance, Android arm64 cross-build, deterministic package verification, and workflow/governance audit all pass.
