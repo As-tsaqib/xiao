@@ -818,13 +818,19 @@ async fn model_command(
     match sub {
         "show" if args.len() == 1 => {
             let session = client.target_session(options).await?;
-            presenter.success("model show", dto_session_item(session_by_id(client, &session).await?))
+            presenter.success(
+                "model show",
+                dto_session_item(session_by_id(client, &session).await?),
+            )
         }
         "list" if args.len() == 1 => {
             let session = client.target_session(options).await?;
             let selected = session_by_id(client, &session).await?;
             let providers = client.get_admin("/v1/admin/providers").await?;
-            presenter.success("model list", dto_model_list(models_for_session(&selected, &providers)))
+            presenter.success(
+                "model list",
+                dto_model_list(models_for_session(&selected, &providers)),
+            )
         }
         "use" if args.len() == 2 => {
             let session_id = client.target_session(options).await?;
@@ -868,14 +874,14 @@ async fn accounts_command(
     match args.first().map(String::as_str) {
         Some("list") if args.len() == 1 => {
             let providers = client.get_admin("/v1/admin/providers").await?;
-            presenter.success(
-                "model accounts list",
-                dto_model_accounts(providers),
-            )
+            presenter.success("model accounts list", dto_model_accounts(providers))
         }
         Some("show") if args.len() == 2 => {
             let account = account_by_id(client, &args[1]).await?;
-            presenter.success("model accounts show", xiao::cli_contract::project_account(account))
+            presenter.success(
+                "model accounts show",
+                xiao::cli_contract::project_account(account),
+            )
         }
         Some("use") if args.len() == 2 || args.len() == 3 => {
             let account = account_by_id(client, &args[1]).await?;
@@ -1259,7 +1265,7 @@ async fn sessions_command(
                         &json!({"action":"use","session_id":args[1]}),
                     )
                     .await?,
-            )
+            ),
         ),
         Some("rename") if args.len() >= 3 => presenter.success(
             "sessions rename",
