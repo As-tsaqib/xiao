@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     config::CustomProviderConfig,
+    security::secrets::SecretStore,
     storage::{ProviderProfileInput, ProviderProfileModelRecord, ProviderProfileRecord, Storage},
 };
 

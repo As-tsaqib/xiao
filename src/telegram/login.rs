@@ -182,6 +182,22 @@ pub fn alias_view(id: &str) -> View {
     }
 }
 
+pub fn alias_collision_view(id: &str, alias: &str) -> View {
+    View {
+        title: Some("CUSTOM LOGIN · ALIAS".into()),
+        blocks: vec![Block::Paragraph {
+            text: format!(
+                "Alias `{alias}` already exists. Send a different alias or use Back to keep the current.",
+            ),
+        }],
+        actions: vec![vec![
+            Action::command("Back", format!("/_custom:{id}:wizard_back")),
+            Action::close(),
+        ]],
+        side_mode: false,
+    }
+}
+
 pub fn model_view(wizard: &CustomLoginWizard) -> View {
     let paginator = Paginator::new(wizard.models.len(), wizard.page, 5);
     let indexes = paginator.range().collect::<Vec<_>>();
@@ -216,7 +232,10 @@ pub fn model_view(wizard: &CustomLoginWizard) -> View {
             format!("/_custom:{}:page:{}", wizard.id, paginator.next()),
         ),
     ]);
-    actions.push(vec![Action::close()]);
+    actions.push(vec![
+        Action::command("Back", format!("/_custom:{}:wizard_back", wizard.id)),
+        Action::close(),
+    ]);
     View {
         title: Some("CUSTOM LOGIN · MODELS".into()),
         blocks: vec![Block::Table {

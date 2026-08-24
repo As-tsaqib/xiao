@@ -3,10 +3,7 @@ use std::{
     fs,
     io::{Cursor, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::Arc,
-    thread,
-    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -20,6 +17,7 @@ use zip::ZipArchive;
 
 use crate::{
     config::AttachmentConfig,
+    runtime::{CapabilityRegistry, CapabilityStatus, ExecutionPurpose, TermuxCommand},
     security::redact::redact_text,
     storage::{AttachmentChunkRecord, AttachmentRecord, NewAttachmentRecord, Storage},
 };

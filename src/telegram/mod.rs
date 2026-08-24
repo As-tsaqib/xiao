@@ -713,7 +713,11 @@ impl TelegramAdapter {
             }
             "alias" if wizard.phase == CustomLoginPhase::Alias => {
                 let alias = validate_custom_alias(text)?;
-                self.ensure_custom_alias_available(context.principal, &alias)?;
+                if self.custom_alias_exists(context.principal, &alias)? {
+                    menu.pending_input = Some(format!("custom:{}:alias", wizard.id));
+                    menu.current_view = login::alias_collision_view(&wizard.id, &alias);
+                    return Ok(());
+                }
                 wizard.alias = alias;
                 menu.current_view = View::info(
                     "CUSTOM LOGIN",
@@ -728,9 +732,13 @@ impl TelegramAdapter {
         Ok(())
     }
 
-    fn ensure_custom_alias_available(&self, principal: &str, alias: &str) -> Result<()> {
+    fn custom_alias_exists(&self, principal: &str, alias: &str) -> Result<bool> {
         let store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
-        if store.get_by_alias(principal, alias)?.is_some() {
+        Ok(store.get_by_alias(principal, alias)?.is_some())
+    }
+
+    fn ensure_custom_alias_available(&self, principal: &str, alias: &str) -> Result<()> {
+        if self.custom_alias_exists(principal, alias)? {
             return Err(anyhow!(
                 "Custom profile alias `{alias}` already exists. Choose a different alias."
             ));

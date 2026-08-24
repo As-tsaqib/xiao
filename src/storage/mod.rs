@@ -2533,6 +2533,99 @@ impl Storage {
         })
     }
 
+    /// Atomic reservation: quota checks and durable insertion are performed in a
+    /// single IMMEDIATE transaction so concurrent uploads cannot race past the
+    /// session/owner/global limits. The Storage mutex serializes connections;
+    /// the transaction provides the DB-level critical section.
+    pub fn insert_attachment_with_quota(
+        &self,
+        record: NewAttachmentRecord<'_>,
+        max_session_bytes: u64,
+        max_owner_bytes: u64,
+        max_global_bytes: u64,
+    ) -> Result<()> {
+        if !matches!(record.kind, "image" | "document")
+            || record.size_bytes > i64::MAX as u64
+            || record.original_name.trim().is_empty()
+            || record.sha256.len() != 64
+        {
+            return Err(anyhow::anyhow!("invalid attachment metadata"));
+        }
+        self.with_conn(|connection| {
+            let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let owns: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=? AND owner_principal=?)",
+                params![record.session_id, record.owner_id],
+                |row| row.get(0),
+            )?;
+            if !owns {
+                return Err(anyhow::anyhow!("attachment session does not belong to owner"));
+            }
+            // Same accounting as AttachmentManager::ingest checks, but evaluated
+            // atomically inside the reservation transaction.
+            let session_bytes: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM attachments WHERE owner_id=? AND session_id=? AND processing_status NOT IN ('rejected','failed')",
+                params![record.owner_id, record.session_id],
+                |row| row.get(0),
+            )?;
+            let owner_bytes: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM attachments WHERE owner_id=?",
+                params![record.owner_id],
+                |row| row.get(0),
+            )?;
+            let global_bytes: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM attachments",
+                [],
+                |row| row.get(0),
+            )?;
+            let incoming = record.size_bytes;
+            if (session_bytes.max(0) as u64).saturating_add(incoming) > max_session_bytes {
+                return Err(anyhow::anyhow!("attachment would exceed the session storage quota"));
+            }
+            if (owner_bytes.max(0) as u64).saturating_add(incoming) > max_owner_bytes {
+                return Err(anyhow::anyhow!("attachment would exceed the owner storage quota"));
+            }
+            if (global_bytes.max(0) as u64).saturating_add(incoming) > max_global_bytes {
+                return Err(anyhow::anyhow!("attachment would exceed the global storage quota"));
+            }
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO attachments(attachment_id,owner_id,session_id,telegram_file_id,telegram_unique_id,original_name,declared_mime,detected_mime,kind,size_bytes,sha256,local_path,processing_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'downloaded',?,?)",
+                params![record.attachment_id, record.owner_id, record.session_id, record.telegram_file_id, record.telegram_unique_id, record.original_name, record.detected_mime, record.kind, record.size_bytes as i64, record.sha256, record.local_path, now, now],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Startup reconciliation for stale reservations: attachments that were
+    /// reserved as `downloaded` but never reached `processing`/`ready` and
+    /// whose raw file is missing are removed so quota is not leaked.
+    pub fn reconcile_stale_attachment_reservations(&self, root: &std::path::Path) -> Result<usize> {
+        let records = self.all_attachment_paths()?;
+        let mut removed = 0usize;
+        for (attachment_id, owner_id, _session_id, local_path) in records {
+            let path = std::path::Path::new(&local_path);
+            if path.starts_with(root) && !path.exists() {
+                let status: Option<String> = self.with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT processing_status FROM attachments WHERE attachment_id=? AND owner_id=?",
+                        params![attachment_id, owner_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(Into::into)
+                })?;
+                if matches!(status.as_deref(), Some("downloaded") | Some("processing")) {
+                    if self.delete_attachment(&owner_id, &attachment_id)? {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn set_attachment_status(
         &self,
         owner: &str,
