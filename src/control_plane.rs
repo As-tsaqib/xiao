@@ -582,7 +582,14 @@ mod tests {
     fn custom_model_readiness_semantics_handles_optional_vision_and_file_capabilities() {
         use crate::storage::ProviderProfileModelRecord;
 
-        let make_record = |native: &str, structured: &str, cont: &str, vis: &str, file: &str, probed: &str, ev: &str| -> ProviderProfileModelRecord {
+        let make_record = |native: &str,
+                           structured: &str,
+                           cont: &str,
+                           vis: &str,
+                           file: &str,
+                           probed: &str,
+                           ev: &str|
+         -> ProviderProfileModelRecord {
             ProviderProfileModelRecord {
                 profile_id: "p1".into(),
                 model_id: "m1".into(),
@@ -598,35 +605,96 @@ mod tests {
                 vision_state: vis.into(),
                 file_input_state: file.into(),
                 model_discovery: true,
-                tool_protocol: if native == "supported" { "native".into() } else if structured == "supported" { "structured_json_fallback".into() } else { "chat_only".into() },
+                tool_protocol: if native == "supported" {
+                    "native".into()
+                } else if structured == "supported" {
+                    "structured_json_fallback".into()
+                } else {
+                    "chat_only".into()
+                },
                 evidence: ev.into(),
                 probed_at: probed.into(),
             }
         };
 
         // A. native=Supported, structured=Supported, continuation=Supported, vision=Unknown, file=Unknown => AgentNative
-        let rec_a = make_record("supported", "supported", "supported", "unknown", "unknown", "2026-01-01T00:00:00Z", "bounded custom probe");
-        assert_eq!(SessionAiService::model_readiness(&rec_a), CustomModelReadiness::AgentNative);
+        let rec_a = make_record(
+            "supported",
+            "supported",
+            "supported",
+            "unknown",
+            "unknown",
+            "2026-01-01T00:00:00Z",
+            "bounded custom probe",
+        );
+        assert_eq!(
+            SessionAiService::model_readiness(&rec_a),
+            CustomModelReadiness::AgentNative
+        );
         assert!(!SessionAiService::is_unprobed(&rec_a));
 
         // B. native=Unsupported, structured=Supported, continuation=Supported, vision=Unknown, file=Unknown => AgentStructured
-        let rec_b = make_record("unsupported", "supported", "supported", "unknown", "unknown", "2026-01-01T00:00:00Z", "bounded custom probe");
-        assert_eq!(SessionAiService::model_readiness(&rec_b), CustomModelReadiness::AgentStructured);
+        let rec_b = make_record(
+            "unsupported",
+            "supported",
+            "supported",
+            "unknown",
+            "unknown",
+            "2026-01-01T00:00:00Z",
+            "bounded custom probe",
+        );
+        assert_eq!(
+            SessionAiService::model_readiness(&rec_b),
+            CustomModelReadiness::AgentStructured
+        );
         assert!(!SessionAiService::is_unprobed(&rec_b));
 
         // C. native=Unsupported, structured=Unsupported, continuation=Unsupported, completed probe => ChatOnly
-        let rec_c = make_record("unsupported", "unsupported", "unsupported", "unsupported", "unsupported", "2026-01-01T00:00:00Z", "bounded custom probe");
-        assert_eq!(SessionAiService::model_readiness(&rec_c), CustomModelReadiness::ChatOnly);
+        let rec_c = make_record(
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "unsupported",
+            "2026-01-01T00:00:00Z",
+            "bounded custom probe",
+        );
+        assert_eq!(
+            SessionAiService::model_readiness(&rec_c),
+            CustomModelReadiness::ChatOnly
+        );
         assert!(!SessionAiService::is_unprobed(&rec_c));
 
         // D. native=Unknown, structured=Unknown, continuation=Unknown => Indeterminate
-        let rec_d = make_record("unknown", "unknown", "unknown", "unknown", "unknown", "2026-01-01T00:00:00Z", "bounded custom probe");
-        assert_eq!(SessionAiService::model_readiness(&rec_d), CustomModelReadiness::Indeterminate);
+        let rec_d = make_record(
+            "unknown",
+            "unknown",
+            "unknown",
+            "unknown",
+            "unknown",
+            "2026-01-01T00:00:00Z",
+            "bounded custom probe",
+        );
+        assert_eq!(
+            SessionAiService::model_readiness(&rec_d),
+            CustomModelReadiness::Indeterminate
+        );
         assert!(SessionAiService::is_unprobed(&rec_d));
 
         // E. catalog discovery without exact capability probe => Unprobed
-        let rec_e = make_record("unknown", "unknown", "unknown", "unknown", "unknown", "", "model discovered; active capability probe budget not spent");
-        assert_eq!(SessionAiService::model_readiness(&rec_e), CustomModelReadiness::Unprobed);
+        let rec_e = make_record(
+            "unknown",
+            "unknown",
+            "unknown",
+            "unknown",
+            "unknown",
+            "",
+            "model discovered; active capability probe budget not spent",
+        );
+        assert_eq!(
+            SessionAiService::model_readiness(&rec_e),
+            CustomModelReadiness::Unprobed
+        );
         assert!(SessionAiService::is_unprobed(&rec_e));
     }
 
