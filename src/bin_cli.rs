@@ -419,7 +419,10 @@ async fn public_daemon_command(
     match args[0].as_str() {
         "status" => {
             exact_arity(args, 1, "usage: xiao status")?;
-            presenter.success("status", client.get_admin("/v1/admin/dashboard").await?)
+            presenter.success(
+                "status",
+                dto_status(client.get_admin("/v1/admin/dashboard").await?),
+            )
         }
         "context" => {
             exact_arity(args, 1, "usage: xiao context")?;
@@ -430,18 +433,26 @@ async fn public_daemon_command(
             };
             presenter.success(
                 "context",
-                client
-                    .get_admin(&format!("/v1/admin/context{session}"))
-                    .await?,
+                dto_context(
+                    client
+                        .get_admin(&format!("/v1/admin/context{session}"))
+                        .await?,
+                ),
             )
         }
         "doctor" => {
             exact_arity(args, 1, "usage: xiao doctor")?;
-            presenter.success("doctor", client.get_admin("/v1/admin/diagnostics").await?)
+            presenter.success(
+                "doctor",
+                dto_doctor(client.get_admin("/v1/admin/diagnostics").await?),
+            )
         }
         "tools" => {
             exact_arity(args, 1, "usage: xiao tools")?;
-            presenter.success("tools", client.get_admin("/v1/admin/tools").await?)
+            presenter.success(
+                "tools",
+                dto_tools(client.get_admin("/v1/admin/tools").await?),
+            )
         }
         "telegram" => telegram_command(&client, &args[1..], presenter).await,
         "login" => login_command(&client, &args[1..], presenter).await,
@@ -618,13 +629,15 @@ async fn telegram_command(
     match args.first().map(String::as_str) {
         Some("status") if args.len() == 1 => presenter.success(
             "telegram status",
-            client.get_admin("/v1/admin/telegram").await?,
+            dto_telegram(client.get_admin("/v1/admin/telegram").await?),
         ),
         Some("test") if args.len() == 1 => presenter.success(
             "telegram test",
-            client
-                .post_admin("/v1/admin/telegram", &json!({"action":"test"}))
-                .await?,
+            dto_telegram(
+                client
+                    .post_admin("/v1/admin/telegram", &json!({"action":"test"}))
+                    .await?,
+            ),
         ),
         Some("set-token-file") if args.len() == 2 => {
             let token = read_secret_file(Path::new(&args[1]), "Telegram Bot Token")?;
@@ -1199,7 +1212,7 @@ async fn sessions_command(
     match args.first().map(String::as_str) {
         Some("list") if args.len() == 1 => presenter.success(
             "sessions list",
-            client.get_admin("/v1/admin/sessions?limit=50").await?,
+            dto_sessions(client.get_admin("/v1/admin/sessions?limit=50").await?),
         ),
         Some("new") if args.len() == 1 => presenter.success(
             "sessions new",
@@ -1279,13 +1292,15 @@ async fn memory_command(
     match args.first().map(String::as_str) {
         Some("list") if args.len() == 1 || args.len() == 2 => {
             let query = args.get(1).map(|scope| format!("?scope={}", url_encode(scope))).unwrap_or_default();
-            presenter.success("memory list", client.get_admin(&format!("/v1/admin/memory{query}")).await?)
+            presenter.success("memory list", dto_memory(client.get_admin(&format!("/v1/admin/memory{query}")).await?))
         }
         Some("search") if args.len() >= 2 => presenter.success(
             "memory search",
-            client
-                .get_admin(&format!("/v1/admin/memory?query={}", url_encode(&args[1..].join(" "))))
-                .await?,
+            dto_memory(
+                client
+                    .get_admin(&format!("/v1/admin/memory?query={}", url_encode(&args[1..].join(" "))))
+                    .await?,
+            ),
         ),
         Some("get") if args.len() == 4 => {
             let data = client.get_admin(&format!("/v1/admin/memory?scope={}", url_encode(&args[1]))).await?;
@@ -1332,13 +1347,15 @@ async fn skills_command(
     match args.first().map(String::as_str) {
         Some("list") if args.len() == 1 => presenter.success(
             "skills list",
-            client.get_admin("/v1/admin/skills?limit=50").await?,
+            dto_skills(client.get_admin("/v1/admin/skills?limit=50").await?),
         ),
         Some("search") if args.len() >= 2 => presenter.success(
             "skills search",
-            client
-                .get_admin(&format!("/v1/admin/skills?query={}", url_encode(&args[1..].join(" "))))
-                .await?,
+            dto_skills(
+                client
+                    .get_admin(&format!("/v1/admin/skills?query={}", url_encode(&args[1..].join(" "))))
+                    .await?,
+            ),
         ),
         Some("show") if args.len() == 2 => {
             let data = client.get_admin("/v1/admin/skills?limit=50").await?;
@@ -1379,7 +1396,7 @@ async fn approvals_command(
             let security = client.get_admin("/v1/admin/security").await?;
             presenter.success(
                 "approvals list",
-                json!({"items":security.get("pending_approvals").cloned().unwrap_or_else(|| json!([]))}),
+                dto_approvals(json!({"items":security.get("pending_approvals").cloned().unwrap_or_else(|| json!([]))})),
             )
         }
         Some("approve" | "deny") if args.len() == 2 => presenter.success(
@@ -1407,12 +1424,14 @@ async fn attachments_command(
     match args.first().map(String::as_str) {
         Some("list") if args.len() == 1 => presenter.success(
             "attachments list",
-            client
-                .get_admin(&format!(
-                    "/v1/admin/attachments?session_id={}",
-                    url_encode(&session)
-                ))
-                .await?,
+            dto_attachments(
+                client
+                    .get_admin(&format!(
+                        "/v1/admin/attachments?session_id={}",
+                        url_encode(&session)
+                    ))
+                    .await?,
+            ),
         ),
         Some("show") if args.len() == 2 => {
             let data = client
@@ -1447,7 +1466,7 @@ async fn runs_command(
     match args.first().map(String::as_str) {
         Some("list") if args.len() == 1 => presenter.success(
             "runs list",
-            client.get_admin("/v1/admin/runs?limit=50").await?,
+            dto_runs(client.get_admin("/v1/admin/runs?limit=50").await?),
         ),
         Some("show") if args.len() == 2 => {
             let data = client.get_admin("/v1/admin/runs?limit=50").await?;
@@ -2020,7 +2039,279 @@ fn connection_failure(error: reqwest::Error) -> CliFailure {
     }
 }
 
+fn dto_pick(value: Value, allowed: &[&str]) -> Value {
+    if let Value::Object(map) = value {
+        let mut out = serde_json::Map::new();
+        for key in allowed {
+            if let Some(v) = map.get(*key) {
+                out.insert((*key).to_string(), v.clone());
+            }
+        }
+        // Preserve items/page wrappers if present
+        for extra in [
+            "items",
+            "page",
+            "pages",
+            "page_size",
+            "active_cli_session_id",
+            "models",
+            "session",
+        ] {
+            if let Some(v) = map.get(extra) {
+                out.entry(extra.to_string()).or_insert_with(|| v.clone());
+            }
+        }
+        // Never expose Telegram view/button schema
+        out.remove("blocks");
+        out.remove("actions");
+        out.remove("view");
+        out.remove("buttons");
+        return Value::Object(out);
+    }
+    value
+}
+
+fn dto_status(value: Value) -> Value {
+    // Stable projection for dashboard: owner, health summary, counts, current_ai, runtime
+    if let Value::Object(mut map) = value.clone() {
+        // Dashboard already is stable; ensure we expose only documented keys and strip internals
+        let allowed = ["owner_id", "health", "counts", "current_ai", "runtime"];
+        let mut out = serde_json::Map::new();
+        for k in allowed {
+            if let Some(v) = map.get(k) {
+                out.insert(k.to_string(), v.clone());
+            }
+        }
+        // health is an object with daemon_running, provider_states etc - keep as-is but ensure no secrets
+        return Value::Object(out);
+    }
+    value
+}
+
+fn dto_telegram(value: Value) -> Value {
+    // Telegram status DTO is under telegram key
+    if let Value::Object(map) = &value {
+        if let Some(t) = map.get("telegram") {
+            return json!({ "telegram": t.clone() });
+        }
+    }
+    value
+}
+
+fn dto_sessions(value: Value) -> Value {
+    dto_pick(
+        value,
+        &[
+            "items",
+            "page",
+            "pages",
+            "page_size",
+            "active_cli_session_id",
+        ],
+    )
+}
+
+fn dto_context(value: Value) -> Value {
+    dto_pick(
+        value,
+        &[
+            "session_id",
+            "main_session_id",
+            "mode",
+            "main_messages",
+            "effective_messages",
+            "stored_characters",
+            "context_budget_characters",
+            "summary_available",
+            "active_memory_entries",
+            "skills_available",
+            "provider",
+            "account_or_profile_id",
+            "model",
+        ],
+    )
+}
+
+fn dto_memory(value: Value) -> Value {
+    dto_pick(value, &["items", "page", "pages", "page_size"])
+}
+
+fn dto_skills(value: Value) -> Value {
+    dto_pick(value, &["items", "page", "pages", "page_size"])
+}
+
+fn dto_approvals(value: Value) -> Value {
+    if let Value::Object(map) = &value {
+        if let Some(items) = map.get("items") {
+            return json!({ "items": items.clone() });
+        }
+        if let Some(pending) = map.get("pending_approvals") {
+            return json!({ "items": pending.clone() });
+        }
+    }
+    value
+}
+
+fn dto_attachments(value: Value) -> Value {
+    dto_pick(value, &["items", "usage"])
+}
+
+fn dto_runs(value: Value) -> Value {
+    dto_pick(value, &["items", "page", "pages", "page_size"])
+}
+
+fn dto_doctor(value: Value) -> Value {
+    // Doctor is diagnostics output; expose checks as array and summary
+    value
+}
+
+fn dto_tools(value: Value) -> Value {
+    value
+}
+
+fn dto_model_accounts(value: Value) -> Value {
+    dto_pick(value, &["items"])
+}
+
+fn dto_model_custom(value: Value) -> Value {
+    dto_pick(value, &["items"])
+}
+
+fn render_status_human(value: &Value) {
+    if let Some(obj) = value.as_object() {
+        if obj.contains_key("health") || obj.contains_key("counts") {
+            if let Some(health) = obj.get("health") {
+                println!(
+                    "health: {}",
+                    serde_json::to_string(health).unwrap_or_else(|_| "{}".into())
+                );
+            }
+            if let Some(counts) = obj.get("counts") {
+                println!(
+                    "counts: {}",
+                    serde_json::to_string(counts).unwrap_or_else(|_| "{}".into())
+                );
+            }
+            if let Some(ai) = obj.get("current_ai") {
+                println!(
+                    "current_ai: {}",
+                    serde_json::to_string(ai).unwrap_or_else(|_| "none".into())
+                );
+            }
+            if let Some(owner) = obj.get("owner_id") {
+                println!("owner: {}", scalar(owner));
+            }
+            return;
+        }
+    }
+    // fallback generic
+    for (k, v) in value
+        .as_object()
+        .map(|m| m.iter().collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        if is_scalar(v) {
+            println!("{}: {}", human_key(k), scalar(v));
+        }
+    }
+}
+
+fn render_sessions_human(value: &Value) {
+    if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
+        for item in items {
+            if let Some(obj) = item.as_object() {
+                let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+                let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let provider = obj.get("provider").and_then(|v| v.as_str()).unwrap_or("-");
+                let model = obj.get("model").and_then(|v| v.as_str()).unwrap_or("-");
+                let prov_short = if name.is_empty() {
+                    format!("{provider}/{model}")
+                } else {
+                    format!("{name} {provider}/{model}")
+                };
+                println!("- {id}  {prov_short}");
+            } else {
+                println!("- {}", item);
+            }
+        }
+        if let Some(active) = value.get("active_cli_session_id").and_then(|v| v.as_str()) {
+            println!("active: {active}");
+        }
+        return;
+    }
+    // fallback
+    println!("{value}");
+}
+
+fn render_doctor_human(value: &Value) {
+    if let Some(arr) = value
+        .get("checks")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.get("items").and_then(|v| v.as_array()))
+    {
+        for check in arr {
+            let name = check
+                .get("name")
+                .or_else(|| check.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("check");
+            let status = check
+                .get("status")
+                .or_else(|| check.get("state"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            let detail = check
+                .get("evidence")
+                .or_else(|| check.get("detail"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if detail.is_empty() {
+                println!("{name}: {status}");
+            } else {
+                println!("{name}: {status} · {detail}");
+            }
+        }
+        return;
+    }
+    // generic fallback
+    for (k, v) in value
+        .as_object()
+        .map(|m| m.iter().collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        println!("{}: {}", human_key(k), scalar(v));
+    }
+}
+
 fn render_human(value: &Value) {
+    // P1-9: intentional human rendering for key surfaces
+    if value.get("health").is_some() || value.get("counts").is_some() {
+        render_status_human(value);
+        return;
+    }
+    if value.get("items").is_some() && value.get("active_cli_session_id").is_some() {
+        render_sessions_human(value);
+        return;
+    }
+    if value.get("checks").is_some()
+        || (value.get("items").is_some()
+            && value.as_object().map(|m| m.len() == 1).unwrap_or(false))
+    {
+        // Heuristic for doctor diagnostics: treat as doctor if items contain status-like entries
+        if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
+            if items
+                .iter()
+                .any(|it| it.get("status").is_some() || it.get("state").is_some())
+            {
+                render_doctor_human(value);
+                return;
+            }
+        }
+        if value.get("checks").is_some() {
+            render_doctor_human(value);
+            return;
+        }
+    }
     if let Some(answer) = value.get("answer").and_then(Value::as_str) {
         println!("{answer}");
         if let Some(artifacts) = value.get("artifacts").and_then(Value::as_array) {

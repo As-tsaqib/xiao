@@ -20,6 +20,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 
+// P2-2: hidden legacy management paths are thin deprecated delegates.
+// Unified control plane owns Telegram, profile, session and attachment logic;
+// legacy admin/base64 routes delegate or reject to avoid duplicate business logic.
+
 use crate::{
     app::AppState,
     control_plane::{TelegramConfigureInput, TelegramSetupService},
@@ -85,8 +89,11 @@ struct AttachmentActionRequest {
 pub struct ApplyRequest {
     pub gateway_enabled: Option<bool>,
     pub gateway_auto_restart: Option<bool>,
+    /// Deprecated legacy telegram mutation. Use POST /v1/admin/telegram (TelegramSetupService).
     pub telegram_enabled: Option<bool>,
+    /// Deprecated. Use POST /v1/admin/telegram.
     pub telegram_bot_token: Option<String>,
+    /// Deprecated. Use POST /v1/admin/telegram.
     pub allowed_chat_ids: Option<String>,
     pub owner_user_id: Option<i64>,
     /// Legacy low-level field. v0.2.7 never accepts multiple owners.
@@ -238,6 +245,7 @@ pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
     };
     let router = Router::new()
         .route("/v1/status", get(status))
+        // Deprecated legacy aliases: thin delegates to canonical chat handler
         .route("/v1/command", post(execute))
         .route("/v1/chat", post(execute))
         .route("/v1/session-chat", post(execute_session))

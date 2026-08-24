@@ -94,7 +94,7 @@ impl TelegramClient {
         if file_id.trim().is_empty() || file_id.chars().count() > 1_024 {
             return Err(anyhow!("invalid Telegram file id"));
         }
-        self.call("getFile", json!({"file_id":file_id})).await
+        self.call("getFile", json!({ "file_id": file_id })).await
     }
 
     pub async fn download_file_bounded(&self, file_path: &str, max_bytes: u64) -> Result<Vec<u8>> {
@@ -146,7 +146,7 @@ impl TelegramClient {
         Ok(bytes)
     }
     pub async fn set_my_commands(&self, commands: &[BotCommand]) -> Result<bool> {
-        self.call("setMyCommands", json!({"commands":commands}))
+        self.call("setMyCommands", json!({ "commands": commands }))
             .await
     }
     pub async fn get_updates(&self, offset: Option<i64>, timeout: u64) -> Result<Vec<Update>> {

@@ -152,7 +152,7 @@ pub fn keyboard(view: &View, menu_id: &str, revision: u64) -> Value {
         }).collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    json!({"inline_keyboard":rows})
+    json!({ "inline_keyboard": rows })
 }
 
 pub fn action_at(view: &View, index: usize) -> Option<Action> {

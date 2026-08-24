@@ -818,7 +818,11 @@ impl TelegramAdapter {
                 menu.current_view = login::alias_view(wizard_id);
             }
             "default_alias" if wizard.phase == CustomLoginPhase::Alias => {
-                self.ensure_custom_alias_available(principal, "custom")?;
+                if self.custom_alias_exists(principal, "custom")? {
+                    menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                    menu.current_view = login::alias_collision_view(wizard_id, "custom");
+                    return Ok(());
+                }
                 wizard.alias = "custom".into();
                 self.discover_custom_models(&mut wizard).await?;
                 menu.pending_input = None;

@@ -20,7 +20,6 @@ use zip::ZipArchive;
 
 use crate::{
     config::AttachmentConfig,
-    runtime::{CapabilityRegistry, CapabilityStatus, ExecutionPurpose, TermuxCommand},
     security::redact::redact_text,
     storage::{AttachmentChunkRecord, AttachmentRecord, NewAttachmentRecord, Storage},
 };

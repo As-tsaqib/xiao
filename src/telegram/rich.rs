@@ -21,7 +21,7 @@ pub fn render(view: &View, draft: bool) -> Value {
     for block in &view.blocks {
         blocks.extend(render_block(block, draft));
     }
-    json!({"blocks":blocks})
+    json!({ "blocks": blocks })
 }
 fn render_block(block: &Block, draft: bool) -> Vec<Value> {
     match block {
