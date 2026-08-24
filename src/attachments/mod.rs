@@ -1148,10 +1148,12 @@ mod tests {
         let session_b = storage
             .create_session("owner:test", "B", "custom", None, "m", false, None)
             .unwrap();
-        let mut config = AttachmentConfig::default();
-        config.max_owner_bytes = 70;
-        config.max_global_bytes = 80;
-        config.max_session_bytes = 80;
+        let config = AttachmentConfig {
+            max_owner_bytes: 70,
+            max_global_bytes: 80,
+            max_session_bytes: 80,
+            ..AttachmentConfig::default()
+        };
         let manager = AttachmentManager::new(storage.clone(), directory.path(), config).unwrap();
         let first = b"first durable attachment has enough meaningful text".to_vec();
         manager

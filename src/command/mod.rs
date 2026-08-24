@@ -3591,7 +3591,7 @@ mod tests {
         };
         let request = storage
             .request_approval(crate::storage::ApprovalRequest {
-                binding: binding.clone(),
+                binding,
                 capability: "android.service.restart",
                 risk: "privileged",
                 summary: "parity approval",

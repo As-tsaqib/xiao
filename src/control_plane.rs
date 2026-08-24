@@ -141,7 +141,7 @@ impl TelegramSetupService {
             next.telegram.access.allowed_user_ids.clear();
         }
         if let Some(mut allowed_chat_ids) = input.allowed_chat_ids {
-            if allowed_chat_ids.iter().any(|id| *id == 0) {
+            if allowed_chat_ids.contains(&0) {
                 return Err(anyhow!("allowed chat ids cannot contain zero"));
             }
             allowed_chat_ids.sort_unstable();

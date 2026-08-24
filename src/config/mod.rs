@@ -84,13 +84,7 @@ impl AppConfig {
         if self.telegram.access.owner_user_id == Some(0) {
             return Err(anyhow!("telegram.access.owner_user_id must be non-zero"));
         }
-        if self
-            .telegram
-            .access
-            .allowed_chat_ids
-            .iter()
-            .any(|id| *id == 0)
-        {
+        if self.telegram.access.allowed_chat_ids.contains(&0) {
             return Err(anyhow!(
                 "telegram.access.allowed_chat_ids cannot contain zero"
             ));

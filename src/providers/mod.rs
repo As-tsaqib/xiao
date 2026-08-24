@@ -1778,18 +1778,6 @@ pub(crate) async fn probe_custom_capabilities(
     }
 }
 
-pub(crate) async fn probe_custom_tool_capability(
-    base: &str,
-    headers: &std::collections::BTreeMap<String, String>,
-    api_key: Option<&str>,
-    protocol: &str,
-    model: &str,
-) -> ProviderCapabilities {
-    probe_custom_capabilities(base, headers, api_key, protocol, model)
-        .await
-        .capabilities
-}
-
 fn result_state(result: &Result<bool>) -> CapabilityState {
     match result {
         Ok(true) => CapabilityState::Supported,

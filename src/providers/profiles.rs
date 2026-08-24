@@ -152,9 +152,7 @@ impl ProviderProfileStore {
         if let Some(protocol) = protocol {
             validate_protocol(protocol)?;
         }
-        let headers_json = headers
-            .map(|headers| serde_json::to_string(headers))
-            .transpose()?;
+        let headers_json = headers.map(serde_json::to_string).transpose()?;
         if let Some(raw) = headers_json.as_deref() {
             let _ = parse_safe_headers(raw)?;
         }
