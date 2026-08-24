@@ -2164,7 +2164,8 @@ impl CommandCore {
         )
         .await;
         let probed_at = chrono::Utc::now().to_rfc3339();
-        *selected = crate::providers::profile_model_from_probe(profile_id, model, &probe, &probed_at);
+        *selected =
+            crate::providers::profile_model_from_probe(profile_id, model, &probe, &probed_at);
         profiles.replace_models(principal, profile_id, &models)?;
         Ok(())
     }

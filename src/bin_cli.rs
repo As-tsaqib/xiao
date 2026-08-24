@@ -818,13 +818,13 @@ async fn model_command(
     match sub {
         "show" if args.len() == 1 => {
             let session = client.target_session(options).await?;
-            presenter.success("model show", session_by_id(client, &session).await?)
+            presenter.success("model show", dto_session_item(session_by_id(client, &session).await?))
         }
         "list" if args.len() == 1 => {
             let session = client.target_session(options).await?;
             let selected = session_by_id(client, &session).await?;
             let providers = client.get_admin("/v1/admin/providers").await?;
-            presenter.success("model list", models_for_session(&selected, &providers))
+            presenter.success("model list", dto_model_list(models_for_session(&selected, &providers)))
         }
         "use" if args.len() == 2 => {
             let session_id = client.target_session(options).await?;
@@ -870,12 +870,12 @@ async fn accounts_command(
             let providers = client.get_admin("/v1/admin/providers").await?;
             presenter.success(
                 "model accounts list",
-                json!({"items":providers.get("accounts").cloned().unwrap_or_else(|| json!([]))}),
+                dto_model_accounts(providers),
             )
         }
         Some("show") if args.len() == 2 => {
             let account = account_by_id(client, &args[1]).await?;
-            presenter.success("model accounts show", account)
+            presenter.success("model accounts show", xiao::cli_contract::project_account(account))
         }
         Some("use") if args.len() == 2 || args.len() == 3 => {
             let account = account_by_id(client, &args[1]).await?;
@@ -949,11 +949,12 @@ async fn custom_command(
             let providers = client.get_admin("/v1/admin/providers").await?;
             presenter.success(
                 "model custom list",
-                json!({"items":providers.get("custom_profiles").cloned().unwrap_or_else(|| json!([]))}),
+                dto_model_custom(providers),
             )
         }
         Some("show") if args.len() == 2 => {
-            presenter.success("model custom show", custom_by_id(client, &args[1]).await?)
+            let raw = custom_by_id(client, &args[1]).await?;
+            presenter.success("model custom show", xiao::cli_contract::project_custom_profile(raw))
         }
         Some("add") => custom_add(client, &args[1..], presenter).await,
         Some("edit") => custom_edit(client, &args[1..], presenter).await,
@@ -1246,16 +1247,18 @@ async fn sessions_command(
                 .await?,
         ),
         Some("show") if args.len() == 2 => {
-            presenter.success("sessions show", session_by_id(client, &args[1]).await?)
+            presenter.success("sessions show", dto_session_item(session_by_id(client, &args[1]).await?))
         }
         Some("use") if args.len() == 2 => presenter.success(
             "sessions use",
-            client
-                .post_admin(
-                    "/v1/admin/sessions",
-                    &json!({"action":"use","session_id":args[1]}),
-                )
-                .await?,
+            dto_session_item(
+                client
+                    .post_admin(
+                        "/v1/admin/sessions",
+                        &json!({"action":"use","session_id":args[1]}),
+                    )
+                    .await?,
+            )
         ),
         Some("rename") if args.len() >= 3 => presenter.success(
             "sessions rename",
@@ -1774,6 +1777,7 @@ async fn admin(
                 serde_json::from_str(&raw).map_err(|error| CliFailure::usage(error.to_string()))?;
             raw_success(client.post_admin("/v1/admin/apply", &body).await?)
         }
+        // P2-2: deprecated legacy base64 envelope — thin delegate to typed manager endpoints.
         Some("apply-base64") if args.len() == 2 => {
             let body = decode_payload(&args[1])?;
             raw_success(client.post_admin("/v1/admin/apply", &body).await?)
@@ -1803,6 +1807,7 @@ async fn admin(
             let body = decode_payload(&args[1])?;
             raw_success(client.post_admin("/v1/admin/custom/models", &body).await?)
         }
+        // P2-2: deprecated legacy WebUI/CLI base64 envelope — thin delegates.
         Some("manager-get-base64") if args.len() == 2 => {
             let request = decode_payload(&args[1])?;
             let resource = request
@@ -1849,6 +1854,7 @@ async fn admin(
                 .map_err(connection_failure)?;
             raw_success(parse_response(response).await?)
         }
+        // P2-2: deprecated legacy base64 envelope — thin delegate.
         Some("manager-post-base64") if args.len() == 2 => {
             let request = decode_payload(&args[1])?;
             let resource = request
@@ -2064,254 +2070,103 @@ fn connection_failure(error: reqwest::Error) -> CliFailure {
     }
 }
 
+// ---------------------------------------------------------------------------
+// P1-9 stable CLI contracts — projections delegate to crate::cli_contract
+// ---------------------------------------------------------------------------
+
+fn dto_status(value: Value) -> Value {
+    xiao::cli_contract::project_status(value)
+}
+fn dto_telegram(value: Value) -> Value {
+    xiao::cli_contract::project_telegram(value)
+}
+fn dto_sessions(value: Value) -> Value {
+    xiao::cli_contract::project_sessions(value)
+}
+fn dto_context(value: Value) -> Value {
+    xiao::cli_contract::project_context(value)
+}
+fn dto_memory(value: Value) -> Value {
+    xiao::cli_contract::project_memory(value)
+}
+fn dto_skills(value: Value) -> Value {
+    xiao::cli_contract::project_skills(value)
+}
+fn dto_approvals(value: Value) -> Value {
+    xiao::cli_contract::project_approvals(value)
+}
+fn dto_attachments(value: Value) -> Value {
+    xiao::cli_contract::project_attachments(value)
+}
+fn dto_runs(value: Value) -> Value {
+    xiao::cli_contract::project_runs(value)
+}
+fn dto_doctor(value: Value) -> Value {
+    xiao::cli_contract::project_doctor(value)
+}
+fn dto_tools(value: Value) -> Value {
+    xiao::cli_contract::project_tools(value)
+}
+fn dto_model_accounts(value: Value) -> Value {
+    xiao::cli_contract::project_accounts(value)
+}
+fn dto_model_custom(value: Value) -> Value {
+    xiao::cli_contract::project_custom_profiles(value)
+}
+#[allow(dead_code)]
+fn dto_model_list(value: Value) -> Value {
+    xiao::cli_contract::project_model_list_for_session(value)
+}
+fn dto_session_item(value: Value) -> Value {
+    xiao::cli_contract::project_session_item(value)
+}
+
+// Legacy pick helper retained for ad-hoc call sites that haven't migrated to
+// typed projections; delegates to sanitizer.
 fn dto_pick(value: Value, allowed: &[&str]) -> Value {
-    if let Value::Object(map) = value {
+    let sanitized = xiao::cli_contract::project_generic(value);
+    if let Value::Object(map) = sanitized {
         let mut out = serde_json::Map::new();
         for key in allowed {
             if let Some(v) = map.get(*key) {
                 out.insert((*key).to_string(), v.clone());
             }
         }
-        // Preserve items/page wrappers if present
-        for extra in [
-            "items",
-            "page",
-            "pages",
-            "page_size",
-            "active_cli_session_id",
-            "models",
-            "session",
-        ] {
+        for extra in ["items", "page", "pages", "page_size", "active_cli_session_id", "models", "session"] {
             if let Some(v) = map.get(extra) {
                 out.entry(extra.to_string()).or_insert_with(|| v.clone());
             }
         }
-        // Never expose Telegram view/button schema
-        out.remove("blocks");
-        out.remove("actions");
-        out.remove("view");
-        out.remove("buttons");
         return Value::Object(out);
     }
-    value
-}
-
-fn dto_status(value: Value) -> Value {
-    // Stable projection for dashboard: owner, health summary, counts, current_ai, runtime
-    if let Value::Object(map) = value.clone() {
-        // Dashboard already is stable; ensure we expose only documented keys and strip internals
-        let allowed = ["owner_id", "health", "counts", "current_ai", "runtime"];
-        let mut out = serde_json::Map::new();
-        for k in allowed {
-            if let Some(v) = map.get(k) {
-                out.insert(k.to_string(), v.clone());
-            }
-        }
-        // health is an object with daemon_running, provider_states etc - keep as-is but ensure no secrets
-        return Value::Object(out);
-    }
-    value
-}
-
-fn dto_telegram(value: Value) -> Value {
-    // Telegram status DTO is under telegram key
-    if let Value::Object(map) = &value {
-        if let Some(t) = map.get("telegram") {
-            return json!({ "telegram": t.clone() });
-        }
-    }
-    value
-}
-
-fn dto_sessions(value: Value) -> Value {
-    dto_pick(
-        value,
-        &[
-            "items",
-            "page",
-            "pages",
-            "page_size",
-            "active_cli_session_id",
-        ],
-    )
-}
-
-fn dto_context(value: Value) -> Value {
-    dto_pick(
-        value,
-        &[
-            "session_id",
-            "main_session_id",
-            "mode",
-            "main_messages",
-            "effective_messages",
-            "stored_characters",
-            "context_budget_characters",
-            "summary_available",
-            "active_memory_entries",
-            "skills_available",
-            "provider",
-            "account_or_profile_id",
-            "model",
-        ],
-    )
-}
-
-fn dto_memory(value: Value) -> Value {
-    dto_pick(value, &["items", "page", "pages", "page_size"])
-}
-
-fn dto_skills(value: Value) -> Value {
-    dto_pick(value, &["items", "page", "pages", "page_size"])
-}
-
-fn dto_approvals(value: Value) -> Value {
-    if let Value::Object(map) = &value {
-        if let Some(items) = map.get("items") {
-            return json!({ "items": items.clone() });
-        }
-        if let Some(pending) = map.get("pending_approvals") {
-            return json!({ "items": pending.clone() });
-        }
-    }
-    value
-}
-
-fn dto_attachments(value: Value) -> Value {
-    dto_pick(value, &["items", "usage"])
-}
-
-fn dto_runs(value: Value) -> Value {
-    dto_pick(value, &["items", "page", "pages", "page_size"])
-}
-
-fn dto_doctor(value: Value) -> Value {
-    // Doctor is diagnostics output; expose checks as array and summary
-    value
-}
-
-fn dto_tools(value: Value) -> Value {
-    value
-}
-
-#[allow(dead_code)]
-fn dto_model_accounts(value: Value) -> Value {
-    dto_pick(value, &["items"])
-}
-
-#[allow(dead_code)]
-fn dto_model_custom(value: Value) -> Value {
-    dto_pick(value, &["items"])
+    sanitized
 }
 
 fn render_status_human(value: &Value) {
-    if let Some(obj) = value.as_object() {
-        if obj.contains_key("health") || obj.contains_key("counts") {
-            if let Some(health) = obj.get("health") {
-                println!(
-                    "health: {}",
-                    serde_json::to_string(health).unwrap_or_else(|_| "{}".into())
-                );
-            }
-            if let Some(counts) = obj.get("counts") {
-                println!(
-                    "counts: {}",
-                    serde_json::to_string(counts).unwrap_or_else(|_| "{}".into())
-                );
-            }
-            if let Some(ai) = obj.get("current_ai") {
-                println!(
-                    "current_ai: {}",
-                    serde_json::to_string(ai).unwrap_or_else(|_| "none".into())
-                );
-            }
-            if let Some(owner) = obj.get("owner_id") {
-                println!("owner: {}", scalar(owner));
-            }
-            return;
-        }
-    }
-    // fallback generic
-    for (k, v) in value
-        .as_object()
-        .map(|m| m.iter().collect::<Vec<_>>())
-        .unwrap_or_default()
-    {
-        if is_scalar(v) {
-            println!("{}: {}", human_key(k), scalar(v));
-        }
+    for line in xiao::cli_contract::human_status(value).lines() {
+        println!("{line}");
     }
 }
-
 fn render_sessions_human(value: &Value) {
-    if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
-        for item in items {
-            if let Some(obj) = item.as_object() {
-                let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("-");
-                let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let provider = obj.get("provider").and_then(|v| v.as_str()).unwrap_or("-");
-                let model = obj.get("model").and_then(|v| v.as_str()).unwrap_or("-");
-                let prov_short = if name.is_empty() {
-                    format!("{provider}/{model}")
-                } else {
-                    format!("{name} {provider}/{model}")
-                };
-                println!("- {id}  {prov_short}");
-            } else {
-                println!("- {}", item);
-            }
-        }
-        if let Some(active) = value.get("active_cli_session_id").and_then(|v| v.as_str()) {
-            println!("active: {active}");
-        }
-        return;
+    for line in xiao::cli_contract::human_sessions(value).lines() {
+        println!("{line}");
     }
-    // fallback
-    println!("{value}");
 }
-
 fn render_doctor_human(value: &Value) {
-    if let Some(arr) = value
-        .get("checks")
-        .and_then(|v| v.as_array())
-        .or_else(|| value.get("items").and_then(|v| v.as_array()))
-    {
-        for check in arr {
-            let name = check
-                .get("name")
-                .or_else(|| check.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("check");
-            let status = check
-                .get("status")
-                .or_else(|| check.get("state"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("-");
-            let detail = check
-                .get("evidence")
-                .or_else(|| check.get("detail"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if detail.is_empty() {
-                println!("{name}: {status}");
-            } else {
-                println!("{name}: {status} · {detail}");
-            }
-        }
-        return;
+    for line in xiao::cli_contract::human_doctor(value).lines() {
+        println!("{line}");
     }
-    // generic fallback
-    for (k, v) in value
-        .as_object()
-        .map(|m| m.iter().collect::<Vec<_>>())
-        .unwrap_or_default()
-    {
-        println!("{}: {}", human_key(k), scalar(v));
+}
+fn render_model_human(value: &Value) {
+    for line in xiao::cli_contract::human_model(value).lines() {
+        println!("{line}");
     }
 }
 
 fn render_human(value: &Value) {
-    // P1-9: intentional human rendering for key surfaces
+    // Intentional routing — status / sessions / doctor / model get dedicated
+    // formatting instead of generic nested-JSON. Detection is via stable DTO
+    // keys produced by cli_contract projections.
     if value.get("health").is_some() || value.get("counts").is_some() {
         render_status_human(value);
         return;
@@ -2320,23 +2175,42 @@ fn render_human(value: &Value) {
         render_sessions_human(value);
         return;
     }
-    if value.get("checks").is_some()
-        || (value.get("items").is_some()
-            && value.as_object().map(|m| m.len() == 1).unwrap_or(false))
-    {
-        // Heuristic for doctor diagnostics: treat as doctor if items contain status-like entries
-        if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
-            if items
-                .iter()
-                .any(|it| it.get("status").is_some() || it.get("state").is_some())
-            {
-                render_doctor_human(value);
-                return;
+    if value.get("checks").is_some() {
+        render_doctor_human(value);
+        return;
+    }
+    // model surfaces: accounts list, custom list, or session model list
+    if value.get("models").is_some() && (value.get("session_id").is_some() || value.get("provider").is_some()) {
+        render_model_human(value);
+        return;
+    }
+    if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
+        if !items.is_empty() {
+            let first = &items[0];
+            // doctor fallback: items with status/state
+            if first.get("status").is_some() || first.get("state").is_some() {
+                // could be runs or doctor; doctor has checks-style, runs have id+session_id
+                // prefer doctor if no session_id/provider combo
+                if first.get("session_id").is_none() && value.get("active_cli_session_id").is_none() {
+                    // peek if looks like account/custom vs doctor: account has provider+label, custom has alias
+                    let is_account_or_custom = first.get("provider").is_some() || first.get("alias").is_some() || first.get("attachment_id").is_some();
+                    if !is_account_or_custom {
+                        // treat single-key items as doctor fallback
+                        if value.as_object().map(|m| m.len()==1).unwrap_or(false) {
+                            render_doctor_human(value);
+                            return;
+                        }
+                    }
+                }
             }
-        }
-        if value.get("checks").is_some() {
-            render_doctor_human(value);
-            return;
+            // model accounts / custom
+            if first.get("provider").is_some() || first.get("alias").is_some() {
+                // distinguish from sessions (sessions have id+provider+model, accounts have label, custom have alias)
+                if first.get("label").is_some() || first.get("alias").is_some() {
+                    render_model_human(value);
+                    return;
+                }
+            }
         }
     }
     if let Some(answer) = value.get("answer").and_then(Value::as_str) {
@@ -2361,6 +2235,7 @@ fn render_human(value: &Value) {
             }
         }
         Value::Object(map) => {
+            // If items present but not matched above, render list then scalars
             if let Some(items) = map.get("items").and_then(Value::as_array) {
                 for item in items {
                     render_list_item(item);

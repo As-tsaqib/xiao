@@ -625,39 +625,10 @@ async fn admin_apply(
     }
     next.validate().map_err(bad)?;
 
-    let store = SecretStore::new(next.paths.secrets_dir.clone());
-    let new_bot = req
-        .telegram_bot_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|x| !x.is_empty());
-    let identity = if let Some(token) = new_bot {
-        Some(
-            TelegramClient::new(token.to_owned())
-                .map_err(bad)?
-                .get_me()
-                .await
-                .map_err(bad)?,
-        )
-    } else {
-        None
-    };
-
     // External validation is complete before any config commit.
+    // P2-2: legacy telegram fields are never mutated here; canonical
+    // TelegramSetupService (/v1/admin/telegram) owns token/owner state.
     next.save_atomic(&state.config_path).map_err(bad)?;
-    if let Some(token) = new_bot {
-        store.put("telegram-bot-token", token).map_err(bad)?;
-        if let Some(identity) = identity {
-            state
-                .app
-                .storage
-                .put_setting(
-                    "telegram_bot_identity",
-                    &serde_json::to_string(&identity).map_err(bad)?,
-                )
-                .map_err(bad)?;
-        }
-    }
     if let Some(key) = req
         .custom_api_key
         .as_deref()
@@ -724,8 +695,8 @@ async fn admin_apply(
     *state.app.config.write().await = next.clone();
     state.app.events.publish(AppEvent::ConfigReloaded);
 
-    let restart_required = new_bot.is_some()
-        || old.gateway.enabled != next.gateway.enabled
+    // P2-2: legacy telegram token no longer triggers restart here.
+    let restart_required = old.gateway.enabled != next.gateway.enabled
         || old.telegram.enabled != next.telegram.enabled
         || old.daemon.log_level != next.daemon.log_level;
     Ok(Json(json!({
@@ -1358,10 +1329,7 @@ async fn manager_custom_profile_action(
                     )
                     .await;
                     models.push(crate::providers::profile_model_from_probe(
-                        profile_id,
-                        &model_id,
-                        &probe,
-                        &now,
+                        profile_id, &model_id, &probe, &now,
                     ));
                 } else {
                     models.push(prior.get(&model_id).cloned().unwrap_or(
@@ -1407,11 +1375,7 @@ async fn manager_custom_profile_action(
                 .get(&owner, profile_id)
                 .map_err(bad)?
                 .ok_or_else(|| bad("Custom profile not found"))?;
-            if profiles
-                .model(profile_id, model)
-                .map_err(bad)?
-                .is_none()
-            {
+            if profiles.model(profile_id, model).map_err(bad)?.is_none() {
                 return Err(bad("model has not been discovered for this Custom profile"));
             }
             let headers = profile.merged_headers(&secrets).map_err(bad)?;
@@ -1434,8 +1398,11 @@ async fn manager_custom_profile_action(
             let now = chrono::Utc::now().to_rfc3339();
             let mut models = profiles.models(profile_id).map_err(bad)?;
             if let Some(pos) = models.iter().position(|m| m.model_id == model) {
-                models[pos] = crate::providers::profile_model_from_probe(profile_id, model, &probe, &now);
-                profiles.replace_models(&owner, profile_id, &models).map_err(bad)?;
+                models[pos] =
+                    crate::providers::profile_model_from_probe(profile_id, model, &probe, &now);
+                profiles
+                    .replace_models(&owner, profile_id, &models)
+                    .map_err(bad)?;
                 Ok(Json(json!({"ok":true,"model":models[pos]})))
             } else {
                 Err(bad("model has not been discovered for this Custom profile"))
@@ -2605,9 +2572,16 @@ async fn client_config(
     })))
 }
 
+// P2-2: deprecated thin delegate helpers for the legacy WebUI/CLI base64
+// envelope (manager-get-base64 / manager-post-base64). No business logic
+// lives here; the base64 layer only transports JSON to the canonical typed
+// manager endpoints defined in `serve`.
 pub fn encode_admin_payload(json: &str) -> String {
     URL_SAFE_NO_PAD.encode(json.as_bytes())
 }
+/// Deprecated thin delegate. Decodes the base64 envelope used by the legacy
+/// WebUI/CLI bridge and returns the inner JSON; caller must route to the
+/// canonical manager handler. No independent validation is performed here.
 pub fn decode_admin_payload(value: &str) -> Result<String> {
     Ok(String::from_utf8(
         URL_SAFE_NO_PAD
@@ -3034,5 +3008,47 @@ mod tests {
                 "missing WebUI management behavior {behavior}"
             );
         }
+    }
+
+    // P2-2: legacy delegates must remain thin — no independent business logic.
+    #[test]
+    fn legacy_admin_payload_roundtrip_is_thin_delegate() {
+        let original = r#"{"resource":"dashboard","query":{"page":1}}"#;
+        let encoded = encode_admin_payload(original);
+        let decoded = decode_admin_payload(&encoded).unwrap();
+        assert_eq!(decoded, original);
+        assert!(decode_admin_payload("!!!not-base64!!!").is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_apply_rejects_telegram_fields_via_canonical_delegate() {
+        let (state, _directory) = test_state().await;
+        let headers = admin_headers("admin-test-token");
+        for body in [
+            json!({"telegram_enabled": true}),
+            json!({"owner_user_id": 123}),
+            json!({"telegram_bot_token": "123:abc"}),
+            json!({"allowed_chat_ids": "-100"}),
+            json!({"allowed_user_ids": "1,2"}),
+        ] {
+            let result =
+                admin_apply(State(state.clone()), headers.clone(), Json(serde_json::from_value(body).unwrap())).await;
+            assert!(result.is_err(), "legacy field should be rejected");
+            let (status, Json(value)) = result.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(value.get("error").is_some());
+        }
+    }
+
+    #[test]
+    fn apply_request_legacy_fields_are_deprecated_delegates() {
+        // Ensure ApplyRequest still deserializes legacy fields for wire compat
+        // but the handler treats them as deprecated delegates (see test above).
+        let raw = r#"{"telegram_enabled":true,"owner_user_id":99,"allowed_chat_ids":"-100","allowed_user_ids":"1,2"}"#;
+        let req: ApplyRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.telegram_enabled, Some(true));
+        assert_eq!(req.owner_user_id, Some(99));
+        assert_eq!(req.allowed_chat_ids.as_deref(), Some("-100"));
+        assert_eq!(req.allowed_user_ids.as_deref(), Some("1,2"));
     }
 }

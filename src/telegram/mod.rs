@@ -869,7 +869,25 @@ impl TelegramAdapter {
                 menu.current_view = login::confirmation_view(&wizard);
             }
             "confirm" if wizard.phase == CustomLoginPhase::Confirm => {
-                self.commit_custom_login(principal, &wizard).await?;
+                if self.custom_alias_exists(principal, &wizard.alias)? {
+                    wizard.phase = CustomLoginPhase::Alias;
+                    menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                    menu.current_view = login::alias_collision_view(wizard_id, &wizard.alias);
+                    return Ok(());
+                }
+                if let Err(error) = self.commit_custom_login(principal, &wizard).await {
+                    let msg = error.to_string().to_ascii_lowercase();
+                    if (msg.contains("already exists") && msg.contains("alias"))
+                        || (msg.contains("unique") && msg.contains("alias"))
+                    {
+                        wizard.phase = CustomLoginPhase::Alias;
+                        let alias = wizard.alias.clone();
+                        menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                        menu.current_view = login::alias_collision_view(wizard_id, &alias);
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
                 let model = wizard
                     .selected_index
                     .and_then(|index| wizard.models.get(index))
@@ -903,7 +921,25 @@ impl TelegramAdapter {
                     menu.current_view = login::model_view(&wizard);
                 }
                 CustomLoginPhase::Confirm => {
-                    self.commit_custom_login(principal, &wizard).await?;
+                    if self.custom_alias_exists(principal, &wizard.alias)? {
+                        wizard.phase = CustomLoginPhase::Alias;
+                        menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                        menu.current_view = login::alias_collision_view(wizard_id, &wizard.alias);
+                        return Ok(());
+                    }
+                    if let Err(error) = self.commit_custom_login(principal, &wizard).await {
+                        let msg = error.to_string().to_ascii_lowercase();
+                        if (msg.contains("already exists") && msg.contains("alias"))
+                            || (msg.contains("unique") && msg.contains("alias"))
+                        {
+                            wizard.phase = CustomLoginPhase::Alias;
+                            let alias = wizard.alias.clone();
+                            menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                            menu.current_view = login::alias_collision_view(wizard_id, &alias);
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
                     let model = wizard
                         .selected_index
                         .and_then(|index| wizard.models.get(index))
@@ -1244,15 +1280,52 @@ impl TelegramAdapter {
                             .split(':')
                             .next()
                             .unwrap_or_default();
-                        let endpoint = self
-                            .custom_logins
-                            .get(wizard_id)
-                            .and_then(|wizard| wizard.try_lock().ok()?.endpoint.clone());
-                        guard.current_view = login::failure_view(
-                            wizard_id,
-                            endpoint.as_deref(),
-                            &classify_custom_error(&error),
-                        );
+                        let msg = error.to_string().to_ascii_lowercase();
+                        let is_alias_collision = (msg.contains("already exists")
+                            && msg.contains("alias"))
+                            || (msg.contains("unique") && msg.contains("alias"));
+                        if is_alias_collision {
+                            if let Some(wizard) = self.custom_logins.get(wizard_id) {
+                                if let Ok(mut state) = wizard.try_lock() {
+                                    state.phase = login::CustomLoginPhase::Alias;
+                                    let alias = state.alias.clone();
+                                    guard.pending_input =
+                                        Some(format!("custom:{wizard_id}:alias"));
+                                    guard.current_view =
+                                        login::alias_collision_view(wizard_id, &alias);
+                                } else {
+                                    let endpoint = self
+                                        .custom_logins
+                                        .get(wizard_id)
+                                        .and_then(|w| w.try_lock().ok()?.endpoint.clone());
+                                    guard.current_view = login::failure_view(
+                                        wizard_id,
+                                        endpoint.as_deref(),
+                                        &classify_custom_error(&error),
+                                    );
+                                }
+                            } else {
+                                let endpoint = self
+                                    .custom_logins
+                                    .get(wizard_id)
+                                    .and_then(|wizard| wizard.try_lock().ok()?.endpoint.clone());
+                                guard.current_view = login::failure_view(
+                                    wizard_id,
+                                    endpoint.as_deref(),
+                                    &classify_custom_error(&error),
+                                );
+                            }
+                        } else {
+                            let endpoint = self
+                                .custom_logins
+                                .get(wizard_id)
+                                .and_then(|wizard| wizard.try_lock().ok()?.endpoint.clone());
+                            guard.current_view = login::failure_view(
+                                wizard_id,
+                                endpoint.as_deref(),
+                                &classify_custom_error(&error),
+                            );
+                        }
                     }
                     guard.revision += 1;
                     self.advance_menu_prompt(&mut guard).await?;

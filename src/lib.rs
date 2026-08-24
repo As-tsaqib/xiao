@@ -25,4 +25,5 @@ pub mod telegram;
 pub mod tools;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub mod cli_contract;
 pub mod presentation;
