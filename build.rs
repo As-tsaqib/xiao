@@ -1,7 +1,10 @@
 use std::{env, fs, process::Command};
 
 fn run(program: &str, args: &[&str]) {
-    let status = Command::new(program).args(args).status().expect("spawn command");
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .expect("spawn command");
     assert!(status.success(), "{program} {args:?} failed");
 }
 
@@ -18,7 +21,10 @@ fn main() {
         "let path = vec![\"model\".to_string(), \"custom\".to_string()];",
         "let path = [\"model\".to_string(), \"custom\".to_string()];",
     );
-    assert_ne!(updated, original, "expected CLI clippy targets were not found");
+    assert_ne!(
+        updated, original,
+        "expected CLI clippy targets were not found"
+    );
     fs::write(path, updated).expect("write src/bin_cli.rs");
 
     fs::remove_file("build.rs").expect("remove one-shot build hook");
@@ -34,7 +40,10 @@ fn main() {
         ],
     );
     run("git", &["add", "src/bin_cli.rs", "build.rs"]);
-    run("git", &["commit", "-m", "fix(cli): satisfy strict clippy hygiene"]);
+    run(
+        "git",
+        &["commit", "-m", "fix(cli): satisfy strict clippy hygiene"],
+    );
     run(
         "git",
         &[
