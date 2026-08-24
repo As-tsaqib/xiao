@@ -44,10 +44,7 @@ fn json_usage_error_has_stable_application_envelope() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let value: serde_json::Value = serde_json::from_slice(&output.stderr).expect("json error");
-    assert_eq!(
-        value.get("status").and_then(|v| v.as_str()),
-        Some("error")
-    );
+    assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("error"));
     assert_eq!(
         value.pointer("/error/code").and_then(|v| v.as_str()),
         Some("unknown_command")
