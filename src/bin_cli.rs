@@ -260,7 +260,11 @@ impl DaemonClient {
             let found = response
                 .get("items")
                 .and_then(Value::as_array)
-                .is_some_and(|items| items.iter().any(|item| item.get("id").and_then(Value::as_str) == Some(session)));
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item.get("id").and_then(Value::as_str) == Some(session))
+                });
             if !found {
                 return Err(CliFailure {
                     code: EXIT_NOT_FOUND,
@@ -322,11 +326,13 @@ fn parse_global_options(raw: Vec<String>) -> CliResult<(GlobalOptions, Vec<Strin
                 let raw_timeout = raw
                     .get(index)
                     .ok_or_else(|| CliFailure::usage("--timeout requires seconds"))?;
-                let seconds = raw_timeout
-                    .parse::<u64>()
-                    .map_err(|_| CliFailure::usage("--timeout must be an integer number of seconds"))?;
+                let seconds = raw_timeout.parse::<u64>().map_err(|_| {
+                    CliFailure::usage("--timeout must be an integer number of seconds")
+                })?;
                 if !(1..=3600).contains(&seconds) {
-                    return Err(CliFailure::usage("--timeout must be between 1 and 3600 seconds"));
+                    return Err(CliFailure::usage(
+                        "--timeout must be between 1 and 3600 seconds",
+                    ));
                 }
                 options.timeout_seconds = Some(seconds);
             }
@@ -338,15 +344,26 @@ fn parse_global_options(raw: Vec<String>) -> CliResult<(GlobalOptions, Vec<Strin
 }
 
 async fn run(options: GlobalOptions, args: Vec<String>, presenter: &CliPresenter) -> CliResult<()> {
-    if args.is_empty() || matches!(args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
+    if args.is_empty()
+        || matches!(
+            args.first().map(String::as_str),
+            Some("-h" | "--help" | "help")
+        )
+    {
         print_help();
         return Ok(());
     }
-    if let Some(position) = args.iter().position(|arg| matches!(arg.as_str(), "-h" | "--help")) {
+    if let Some(position) = args
+        .iter()
+        .position(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
         print_subcommand_help(&args[..position]);
         return Ok(());
     }
-    if matches!(args.first().map(String::as_str), Some("-V" | "--version" | "version")) {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-V" | "--version" | "version")
+    ) {
         presenter.line(format!("xiao {}", xiao::VERSION));
         return Ok(());
     }
@@ -394,7 +411,7 @@ async fn public_daemon_command(
         "status" => {
             exact_arity(args, 1, "usage: xiao status")?;
             presenter.success("status", client.get_admin("/v1/admin/dashboard").await?)
-        },
+        }
         "context" => {
             exact_arity(args, 1, "usage: xiao context")?;
             let session = if let Some(id) = options.session.as_deref() {
@@ -402,7 +419,12 @@ async fn public_daemon_command(
             } else {
                 String::new()
             };
-            presenter.success("context", client.get_admin(&format!("/v1/admin/context{session}")).await?)
+            presenter.success(
+                "context",
+                client
+                    .get_admin(&format!("/v1/admin/context{session}"))
+                    .await?,
+            )
         }
         "doctor" => {
             exact_arity(args, 1, "usage: xiao doctor")?;
@@ -477,7 +499,11 @@ async fn chat(
     while index < args.len() {
         match args[index].as_str() {
             "--file" | "--image" => {
-                let kind = if args[index] == "--image" { "image" } else { "file" };
+                let kind = if args[index] == "--image" {
+                    "image"
+                } else {
+                    "file"
+                };
                 index += 1;
                 let path = args
                     .get(index)
@@ -539,16 +565,21 @@ async fn ingest_cli_attachment(
     kind: &str,
     path: &Path,
 ) -> CliResult<()> {
-    let metadata = fs::metadata(path).map_err(|error| CliFailure::local(format!(
-        "read attachment metadata {}: {error}",
-        path.display()
-    )))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        CliFailure::local(format!(
+            "read attachment metadata {}: {error}",
+            path.display()
+        ))
+    })?;
     // Client-side bound avoids accidentally constructing enormous base64 argv/JSON.
     if metadata.len() > 200 * 1024 * 1024 {
-        return Err(CliFailure::local("attachment exceeds the client safety bound"));
+        return Err(CliFailure::local(
+            "attachment exceeds the client safety bound",
+        ));
     }
-    let bytes = fs::read(path)
-        .map_err(|error| CliFailure::local(format!("read attachment {}: {error}", path.display())))?;
+    let bytes = fs::read(path).map_err(|error| {
+        CliFailure::local(format!("read attachment {}: {error}", path.display()))
+    })?;
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -576,9 +607,10 @@ async fn telegram_command(
     presenter: &CliPresenter,
 ) -> CliResult<()> {
     match args.first().map(String::as_str) {
-        Some("status") if args.len() == 1 => {
-            presenter.success("telegram status", client.get_admin("/v1/admin/telegram").await?)
-        }
+        Some("status") if args.len() == 1 => presenter.success(
+            "telegram status",
+            client.get_admin("/v1/admin/telegram").await?,
+        ),
         Some("test") if args.len() == 1 => presenter.success(
             "telegram test",
             client
@@ -604,7 +636,9 @@ async fn telegram_command(
                 ));
             }
             let owner = parse_i64(&args[1], "owner user id")?;
-            let confirm = args.get(2).is_some_and(|value| value == "--confirm-owner-change");
+            let confirm = args
+                .get(2)
+                .is_some_and(|value| value == "--confirm-owner-change");
             if args.len() == 3 && !confirm {
                 return Err(CliFailure::usage("unknown set-owner option"));
             }
@@ -668,16 +702,20 @@ async fn telegram_configure(
             }
             "--token-file" => {
                 index += 1;
-                token_file = Some(PathBuf::from(
-                    args.get(index)
-                        .ok_or_else(|| CliFailure::usage("--token-file requires PATH"))?,
-                ));
+                token_file =
+                    Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                        CliFailure::usage("--token-file requires PATH")
+                    })?));
             }
             "--enable" => enabled = Some(true),
             "--disable" => enabled = Some(false),
             "--confirm-owner-change" => confirm = true,
             "--test" => test = true,
-            other => return Err(CliFailure::usage(format!("unknown telegram configure option `{other}`"))),
+            other => {
+                return Err(CliFailure::usage(format!(
+                    "unknown telegram configure option `{other}`"
+                )))
+            }
         }
         index += 1;
     }
@@ -747,15 +785,14 @@ async fn model_command(
     presenter: &CliPresenter,
 ) -> CliResult<()> {
     let Some(sub) = args.first().map(String::as_str) else {
-        return Err(CliFailure::usage("usage: xiao model <show|list|use|accounts|custom>"));
+        return Err(CliFailure::usage(
+            "usage: xiao model <show|list|use|accounts|custom>",
+        ));
     };
     match sub {
         "show" if args.len() == 1 => {
             let session = client.target_session(options).await?;
-            presenter.success(
-                "model show",
-                session_by_id(client, &session).await?,
-            )
+            presenter.success("model show", session_by_id(client, &session).await?)
         }
         "list" if args.len() == 1 => {
             let session = client.target_session(options).await?;
@@ -766,8 +803,14 @@ async fn model_command(
         "use" if args.len() == 2 => {
             let session_id = client.target_session(options).await?;
             let selected = session_by_id(client, &session_id).await?;
-            let provider = selected.get("provider").and_then(Value::as_str).unwrap_or_default();
-            let binding = selected.get("account_or_profile_id").cloned().unwrap_or(Value::Null);
+            let provider = selected
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let binding = selected
+                .get("account_or_profile_id")
+                .cloned()
+                .unwrap_or(Value::Null);
             let value = client
                 .post_admin(
                     "/v1/admin/sessions",
@@ -784,7 +827,9 @@ async fn model_command(
         }
         "accounts" => accounts_command(client, options, &args[1..], presenter).await,
         "custom" => custom_command(client, options, &args[1..], presenter).await,
-        _ => Err(CliFailure::usage("usage: xiao model <show|list|use> | xiao model accounts ... | xiao model custom ...")),
+        _ => Err(CliFailure::usage(
+            "usage: xiao model <show|list|use> | xiao model accounts ... | xiao model custom ...",
+        )),
     }
 }
 
@@ -808,7 +853,10 @@ async fn accounts_command(
         }
         Some("use") if args.len() == 2 || args.len() == 3 => {
             let account = account_by_id(client, &args[1]).await?;
-            let provider = account.get("provider").and_then(Value::as_str).unwrap_or_default();
+            let provider = account
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let model = if let Some(model) = args.get(2) {
                 model.clone()
             } else {
@@ -818,7 +866,10 @@ async fn accounts_command(
                     .and_then(|models| models.first())
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .ok_or_else(|| CliFailure { code: EXIT_REJECTED, message: "account has no available model".into() })?
+                    .ok_or_else(|| CliFailure {
+                        code: EXIT_REJECTED,
+                        message: "account has no available model".into(),
+                    })?
             };
             let session = client.target_session(options).await?;
             presenter.success(
@@ -880,21 +931,19 @@ async fn custom_command(
         }
         Some("add") => custom_add(client, &args[1..], presenter).await,
         Some("edit") => custom_edit(client, &args[1..], presenter).await,
-        Some("test") if args.len() == 2 || args.len() == 3 => {
-            presenter.success(
-                "model custom test",
-                client
-                    .post_admin(
-                        "/v1/admin/providers/custom",
-                        &json!({
-                            "action":"test",
-                            "profile_id":args[1],
-                            "model":args.get(2),
-                        }),
-                    )
-                    .await?,
-            )
-        }
+        Some("test") if args.len() == 2 || args.len() == 3 => presenter.success(
+            "model custom test",
+            client
+                .post_admin(
+                    "/v1/admin/providers/custom",
+                    &json!({
+                        "action":"test",
+                        "profile_id":args[1],
+                        "model":args.get(2),
+                    }),
+                )
+                .await?,
+        ),
         Some("models") if args.len() == 2 => {
             let profile = custom_by_id(client, &args[1]).await?;
             presenter.success(
@@ -960,10 +1009,10 @@ async fn custom_add(
             }
             "--key-file" => {
                 index += 1;
-                key_file = Some(PathBuf::from(
-                    args.get(index)
-                        .ok_or_else(|| CliFailure::usage("--key-file requires PATH"))?,
-                ));
+                key_file =
+                    Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                        CliFailure::usage("--key-file requires PATH")
+                    })?));
             }
             "--header" => {
                 index += 1;
@@ -975,7 +1024,11 @@ async fn custom_add(
                     .ok_or_else(|| CliFailure::usage("--header requires NAME=VALUE"))?;
                 headers.insert(name.to_owned(), value.to_owned());
             }
-            other => return Err(CliFailure::usage(format!("unknown custom add option `{other}`"))),
+            other => {
+                return Err(CliFailure::usage(format!(
+                    "unknown custom add option `{other}`"
+                )))
+            }
         }
         index += 1;
     }
@@ -1054,24 +1107,55 @@ async fn custom_edit(
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
-            "--alias" => { index += 1; alias = Some(required_arg(args, index, "--alias")?.to_owned()); }
-            "--endpoint" => { index += 1; endpoint = Some(required_arg(args, index, "--endpoint")?.to_owned()); }
-            "--protocol" => { index += 1; protocol = Some(required_arg(args, index, "--protocol")?.to_owned()); }
-            "--key-file" => { index += 1; api_key = Some(read_secret_file(Path::new(required_arg(args, index, "--key-file")?), "Custom API key")?); }
+            "--alias" => {
+                index += 1;
+                alias = Some(required_arg(args, index, "--alias")?.to_owned());
+            }
+            "--endpoint" => {
+                index += 1;
+                endpoint = Some(required_arg(args, index, "--endpoint")?.to_owned());
+            }
+            "--protocol" => {
+                index += 1;
+                protocol = Some(required_arg(args, index, "--protocol")?.to_owned());
+            }
+            "--key-file" => {
+                index += 1;
+                api_key = Some(read_secret_file(
+                    Path::new(required_arg(args, index, "--key-file")?),
+                    "Custom API key",
+                )?);
+            }
             "--remove-key" => remove_api_key = true,
             "--keep-credential" => keep_credential = true,
             "--headers-file" => {
                 index += 1;
                 let path = Path::new(required_arg(args, index, "--headers-file")?);
-                let raw = fs::read_to_string(path).map_err(|error| CliFailure::local(format!("read {}: {error}", path.display())))?;
-                headers = Some(serde_json::from_str(&raw).map_err(|error| CliFailure::usage(format!("invalid headers JSON: {error}")))?);
+                let raw = fs::read_to_string(path).map_err(|error| {
+                    CliFailure::local(format!("read {}: {error}", path.display()))
+                })?;
+                headers = Some(serde_json::from_str(&raw).map_err(|error| {
+                    CliFailure::usage(format!("invalid headers JSON: {error}"))
+                })?);
             }
-            other => return Err(CliFailure::usage(format!("unknown custom edit option `{other}`"))),
+            other => {
+                return Err(CliFailure::usage(format!(
+                    "unknown custom edit option `{other}`"
+                )))
+            }
         }
         index += 1;
     }
-    if alias.is_none() && endpoint.is_none() && protocol.is_none() && api_key.is_none() && !remove_api_key && headers.is_none() {
-        return Err(CliFailure::usage("custom edit requires at least one change"));
+    if alias.is_none()
+        && endpoint.is_none()
+        && protocol.is_none()
+        && api_key.is_none()
+        && !remove_api_key
+        && headers.is_none()
+    {
+        return Err(CliFailure::usage(
+            "custom edit requires at least one change",
+        ));
     }
     presenter.success(
         "model custom edit",
@@ -1100,17 +1184,19 @@ async fn sessions_command(
     presenter: &CliPresenter,
 ) -> CliResult<()> {
     match args.first().map(String::as_str) {
-        Some("list") if args.len() == 1 => {
-            presenter.success("sessions list", client.get_admin("/v1/admin/sessions?limit=50").await?)
-        }
+        Some("list") if args.len() == 1 => presenter.success(
+            "sessions list",
+            client.get_admin("/v1/admin/sessions?limit=50").await?,
+        ),
         Some("new") if args.len() == 1 => presenter.success(
             "sessions new",
-            client.post_admin("/v1/admin/sessions", &json!({"action":"new"})).await?,
+            client
+                .post_admin("/v1/admin/sessions", &json!({"action":"new"}))
+                .await?,
         ),
-        Some("show") if args.len() == 2 => presenter.success(
-            "sessions show",
-            session_by_id(client, &args[1]).await?,
-        ),
+        Some("show") if args.len() == 2 => {
+            presenter.success("sessions show", session_by_id(client, &args[1]).await?)
+        }
         Some("use") if args.len() == 2 => presenter.success(
             "sessions use",
             client
@@ -1309,12 +1395,18 @@ async fn attachments_command(
         Some("list") if args.len() == 1 => presenter.success(
             "attachments list",
             client
-                .get_admin(&format!("/v1/admin/attachments?session_id={}", url_encode(&session)))
+                .get_admin(&format!(
+                    "/v1/admin/attachments?session_id={}",
+                    url_encode(&session)
+                ))
                 .await?,
         ),
         Some("show") if args.len() == 2 => {
             let data = client
-                .get_admin(&format!("/v1/admin/attachments?id={}", url_encode(&args[1])))
+                .get_admin(&format!(
+                    "/v1/admin/attachments?id={}",
+                    url_encode(&args[1])
+                ))
                 .await?;
             let item = find_item(&data, &args[1], &["attachment_id"])?;
             presenter.success("attachments show", item)
@@ -1340,24 +1432,34 @@ async fn runs_command(
     presenter: &CliPresenter,
 ) -> CliResult<()> {
     match args.first().map(String::as_str) {
-        Some("list") if args.len() == 1 => {
-            presenter.success("runs list", client.get_admin("/v1/admin/runs?limit=50").await?)
-        }
+        Some("list") if args.len() == 1 => presenter.success(
+            "runs list",
+            client.get_admin("/v1/admin/runs?limit=50").await?,
+        ),
         Some("show") if args.len() == 2 => {
             let data = client.get_admin("/v1/admin/runs?limit=50").await?;
-            presenter.success("runs show", find_item(&data, &args[1], &["id"])? )
+            presenter.success("runs show", find_item(&data, &args[1], &["id"])?)
         }
         Some("cancel") if args.len() == 2 => presenter.success(
             "runs cancel",
             client
-                .post_admin("/v1/admin/runs", &json!({"action":"cancel","run_id":args[1]}))
+                .post_admin(
+                    "/v1/admin/runs",
+                    &json!({"action":"cancel","run_id":args[1]}),
+                )
                 .await?,
         ),
-        _ => Err(CliFailure::usage("usage: xiao runs <list|show ID|cancel ID>")),
+        _ => Err(CliFailure::usage(
+            "usage: xiao runs <list|show ID|cancel ID>",
+        )),
     }
 }
 
-async fn setup(paths: &CliPaths, options: &GlobalOptions, presenter: &CliPresenter) -> CliResult<()> {
+async fn setup(
+    paths: &CliPaths,
+    options: &GlobalOptions,
+    presenter: &CliPresenter,
+) -> CliResult<()> {
     if !io::stdin().is_terminal() {
         return Err(CliFailure::usage(
             "xiao setup requires an interactive TTY; automation should use `xiao telegram set-token-file` and `xiao telegram set-owner`",
@@ -1398,17 +1500,30 @@ async fn setup(paths: &CliPaths, options: &GlobalOptions, presenter: &CliPresent
     let provider = prompt_line("Provider [skip/codex/antigravity/custom]: ")?;
     let provider_result = match provider.trim().to_ascii_lowercase().as_str() {
         "" | "skip" => Value::Null,
-        "codex" | "antigravity" => client
-            .post_admin(
-                "/v1/admin/providers/accounts",
-                &json!({"action":"login","provider":provider.trim().to_ascii_lowercase()}),
-            )
-            .await?,
+        "codex" | "antigravity" => {
+            client
+                .post_admin(
+                    "/v1/admin/providers/accounts",
+                    &json!({"action":"login","provider":provider.trim().to_ascii_lowercase()}),
+                )
+                .await?
+        }
         "custom" => {
-            custom_add_interactive(&client, &CliPresenter::new(GlobalOptions { quiet: true, ..options.clone() })).await?;
+            custom_add_interactive(
+                &client,
+                &CliPresenter::new(GlobalOptions {
+                    quiet: true,
+                    ..options.clone()
+                }),
+            )
+            .await?;
             json!({"started":true,"provider":"custom"})
         }
-        _ => return Err(CliFailure::usage("setup provider must be skip, codex, antigravity, or custom")),
+        _ => {
+            return Err(CliFailure::usage(
+                "setup provider must be skip, codex, antigravity, or custom",
+            ))
+        }
     };
     presenter.line("5/6 Running bounded diagnostics...");
     let diagnostics = client.get_admin("/v1/admin/diagnostics").await?;
@@ -1433,42 +1548,59 @@ async fn quickstart(paths: &CliPaths, args: &[String], presenter: &CliPresenter)
     };
     let init = standalone::initialize(paths).map_err(anyhow::Error::from)?;
     if no_start {
-        return presenter.success("quickstart", json!({
-            "config":paths.config,
-            "data":init.runtime.data_dir,
-            "started":false,
-        }));
+        return presenter.success(
+            "quickstart",
+            json!({
+                "config":paths.config,
+                "data":init.runtime.data_dir,
+                "started":false,
+            }),
+        );
     }
     let started = standalone::start_daemon(paths, &init)
         .await
         .map_err(anyhow::Error::from)?;
-    presenter.success("quickstart", json!({
-        "config":paths.config,
-        "data":init.runtime.data_dir,
-        "started":true,
-        "pid":started.pid,
-        "already_running":started.already_running,
-    }))
+    presenter.success(
+        "quickstart",
+        json!({
+            "config":paths.config,
+            "data":init.runtime.data_dir,
+            "started":true,
+            "pid":started.pid,
+            "already_running":started.already_running,
+        }),
+    )
 }
 
 async fn daemon(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -> CliResult<()> {
     match args.first().map(String::as_str) {
         Some("start") if args.len() == 1 => {
             let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            let result = standalone::start_daemon(paths, &init).await.map_err(anyhow::Error::from)?;
+            let result = standalone::start_daemon(paths, &init)
+                .await
+                .map_err(anyhow::Error::from)?;
             presenter.success("daemon start", start_value(result))
         }
         Some("foreground") if args.len() == 1 => {
             let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            let status = standalone::run_daemon_foreground(paths, &init).map_err(anyhow::Error::from)?;
+            let status =
+                standalone::run_daemon_foreground(paths, &init).map_err(anyhow::Error::from)?;
             if !status.success() {
-                return Err(CliFailure { code: EXIT_ERROR, message: format!("xiaod exited with {status}") });
+                return Err(CliFailure {
+                    code: EXIT_ERROR,
+                    message: format!("xiaod exited with {status}"),
+                });
             }
-            presenter.success("daemon foreground", json!({"exit_status":status.to_string()}))
+            presenter.success(
+                "daemon foreground",
+                json!({"exit_status":status.to_string()}),
+            )
         }
         Some("status") if args.len() == 1 => {
             let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            let status = standalone::daemon_status(paths, &init).await.map_err(anyhow::Error::from)?;
+            let status = standalone::daemon_status(paths, &init)
+                .await
+                .map_err(anyhow::Error::from)?;
             let value = json!({
                 "managed_pid":status.managed_pid,
                 "reachable":status.reachable,
@@ -1477,41 +1609,69 @@ async fn daemon(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -> 
             });
             if !status.reachable {
                 presenter.success("daemon status", value)?;
-                return Err(CliFailure { code: EXIT_DAEMON_UNAVAILABLE, message: "xiaod is not ready".into() });
+                return Err(CliFailure {
+                    code: EXIT_DAEMON_UNAVAILABLE,
+                    message: "xiaod is not ready".into(),
+                });
             }
             presenter.success("daemon status", value)
         }
         Some("logs") => {
             let lines = parse_lines(args.get(1))?;
-            if args.len() > 2 { return Err(CliFailure::usage("usage: xiao daemon logs [N]")); }
+            if args.len() > 2 {
+                return Err(CliFailure::usage("usage: xiao daemon logs [N]"));
+            }
             let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            let rows = standalone::tail_daemon_log(&init.runtime, lines).map_err(anyhow::Error::from)?;
+            let rows =
+                standalone::tail_daemon_log(&init.runtime, lines).map_err(anyhow::Error::from)?;
             presenter.success("daemon logs", json!({"lines":rows}))
         }
         Some("stop") if args.len() == 1 => {
             let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            presenter.success("daemon stop", stop_value(standalone::stop_daemon(paths, &init).await.map_err(anyhow::Error::from)?))
+            presenter.success(
+                "daemon stop",
+                stop_value(
+                    standalone::stop_daemon(paths, &init)
+                        .await
+                        .map_err(anyhow::Error::from)?,
+                ),
+            )
         }
         Some("restart") if args.len() == 1 => {
             let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
-            let stop = standalone::stop_daemon(paths, &init).await.map_err(anyhow::Error::from)?;
+            let stop = standalone::stop_daemon(paths, &init)
+                .await
+                .map_err(anyhow::Error::from)?;
             if matches!(stop, StopResult::UnmanagedRunning) {
-                return Err(CliFailure { code: EXIT_REJECTED, message: "xiaod is running outside this lifecycle".into() });
+                return Err(CliFailure {
+                    code: EXIT_REJECTED,
+                    message: "xiaod is running outside this lifecycle".into(),
+                });
             }
-            let start = standalone::start_daemon(paths, &init).await.map_err(anyhow::Error::from)?;
-            presenter.success("daemon restart", json!({"stop":stop_value(stop),"start":start_value(start)}))
+            let start = standalone::start_daemon(paths, &init)
+                .await
+                .map_err(anyhow::Error::from)?;
+            presenter.success(
+                "daemon restart",
+                json!({"stop":stop_value(stop),"start":start_value(start)}),
+            )
         }
-        _ => Err(CliFailure::usage("usage: xiao daemon <start|foreground|stop|restart|status|logs>")),
+        _ => Err(CliFailure::usage(
+            "usage: xiao daemon <start|foreground|stop|restart|status|logs>",
+        )),
     }
 }
 
 fn config_command(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -> CliResult<()> {
     match args.first().map(String::as_str) {
-        Some("path") if args.len() == 1 => presenter.success("config path", json!({
-            "config":paths.config,
-            "client":paths.client_config,
-            "default_data":paths.default_data_dir,
-        })),
+        Some("path") if args.len() == 1 => presenter.success(
+            "config path",
+            json!({
+                "config":paths.config,
+                "client":paths.client_config,
+                "default_data":paths.default_data_dir,
+            }),
+        ),
         Some("check") if args.len() == 1 => {
             let init = standalone::load_existing(paths).map_err(anyhow::Error::from)?;
             if paths.client_config.exists() {
@@ -1539,9 +1699,14 @@ async fn logs_command(
     presenter: &CliPresenter,
 ) -> CliResult<()> {
     let lines = parse_lines(args.first())?;
-    if args.len() > 1 { return Err(CliFailure::usage("usage: xiao logs [N]")); }
+    if args.len() > 1 {
+        return Err(CliFailure::usage("usage: xiao logs [N]"));
+    }
     let client = DaemonClient::load(paths, options)?;
-    presenter.success("logs", client.get_admin(&format!("/v1/logs?lines={lines}")).await?)
+    presenter.success(
+        "logs",
+        client.get_admin(&format!("/v1/logs?lines={lines}")).await?,
+    )
 }
 
 async fn admin(
@@ -1552,15 +1717,21 @@ async fn admin(
 ) -> CliResult<()> {
     let client = DaemonClient::load(paths, options)?;
     match args.first().map(String::as_str) {
-        Some("snapshot") if args.len() == 1 => raw_success(client.get_admin("/v1/admin/snapshot").await?),
+        Some("snapshot") if args.len() == 1 => {
+            raw_success(client.get_admin("/v1/admin/snapshot").await?)
+        }
         Some("logs") => {
             let lines = parse_lines(args.get(1))?;
             raw_success(client.get_admin(&format!("/v1/logs?lines={lines}")).await?)
         }
-        Some("client-config") if args.len() == 1 => raw_success(client.get_admin("/v1/admin/client-config").await?),
+        Some("client-config") if args.len() == 1 => {
+            raw_success(client.get_admin("/v1/admin/client-config").await?)
+        }
         Some("apply-file") if args.len() == 2 => {
-            let raw = fs::read_to_string(&args[1]).map_err(|error| CliFailure::local(error.to_string()))?;
-            let body: Value = serde_json::from_str(&raw).map_err(|error| CliFailure::usage(error.to_string()))?;
+            let raw = fs::read_to_string(&args[1])
+                .map_err(|error| CliFailure::local(error.to_string()))?;
+            let body: Value =
+                serde_json::from_str(&raw).map_err(|error| CliFailure::usage(error.to_string()))?;
             raw_success(client.post_admin("/v1/admin/apply", &body).await?)
         }
         Some("apply-base64") if args.len() == 2 => {
@@ -1569,11 +1740,24 @@ async fn admin(
         }
         Some("test-token-file") if args.len() == 2 => {
             let token = read_secret_file(Path::new(&args[1]), "Telegram Bot Token")?;
-            raw_success(client.post_admin("/v1/admin/telegram/test", &json!({"token":token})).await?)
+            raw_success(
+                client
+                    .post_admin("/v1/admin/telegram/test", &json!({"token":token}))
+                    .await?,
+            )
         }
         Some("test-token-base64") if args.len() == 2 => {
-            let token = String::from_utf8(URL_SAFE_NO_PAD.decode(&args[1]).map_err(anyhow::Error::from)?).map_err(anyhow::Error::from)?;
-            raw_success(client.post_admin("/v1/admin/telegram/test", &json!({"token":token})).await?)
+            let token = String::from_utf8(
+                URL_SAFE_NO_PAD
+                    .decode(&args[1])
+                    .map_err(anyhow::Error::from)?,
+            )
+            .map_err(anyhow::Error::from)?;
+            raw_success(
+                client
+                    .post_admin("/v1/admin/telegram/test", &json!({"token":token}))
+                    .await?,
+            )
         }
         Some("fetch-models-base64") if args.len() == 2 => {
             let body = decode_payload(&args[1])?;
@@ -1581,33 +1765,75 @@ async fn admin(
         }
         Some("manager-get-base64") if args.len() == 2 => {
             let request = decode_payload(&args[1])?;
-            let resource = request.get("resource").and_then(Value::as_str).ok_or_else(|| CliFailure::usage("manager resource is required"))?;
+            let resource = request
+                .get("resource")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliFailure::usage("manager resource is required"))?;
             let path = manager_resource_path(resource)?;
-            let mut url = reqwest::Url::parse(&format!("{}{}", client.endpoint, path)).map_err(anyhow::Error::from)?;
+            let mut url = reqwest::Url::parse(&format!("{}{}", client.endpoint, path))
+                .map_err(anyhow::Error::from)?;
             if let Some(query) = request.get("query").and_then(Value::as_object) {
                 let mut pairs = url.query_pairs_mut();
                 for (key, value) in query {
-                    if !matches!(key.as_str(), "page"|"limit"|"query"|"scope"|"include_archived"|"lines"|"session_id"|"id") {
-                        return Err(CliFailure::usage(format!("unsupported manager query field: {key}")));
+                    if !matches!(
+                        key.as_str(),
+                        "page"
+                            | "limit"
+                            | "query"
+                            | "scope"
+                            | "include_archived"
+                            | "lines"
+                            | "session_id"
+                            | "id"
+                    ) {
+                        return Err(CliFailure::usage(format!(
+                            "unsupported manager query field: {key}"
+                        )));
                     }
-                    pairs.append_pair(key, value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string()).as_str());
+                    pairs.append_pair(
+                        key,
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| value.to_string())
+                            .as_str(),
+                    );
                 }
             }
-            let response = client.http.get(url).bearer_auth(&client.admin_token).send().await.map_err(connection_failure)?;
+            let response = client
+                .http
+                .get(url)
+                .bearer_auth(&client.admin_token)
+                .send()
+                .await
+                .map_err(connection_failure)?;
             raw_success(parse_response(response).await?)
         }
         Some("manager-post-base64") if args.len() == 2 => {
             let request = decode_payload(&args[1])?;
-            let resource = request.get("resource").and_then(Value::as_str).ok_or_else(|| CliFailure::usage("manager resource is required"))?;
-            let body = request.get("body").cloned().ok_or_else(|| CliFailure::usage("manager request body is required"))?;
-            raw_success(client.post_admin(manager_resource_path(resource)?, &body).await?)
+            let resource = request
+                .get("resource")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliFailure::usage("manager resource is required"))?;
+            let body = request
+                .get("body")
+                .cloned()
+                .ok_or_else(|| CliFailure::usage("manager request body is required"))?;
+            raw_success(
+                client
+                    .post_admin(manager_resource_path(resource)?, &body)
+                    .await?,
+            )
         }
         _ => Err(CliFailure::usage("unsupported hidden admin command")),
     }
 }
 
 fn raw_success(value: Value) -> CliResult<()> {
-    println!("{}", serde_json::to_string(&value).map_err(anyhow::Error::from)?);
+    println!(
+        "{}",
+        serde_json::to_string(&value).map_err(anyhow::Error::from)?
+    );
     Ok(())
 }
 
@@ -1644,28 +1870,49 @@ async fn account_by_id(client: &DaemonClient, id: &str) -> CliResult<Value> {
     let data = client.get_admin("/v1/admin/providers").await?;
     data.get("accounts")
         .and_then(Value::as_array)
-        .and_then(|items| items.iter().find(|item| item.get("id").and_then(Value::as_str) == Some(id)))
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+        })
         .cloned()
-        .ok_or_else(|| CliFailure { code: EXIT_NOT_FOUND, message: format!("account `{id}` not found") })
+        .ok_or_else(|| CliFailure {
+            code: EXIT_NOT_FOUND,
+            message: format!("account `{id}` not found"),
+        })
 }
 
 async fn custom_by_id(client: &DaemonClient, id: &str) -> CliResult<Value> {
     let data = client.get_admin("/v1/admin/providers").await?;
     data.get("custom_profiles")
         .and_then(Value::as_array)
-        .and_then(|items| items.iter().find(|item| item.get("id").and_then(Value::as_str) == Some(id)))
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+        })
         .cloned()
-        .ok_or_else(|| CliFailure { code: EXIT_NOT_FOUND, message: format!("Custom profile `{id}` not found") })
+        .ok_or_else(|| CliFailure {
+            code: EXIT_NOT_FOUND,
+            message: format!("Custom profile `{id}` not found"),
+        })
 }
 
 fn models_for_session(session: &Value, providers: &Value) -> Value {
-    let provider = session.get("provider").and_then(Value::as_str).unwrap_or_default();
+    let provider = session
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let binding = session.get("account_or_profile_id").and_then(Value::as_str);
     let models = if provider == "custom" {
         providers
             .get("custom_profiles")
             .and_then(Value::as_array)
-            .and_then(|items| items.iter().find(|item| item.get("id").and_then(Value::as_str) == binding))
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(Value::as_str) == binding)
+            })
             .and_then(|item| item.get("models"))
             .cloned()
             .unwrap_or_else(|| json!([]))
@@ -1673,7 +1920,11 @@ fn models_for_session(session: &Value, providers: &Value) -> Value {
         providers
             .get("accounts")
             .and_then(Value::as_array)
-            .and_then(|items| items.iter().find(|item| item.get("id").and_then(Value::as_str) == binding))
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(Value::as_str) == binding)
+            })
             .and_then(|item| item.get("models"))
             .cloned()
             .unwrap_or_else(|| json!([]))
@@ -1692,11 +1943,16 @@ fn find_item(data: &Value, id: &str, fields: &[&str]) -> CliResult<Value> {
         .and_then(Value::as_array)
         .and_then(|items| {
             items.iter().find(|item| {
-                fields.iter().any(|field| item.get(field).and_then(Value::as_str) == Some(id))
+                fields
+                    .iter()
+                    .any(|field| item.get(field).and_then(Value::as_str) == Some(id))
             })
         })
         .cloned()
-        .ok_or_else(|| CliFailure { code: EXIT_NOT_FOUND, message: format!("`{id}` not found") })
+        .ok_or_else(|| CliFailure {
+            code: EXIT_NOT_FOUND,
+            message: format!("`{id}` not found"),
+        })
 }
 
 fn app_result_schema(value: Value) -> Value {
@@ -1732,16 +1988,28 @@ async fn parse_response(response: reqwest::Response) -> CliResult<Value> {
     if !status.is_success() {
         let message = serde_json::from_str::<Value>(&text)
             .ok()
-            .and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_owned))
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| text.clone());
         let code = if status.as_u16() == 404 {
             EXIT_NOT_FOUND
-        } else if status.as_u16() == 401 || status.as_u16() == 403 || status.as_u16() == 400 || status.as_u16() == 409 {
+        } else if status.as_u16() == 401
+            || status.as_u16() == 403
+            || status.as_u16() == 400
+            || status.as_u16() == 409
+        {
             EXIT_REJECTED
         } else {
             EXIT_ERROR
         };
-        return Err(CliFailure { code, message: redact_text(&message) });
+        return Err(CliFailure {
+            code,
+            message: redact_text(&message),
+        });
     }
     serde_json::from_str(&text).map_err(|error| CliFailure {
         code: EXIT_ERROR,
@@ -1794,7 +2062,8 @@ fn render_human(value: &Value) {
                         println!("{}: {}", human_key(key), scalar(value));
                     } else {
                         println!("{}:", human_key(key));
-                        let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+                        let pretty = serde_json::to_string_pretty(value)
+                            .unwrap_or_else(|_| value.to_string());
                         for line in pretty.lines() {
                             println!("  {line}");
                         }
@@ -1807,10 +2076,24 @@ fn render_human(value: &Value) {
 
 fn render_list_item(item: &Value) {
     if let Some(object) = item.as_object() {
-        let fields = ["id", "attachment_id", "name", "alias", "provider", "model", "status", "processing_status"];
+        let fields = [
+            "id",
+            "attachment_id",
+            "name",
+            "alias",
+            "provider",
+            "model",
+            "status",
+            "processing_status",
+        ];
         let summary = fields
             .iter()
-            .filter_map(|field| object.get(*field).filter(|value| is_scalar(value)).map(|value| format!("{field}={}", scalar(value))))
+            .filter_map(|field| {
+                object
+                    .get(*field)
+                    .filter(|value| is_scalar(value))
+                    .map(|value| format!("{field}={}", scalar(value)))
+            })
             .collect::<Vec<_>>();
         if !summary.is_empty() {
             println!("- {}", summary.join("  "));
@@ -1821,7 +2104,10 @@ fn render_list_item(item: &Value) {
 }
 
 fn is_scalar(value: &Value) -> bool {
-    matches!(value, Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_))
+    matches!(
+        value,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+    )
 }
 
 fn scalar(value: &Value) -> String {
@@ -1838,14 +2124,18 @@ fn human_key(value: &str) -> String {
 
 fn parse_lines(value: Option<&String>) -> CliResult<usize> {
     value
-        .map(|raw| raw.parse::<usize>().map_err(|_| CliFailure::usage("line count must be an integer")))
+        .map(|raw| {
+            raw.parse::<usize>()
+                .map_err(|_| CliFailure::usage("line count must be an integer"))
+        })
         .transpose()
         .map(|value| value.unwrap_or(120).clamp(1, 500))
 }
 
 fn read_secret_file(path: &Path, label: &str) -> CliResult<String> {
-    let value = fs::read_to_string(path)
-        .map_err(|error| CliFailure::local(format!("read {label} file {}: {error}", path.display())))?;
+    let value = fs::read_to_string(path).map_err(|error| {
+        CliFailure::local(format!("read {label} file {}: {error}", path.display()))
+    })?;
     let value = value.trim().to_owned();
     if value.is_empty() {
         return Err(CliFailure::local(format!("{label} file is empty")));
@@ -1864,11 +2154,15 @@ fn read_secret_required(prompt: &str) -> CliResult<String> {
 
 fn read_secret_optional(prompt: &str) -> CliResult<String> {
     eprint!("{prompt}");
-    io::stderr().flush().map_err(|error| CliFailure::local(error.to_string()))?;
+    io::stderr()
+        .flush()
+        .map_err(|error| CliFailure::local(error.to_string()))?;
     let stdin = io::stdin();
     if !stdin.is_terminal() {
         let mut value = String::new();
-        stdin.read_line(&mut value).map_err(|error| CliFailure::local(error.to_string()))?;
+        stdin
+            .read_line(&mut value)
+            .map_err(|error| CliFailure::local(error.to_string()))?;
         return Ok(value.trim_end_matches(['\r', '\n']).to_owned());
     }
     #[cfg(unix)]
@@ -1890,15 +2184,21 @@ fn read_secret_optional(prompt: &str) -> CliResult<String> {
         }
     }
     let mut value = String::new();
-    stdin.read_line(&mut value).map_err(|error| CliFailure::local(error.to_string()))?;
+    stdin
+        .read_line(&mut value)
+        .map_err(|error| CliFailure::local(error.to_string()))?;
     Ok(value.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 fn prompt_line(prompt: &str) -> CliResult<String> {
     eprint!("{prompt}");
-    io::stderr().flush().map_err(|error| CliFailure::local(error.to_string()))?;
+    io::stderr()
+        .flush()
+        .map_err(|error| CliFailure::local(error.to_string()))?;
     let mut value = String::new();
-    io::stdin().read_line(&mut value).map_err(|error| CliFailure::local(error.to_string()))?;
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| CliFailure::local(error.to_string()))?;
     Ok(value.trim().to_owned())
 }
 
@@ -1941,9 +2241,12 @@ fn exact_arity(args: &[String], count: usize, usage: &str) -> CliResult<()> {
 }
 
 fn decode_payload(encoded: &str) -> CliResult<Value> {
-    let decoded = URL_SAFE_NO_PAD.decode(encoded).map_err(anyhow::Error::from)?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(anyhow::Error::from)?;
     let raw = String::from_utf8(decoded).map_err(anyhow::Error::from)?;
-    serde_json::from_str(&raw).map_err(|error| CliFailure::usage(format!("invalid JSON payload: {error}")))
+    serde_json::from_str(&raw)
+        .map_err(|error| CliFailure::usage(format!("invalid JSON payload: {error}")))
 }
 
 fn url_encode(value: &str) -> String {
@@ -2103,7 +2406,9 @@ mod cli_tests {
         assert_eq!(error.code, EXIT_USAGE);
         assert!(error.message.contains("status"));
         assert!(unknown_command("about").message.contains("unknown command"));
-        assert!(unknown_command("logout").message.contains("unknown command"));
+        assert!(unknown_command("logout")
+            .message
+            .contains("unknown command"));
     }
 
     #[test]
@@ -2136,14 +2441,35 @@ mod cli_tests {
     fn root_help_snapshot_contains_complete_public_tree_and_exit_codes() {
         let help = help_text();
         for command in [
-            "xiao chat", "xiao ask", "xiao setup", "xiao status", "xiao context",
-            "xiao doctor", "xiao tools", "xiao telegram status",
-            "xiao telegram configure", "xiao telegram set-owner",
-            "xiao telegram set-token-file", "xiao telegram test", "xiao login",
-            "xiao model show|list|use", "xiao model accounts", "xiao model custom",
-            "xiao sessions", "xiao btw", "xiao yolo", "xiao cancel", "xiao retry",
-            "xiao memory", "xiao skills", "xiao approvals", "xiao attachments",
-            "xiao runs", "xiao daemon", "xiao logs", "xiao config",
+            "xiao chat",
+            "xiao ask",
+            "xiao setup",
+            "xiao status",
+            "xiao context",
+            "xiao doctor",
+            "xiao tools",
+            "xiao telegram status",
+            "xiao telegram configure",
+            "xiao telegram set-owner",
+            "xiao telegram set-token-file",
+            "xiao telegram test",
+            "xiao login",
+            "xiao model show|list|use",
+            "xiao model accounts",
+            "xiao model custom",
+            "xiao sessions",
+            "xiao btw",
+            "xiao yolo",
+            "xiao cancel",
+            "xiao retry",
+            "xiao memory",
+            "xiao skills",
+            "xiao approvals",
+            "xiao attachments",
+            "xiao runs",
+            "xiao daemon",
+            "xiao logs",
+            "xiao config",
         ] {
             assert!(help.contains(command), "root help missing {command}");
         }
@@ -2171,7 +2497,9 @@ mod cli_tests {
     #[test]
     fn subcommand_help_is_resolved_before_daemon_access() {
         let path = vec!["model".to_string(), "custom".to_string()];
-        assert_eq!(path.iter().map(String::as_str).collect::<Vec<_>>(), vec!["model", "custom"]);
+        assert_eq!(
+            path.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["model", "custom"]
+        );
     }
-
 }

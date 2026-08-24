@@ -365,17 +365,20 @@ impl ProviderProfileStore {
                     "native" => "supported",
                     "structured_json" | "chat_only" => "unsupported",
                     _ => "unknown",
-                }.into(),
+                }
+                .into(),
                 structured_output_state: match config.tool_protocol.as_str() {
                     "native" | "structured_json" => "supported",
                     "chat_only" => "unsupported",
                     _ => "unknown",
-                }.into(),
+                }
+                .into(),
                 continuation_state: match config.tool_protocol.as_str() {
                     "native" | "structured_json" => "supported",
                     "chat_only" => "unsupported",
                     _ => "unknown",
-                }.into(),
+                }
+                .into(),
                 vision_state: "unknown".into(),
                 file_input_state: "unknown".into(),
                 model_discovery: true,

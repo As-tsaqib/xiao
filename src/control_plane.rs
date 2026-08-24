@@ -9,8 +9,8 @@ use crate::{
     memory::MemoryStore,
     providers::{ProviderProfileStore, ProviderRegistry},
     security::secrets::SecretStore,
-    storage::{SessionRecord, Storage},
     skills::{FilesystemSkills, SkillStore},
+    storage::{SessionRecord, Storage},
     telegram::{client::TelegramClient, types::BotIdentity},
 };
 
@@ -96,7 +96,10 @@ impl TelegramSetupService {
 
     pub async fn test_connection(&self, token_override: Option<&str>) -> Result<BotIdentity> {
         let cfg = self.app.config.read().await.clone();
-        let token = match token_override.map(str::trim).filter(|value| !value.is_empty()) {
+        let token = match token_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             Some(value) => value.to_owned(),
             None => SecretStore::new(cfg.paths.secrets_dir)
                 .get(TELEGRAM_TOKEN_KEY)?
@@ -108,7 +111,10 @@ impl TelegramSetupService {
             .map_err(|_| anyhow!("Telegram getMe probe timed out"))?
     }
 
-    pub async fn configure(&self, input: TelegramConfigureInput) -> Result<TelegramConfigureResult> {
+    pub async fn configure(
+        &self,
+        input: TelegramConfigureInput,
+    ) -> Result<TelegramConfigureResult> {
         let old = self.app.config.read().await.clone();
         let mut next = old.clone();
 
@@ -119,7 +125,11 @@ impl TelegramSetupService {
             if owner_user_id == 0 {
                 return Err(anyhow!("Telegram owner user id must be non-zero"));
             }
-            if old.telegram.access.owner_user_id.is_some_and(|old_id| old_id != owner_user_id)
+            if old
+                .telegram
+                .access
+                .owner_user_id
+                .is_some_and(|old_id| old_id != owner_user_id)
                 && !input.confirm_owner_change
             {
                 return Err(anyhow!(
@@ -187,7 +197,6 @@ impl TelegramSetupService {
     }
 }
 
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionAiConfigInput {
     pub session_id: String,
@@ -220,7 +229,9 @@ impl SessionAiService {
             .session(owner, &input.session_id)?
             .ok_or_else(|| anyhow!("session not found for owner"))?;
         if session.archived {
-            return Err(anyhow!("cannot change AI configuration for an archived session"));
+            return Err(anyhow!(
+                "cannot change AI configuration for an archived session"
+            ));
         }
         let provider = match input.provider.trim().to_ascii_lowercase().as_str() {
             "codex" => "codex",
@@ -245,7 +256,9 @@ impl SessionAiService {
                 .get(owner, binding)?
                 .ok_or_else(|| anyhow!("Custom profile not found for owner"))?;
             if profiles.model(&profile.profile_id, model)?.is_none() {
-                return Err(anyhow!("model has not been discovered for this Custom profile"));
+                return Err(anyhow!(
+                    "model has not been discovered for this Custom profile"
+                ));
             }
             self.storage.set_session_provider(
                 owner,
@@ -294,7 +307,9 @@ mod tests {
         config.paths.secrets_dir = directory.path().join("secrets");
         let config_path = directory.path().join("config.toml");
         config.save_atomic(&config_path).unwrap();
-        let app = AppState::build_from_path(config, &config_path).await.unwrap();
+        let app = AppState::build_from_path(config, &config_path)
+            .await
+            .unwrap();
         (TelegramSetupService::new(app, &config_path), directory)
     }
 

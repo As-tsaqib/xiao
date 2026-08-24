@@ -324,7 +324,10 @@ impl AgentEngine {
             .lock()
             .unwrap()
             .get(&run_key(principal, None, Some(session_id)))
-            .map(|token| { token.cancel(); true })
+            .map(|token| {
+                token.cancel();
+                true
+            })
             .unwrap_or(false)
     }
 
@@ -341,7 +344,8 @@ impl AgentEngine {
         prompt: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        self.run(principal, None, None, prompt, true, progress).await
+        self.run(principal, None, None, prompt, true, progress)
+            .await
     }
 
     pub async fn submit_with_progress_in_scope(
@@ -362,7 +366,8 @@ impl AgentEngine {
         prompt: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        self.run(principal, None, Some(session_id), prompt, true, progress).await
+        self.run(principal, None, Some(session_id), prompt, true, progress)
+            .await
     }
 
     pub async fn retry_to_session_with_progress(
@@ -376,7 +381,8 @@ impl AgentEngine {
             .storage
             .latest_user_message(principal, &ctx.active.id)?
             .ok_or_else(|| anyhow!("no user request available to retry"))?;
-        self.run(principal, None, Some(session_id), &prompt, false, progress).await
+        self.run(principal, None, Some(session_id), &prompt, false, progress)
+            .await
     }
 
     pub async fn retry_with_progress(
@@ -402,7 +408,8 @@ impl AgentEngine {
             .storage
             .latest_user_message(principal, &ctx.active.id)?
             .ok_or_else(|| anyhow!("no user request available to retry"))?;
-        self.run(principal, scope, None, &prompt, false, progress).await
+        self.run(principal, scope, None, &prompt, false, progress)
+            .await
     }
 
     async fn run(
@@ -426,7 +433,8 @@ impl AgentEngine {
 
         if append_user {
             let appended = if let Some(session_id) = explicit_session {
-                self.sessions.append_user_to_session(principal, session_id, prompt)
+                self.sessions
+                    .append_user_to_session(principal, session_id, prompt)
             } else {
                 match scope {
                     Some(scope) => self.sessions.append_user_telegram(principal, scope, prompt),

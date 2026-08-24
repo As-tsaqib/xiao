@@ -728,7 +728,6 @@ impl TelegramAdapter {
         Ok(())
     }
 
-
     fn ensure_custom_alias_available(&self, principal: &str, alias: &str) -> Result<()> {
         let store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
         if store.get_by_alias(principal, alias)?.is_some() {
@@ -1002,11 +1001,36 @@ impl TelegramAdapter {
                         && capability.tool_protocol == crate::providers::ToolProtocol::Native,
                     structured_output: selected && capability.structured_output,
                     continuation: selected && capability.continuation,
-                    native_tools_state: if selected { probe.native_tools.as_str() } else { "unknown" }.into(),
-                    structured_output_state: if selected { probe.structured_output.as_str() } else { "unknown" }.into(),
-                    continuation_state: if selected { probe.continuation.as_str() } else { "unknown" }.into(),
-                    vision_state: if selected { probe.vision.as_str() } else { "unknown" }.into(),
-                    file_input_state: if selected { probe.file_input.as_str() } else { "unknown" }.into(),
+                    native_tools_state: if selected {
+                        probe.native_tools.as_str()
+                    } else {
+                        "unknown"
+                    }
+                    .into(),
+                    structured_output_state: if selected {
+                        probe.structured_output.as_str()
+                    } else {
+                        "unknown"
+                    }
+                    .into(),
+                    continuation_state: if selected {
+                        probe.continuation.as_str()
+                    } else {
+                        "unknown"
+                    }
+                    .into(),
+                    vision_state: if selected {
+                        probe.vision.as_str()
+                    } else {
+                        "unknown"
+                    }
+                    .into(),
+                    file_input_state: if selected {
+                        probe.file_input.as_str()
+                    } else {
+                        "unknown"
+                    }
+                    .into(),
                     model_discovery: true,
                     tool_protocol: if selected {
                         capability.tool_protocol.as_str().into()

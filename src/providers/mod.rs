@@ -1724,7 +1724,8 @@ pub(crate) async fn probe_custom_capabilities(
     let structured_result =
         custom_structured_probe(base, headers, api_key, protocol, model, &nonce).await;
     let vision_result = custom_vision_probe(base, headers, api_key, protocol, model, &nonce).await;
-    let file_result = custom_file_input_probe(base, headers, api_key, protocol, model, &nonce).await;
+    let file_result =
+        custom_file_input_probe(base, headers, api_key, protocol, model, &nonce).await;
 
     let native_tools = result_state(&native_result);
     let structured_output = result_state(&structured_result);
@@ -1860,7 +1861,9 @@ async fn custom_file_input_probe(
     // Chat Completions has no portable first-class file-input contract. Keep
     // this Unknown rather than manufacturing an Unsupported result.
     if protocol != "openai_responses" {
-        return Err(anyhow!("portable file-input probe unavailable for this protocol"));
+        return Err(anyhow!(
+            "portable file-input probe unavailable for this protocol"
+        ));
     }
     let data = STANDARD.encode(format!("Xiao file capability probe {nonce}"));
     let body = serde_json::json!({
@@ -2472,9 +2475,24 @@ mod tests {
             native_tools: tool_protocol == ToolProtocol::Native,
             structured_output: tool_protocol != ToolProtocol::ChatOnly,
             continuation: tool_protocol != ToolProtocol::ChatOnly,
-            native_tools_state: if tool_protocol == ToolProtocol::Native { "supported" } else { "unsupported" }.into(),
-            structured_output_state: if tool_protocol != ToolProtocol::ChatOnly { "supported" } else { "unsupported" }.into(),
-            continuation_state: if tool_protocol != ToolProtocol::ChatOnly { "supported" } else { "unsupported" }.into(),
+            native_tools_state: if tool_protocol == ToolProtocol::Native {
+                "supported"
+            } else {
+                "unsupported"
+            }
+            .into(),
+            structured_output_state: if tool_protocol != ToolProtocol::ChatOnly {
+                "supported"
+            } else {
+                "unsupported"
+            }
+            .into(),
+            continuation_state: if tool_protocol != ToolProtocol::ChatOnly {
+                "supported"
+            } else {
+                "unsupported"
+            }
+            .into(),
             vision_state: "unknown".into(),
             file_input_state: "unknown".into(),
             model_discovery: true,

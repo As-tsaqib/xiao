@@ -65,7 +65,6 @@ pub struct NormalizedImage {
     pub caption: String,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachmentUsage {
     pub owner_bytes: u64,
@@ -389,12 +388,10 @@ impl AttachmentManager {
             < 8
         {
             if detection.mime == "application/pdf" {
-                match self
-                    .scanned_pdf
-                    .extract(bytes, self.root(), &self.config)?
-                {
+                match self.scanned_pdf.extract(bytes, self.root(), &self.config)? {
                     Some(pages) => {
-                        let chunks = chunk_scanned_pages(attachment_id, &pages, self.config.chunk_chars);
+                        let chunks =
+                            chunk_scanned_pages(attachment_id, &pages, self.config.chunk_chars);
                         let useful = chunks
                             .iter()
                             .map(|chunk| chunk.text.chars().filter(|c| !c.is_whitespace()).count())
@@ -402,7 +399,8 @@ impl AttachmentManager {
                         if useful < 8 {
                             return Err(anyhow!("OCR produced no meaningful PDF text"));
                         }
-                        self.storage.replace_attachment_chunks(owner, attachment_id, &chunks)?;
+                        self.storage
+                            .replace_attachment_chunks(owner, attachment_id, &chunks)?;
                         return self.storage.set_attachment_status(
                             owner,
                             attachment_id,
@@ -444,7 +442,9 @@ impl AttachmentManager {
 
     fn delete_raw_and_record(&self, owner: &str, attachment_id: &str, raw: &Path) -> Result<()> {
         if !raw.starts_with(self.root()) {
-            return Err(anyhow!("refusing to remove attachment outside private store"));
+            return Err(anyhow!(
+                "refusing to remove attachment outside private store"
+            ));
         }
         match fs::remove_file(raw) {
             Ok(()) => {}
@@ -459,7 +459,10 @@ impl AttachmentManager {
         let Some(record) = self.storage.attachment(owner, attachment_id)? else {
             return Ok(false);
         };
-        if self.storage.session_has_active_run(owner, &record.session_id)? {
+        if self
+            .storage
+            .session_has_active_run(owner, &record.session_id)?
+        {
             return Err(anyhow!("attachment is protected by an active run"));
         }
         self.delete_raw_and_record(owner, attachment_id, Path::new(&record.local_path))?;
@@ -467,8 +470,8 @@ impl AttachmentManager {
     }
 
     pub fn cleanup_retention(&self, owner: Option<&str>) -> Result<usize> {
-        let cutoff = (Utc::now() - ChronoDuration::days(self.config.retention_days as i64))
-            .to_rfc3339();
+        let cutoff =
+            (Utc::now() - ChronoDuration::days(self.config.retention_days as i64)).to_rfc3339();
         let mut removed = 0usize;
         for record in self.storage.attachments_older_than(owner, &cutoff)? {
             if self
@@ -1077,8 +1080,14 @@ mod tests {
             _config: &AttachmentConfig,
         ) -> Result<Option<Vec<ScannedPdfPage>>> {
             Ok(Some(vec![
-                ScannedPdfPage { page_no: 1, text: "Invoice alpha marker cedar-summit".into() },
-                ScannedPdfPage { page_no: 2, text: "Second page contains verified OCR evidence".into() },
+                ScannedPdfPage {
+                    page_no: 1,
+                    text: "Invoice alpha marker cedar-summit".into(),
+                },
+                ScannedPdfPage {
+                    page_no: 2,
+                    text: "Second page contains verified OCR evidence".into(),
+                },
             ]))
         }
     }
@@ -1170,7 +1179,10 @@ mod tests {
             expected_kind: AttachmentKind::Document,
             bytes: b"second attachment pushes owner storage over quota".to_vec(),
         });
-        assert!(second.unwrap_err().to_string().contains("owner storage quota"));
+        assert!(second
+            .unwrap_err()
+            .to_string()
+            .contains("owner storage quota"));
     }
 
     #[test]
@@ -1211,7 +1223,13 @@ mod tests {
             })
             .unwrap();
         storage
-            .create_agent_run("owner:test", &session, "custom", "m", Some("protect attachment"))
+            .create_agent_run(
+                "owner:test",
+                &session,
+                "custom",
+                "m",
+                Some("protect attachment"),
+            )
             .unwrap();
         assert!(manager.remove("owner:test", &record.attachment_id).is_err());
         assert_eq!(manager.cleanup_retention(Some("owner:test")).unwrap(), 0);

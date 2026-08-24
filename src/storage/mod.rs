@@ -2459,19 +2459,26 @@ impl Storage {
         })
     }
 
-    pub fn attachments_older_than(&self, owner: Option<&str>, cutoff: &str) -> Result<Vec<AttachmentRecord>> {
+    pub fn attachments_older_than(
+        &self,
+        owner: Option<&str>,
+        cutoff: &str,
+    ) -> Result<Vec<AttachmentRecord>> {
         self.with_conn(|connection| {
             let sql = if owner.is_some() {
-                ATTACHMENT_SELECT.to_owned() + " WHERE owner_id=? AND created_at<? ORDER BY created_at"
+                ATTACHMENT_SELECT.to_owned()
+                    + " WHERE owner_id=? AND created_at<? ORDER BY created_at"
             } else {
                 ATTACHMENT_SELECT.to_owned() + " WHERE created_at<? ORDER BY created_at"
             };
             let mut statement = connection.prepare(&sql)?;
             let rows = if let Some(owner) = owner {
-                statement.query_map(params![owner, cutoff], row_attachment)?
+                statement
+                    .query_map(params![owner, cutoff], row_attachment)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             } else {
-                statement.query_map(params![cutoff], row_attachment)?
+                statement
+                    .query_map(params![cutoff], row_attachment)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             };
             Ok(rows)
@@ -2632,15 +2639,27 @@ impl Storage {
     ) -> Result<Vec<AttachmentRecord>> {
         self.with_conn(|connection| {
             let (sql, bind_session) = if session_id.is_some() {
-                (ATTACHMENT_SELECT.to_owned() + " WHERE owner_id=? AND session_id=? ORDER BY created_at DESC LIMIT ?", true)
+                (
+                    ATTACHMENT_SELECT.to_owned()
+                        + " WHERE owner_id=? AND session_id=? ORDER BY created_at DESC LIMIT ?",
+                    true,
+                )
             } else {
-                (ATTACHMENT_SELECT.to_owned() + " WHERE owner_id=? ORDER BY created_at DESC LIMIT ?", false)
+                (
+                    ATTACHMENT_SELECT.to_owned()
+                        + " WHERE owner_id=? ORDER BY created_at DESC LIMIT ?",
+                    false,
+                )
             };
             let mut statement = connection.prepare(&sql)?;
             let rows = if bind_session {
                 statement
                     .query_map(
-                        params![owner, session_id.unwrap_or_default(), limit.clamp(1, 500) as i64],
+                        params![
+                            owner,
+                            session_id.unwrap_or_default(),
+                            limit.clamp(1, 500) as i64
+                        ],
                         row_attachment,
                     )?
                     .collect::<rusqlite::Result<Vec<_>>>()?
@@ -3381,7 +3400,8 @@ mod tests {
         assert_eq!(storage.management_owner_id().unwrap(), "owner:telegram:42");
         storage
             .with_conn(|connection| {
-                let count: i64 = connection.query_row("SELECT COUNT(*) FROM owners", [], |row| row.get(0))?;
+                let count: i64 =
+                    connection.query_row("SELECT COUNT(*) FROM owners", [], |row| row.get(0))?;
                 assert_eq!(count, 1);
                 Ok(())
             })

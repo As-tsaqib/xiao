@@ -530,14 +530,24 @@ async fn admin_apply(
     if let Some(v) = req.allowed_chat_ids.as_deref() {
         next.telegram.access.allowed_chat_ids = parse_id_list(v).map_err(bad)?;
     }
-    if req.allowed_user_ids.as_deref().is_some_and(|value| !value.trim().is_empty()) {
-        return Err(bad("allowed_user_ids is legacy-only; set one owner_user_id explicitly"));
+    if req
+        .allowed_user_ids
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(bad(
+            "allowed_user_ids is legacy-only; set one owner_user_id explicitly",
+        ));
     }
     if let Some(owner_user_id) = req.owner_user_id {
         if owner_user_id == 0 {
             return Err(bad("owner_user_id must be non-zero"));
         }
-        if old.telegram.access.owner_user_id.is_some_and(|old_id| old_id != owner_user_id)
+        if old
+            .telegram
+            .access
+            .owner_user_id
+            .is_some_and(|old_id| old_id != owner_user_id)
             && !req.confirm_owner_change
         {
             return Err(bad("changing owner_user_id requires explicit confirmation"));
@@ -853,7 +863,9 @@ fn stored_provider_api_key(app: &AppState, provider: &str) -> Result<Option<Stri
 async fn management_owner(state: &ApiState) -> Result<String> {
     let access = state.app.config.read().await.telegram.access.clone();
     if access.owner_resolution_required() {
-        return Err(anyhow!("multiple legacy owners require explicit owner resolution"));
+        return Err(anyhow!(
+            "multiple legacy owners require explicit owner resolution"
+        ));
     }
     let owner = if let Some(user_id) = access.owner_user_id {
         state.app.resolve_telegram_owner(user_id)?.owner_id
@@ -1311,7 +1323,8 @@ async fn manager_custom_profile_action(
                             file_input_state: "unknown".into(),
                             model_discovery: true,
                             tool_protocol: ToolProtocol::ChatOnly.as_str().into(),
-                            evidence: "model discovered; active capability probe budget not spent".into(),
+                            evidence:
+                                "model discovered; active capability probe budget not spent".into(),
                             probed_at: now.clone(),
                         },
                     ));
@@ -1442,7 +1455,10 @@ async fn manager_account_action(
                 .session_id
                 .as_deref()
                 .ok_or_else(|| bad("session_id is required"))?;
-            let model = req.model.as_deref().ok_or_else(|| bad("model is required"))?;
+            let model = req
+                .model
+                .as_deref()
+                .ok_or_else(|| bad("model is required"))?;
             state
                 .app
                 .commands
@@ -1770,7 +1786,11 @@ async fn manager_session_action(
                 .storage
                 .audit(
                     &owner,
-                    if enabled { "yolo_enabled" } else { "yolo_disabled" },
+                    if enabled {
+                        "yolo_enabled"
+                    } else {
+                        "yolo_disabled"
+                    },
                     &format!("session_id={session_id}"),
                 )
                 .map_err(bad)?;
@@ -1782,15 +1802,23 @@ async fn manager_session_action(
                 .management_set_session_ai(
                     &owner,
                     required_session()?,
-                    req.provider.as_deref().ok_or_else(|| bad("provider is required"))?,
+                    req.provider
+                        .as_deref()
+                        .ok_or_else(|| bad("provider is required"))?,
                     req.account_or_profile_id.clone(),
-                    req.model.as_deref().ok_or_else(|| bad("model is required"))?,
+                    req.model
+                        .as_deref()
+                        .ok_or_else(|| bad("model is required"))?,
                 )
                 .map_err(bad)?;
             state
                 .app
                 .storage
-                .audit(&owner, "session_ai_config_changed", &format!("session_id={}", session.id))
+                .audit(
+                    &owner,
+                    "session_ai_config_changed",
+                    &format!("session_id={}", session.id),
+                )
                 .map_err(bad)?;
             return Ok(Json(json!({"ok":true,"session":session})));
         }
@@ -1901,7 +1929,11 @@ async fn manager_attachments(
     let mut items = state
         .app
         .storage
-        .list_attachments(&owner, query.session_id.as_deref(), query.limit.unwrap_or(200))
+        .list_attachments(
+            &owner,
+            query.session_id.as_deref(),
+            query.limit.unwrap_or(200),
+        )
         .map_err(bad)?;
     if let Some(id) = query.id.as_deref() {
         items.retain(|item| item.attachment_id == id);
@@ -2059,14 +2091,7 @@ async fn manager_memory_action(
             state
                 .app
                 .commands
-                .management_memory_set(
-                    &owner,
-                    scope,
-                    category,
-                    key,
-                    value,
-                    "owner_management_edit",
-                )
+                .management_memory_set(&owner, scope, category, key, value, "owner_management_edit")
                 .map_err(bad)?;
             1
         }

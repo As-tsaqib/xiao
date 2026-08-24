@@ -727,16 +727,8 @@ impl CommandCore {
         if value.is_empty() {
             return Err(anyhow!("memory value is required"));
         }
-        self.memory_store().upsert(
-            principal,
-            scope,
-            category,
-            key,
-            value,
-            1.0,
-            source,
-            None,
-        )?;
+        self.memory_store()
+            .upsert(principal, scope, category, key, value, 1.0, source, None)?;
         Ok(())
     }
 
@@ -760,7 +752,11 @@ impl CommandCore {
         SkillStore::new(self.storage.clone()).set_enabled(principal, skill, enabled)?;
         self.storage.audit(
             principal,
-            if enabled { "skill_enabled" } else { "skill_disabled" },
+            if enabled {
+                "skill_enabled"
+            } else {
+                "skill_disabled"
+            },
             &format!("skill_id={skill}"),
         )
     }
@@ -1874,14 +1870,8 @@ impl CommandCore {
                     vec!["Models".into(), models.len().to_string()],
                     vec!["Reachability".into(), profile.reachability.clone()],
                     vec!["Native tools".into(), capability("native_tools")],
-                    vec![
-                        "Structured output".into(),
-                        capability("structured_output"),
-                    ],
-                    vec![
-                        "Continuation".into(),
-                        capability("continuation"),
-                    ],
+                    vec!["Structured output".into(), capability("structured_output")],
+                    vec!["Continuation".into(), capability("continuation")],
                     vec!["Vision".into(), capability("vision")],
                     vec!["File input".into(), capability("file_input")],
                     vec![
@@ -2529,11 +2519,9 @@ impl CommandCore {
                             usage.global_quota_bytes
                         ),
                     ),
-                    Err(error) => check(
-                        "WARN",
-                        "Attachment storage usage",
-                        safe_diagnostic(&error),
-                    ),
+                    Err(error) => {
+                        check("WARN", "Attachment storage usage", safe_diagnostic(&error))
+                    }
                 }
             }
             None => check(
@@ -2651,7 +2639,11 @@ impl CommandCore {
             Ok(context) => {
                 let provider_state = self.providers.state(&context.active.provider);
                 check(
-                    if provider_state == ProviderState::Ready { "PASS" } else { "WARN" },
+                    if provider_state == ProviderState::Ready {
+                        "PASS"
+                    } else {
+                        "WARN"
+                    },
                     "Active provider/auth/model",
                     format!(
                         "LOCAL state · {} / {} / {:?}",
@@ -2675,7 +2667,9 @@ impl CommandCore {
                             let api_key = profile
                                 .credential_ref
                                 .as_deref()
-                                .and_then(|reference| self.auth.credential(reference).ok().flatten())
+                                .and_then(|reference| {
+                                    self.auth.credential(reference).ok().flatten()
+                                })
                                 .and_then(|credential| credential.api_key);
                             let live = tokio::time::timeout(
                                 std::time::Duration::from_secs(12),
@@ -2757,7 +2751,11 @@ impl CommandCore {
                     format!(
                         "CACHED · {} profiles; {unreachable} unreachable; age={}",
                         profiles.len(),
-                        if ages.is_empty() { "unknown" } else { ages.as_str() }
+                        if ages.is_empty() {
+                            "unknown"
+                        } else {
+                            ages.as_str()
+                        }
                     ),
                 );
             }
@@ -3577,7 +3575,8 @@ mod tests {
             .await
             .unwrap();
         assert!(!skill_store.view("p", &skill.id).unwrap().unwrap().enabled);
-        core.management_skill_set_enabled("p", &skill.id, true).unwrap();
+        core.management_skill_set_enabled("p", &skill.id, true)
+            .unwrap();
         assert!(skill_store.view("p", &skill.id).unwrap().unwrap().enabled);
 
         let binding = crate::storage::ApprovalBinding {
@@ -3616,31 +3615,20 @@ mod tests {
         let (core, storage, sessions, _temp) = core();
         let first = sessions.ensure_default_session("p").unwrap();
         let second = storage
-            .create_session(
-                "p",
-                "Second",
-                "custom",
-                None,
-                "default",
-                false,
-                None,
-            )
+            .create_session("p", "Second", "custom", None, "default", false, None)
             .unwrap();
         storage.upsert_account(&account("c1", "codex")).unwrap();
         storage.set_account_owner("p", "c1").unwrap();
 
         let (provider, model) = core.use_account("p", None, "c1").unwrap();
-        assert_eq!((provider.as_str(), model.as_str()), ("codex", "codex-default"));
+        assert_eq!(
+            (provider.as_str(), model.as_str()),
+            ("codex", "codex-default")
+        );
         assert_eq!(sessions.context_for("p").unwrap().active.id, first.id);
 
-        core.management_set_session_ai(
-            "p",
-            &second.id,
-            "codex",
-            Some("c1".into()),
-            "codex-alt",
-        )
-        .unwrap();
+        core.management_set_session_ai("p", &second.id, "codex", Some("c1".into()), "codex-alt")
+            .unwrap();
         let selected = storage.session("p", &second.id).unwrap().unwrap();
         assert_eq!(selected.provider, "codex");
         assert_eq!(selected.account_id.as_deref(), Some("c1"));

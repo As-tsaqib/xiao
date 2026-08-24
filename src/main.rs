@@ -98,9 +98,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn spawn_telegram(
-    app: &AppState,
-) -> Option<tokio::task::JoinHandle<Result<()>>> {
+async fn spawn_telegram(app: &AppState) -> Option<tokio::task::JoinHandle<Result<()>>> {
     let cfg = app.config.read().await.clone();
     if !cfg.gateway.enabled || !cfg.telegram.enabled {
         app.health.set_telegram_polling(false).await;
