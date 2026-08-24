@@ -555,7 +555,11 @@ pub fn project_account(raw: Value) -> Value {
                 "models",
             ];
     let m = pick_object(&raw, &allowed);
-    if m.is_empty() { sanitize(raw) } else { Value::Object(m) }
+    if m.is_empty() {
+        sanitize(raw)
+    } else {
+        Value::Object(m)
+    }
 }
 
 /// custom profiles list
@@ -599,23 +603,33 @@ pub fn project_custom_profiles(raw: Value) -> Value {
 pub fn project_custom_profile(raw: Value) -> Value {
     let raw = sanitize(raw);
     let allowed = [
-                "id",
-                "alias",
-                "endpoint",
-                "protocol",
-                "enabled",
-                "reachability",
-                "api_key_configured",
-                "header_names",
-                "model_count",
-                "models",
-                "last_probe_at",
-            ];
+        "id",
+        "alias",
+        "endpoint",
+        "protocol",
+        "enabled",
+        "reachability",
+        "api_key_configured",
+        "header_names",
+        "model_count",
+        "models",
+        "last_probe_at",
+    ];
     let inner = if let Some(obj) = raw.as_object() {
-        if let Some(p) = obj.get("profile") { p } else { &raw }
-    } else { &raw };
+        if let Some(p) = obj.get("profile") {
+            p
+        } else {
+            &raw
+        }
+    } else {
+        &raw
+    };
     let m = pick_object(inner, &allowed);
-    if m.is_empty() { sanitize(inner.clone()) } else { Value::Object(m) }
+    if m.is_empty() {
+        sanitize(inner.clone())
+    } else {
+        Value::Object(m)
+    }
 }
 
 /// model list for a session: raw from models_for_session helper
@@ -652,7 +666,11 @@ pub fn project_memory_item(raw: Value) -> Value {
         "value",
     ];
     let m = pick_object(&raw, &allowed);
-    if m.is_empty() { raw } else { Value::Object(m) }
+    if m.is_empty() {
+        raw
+    } else {
+        Value::Object(m)
+    }
 }
 
 /// generic sanitizer for ad-hoc success data: strip view/secrets and return
@@ -732,7 +750,10 @@ pub fn human_status(value: &Value) -> String {
         if lines.is_empty() {
             // fallback generic scalar printing
             for (k, v) in obj {
-                if matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null) {
+                if matches!(
+                    v,
+                    Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null
+                ) {
                     lines.push(format!("{}: {}", k, scalar(v)));
                 }
             }
@@ -791,7 +812,9 @@ pub fn human_sessions(value: &Value) -> String {
 
 pub fn human_doctor(value: &Value) -> String {
     let mut lines = Vec::new();
-    let checks = value.get("checks").and_then(|v| v.as_array())
+    let checks = value
+        .get("checks")
+        .and_then(|v| v.as_array())
         .or_else(|| value.get("items").and_then(|v| v.as_array()));
     if let Some(arr) = checks {
         let ok = arr
@@ -924,9 +947,17 @@ pub fn human_model(value: &Value) -> String {
             .get("provider")
             .and_then(|v| v.as_str())
             .unwrap_or("-");
-        let current = value.get("current_model").and_then(|v| v.as_str()).unwrap_or("-");
-        let sess = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("-");
-        lines.push(format!("model for session {sess} · provider {provider} · current {current}"));
+        let current = value
+            .get("current_model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let sess = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        lines.push(format!(
+            "model for session {sess} · provider {provider} · current {current}"
+        ));
         if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
             if models.is_empty() {
                 lines.push("  (no models available)".into());
