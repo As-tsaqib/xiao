@@ -15,7 +15,7 @@ use crate::{
     attachments::AttachmentManager,
     config::AgentConfig,
     context::{ContextEngine, SessionHistoryStore},
-    learning::{LearningEvaluator, LearningTrace, SafeToolObservation},
+    learning::{LearningTrace, SafeToolObservation},
     memory::{MemoryEvaluator, MemoryStore},
     providers::{
         AgentEvent, ProviderPdfFallback, ProviderRegistry, ProviderRequest, ProviderStep,
@@ -73,7 +73,6 @@ pub struct AgentEngine {
     tools: Arc<ToolRegistry>,
     config: Arc<tokio::sync::RwLock<AgentConfig>>,
     memory_store: Arc<MemoryStore>,
-    skill_registry: Arc<SkillRegistry>,
     context_engine: ContextEngine,
     attachments: Option<Arc<AttachmentManager>>,
 }
@@ -283,20 +282,6 @@ impl AgentEngine {
         } else {
             ContextEngine::new(storage.clone(), config.clone())
         };
-        let skill_store = Arc::new(SkillStore::new(storage.clone()));
-        let skill_registry = Arc::new(if let Some(runtime) = &runtime {
-            SkillRegistry::with_filesystem(
-                skill_store.clone(),
-                Arc::new(FilesystemSkills::with_runtime(
-                    runtime.workspace(),
-                    skill_store,
-                    runtime.capabilities(),
-                    None,
-                )),
-            )
-        } else {
-            SkillRegistry::new(skill_store)
-        });
         Self {
             sessions,
             storage,
@@ -305,7 +290,6 @@ impl AgentEngine {
             tools,
             config: Arc::new(tokio::sync::RwLock::new(config)),
             memory_store: memory,
-            skill_registry,
             context_engine,
             attachments,
         }
@@ -682,11 +666,7 @@ impl AgentEngine {
             semantic.clone(),
         ));
         let completion = CompletionVerifier::with_semantic(semantic.clone());
-        let learning = LearningEvaluator::with_semantic(
-            self.skill_registry.clone(),
-            memory_evaluator.clone(),
-            semantic,
-        );
+        let _ = semantic;
 
         let goal = bound_text(redact_text(prompt), 4_096);
         let agent_run_id = match self.storage.create_agent_run(
@@ -1396,7 +1376,7 @@ impl AgentEngine {
             events.extend(provider_events);
             events.push(completed);
             Ok(AgentAnswer {
-                run_id: agent_run_id,
+                run_id: agent_run_id.clone(),
                 progress: events,
                 final_answer,
                 side_mode: ctx.mode == ChatMode::Side,

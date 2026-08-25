@@ -1488,8 +1488,6 @@ impl Provider for CustomProvider {
         if req.account_id.is_none() && !self.cfg.enabled {
             return Err(anyhow!("custom provider is disabled"));
         }
-        let profile_id = req.account_id.clone();
-        let had_images = !req.images.is_empty();
         let target = self.target(req.account_id.as_deref())?;
         let endpoint = if target.protocol == "openai_chat_completions" {
             endpoint_with_suffix(&target.base_url, "/chat/completions")
@@ -1550,6 +1548,8 @@ impl Provider for CustomProvider {
         if req.account_id.is_none() && !self.cfg.enabled {
             return Err(anyhow!("custom provider is disabled"));
         }
+        let profile_id = req.account_id.clone();
+        let had_images = !req.images.is_empty();
         let target = self.target(req.account_id.as_deref())?;
         let capabilities = self.capabilities_for(&req.model, req.account_id.as_deref());
         if !req.images.is_empty() && !capabilities.vision {
