@@ -167,6 +167,7 @@ impl CliPresenter {
 struct DaemonClient {
     http: reqwest::Client,
     endpoint: String,
+    #[allow(dead_code)]
     principal: String,
     client_token: String,
     admin_token: String,
