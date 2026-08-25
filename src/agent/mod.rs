@@ -311,6 +311,83 @@ impl AgentEngine {
         }
     }
 
+    async fn execute_readonly_group(
+        &self,
+        calls: Vec<crate::tools::ToolCall>,
+        context: &ToolContext,
+        run_id: &str,
+        limit: usize,
+        progress: Option<&mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<Vec<ToolResult>> {
+        let mut prepared = Vec::with_capacity(calls.len());
+        for call in calls {
+            let arguments = bounded_json(&redact_json(&call.arguments), 16_384);
+            let id = self.storage.create_tool_run(
+                run_id,
+                &bound_text(redact_text(&call.call_id), 256),
+                &bound_text(redact_text(&call.name), 128),
+                &arguments,
+                "read_only",
+            )?;
+            self.storage
+                .set_tool_run_status(&id, "running", None, None)?;
+            let event = AgentEvent::ToolStartedWithId {
+                tool: call.name.clone(),
+                call_id: call.call_id.clone(),
+            };
+            if let Some(progress) = progress {
+                let _ = progress.send(event);
+            }
+            prepared.push((call, id));
+        }
+        let ids = prepared
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>();
+        let calls = prepared.into_iter().map(|(call, _)| call).collect();
+        let executions = crate::tools::scheduler::schedule(
+            calls,
+            true,
+            limit,
+            |_| crate::tools::scheduler::ToolExecutionClass::ReadOnlyParallelSafe,
+            |call| async move { self.tools.execute(&call, context).await },
+        )
+        .await;
+        let mut results = Vec::with_capacity(executions.len());
+        for (id, execution) in ids.into_iter().zip(executions) {
+            let result = execution.result;
+            let interrupted = context.cancellation.is_cancelled();
+            self.storage.set_tool_run_status(
+                &id,
+                if interrupted {
+                    "interrupted"
+                } else {
+                    execution.status.as_str()
+                },
+                (!result.is_error).then_some(result.output.as_str()),
+                result.is_error.then_some(result.output.as_str()),
+            )?;
+            if let Some(progress) = progress {
+                let _ = progress.send(AgentEvent::ToolCompletedWithId {
+                    tool: result.name.clone(),
+                    call_id: result.call_id.clone(),
+                    summary: if interrupted {
+                        "cancelled".into()
+                    } else if result.is_error {
+                        format!("failed: {}", result.output)
+                    } else {
+                        "completed".into()
+                    },
+                });
+            }
+            results.push(result);
+        }
+        if context.cancellation.is_cancelled() {
+            return Err(anyhow!("generation cancelled during parallel tool group"));
+        }
+        Ok(results)
+    }
+
     pub fn cancel(&self, principal: &str) -> bool {
         self.cancel_in_scope(principal, None)
     }
@@ -941,6 +1018,14 @@ impl AgentEngine {
                         }
                         if calls.is_empty(){return Err(anyhow!("provider returned an empty tool-call turn"));}
                         continuation=turn.continuation;
+                        if config.parallel_readonly_tools && calls.len()>1 && calls.iter().all(|call| crate::tools::scheduler::execution_class(self.tools.spec(&call.name).as_ref())==crate::tools::scheduler::ToolExecutionClass::ReadOnlyParallelSafe) {
+                            if tool_calls.saturating_add(calls.len())>config.max_tool_calls { return Err(anyhow!("agent tool-call limit ({}) reached",config.max_tool_calls)); }
+                            tool_calls+=calls.len();
+                            let group_started=timing_started.elapsed().as_millis() as u64;
+                            tool_results=self.execute_readonly_group(calls,&tool_context,&agent_run_id,config.max_parallel_readonly_tools,progress.as_ref()).await?;
+                            self.storage.record_agent_run_event(&agent_run_id,"tool_group",timing_started.elapsed().as_millis() as u64,&serde_json::json!({"started_ms":group_started,"class":"parallel_read_only","count":tool_results.len()}))?;
+                            continue;
+                        }
                         let mut next=Vec::with_capacity(calls.len());
                         for call in calls {
                             tool_calls += 1;
