@@ -47,12 +47,14 @@ impl CliPaths {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeLayout {
     pub data_dir: PathBuf,
+    pub run_dir: PathBuf,
     pub logs_dir: PathBuf,
     pub secrets_dir: PathBuf,
     pub database: PathBuf,
     pub daemon_log: PathBuf,
     pub managed_state: PathBuf,
-    lifecycle_lock: PathBuf,
+    pub control_socket: PathBuf,
+    pub runtime_lock: PathBuf,
 }
 
 impl RuntimeLayout {
@@ -63,13 +65,16 @@ impl RuntimeLayout {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let data_dir = resolve_from(&base, &config.paths.data_dir);
+        let run_dir = data_dir.join("run");
         let logs_dir = resolve_from(&base, &config.paths.logs_dir);
         let secrets_dir = resolve_from(&base, &config.paths.secrets_dir);
         let database = resolve_from(&base, &config.storage.database);
         Self {
             daemon_log: logs_dir.join("daemon.log"),
             managed_state: data_dir.join("xiao-daemon.toml"),
-            lifecycle_lock: data_dir.join("xiao-lifecycle.lock"),
+            control_socket: run_dir.join("control.sock"),
+            runtime_lock: run_dir.join("runtime.lock"),
+            run_dir,
             data_dir,
             logs_dir,
             secrets_dir,
@@ -78,16 +83,20 @@ impl RuntimeLayout {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
-    pub endpoint: String,
+    pub endpoint: Option<String>,
+    pub control_socket: Option<PathBuf>,
     pub token: String,
     pub principal: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct ClientConfigFile {
-    endpoint: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    control_socket: Option<PathBuf>,
     token: String,
     #[serde(default = "default_principal")]
     principal: String,
@@ -102,6 +111,7 @@ impl ClientConfig {
             toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
         let config = Self {
             endpoint: file.endpoint,
+            control_socket: file.control_socket,
             token: file.token,
             principal: file.principal,
         };
@@ -110,12 +120,16 @@ impl ClientConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        let url = url::Url::parse(&self.endpoint).context("invalid client endpoint")?;
-        if url.scheme() != "http" {
-            bail!("client endpoint must use http over loopback");
-        }
-        if !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
-            bail!("client refuses non-loopback endpoints");
+        if let Some(endpoint) = &self.endpoint {
+            let url = url::Url::parse(endpoint).context("invalid client endpoint")?;
+            if url.scheme() != "http" {
+                bail!("client endpoint must use http over loopback");
+            }
+            if !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
+                bail!("client refuses non-loopback endpoints");
+            }
+        } else if self.control_socket.is_none() {
+            bail!("client requires either control_socket or loopback endpoint");
         }
         if self.token.trim().is_empty() {
             bail!("client token is empty");
@@ -130,6 +144,7 @@ impl ClientConfig {
         self.validate()?;
         Ok(toml::to_string_pretty(&ClientConfigFile {
             endpoint: self.endpoint.clone(),
+            control_socket: self.control_socket.clone(),
             token: self.token.clone(),
             principal: self.principal.clone(),
         })?)
@@ -223,7 +238,7 @@ pub fn load_existing(paths: &CliPaths) -> Result<InitResult> {
 
 pub fn provision_client_config(
     paths: &CliPaths,
-    config: &AppConfig,
+    _config: &AppConfig,
     runtime: &RuntimeLayout,
 ) -> Result<bool> {
     if paths.client_config.exists() {
@@ -235,17 +250,21 @@ pub fn provision_client_config(
         .get("ipc-client-token")?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("daemon has not provisioned the client credential yet"))?;
-    let client = ClientConfig {
-        endpoint: format!("http://{}", config.ipc.bind),
+    let client = ClientConfigFile {
+        endpoint: None,
+        control_socket: Some(runtime.control_socket.clone()),
         token,
         principal: default_principal(),
     };
     ensure_parent(&paths.client_config)?;
-    write_new_private(&paths.client_config, client.to_toml()?.as_bytes())
+    write_new_private(
+        &paths.client_config,
+        toml::to_string_pretty(&client)?.as_bytes(),
+    )
 }
 
 pub async fn start_daemon(paths: &CliPaths, init: &InitResult) -> Result<StartResult> {
-    let _lock = LifecycleLock::acquire(&init.runtime)?;
+    let _lock = RuntimeLock::acquire(&init.runtime)?;
     if let Some(pid) = valid_managed_pid(paths, &init.runtime)? {
         if probe_daemon(&init.config, &init.runtime).await {
             let client_config_created =
@@ -317,7 +336,7 @@ pub async fn start_daemon(paths: &CliPaths, init: &InitResult) -> Result<StartRe
 }
 
 pub async fn stop_daemon(paths: &CliPaths, init: &InitResult) -> Result<StopResult> {
-    let _lock = LifecycleLock::acquire(&init.runtime)?;
+    let _lock = RuntimeLock::acquire(&init.runtime)?;
     let Some(record) = read_managed_process(&init.runtime)? else {
         return if probe_daemon(&init.config, &init.runtime).await {
             Ok(StopResult::UnmanagedRunning)
@@ -358,12 +377,12 @@ pub async fn daemon_status(paths: &CliPaths, init: &InitResult) -> Result<Daemon
     Ok(DaemonStatus {
         managed_pid,
         reachable,
-        endpoint: format!("http://{}", init.config.ipc.bind),
+        endpoint: init.runtime.control_socket.display().to_string(),
     })
 }
 
 pub fn run_daemon_foreground(paths: &CliPaths, init: &InitResult) -> Result<ExitStatus> {
-    let _lock = LifecycleLock::acquire(&init.runtime)?;
+    let _lock = RuntimeLock::acquire(&init.runtime)?;
     if valid_managed_pid(paths, &init.runtime)?.is_some() {
         bail!("xiao daemon is already running for this config");
     }
@@ -441,23 +460,36 @@ async fn wait_until_ready(
     }
 }
 
-async fn probe_daemon(config: &AppConfig, runtime: &RuntimeLayout) -> bool {
-    let Ok(Some(token)) = SecretStore::new(runtime.secrets_dir.clone()).get("ipc-client-token")
-    else {
-        return false;
-    };
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(Duration::from_millis(750))
-        .build()
-    else {
-        return false;
-    };
-    client
-        .get(format!("http://{}/v1/status", config.ipc.bind))
-        .bearer_auth(token)
-        .send()
-        .await
-        .is_ok_and(|response| response.status().is_success())
+async fn probe_daemon(_config: &AppConfig, runtime: &RuntimeLayout) -> bool {
+    #[cfg(unix)]
+    {
+        if !runtime.control_socket.exists() {
+            return false;
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(750))
+            .unix_socket(runtime.control_socket.clone())
+            .build();
+        let Ok(client) = client else {
+            return false;
+        };
+        let token = SecretStore::new(runtime.secrets_dir.clone())
+            .get("ipc-client-token")
+            .ok()
+            .flatten();
+        let mut req = client.get("http://localhost/v1/status");
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        req.send().await.is_ok_and(|response| {
+            response.status().is_success()
+                || response.status() == reqwest::StatusCode::UNAUTHORIZED
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn valid_managed_pid(paths: &CliPaths, runtime: &RuntimeLayout) -> Result<Option<u32>> {
@@ -609,47 +641,43 @@ fn configure_detached(command: &mut Command) {
 #[cfg(not(unix))]
 fn configure_detached(_command: &mut Command) {}
 
-struct LifecycleLock {
-    path: PathBuf,
+pub struct RuntimeLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+    pub path: PathBuf,
 }
 
-impl LifecycleLock {
-    fn acquire(runtime: &RuntimeLayout) -> Result<Self> {
-        for _ in 0..2 {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&runtime.lifecycle_lock)
-            {
-                Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id())?;
-                    file.sync_all()?;
-                    set_private_file(&runtime.lifecycle_lock)?;
-                    return Ok(Self {
-                        path: runtime.lifecycle_lock.clone(),
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let owner = fs::read_to_string(&runtime.lifecycle_lock)
-                        .ok()
-                        .and_then(|raw| raw.trim().parse::<u32>().ok());
-                    if owner.is_some_and(process_alive) {
-                        bail!("another xiao daemon lifecycle command is still running");
-                    }
-                    fs::remove_file(&runtime.lifecycle_lock).with_context(|| {
-                        format!("remove stale {}", runtime.lifecycle_lock.display())
-                    })?;
-                }
-                Err(error) => return Err(error).context("create daemon lifecycle lock"),
+impl RuntimeLock {
+    pub fn acquire(runtime: &RuntimeLayout) -> Result<Self> {
+        ensure_parent(&runtime.runtime_lock)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&runtime.runtime_lock)
+            .with_context(|| format!("open {}", runtime.runtime_lock.display()))?;
+        set_private_file(&runtime.runtime_lock)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                bail!("xiao runtime is locked by another daemon: {err}");
             }
         }
-        bail!("could not acquire daemon lifecycle lock")
+        Ok(Self {
+            #[cfg(unix)]
+            _file: file,
+            path: runtime.runtime_lock.clone(),
+        })
     }
 }
 
-impl Drop for LifecycleLock {
+impl Drop for RuntimeLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -714,7 +742,7 @@ fn normalized(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn ensure_parent(path: &Path) -> Result<()> {
+pub fn ensure_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent, false)?;
     }
@@ -746,7 +774,7 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn set_private_file(path: &Path) -> Result<()> {
+pub fn set_private_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
@@ -758,7 +786,7 @@ fn set_private_file(_path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn set_private_dir(path: &Path) -> Result<()> {
+pub fn set_private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
@@ -876,7 +904,8 @@ mod tests {
         };
         let init = initialize(&paths).unwrap();
         let existing = ClientConfig {
-            endpoint: "http://127.0.0.1:49999".into(),
+            endpoint: Some("http://127.0.0.1:49999".into()),
+            control_socket: None,
             token: "existing-token".into(),
             principal: "termux:kept".into(),
         }
@@ -893,18 +922,19 @@ mod tests {
     #[test]
     fn client_config_accepts_only_http_loopback_with_nonempty_identity() {
         let valid = ClientConfig {
-            endpoint: "http://127.0.0.1:37921".into(),
+            endpoint: Some("http://127.0.0.1:37921".into()),
+            control_socket: None,
             token: "token".into(),
             principal: "termux:test".into(),
         };
         assert!(valid.validate().is_ok());
 
         let mut invalid = valid.clone();
-        invalid.endpoint = "https://127.0.0.1:37921".into();
+        invalid.endpoint = Some("https://127.0.0.1:37921".into());
         assert!(invalid.validate().is_err());
-        invalid.endpoint = "http://192.0.2.1:37921".into();
+        invalid.endpoint = Some("http://192.0.2.1:37921".into());
         assert!(invalid.validate().is_err());
-        invalid.endpoint = "http://127.0.0.1:37921".into();
+        invalid.endpoint = Some("http://127.0.0.1:37921".into());
         invalid.token.clear();
         assert!(invalid.validate().is_err());
     }

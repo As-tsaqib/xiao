@@ -190,14 +190,23 @@ impl DaemonClient {
                 message: "admin IPC token missing; start xiao daemon first".into(),
             })?;
         let timeout = Duration::from_secs(options.timeout_seconds.unwrap_or(300).clamp(1, 3600));
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(timeout)
-            .build()
-            .map_err(anyhow::Error::from)?;
+            .timeout(timeout);
+        #[cfg(unix)]
+        if let Some(sock) = &client.control_socket {
+            builder = builder.unix_socket(sock.clone());
+        }
+        let http = builder.build().map_err(anyhow::Error::from)?;
+        let endpoint = client
+            .endpoint
+            .as_deref()
+            .unwrap_or("http://localhost")
+            .trim_end_matches('/')
+            .to_owned();
         Ok(Self {
             http,
-            endpoint: client.endpoint.trim_end_matches('/').to_owned(),
+            endpoint,
             principal: client.principal,
             client_token: client.token,
             admin_token,

@@ -231,10 +231,16 @@ struct LogsQuery {
 
 pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
     let cfg = app.config.read().await.clone();
-    let addr = cfg.ipc.socket_addr()?;
-    if !addr.ip().is_loopback() {
-        return Err(anyhow!("refusing non-loopback IPC bind"));
-    }
+    let paths = crate::standalone::CliPaths {
+        config: config_path.as_ref().to_owned(),
+        client_config: config_path.as_ref().with_file_name("client.toml"),
+        default_data_dir: cfg.paths.data_dir.clone(),
+    };
+    let runtime = crate::standalone::RuntimeLayout::from_config(&paths, &cfg);
+    crate::standalone::ensure_parent(&runtime.control_socket)?;
+    crate::standalone::set_private_dir(&runtime.run_dir)?;
+    let _ = std::fs::remove_file(&runtime.control_socket);
+
     let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
     let client_token = load_or_create_token(&secrets, "ipc-client-token")?;
     let admin_token = load_or_create_token(&secrets, "ipc-admin-token")?;
@@ -292,10 +298,26 @@ pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
             get(manager_security).post(manager_approval_action),
         )
         .route("/v1/admin/diagnostics", get(manager_diagnostics))
+        .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "local authenticated IPC listening");
-    axum::serve(listener, router).await?;
+    #[cfg(unix)]
+    {
+        let listener = tokio::net::UnixListener::bind(&runtime.control_socket)?;
+        crate::standalone::set_private_file(&runtime.control_socket)?;
+        tracing::info!(
+            socket = %runtime.control_socket.display(),
+            "local Unix control socket listening"
+        );
+        let res = axum::serve(listener, router).await;
+        let _ = std::fs::remove_file(&runtime.control_socket);
+        res?;
+    }
+    #[cfg(not(unix))]
+    {
+        let addr = cfg.ipc.socket_addr()?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, router).await?;
+    }
     Ok(())
 }
 

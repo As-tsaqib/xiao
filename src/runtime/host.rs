@@ -1,15 +1,21 @@
 use anyhow::Result;
 
-use crate::{app::AppState, config::AppConfig, standalone::CliPaths};
+use crate::{
+    app::AppState,
+    config::AppConfig,
+    standalone::{CliPaths, RuntimeLayout, RuntimeLock},
+};
 
 pub struct RuntimeHost {
     app: AppState,
     config_path: std::path::PathBuf,
+    _runtime_lock: RuntimeLock,
 }
 
 impl RuntimeHost {
     pub async fn bootstrap() -> Result<Self> {
-        let config_path = CliPaths::from_env()?.config;
+        let paths = CliPaths::from_env()?;
+        let config_path = paths.config.clone();
         if !config_path.is_file() {
             anyhow::bail!(
                 "xiao config is missing at {}; run `xiao quickstart` first",
@@ -17,13 +23,20 @@ impl RuntimeHost {
             );
         }
         let config = AppConfig::load(&config_path)?;
+        let layout = RuntimeLayout::from_config(&paths, &config);
+        let runtime_lock = RuntimeLock::acquire(&layout)?;
+
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(
                 config.daemon.log_level.clone(),
             ))
             .init();
         let app = AppState::build_from_path(config, config_path.clone()).await?;
-        Ok(Self { app, config_path })
+        Ok(Self {
+            app,
+            config_path,
+            _runtime_lock: runtime_lock,
+        })
     }
 
     pub async fn run(self) -> Result<()> {
