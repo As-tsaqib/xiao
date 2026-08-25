@@ -9,6 +9,7 @@ use crate::{
 pub struct RuntimeHost {
     app: AppState,
     config_path: std::path::PathBuf,
+    layout: RuntimeLayout,
     _runtime_lock: RuntimeLock,
 }
 
@@ -35,6 +36,7 @@ impl RuntimeHost {
         Ok(Self {
             app,
             config_path,
+            layout,
             _runtime_lock: runtime_lock,
         })
     }
@@ -98,6 +100,7 @@ impl RuntimeHost {
         if let Err(error) = self.app.storage.checkpoint() {
             tracing::warn!(%error, "SQLite WAL checkpoint failed during shutdown");
         }
+        let _ = std::fs::remove_file(&self.layout.control_socket);
         Ok(())
     }
 }

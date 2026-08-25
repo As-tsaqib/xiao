@@ -244,6 +244,7 @@ impl AppState {
             let _ =
                 profiles.migrate_singleton(&owner_id, &cfg.providers.custom, legacy_credential)?;
         }
+        let _ = profiles.migrate_legacy_credentials(auth.secrets(), &auth);
         let providers = Arc::new(ProviderRegistry::new(cfg.clone(), auth.clone()));
         for provider_id in providers.list() {
             // Custom capabilities are endpoint/model-specific and are stored

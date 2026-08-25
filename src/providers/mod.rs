@@ -1341,14 +1341,10 @@ impl CustomProvider {
             }
             // Critical isolation rule: resolve only the selected profile's
             // credential reference. Absence means no Authorization header.
-            let api_key = match profile.credential_ref.as_deref() {
-                Some(reference) => self
-                    .auth
-                    .credential(reference)?
-                    .and_then(|credential| credential.api_key)
-                    .filter(|key| !key.trim().is_empty()),
-                None => None,
-            };
+            let api_key = self
+                .profiles
+                .resolve_api_key(self.auth.secrets(), &profile)?
+                .filter(|key| !key.trim().is_empty());
             let headers = profile.merged_headers(self.auth.secrets())?;
             return Ok(CustomTarget {
                 base_url: profile.endpoint,

@@ -63,6 +63,14 @@ pub struct CapabilityRegistry {
     entries: Arc<RwLock<BTreeMap<String, Capability>>>,
 }
 
+impl Default for CapabilityRegistry {
+    fn default() -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+}
+
 impl CapabilityRegistry {
     pub fn from_environment(environment: &RuntimeEnvironment) -> Self {
         let registry = Self {

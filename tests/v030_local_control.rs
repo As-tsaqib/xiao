@@ -4,7 +4,8 @@ use xiao::{
     config::AppConfig,
     security::secrets::SecretStore,
     standalone::{
-        initialize, provision_client_config, CliPaths, ClientConfig, RuntimeLayout, RuntimeLock,
+        initialize, provision_client_config, CliPaths, ClientConfig, LifecycleLock, RuntimeLayout,
+        RuntimeLock,
     },
 };
 
@@ -26,11 +27,34 @@ fn runtime_layout_uses_private_run_socket_and_exclusive_lock() {
     assert_eq!(layout.run_dir, layout.data_dir.join("run"));
     assert_eq!(layout.control_socket, layout.run_dir.join("control.sock"));
     assert_eq!(layout.runtime_lock, layout.run_dir.join("runtime.lock"));
+    assert_eq!(layout.lifecycle_lock, layout.run_dir.join("lifecycle.lock"));
 
     let first = RuntimeLock::acquire(&layout).unwrap();
     assert!(RuntimeLock::acquire(&layout).is_err());
     drop(first);
     RuntimeLock::acquire(&layout).unwrap();
+}
+
+#[test]
+fn lifecycle_lock_and_runtime_lock_separation() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = paths(directory.path());
+    let config = AppConfig::standalone(paths.default_data_dir.clone());
+    let layout = RuntimeLayout::from_config(&paths, &config);
+
+    let lifecycle = LifecycleLock::acquire(&layout).unwrap();
+    assert!(LifecycleLock::acquire(&layout).is_err());
+
+    let runtime = RuntimeLock::acquire(&layout).unwrap();
+    assert!(RuntimeLock::acquire(&layout).is_err());
+
+    drop(lifecycle);
+    let lifecycle2 = LifecycleLock::acquire(&layout).unwrap();
+    drop(lifecycle2);
+
+    drop(runtime);
+    let runtime2 = RuntimeLock::acquire(&layout).unwrap();
+    drop(runtime2);
 }
 
 #[test]

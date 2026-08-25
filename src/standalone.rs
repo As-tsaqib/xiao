@@ -55,6 +55,7 @@ pub struct RuntimeLayout {
     pub managed_state: PathBuf,
     pub control_socket: PathBuf,
     pub runtime_lock: PathBuf,
+    pub lifecycle_lock: PathBuf,
 }
 
 impl RuntimeLayout {
@@ -74,6 +75,7 @@ impl RuntimeLayout {
             managed_state: data_dir.join("xiao-daemon.toml"),
             control_socket: run_dir.join("control.sock"),
             runtime_lock: run_dir.join("runtime.lock"),
+            lifecycle_lock: run_dir.join("lifecycle.lock"),
             run_dir,
             data_dir,
             logs_dir,
@@ -85,10 +87,8 @@ impl RuntimeLayout {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
-    pub endpoint: Option<String>,
     pub control_socket: Option<PathBuf>,
     pub token: String,
-    pub principal: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,8 +98,8 @@ struct ClientConfigFile {
     #[serde(default)]
     control_socket: Option<PathBuf>,
     token: String,
-    #[serde(default = "default_principal")]
-    principal: String,
+    #[serde(default)]
+    principal: Option<String>,
 }
 
 impl ClientConfig {
@@ -109,33 +109,42 @@ impl ClientConfig {
             .with_context(|| format!("read {} (run `xiao quickstart` first)", path.display()))?;
         let file: ClientConfigFile =
             toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        if file.token.trim().is_empty() {
+            bail!("client token is empty");
+        }
         let config = Self {
-            endpoint: file.endpoint,
             control_socket: file.control_socket,
             token: file.token,
-            principal: file.principal,
         };
-        config.validate()?;
+        if file.principal.is_some() || file.endpoint.is_some() {
+            let _ = Self::save_canonical(path, config.control_socket.as_deref(), &config.token);
+        }
         Ok(config)
     }
 
-    pub fn validate(&self) -> Result<()> {
-        if let Some(endpoint) = &self.endpoint {
-            let url = url::Url::parse(endpoint).context("invalid client endpoint")?;
-            if url.scheme() != "http" {
-                bail!("client endpoint must use http over loopback");
-            }
-            if !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
-                bail!("client refuses non-loopback endpoints");
-            }
-        } else if self.control_socket.is_none() {
-            bail!("client requires either control_socket or loopback endpoint");
+    pub fn save_canonical(
+        path: impl AsRef<Path>,
+        control_socket: Option<&Path>,
+        token: &str,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        ensure_parent(path)?;
+        #[derive(Serialize)]
+        struct CanonicalClient<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            control_socket: Option<&'a Path>,
+            token: &'a str,
         }
+        let content = toml::to_string_pretty(&CanonicalClient {
+            control_socket,
+            token,
+        })?;
+        write_new_private(path, content.as_bytes())
+    }
+
+    pub fn validate(&self) -> Result<()> {
         if self.token.trim().is_empty() {
             bail!("client token is empty");
-        }
-        if self.principal.trim().is_empty() {
-            bail!("client principal is empty");
         }
         Ok(())
     }
@@ -143,11 +152,15 @@ impl ClientConfig {
     #[allow(dead_code)]
     pub fn to_toml(&self) -> Result<String> {
         self.validate()?;
-        Ok(toml::to_string_pretty(&ClientConfigFile {
-            endpoint: self.endpoint.clone(),
-            control_socket: self.control_socket.clone(),
-            token: self.token.clone(),
-            principal: self.principal.clone(),
+        #[derive(Serialize)]
+        struct CanonicalClient<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            control_socket: Option<&'a Path>,
+            token: &'a str,
+        }
+        Ok(toml::to_string_pretty(&CanonicalClient {
+            control_socket: self.control_socket.as_deref(),
+            token: &self.token,
         })?)
     }
 }
@@ -251,21 +264,12 @@ pub fn provision_client_config(
         .get("ipc-client-token")?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("daemon has not provisioned the client credential yet"))?;
-    let client = ClientConfigFile {
-        endpoint: None,
-        control_socket: Some(runtime.control_socket.clone()),
-        token,
-        principal: default_principal(),
-    };
-    ensure_parent(&paths.client_config)?;
-    write_new_private(
-        &paths.client_config,
-        toml::to_string_pretty(&client)?.as_bytes(),
-    )
+    ClientConfig::save_canonical(&paths.client_config, Some(&runtime.control_socket), &token)?;
+    Ok(true)
 }
 
 pub async fn start_daemon(paths: &CliPaths, init: &InitResult) -> Result<StartResult> {
-    let _lock = RuntimeLock::acquire(&init.runtime)?;
+    let _lifecycle = LifecycleLock::acquire(&init.runtime)?;
     if let Some(pid) = valid_managed_pid(paths, &init.runtime)? {
         if probe_daemon(&init.config, &init.runtime).await {
             let client_config_created =
@@ -337,7 +341,7 @@ pub async fn start_daemon(paths: &CliPaths, init: &InitResult) -> Result<StartRe
 }
 
 pub async fn stop_daemon(paths: &CliPaths, init: &InitResult) -> Result<StopResult> {
-    let _lock = RuntimeLock::acquire(&init.runtime)?;
+    let _lifecycle = LifecycleLock::acquire(&init.runtime)?;
     let Some(record) = read_managed_process(&init.runtime)? else {
         return if probe_daemon(&init.config, &init.runtime).await {
             Ok(StopResult::UnmanagedRunning)
@@ -680,6 +684,45 @@ impl Drop for RuntimeLock {
     fn drop(&mut self) {}
 }
 
+pub struct LifecycleLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+    pub path: PathBuf,
+}
+
+impl LifecycleLock {
+    pub fn acquire(runtime: &RuntimeLayout) -> Result<Self> {
+        ensure_parent(&runtime.lifecycle_lock)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&runtime.lifecycle_lock)
+            .with_context(|| format!("open {}", runtime.lifecycle_lock.display()))?;
+        set_private_file(&runtime.lifecycle_lock)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                bail!("failed to acquire lifecycle lock: {err}");
+            }
+        }
+        Ok(Self {
+            #[cfg(unix)]
+            _file: file,
+            path: runtime.lifecycle_lock.clone(),
+        })
+    }
+}
+
+impl Drop for LifecycleLock {
+    fn drop(&mut self) {}
+}
+
 fn resolve_cli_paths(
     home: &Path,
     xdg_config_home: Option<&OsStr>,
@@ -903,10 +946,8 @@ mod tests {
         };
         let init = initialize(&paths).unwrap();
         let existing = ClientConfig {
-            endpoint: Some("http://127.0.0.1:49999".into()),
-            control_socket: None,
+            control_socket: Some(temp.path().join("run/control.sock")),
             token: "existing-token".into(),
-            principal: "termux:kept".into(),
         }
         .to_toml()
         .unwrap();
@@ -919,23 +960,23 @@ mod tests {
     }
 
     #[test]
-    fn client_config_accepts_only_http_loopback_with_nonempty_identity() {
-        let valid = ClientConfig {
-            endpoint: Some("http://127.0.0.1:37921".into()),
-            control_socket: None,
-            token: "token".into(),
-            principal: "termux:test".into(),
-        };
-        assert!(valid.validate().is_ok());
+    fn client_config_validates_token_and_migrates_legacy_format() {
+        let temp = tempfile::tempdir().unwrap();
+        let client_path = temp.path().join("client.toml");
+        let legacy = "endpoint = \"http://127.0.0.1:37921\"\nprincipal = \"owner:legacy\"\ntoken = \"migrated-token\"\n";
+        fs::write(&client_path, legacy).unwrap();
+        let loaded = ClientConfig::load(&client_path).unwrap();
+        assert_eq!(loaded.token, "migrated-token");
+        assert!(loaded.validate().is_ok());
+        let migrated_raw = fs::read_to_string(&client_path).unwrap();
+        assert!(!migrated_raw.contains("principal"));
+        assert!(!migrated_raw.contains("endpoint"));
 
-        let mut invalid = valid.clone();
-        invalid.endpoint = Some("https://127.0.0.1:37921".into());
-        assert!(invalid.validate().is_err());
-        invalid.endpoint = Some("http://192.0.2.1:37921".into());
-        assert!(invalid.validate().is_err());
-        invalid.endpoint = Some("http://127.0.0.1:37921".into());
-        invalid.token.clear();
-        assert!(invalid.validate().is_err());
+        let empty = ClientConfig {
+            control_socket: None,
+            token: "".into(),
+        };
+        assert!(empty.validate().is_err());
     }
 
     #[test]
