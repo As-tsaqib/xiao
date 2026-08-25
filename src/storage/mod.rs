@@ -4918,7 +4918,7 @@ mod tests {
                 connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                     row.get(0)
                 })?;
-            assert_eq!(latest, 25);
+            assert_eq!(latest, 26);
             for table in [
                 "agent_runs",
                 "tool_runs",
