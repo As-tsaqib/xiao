@@ -667,9 +667,11 @@ impl TelegramAdapter {
         loop {
             tokio::select! {
                 result = &mut future => {
-                    if dirty && let Some(draft_id) = draft_id {
-                        let view = aggregator.view();
-                        let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
+                    if dirty {
+                        if let Some(draft_id) = draft_id {
+                            let view = aggregator.view();
+                            let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
+                        }
                     }
                     return result;
                 }
@@ -694,11 +696,13 @@ impl TelegramAdapter {
                     }
                 }
                 _ = ticker.tick() => {
-                    if (dirty || last_sent.elapsed() >= HEARTBEAT) && let Some(draft_id) = draft_id {
-                        let view = aggregator.view();
-                        let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
-                        dirty = false;
-                        last_sent = std::time::Instant::now();
+                    if dirty || last_sent.elapsed() >= HEARTBEAT {
+                        if let Some(draft_id) = draft_id {
+                            let view = aggregator.view();
+                            let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
+                            dirty = false;
+                            last_sent = std::time::Instant::now();
+                        }
                     }
                 }
             }
