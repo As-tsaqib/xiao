@@ -282,9 +282,9 @@ pass 'Approvals bind exact operation identity and YOLO cannot bypass DENY'
     rg -q 'telegram_photo_and_document_are_downloaded_scoped_and_indexed' src/telegram/mod.rs &&
     rg -q 'wrong_txt_extension_cannot_override_pdf_magic_and_empty_pdf_requires_ocr' src/attachments/mod.rs &&
     rg -q 'text_pdf_and_docx_extract_into_fts_without_macro_content' src/attachments/mod.rs &&
-    rg -q 'production_custom_vision_serializes_normalized_image_and_rejects_nonvision_model' src/providers/mod.rs
+    rg -q 'production_custom_vision_serializes_supported_and_unknown_images' src/providers/mod.rs
 } || fail 'Attachment, document and vision pipeline'
-pass 'Attachments are bounded/sniffed/indexed and vision is capability-gated'
+pass 'Attachments are bounded/sniffed/indexed and Unknown vision routes optimistically'
 {
   rg -q 'xiao-semantic-runtime' src/semantic/mod.rs &&
     rg -q 'Semaphore::new' src/semantic/mod.rs &&
