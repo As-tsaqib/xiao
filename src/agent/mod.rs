@@ -43,6 +43,7 @@ use crate::{
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentAnswer {
+    pub run_id: String,
     /// Safe status events only. No private reasoning or provider hidden chain-of-thought is represented here.
     pub progress: Vec<AgentEvent>,
     /// Persistent user-facing final answer only.
@@ -1286,23 +1287,10 @@ impl AgentEngine {
                     verification_evidence: verification.summary.clone(),
                     skill_candidate: None,
                 };
-                // Learning is post-completion and best-effort; failure cannot
-                // rewrite a successfully delivered task into a failed one.
+                // Persist before returning, but keep the job unreleased until
+                // the frontend records final delivery acknowledgement.
                 if config.background_learning {
-                    let learning = learning.clone();
-                    let memory_evaluator = memory_evaluator.clone();
-                    let principal = principal.to_owned();
-                    let session_id = ctx.active.id.clone();
-                    let prompt = prompt.to_owned();
-                    let token = CancellationToken::new();
-                    tokio::spawn(async move {
-                        if append_user {
-                            let _ = memory_evaluator
-                                .apply_explicit_async(&principal, &session_id, &prompt, token)
-                                .await;
-                        }
-                        let _ = learning.evaluate_async(&principal, &trace).await;
-                    });
+                    self.storage.enqueue_learning_job(principal,&agent_run_id,&serde_json::json!({"trace":trace,"explicit_prompt":append_user.then_some(bound_text(redact_text(prompt),2_000))}))?;
                 }
             } else {
                 let status = match verification.state {
@@ -1323,6 +1311,7 @@ impl AgentEngine {
             events.extend(provider_events);
             events.push(completed);
             Ok(AgentAnswer {
+                run_id: agent_run_id,
                 progress: events,
                 final_answer,
                 side_mode: ctx.mode == ChatMode::Side,

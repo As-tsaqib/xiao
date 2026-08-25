@@ -768,6 +768,7 @@ impl TelegramAdapter {
     ) -> Result<()> {
         match result {
             CommandResult::Agent(answer) => {
+                let run_id = answer.run_id.clone();
                 let artifacts = answer.artifacts.clone();
                 let view = agent_final_view(answer);
                 for page in paginate_final_view(&view, 3500) {
@@ -780,6 +781,15 @@ impl TelegramAdapter {
                             .await?;
                     }
                 }
+                self.app.storage.record_agent_run_event(
+                    &run_id,
+                    "final_frontend_delivery",
+                    0,
+                    &serde_json::json!({"frontend":"telegram"}),
+                )?;
+                self.app
+                    .storage
+                    .release_learning_job_after_delivery(&run_id)?;
                 Ok(())
             }
             CommandResult::StartCustomLogin => {
@@ -2625,6 +2635,7 @@ mod tests {
     #[test]
     fn final_surface_excludes_progress_and_keeps_side_marker() {
         let view = agent_final_view(AgentAnswer {
+            run_id: "test-run".into(),
             progress: vec![AgentEvent::ToolCompleted {
                 tool: "shell".into(),
                 summary: "SECRET HUGE TOOL OUTPUT".into(),

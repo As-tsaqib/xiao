@@ -1416,6 +1416,8 @@ impl Storage {
                     INSERT OR IGNORE INTO schema_migrations(version) VALUES(27);
                     "#,
                 )?;
+                ensure_column(&transaction, "learning_jobs", "payload_json", "TEXT NOT NULL DEFAULT '{}'")?;
+                ensure_column(&transaction, "learning_jobs", "delivered_at", "TEXT")?;
                 transaction.commit()?;
             }
             // A database can be opened once before a legacy owner row is
@@ -1890,6 +1892,49 @@ impl Storage {
                     |row| row.get(0),
                 )
                 .map_err(Into::into)
+        })
+    }
+
+    pub fn enqueue_learning_job(
+        &self,
+        owner_id: &str,
+        run_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let id = Uuid::new_v4().to_string();
+        let payload = serde_json::to_string(&crate::security::redact::redact_json(payload))?;
+        self.with_conn(|connection| { connection.execute("INSERT INTO learning_jobs(id,owner_id,run_id,status,attempts,not_before,created_at,updated_at,payload_json) VALUES(?,?,?,'pending',0,'9999-12-31T23:59:59Z',?,?,?) ON CONFLICT(run_id) DO NOTHING",params![id,owner_id,run_id,now,now,payload])?; Ok(()) })
+    }
+
+    pub fn release_learning_job_after_delivery(&self, run_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(|connection| { connection.execute("UPDATE learning_jobs SET not_before=?,delivered_at=?,updated_at=? WHERE run_id=? AND status='pending'",params![now,now,now,run_id])?; Ok(()) })
+    }
+
+    pub fn claim_learning_job(
+        &self,
+    ) -> Result<Option<(String, String, String, serde_json::Value)>> {
+        self.with_conn(|connection| {
+            let transaction=connection.transaction()?; let now=Utc::now(); let stale=(now-chrono::Duration::minutes(15)).to_rfc3339();
+            transaction.execute("UPDATE learning_jobs SET status='pending',updated_at=? WHERE status='running' AND updated_at<? AND attempts<3",params![now.to_rfc3339(),stale])?;
+            let job=transaction.query_row("SELECT id,owner_id,run_id,payload_json FROM learning_jobs WHERE status='pending' AND delivered_at IS NOT NULL AND not_before<=? AND attempts<3 ORDER BY created_at LIMIT 1",params![now.to_rfc3339()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))).optional()?;
+            if let Some((id,owner,run,payload))=job { transaction.execute("UPDATE learning_jobs SET status='running',attempts=attempts+1,updated_at=? WHERE id=?",params![now.to_rfc3339(),id])?; transaction.commit()?; return Ok(Some((id,owner,run,serde_json::from_str(&payload)?))); }
+            transaction.commit()?; Ok(None)
+        })
+    }
+
+    pub fn finish_learning_job(&self, id: &str, result: Result<(), &str>) -> Result<()> {
+        let (status, error) = match result {
+            Ok(()) => ("succeeded", None),
+            Err(error) => ("failed", Some(crate::security::redact::redact_text(error))),
+        };
+        self.with_conn(|connection| {
+            connection.execute(
+                "UPDATE learning_jobs SET status=?,last_error_redacted=?,updated_at=? WHERE id=?",
+                params![status, error, Utc::now().to_rfc3339(), id],
+            )?;
+            Ok(())
         })
     }
 
