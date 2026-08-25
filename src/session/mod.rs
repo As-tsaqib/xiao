@@ -640,7 +640,13 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(crate::skills::SkillStore::new(db.clone()).list(owner, 10).unwrap().len(), 1);
+        assert_eq!(
+            crate::skills::SkillStore::new(db.clone())
+                .list(owner, 10)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(crate::providers::ProviderProfileStore::new(db)
             .get(owner, &profile.profile_id)
             .unwrap()

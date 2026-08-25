@@ -675,11 +675,8 @@ mod tests {
         let client =
             TelegramClient::with_base("test-token".into(), format!("http://{address}")).unwrap();
         let cancellation = CancellationToken::new();
-        let future = client.download_file_bounded_with_cancellation(
-            "files/slow.bin",
-            1024,
-            &cancellation,
-        );
+        let future =
+            client.download_file_bounded_with_cancellation("files/slow.bin", 1024, &cancellation);
         tokio::pin!(future);
         tokio::time::sleep(Duration::from_millis(20)).await;
         cancellation.cancel();

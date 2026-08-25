@@ -340,7 +340,12 @@ impl TelegramAdapter {
             return match self
                 .app
                 .commands
-                .execute_text_in_telegram_scope(&principal, scope, message.text.as_deref().unwrap_or_default(), None)
+                .execute_text_in_telegram_scope(
+                    &principal,
+                    scope,
+                    message.text.as_deref().unwrap_or_default(),
+                    None,
+                )
                 .await
             {
                 Ok(result) => self.send_result(scope, user.id, result).await,

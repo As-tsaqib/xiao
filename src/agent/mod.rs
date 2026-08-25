@@ -560,9 +560,9 @@ impl AgentEngine {
         // message. Writing to the captured id also prevents a concurrent UI
         // session switch from redirecting this request.
         if append_user {
-            if let Err(error) = self
-                .sessions
-                .append_user_to_session(principal, &ctx.active.id, prompt)
+            if let Err(error) =
+                self.sessions
+                    .append_user_to_session(principal, &ctx.active.id, prompt)
             {
                 self.active.lock().unwrap().remove(&active_key);
                 return Err(error);

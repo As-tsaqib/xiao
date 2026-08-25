@@ -25,8 +25,8 @@ fn v028_public_telegram_parser_matches_the_exact_registry() {
     assert_eq!(
         primary,
         [
-            "start", "help", "login", "model", "new", "sessions", "btw", "status",
-            "context", "retry", "yolo", "stop", "skills", "tools",
+            "start", "help", "login", "model", "new", "sessions", "btw", "status", "context",
+            "retry", "yolo", "stop", "skills", "tools",
         ]
     );
     assert_eq!(TelegramCommandRegistry::bot_commands().len(), 14);
@@ -36,7 +36,10 @@ fn v028_public_telegram_parser_matches_the_exact_registry() {
         parse("/sessions").unwrap(),
         Some(Command::Session { page: 1 })
     ));
-    assert!(matches!(parse("/s").unwrap(), Some(Command::Session { page: 1 })));
+    assert!(matches!(
+        parse("/s").unwrap(),
+        Some(Command::Session { page: 1 })
+    ));
     assert!(matches!(parse("/retry").unwrap(), Some(Command::Retry)));
     assert!(matches!(parse("/r").unwrap(), Some(Command::Retry)));
     assert!(matches!(
@@ -70,12 +73,7 @@ fn v028_public_telegram_parser_matches_the_exact_registry() {
     ] {
         assert!(parse(removed).is_err(), "{removed} must remain unknown");
     }
-    for unsupported_tree in [
-        "/login codex",
-        "/login antigravity",
-        "/model gpt-5",
-        "/s 2",
-    ] {
+    for unsupported_tree in ["/login codex", "/login antigravity", "/model gpt-5", "/s 2"] {
         assert!(
             parse(unsupported_tree).is_err(),
             "{unsupported_tree} must use scoped controls"
@@ -99,22 +97,50 @@ async fn command_core_keeps_new_alias_sessions_and_yolo_session_scoped() {
     assert!(matches!(from_alias, CommandResult::Confirmation(_)));
     let current = app.sessions.context_for(principal).unwrap().main;
     assert_ne!(initial.id, current.id);
-    assert!(app.storage.session(principal, &initial.id).unwrap().is_some());
+    assert!(app
+        .storage
+        .session(principal, &initial.id)
+        .unwrap()
+        .is_some());
     assert_eq!(app.storage.count_main_sessions(principal).unwrap(), 3);
 
     let manager = app.commands.execute_text(principal, "/s").await.unwrap();
     assert!(matches!(manager, CommandResult::ManagerView(_)));
     let enabled = app.commands.execute_text(principal, "/y").await.unwrap();
     assert!(matches!(enabled, CommandResult::ManagerView(_)));
-    assert!(app.sessions.context_for(principal).unwrap().active.yolo_mode);
+    assert!(
+        app.sessions
+            .context_for(principal)
+            .unwrap()
+            .active
+            .yolo_mode
+    );
     app.commands.execute_text(principal, "/yolo").await.unwrap();
-    assert!(!app.sessions.context_for(principal).unwrap().active.yolo_mode);
+    assert!(
+        !app.sessions
+            .context_for(principal)
+            .unwrap()
+            .active
+            .yolo_mode
+    );
 
     app.commands.execute_text(principal, "/btw").await.unwrap();
-    assert_eq!(app.sessions.context_for(principal).unwrap().mode, ChatMode::Side);
-    assert!(!app.sessions.context_for(principal).unwrap().active.yolo_mode);
+    assert_eq!(
+        app.sessions.context_for(principal).unwrap().mode,
+        ChatMode::Side
+    );
+    assert!(
+        !app.sessions
+            .context_for(principal)
+            .unwrap()
+            .active
+            .yolo_mode
+    );
     app.commands.execute_text(principal, "/btw").await.unwrap();
-    assert_eq!(app.sessions.context_for(principal).unwrap().mode, ChatMode::Main);
+    assert_eq!(
+        app.sessions.context_for(principal).unwrap().mode,
+        ChatMode::Main
+    );
 }
 
 #[tokio::test]
@@ -124,11 +150,17 @@ async fn direct_custom_login_and_model_surface_replace_provider_manager_routes()
     let principal = "integration:provider";
 
     assert!(matches!(
-        app.commands.execute_text(principal, "/login").await.unwrap(),
+        app.commands
+            .execute_text(principal, "/login")
+            .await
+            .unwrap(),
         CommandResult::StartCustomLogin
     ));
     assert!(matches!(
-        app.commands.execute_text(principal, "/model").await.unwrap(),
+        app.commands
+            .execute_text(principal, "/model")
+            .await
+            .unwrap(),
         CommandResult::ManagerView(_)
     ));
     for removed in [

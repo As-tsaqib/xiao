@@ -2705,7 +2705,10 @@ mod tests {
             "Diagnostics",
             "Logs",
         ] {
-            assert!(app.contains(section), "missing WebUI manager section {section}");
+            assert!(
+                app.contains(section),
+                "missing WebUI manager section {section}"
+            );
         }
         for required in [
             "write-only",

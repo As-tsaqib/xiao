@@ -77,7 +77,9 @@ impl ProviderProfileStore {
             return Err(anyhow!("selected Custom model is empty or too long"));
         }
         if !models.iter().any(|model| model.model_id == selected_model) {
-            return Err(anyhow!("selected Custom model is absent from the discovered catalog"));
+            return Err(anyhow!(
+                "selected Custom model is absent from the discovered catalog"
+            ));
         }
         for model in models {
             validate_tool_protocol(&model.tool_protocol)?;
