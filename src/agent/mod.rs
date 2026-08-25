@@ -777,8 +777,10 @@ impl AgentEngine {
             let mut last_unverified_signature = None::<String>;
             let mut last_unverified_evidence = None::<CompletionEvidence>;
             let mut no_progress_repeats = 0usize;
+            let mut observation_signatures = std::collections::VecDeque::<String>::new();
             let run_started = std::time::Instant::now();
             loop {
+                compact_provider_messages(&mut request.messages, self.config.context_max_chars, self.config.summary_threshold_chars);
                 if run_started.elapsed().as_secs() >= self.config.max_runtime_seconds {
                     return Err(anyhow!(
                         "agent runtime limit ({} seconds) reached",
@@ -1157,6 +1159,16 @@ impl AgentEngine {
                             provider_events.push(completed);
                             next.push(result);
                         }
+                        let signature = next.iter().map(|result| format!("{}:{}:{}", result.name, result.is_error, short_hash(&result.output))).collect::<Vec<_>>().join("|");
+                        observation_signatures.push_back(signature);
+                        while observation_signatures.len() > 6 { observation_signatures.pop_front(); }
+                        if result_aware_ping_pong(&observation_signatures, self.config.max_no_progress_repeats) {
+                            let audit=self.storage.tool_runs(principal,&agent_run_id)?;
+                            let mut blocked=completion.verify_for_task_async(prompt,"repeated equivalent observations",&audit).await;
+                            blocked.state=VerificationState::Blocked; blocked.verified=false;
+                            blocked.summary="bounded no-progress limit reached after result-aware ping-pong".into();
+                            return Ok(LoopOutcome { final_answer:format!("Blocked: {}",blocked.summary), verification:blocked });
+                        }
                         tool_results=next;
                     }
                 }
@@ -1370,6 +1382,51 @@ fn bounded_json(value: &serde_json::Value, max_chars: usize) -> String {
         "preview": serialized.chars().take(max_chars.saturating_sub(100)).collect::<String>()
     })
     .to_string()
+}
+
+fn short_hash(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(redact_text(value).as_bytes()))[..16].to_owned()
+}
+
+fn result_aware_ping_pong(signatures: &std::collections::VecDeque<String>, repeats: usize) -> bool {
+    let repeats = repeats.max(2);
+    if signatures.len() < repeats * 2 {
+        return false;
+    }
+    let values = signatures
+        .iter()
+        .rev()
+        .take(repeats * 2)
+        .collect::<Vec<_>>();
+    values.windows(3).all(|window| window[0] == window[2])
+}
+
+fn compact_provider_messages(
+    messages: &mut Vec<crate::storage::MessageRecord>,
+    max_chars: usize,
+    threshold: usize,
+) {
+    let total = messages
+        .iter()
+        .map(|message| message.content.chars().count())
+        .sum::<usize>();
+    if total <= threshold.min(max_chars) {
+        return;
+    }
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for message in messages.iter().rev() {
+        let size = message.content.chars().count();
+        if used + size > max_chars.saturating_sub(512) {
+            continue;
+        }
+        kept.push(message.clone());
+        used += size;
+    }
+    kept.reverse();
+    kept.insert(0, crate::storage::MessageRecord { role:"system".into(), content:"Earlier provider context was compacted. Durable messages and raw tool audit remain stored; rely only on the bounded observable context below.".into(), created_at:chrono::Utc::now().to_rfc3339() });
+    *messages = kept;
 }
 
 #[allow(clippy::too_many_arguments)]

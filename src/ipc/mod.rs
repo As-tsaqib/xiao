@@ -2520,6 +2520,8 @@ mod tests {
                 clear_secret_headers: false,
                 session_id: None,
                 model: None,
+                capability: None,
+                owner_override: None,
             }),
         )
         .await
@@ -2555,6 +2557,8 @@ mod tests {
                 clear_secret_headers: false,
                 session_id: None,
                 model: None,
+                capability: None,
+                owner_override: None,
             }),
         )
         .await;

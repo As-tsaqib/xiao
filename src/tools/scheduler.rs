@@ -1,4 +1,4 @@
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use std::{future::Future, sync::Arc};
 use tokio::sync::Semaphore;
 
