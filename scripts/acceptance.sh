@@ -70,12 +70,14 @@ rg -q 'SIDE CHAT SESSION' src/telegram src/command src/session || fail 'Side mar
 rg -q 'side_never_writes_main' src/session/mod.rs || fail 'Side isolation test'
 pass 'Side-chat isolation implementation'
 {
-  rg -q 'activate_account' src/storage/mod.rs &&
-    rg -q 'UseAccount' src/command/mod.rs &&
-    rg -q 'use_account_no_models_rolls_back_all_session_fields' src/command/mod.rs
-} || fail 'Atomic account activation'
-! rg -q 'SetAccount' src/command/mod.rs || fail 'Legacy non-atomic SetAccount path remains'
-pass 'Login/account activation is atomic across provider/account/model'
+  rg -q 'struct SessionAiService' src/control_plane.rs &&
+    rg -q 'management_set_session_ai' src/command/mod.rs src/ipc/mod.rs &&
+    rg -q 'set_session_provider' src/control_plane.rs src/storage/mod.rs &&
+    rg -q 'capability_probe_required' src/control_plane.rs &&
+    rg -q 'legacy_provider_accounts_are_hidden_and_cannot_be_selected' src/ipc/mod.rs
+} || fail 'Atomic Custom session AI activation'
+! rg -q 'SetAccount|UseAccount' src/command/mod.rs || fail 'Legacy account-selection command path remains'
+pass 'Session AI activation is exact-session, Custom-only and exact-probe guarded'
 {
   rg -q 'ANTIGRAVITY_CLIENT_ID' src/auth/mod.rs &&
     rg -q 'ANTIGRAVITY_OAUTH_REDIRECT_URI' src/auth/mod.rs &&
@@ -281,13 +283,17 @@ pass 'Attachments are bounded/sniffed/indexed and vision is capability-gated'
 } || fail 'Reusable bounded semantic runtime'
 pass 'Semantic evaluation uses one bounded cancellable worker runtime'
 {
-  rg -q 'Command::Approvals' src/command/mod.rs &&
-    rg -q 'Command::Approve' src/command/mod.rs &&
-    rg -q 'Command::Deny' src/command/mod.rs &&
+  rg -q 'AgentEvent::ApprovalRequested' src/agent/mod.rs src/telegram/mod.rs &&
+    rg -q 'send_approval_card' src/telegram/mod.rs &&
+    rg -q 'parse_internal_approval_command' src/telegram/mod.rs &&
+    rg -q 'approval_is_exact_one_shot_and_cannot_cross_sessions_or_runs' src/storage/mod.rs &&
+    rg -q '"approvals"' src/telegram/commands.rs &&
+    rg -q '"approve"' src/telegram/commands.rs &&
+    rg -q '"deny"' src/telegram/commands.rs &&
     rg -q 'send_document' src/telegram/mod.rs src/telegram/client.rs &&
     rg -q 'result_file_is_sent_through_telegram_multipart_document_path' src/telegram/client.rs
-} || fail 'Telegram approvals and file results'
-pass 'Telegram exposes approvals and verified multipart result files'
+} || fail 'Inline Telegram approvals and file results'
+pass 'Telegram approvals are exact inline callbacks, removed slash routes stay unknown, and verified files use multipart'
 {
   [ -f src/telegram/scope.rs ] &&
     [ -f src/telegram/commands.rs ] &&
@@ -299,7 +305,8 @@ pass 'Telegram exposes approvals and verified multipart result files'
     rg -q 'failed_custom_wizard_commit_restores_session_and_removes_partial_profile' src/telegram/mod.rs &&
     rg -q 'credential_input_payload_is_scrubbed_without_changing_inbox_state' src/storage/mod.rs &&
     rg -q 'wizard_state_requires_owner_chat_topic_menu_and_unexpired_state' src/telegram/login.rs &&
-    rg -q 'topic_session_manager_paginates_and_preserves_archived_history' src/command/mod.rs
+    rg -q 'telegram_session_manager_paginates_thirteen_main_sessions_as_five_five_three' src/session/mod.rs &&
+    rg -q 'telegram_topics_have_independent_sessions_lists_and_yolo_state' src/session/mod.rs
 } || fail 'Telegram topic scope, registry and Custom login UX'
 ! rg -q '"provider"[[:space:]]*=>' src/command/mod.rs || fail 'Removed /provider route remains'
 pass 'Telegram topics, exact command registry, removed commands and scoped Custom wizard are covered'
@@ -362,31 +369,38 @@ pass 'Gateway/provider health distinguishes readiness from daemon liveness'
 [ "$(rg -n '"compact"[[:space:]]*=>' src/command/mod.rs | wc -l)" -eq 0 ] || fail 'Fake /compact command still exposed'
 pass 'No fake /compact command is exposed'
 {
-  [ -f module/webroot/index.html ] &&
-    rg -q "const ACTION = '/data/adb/modules/xiao/action.sh'" module/webroot/assets/app.js &&
-    rg -q 'manager-get-base64' module/webroot/assets/app.js module/action.sh src/bin_cli.rs &&
-    rg -q 'manager-post-base64' module/webroot/assets/app.js module/action.sh src/bin_cli.rs &&
-    rg -q 'id="view-dashboard"' module/webroot/index.html &&
-    rg -q 'id="view-setup"' module/webroot/index.html &&
-    rg -q 'telegramToken' module/webroot/index.html module/webroot/assets/app.js &&
-    rg -q 'telegramOwnerId' module/webroot/index.html module/webroot/assets/app.js &&
-    rg -q 'id="view-providers"' module/webroot/index.html &&
-    rg -q 'id="view-runtime"' module/webroot/index.html &&
-    rg -q 'id="view-sessions"' module/webroot/index.html &&
-    rg -q 'id="view-tasks"' module/webroot/index.html &&
-    rg -q 'id="view-memory"' module/webroot/index.html &&
-    rg -q 'id="view-skills"' module/webroot/index.html &&
-    rg -q 'id="view-tools"' module/webroot/index.html &&
-    rg -q 'id="view-security"' module/webroot/index.html &&
-    rg -q 'id="view-diagnostics"' module/webroot/index.html &&
-    rg -q 'id="view-logs"' module/webroot/index.html &&
-    rg -q 'sessionAiDialog' module/webroot/index.html module/webroot/assets/app.js &&
-    rg -q 'Change AI Configuration' module/webroot/assets/app.js &&
-    rg -q 'profileEditDialog' module/webroot/index.html module/webroot/assets/app.js &&
-    ! rg -q 'current_ai\?\.session_id' module/webroot/assets/app.js &&
-    ! rg -q 'sqlite3|xiao\.db|/system/bin/su|raw-root' module/webroot/assets/app.js
+  [ -f webui/package-lock.json ] &&
+    [ -f webui/src/App.jsx ] &&
+    [ -f webui/src/bridge.js ] &&
+    [ -f webui/src/styles.css ] &&
+    [ -f module/webroot/index.html ] &&
+    [ -f module/webroot/assets/app.js ] &&
+    [ -f module/webroot/assets/app.css ] &&
+    [ -f module/webroot/assets/ksu-bridge.js ] &&
+    rg -q "outDir: '../module/webroot'" webui/vite.config.js &&
+    rg -q "const ACTION = '/data/adb/modules/xiao/action.sh'" webui/src/bridge.js &&
+    rg -q 'manager-get-base64' webui/src/bridge.js module/action.sh src/bin_cli.rs &&
+    rg -q 'manager-post-base64' webui/src/bridge.js module/action.sh src/bin_cli.rs &&
+    rg -q "\['dashboard', 'Overview'" webui/src/App.jsx &&
+    rg -q "\['setup', 'Telegram'" webui/src/App.jsx &&
+    rg -q "\['providers', 'Custom AI'" webui/src/App.jsx &&
+    rg -q "\['sessions', 'Sessions'" webui/src/App.jsx &&
+    rg -q "\['attachments', 'Attachments'" webui/src/App.jsx &&
+    rg -q "\['tasks', 'Runs'" webui/src/App.jsx &&
+    rg -q "\['memory', 'Memory'" webui/src/App.jsx &&
+    rg -q "\['skills', 'Skills'" webui/src/App.jsx &&
+    rg -q "\['tools', 'Tools'" webui/src/App.jsx &&
+    rg -q "\['security', 'Security'" webui/src/App.jsx &&
+    rg -q "\['runtime', 'Runtime'" webui/src/App.jsx &&
+    rg -q "\['diagnostics', 'Diagnostics'" webui/src/App.jsx &&
+    rg -q "\['logs', 'Logs'" webui/src/App.jsx &&
+    rg -q 'confirm_owner_change' webui/src/App.jsx &&
+    rg -q 'ProfileEditor' webui/src/App.jsx &&
+    rg -q 'SessionAiDialog' webui/src/App.jsx &&
+    rg -q "action: 'ai_config'" webui/src/App.jsx &&
+    ! rg -q 'sqlite3|xiao\.db|/system/bin/su|raw-root' webui/src
 } || fail 'Xiao Manager WebUI surfaces'
-pass 'Xiao Manager uses only typed xiaod actions across all required sections'
+pass 'Xiao Manager React source builds to the module and uses only typed daemon actions'
 {
   rg -q '/v1/admin/custom/models' src/ipc/mod.rs src/bin_cli.rs &&
     rg -q 'custom_model_catalog_is_sorted_deduplicated' src/ipc/mod.rs &&
