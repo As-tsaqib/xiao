@@ -243,6 +243,10 @@ impl Tool for TermuxJobTool {
                     continue;
                 }
             }
+            if context.cancellation.is_cancelled() {
+                results.push(json!({"index":index,"id":step.id,"status":"cancelled","error":"job cancelled"}));
+                break;
+            }
             match self.terminal.execute(context, call).await {
                 Ok(output) => results.push(
                     json!({"index":index,"id":step.id,"status":"succeeded","summary":output}),
@@ -253,6 +257,7 @@ impl Tool for TermuxJobTool {
                         break;
                     }
                 }
+            }
             }
         }
         Ok(serde_json::to_string(&json!({
