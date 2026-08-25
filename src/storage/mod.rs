@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Mutex};
+use std::{path::Path, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::telegram::TelegramScope;
+use crate::{owner::OwnerIdentity, telegram::TelegramScope};
 
 #[derive(Debug)]
 pub struct Storage {
@@ -29,6 +29,12 @@ pub struct SessionRecord {
     pub yolo_mode: bool,
     pub created_at: String,
     pub last_active_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionDeletionResult {
+    pub active_session_id: String,
+    pub attachment_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,8 +186,30 @@ pub struct ProviderCapabilityRecord {
     pub native_tool_calls: bool,
     pub structured_output: bool,
     pub continuation: bool,
+    pub probe_status: String,
+    pub probe_version: u32,
     pub probed_at: String,
     pub evidence: String,
+}
+
+/// Machine-readable probe lifecycle. `evidence` remains diagnostic prose and
+/// is never consulted to decide activation or fallback permission.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeStatus {
+    Unprobed,
+    Completed,
+    Indeterminate,
+}
+
+impl ProbeStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unprobed => "unprobed",
+            Self::Completed => "completed",
+            Self::Indeterminate => "indeterminate",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,9 +239,18 @@ pub struct ProviderProfileModelRecord {
     pub native_tools: bool,
     pub structured_output: bool,
     pub continuation: bool,
+    /// Tri-state probe results. Boolean fields above are runtime-compatible
+    /// "supported" projections and must never be used to represent Unknown.
+    pub native_tools_state: String,
+    pub structured_output_state: String,
+    pub continuation_state: String,
+    pub vision_state: String,
+    pub file_input_state: String,
     pub model_discovery: bool,
     pub tool_protocol: String,
     pub evidence: String,
+    pub probe_status: String,
+    pub probe_version: u32,
     pub probed_at: String,
 }
 
@@ -233,6 +270,29 @@ pub struct OwnerMigrationResult {
     pub owner_id: String,
     pub migrated_legacy_principals: usize,
     pub requires_file_reconcile: bool,
+    pub binding_changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelegramControlState {
+    pub enabled: bool,
+    pub owner_user_id: Option<i64>,
+    pub allowed_chat_ids: Vec<i64>,
+    pub bot_token_ref: Option<String>,
+    pub bot_identity_json: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentReservation {
+    pub reservation_id: String,
+    pub owner_id: String,
+    pub session_id: String,
+    pub attachment_id: Option<String>,
+    pub bytes: u64,
+    pub status: String,
+    pub created_at: String,
+    pub expires_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -817,7 +877,7 @@ impl Storage {
                   size_bytes INTEGER NOT NULL CHECK(size_bytes>=0),
                   sha256 TEXT NOT NULL,
                   local_path TEXT NOT NULL,
-                  processing_status TEXT NOT NULL CHECK(processing_status IN ('downloaded','processing','ready','needs_ocr','rejected','failed')),
+                  processing_status TEXT NOT NULL CHECK(processing_status IN ('downloaded','processing','ready','needs_ocr','blocked','rejected','failed')),
                   summary TEXT,
                   error TEXT,
                   created_at TEXT NOT NULL,
@@ -870,217 +930,848 @@ impl Storage {
                 INSERT OR IGNORE INTO schema_migrations(version) VALUES(16);
                 "#,
             )?;
+            // v0.2.7 preserves Unknown independently from Unsupported. Older
+            // false booleans did not carry enough evidence, so migrate them to
+            // unknown; only prior true values can safely become supported.
+            ensure_column(conn, "provider_profile_models", "native_tools_state", "TEXT NOT NULL DEFAULT 'unknown'")?;
+            ensure_column(conn, "provider_profile_models", "structured_output_state", "TEXT NOT NULL DEFAULT 'unknown'")?;
+            ensure_column(conn, "provider_profile_models", "continuation_state", "TEXT NOT NULL DEFAULT 'unknown'")?;
+            ensure_column(conn, "provider_profile_models", "vision_state", "TEXT NOT NULL DEFAULT 'unknown'")?;
+            ensure_column(conn, "provider_profile_models", "file_input_state", "TEXT NOT NULL DEFAULT 'unknown'")?;
+            conn.execute_batch(
+                r#"
+                UPDATE provider_profile_models SET native_tools_state='supported' WHERE native_tools=1 AND native_tools_state='unknown';
+                UPDATE provider_profile_models SET structured_output_state='supported' WHERE structured_output=1 AND structured_output_state='unknown';
+                UPDATE provider_profile_models SET continuation_state='supported' WHERE continuation=1 AND continuation_state='unknown';
+                UPDATE provider_profile_models SET vision_state='supported' WHERE vision_capable=1 AND vision_state='unknown';
+                UPDATE provider_profile_models SET file_input_state='supported' WHERE file_input_capable=1 AND file_input_state='unknown';
+                INSERT OR IGNORE INTO schema_migrations(version) VALUES(17);
+                "#,
+            )?;
+            // v0.2.7 final hardening: introduce an installation-scoped owner
+            // and keep Telegram authentication as a replaceable binding. This
+            // migration deliberately records ambiguity instead of selecting a
+            // historical principal on the operator's behalf.
+            {
+                let transaction = conn.transaction()?;
+                transaction.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS installation_owner(
+                      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                      owner_id TEXT NOT NULL UNIQUE,
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS owner_bindings(
+                      id TEXT PRIMARY KEY,
+                      owner_id TEXT NOT NULL REFERENCES installation_owner(owner_id),
+                      binding_kind TEXT NOT NULL,
+                      external_id TEXT NOT NULL,
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL,
+                      UNIQUE(binding_kind,external_id),
+                      UNIQUE(owner_id,binding_kind)
+                    );
+                    CREATE TABLE IF NOT EXISTS telegram_control_state(
+                      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                      enabled INTEGER NOT NULL DEFAULT 0,
+                      owner_user_id INTEGER,
+                      allowed_chat_ids_json TEXT NOT NULL DEFAULT '[]',
+                      bot_token_ref TEXT,
+                      bot_identity_json TEXT,
+                      updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS owner_migration_candidates(
+                      legacy_owner_id TEXT PRIMARY KEY,
+                      reason TEXT NOT NULL,
+                      created_at TEXT NOT NULL
+                    );
+                    INSERT OR IGNORE INTO schema_migrations(version) VALUES(18);
+                    "#,
+                )?;
+                let now = Utc::now().to_rfc3339();
+                let existing: Option<String> = transaction
+                    .query_row(
+                        "SELECT owner_id FROM installation_owner WHERE singleton=1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if existing.is_none() {
+                    let mut candidates = std::collections::BTreeSet::new();
+                    for sql in [
+                        "SELECT owner_id FROM owners",
+                        "SELECT owner_principal FROM sessions",
+                        "SELECT principal FROM frontend_state",
+                        "SELECT principal FROM access_principals",
+                        "SELECT owner_principal FROM memories",
+                        "SELECT owner_principal FROM memory_history",
+                        "SELECT owner_principal FROM skills",
+                        "SELECT owner_principal FROM skill_history",
+                        "SELECT owner_principal FROM session_summaries",
+                        "SELECT owner_principal FROM agent_runs",
+                        "SELECT owner_principal FROM approvals",
+                        "SELECT principal FROM audit_events",
+                        "SELECT owner_id FROM provider_accounts WHERE owner_id IS NOT NULL",
+                        "SELECT owner_id FROM provider_profiles",
+                        "SELECT owner_id FROM attachments",
+                        "SELECT owner_principal FROM telegram_session_scopes",
+                        "SELECT owner_principal FROM telegram_active_sessions",
+                    ] {
+                        let mut statement = transaction.prepare(sql)?;
+                        let values = statement
+                            .query_map([], |row| row.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        candidates.extend(
+                            values
+                                .into_iter()
+                                .filter(|value| !value.trim().is_empty()),
+                        );
+                    }
+                    let stable = if candidates.len() == 1 {
+                        let candidate = candidates.iter().next().expect("one candidate");
+                        if candidate.starts_with("owner:installation:") {
+                            candidate.clone()
+                        } else {
+                            OwnerIdentity::new_installation().owner_id
+                        }
+                    } else {
+                        OwnerIdentity::new_installation().owner_id
+                    };
+                    transaction.execute(
+                        "INSERT INTO installation_owner(singleton,owner_id,created_at,updated_at) VALUES(1,?,?,?)",
+                        params![stable, now, now],
+                    )?;
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,NULL,?,?)",
+                        params![stable, now, now],
+                    )?;
+                    if candidates.len() == 1 {
+                        let legacy = candidates.iter().next().expect("one candidate");
+                        if legacy != &stable {
+                            rekey_owner_transaction(&transaction, legacy, &stable)?;
+                        }
+                        transaction.execute(
+                            "DELETE FROM owner_migration_candidates WHERE legacy_owner_id=?",
+                            params![legacy],
+                        )?;
+                    } else {
+                        for legacy in candidates {
+                            transaction.execute(
+                                "INSERT OR IGNORE INTO owner_migration_candidates(legacy_owner_id,reason,created_at) VALUES(?, 'multiple legacy owner candidates require explicit resolution', ?)",
+                                params![legacy, now],
+                            )?;
+                        }
+                    }
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO telegram_control_state(singleton,enabled,owner_user_id,allowed_chat_ids_json,bot_token_ref,bot_identity_json,updated_at) VALUES(1,0,NULL,'[]',NULL,NULL,?)",
+                        params![now],
+                    )?;
+                }
+                transaction.commit()?;
+            }
+            // Explicit probe lifecycle metadata. Legacy rows are conservative:
+            // only records produced by the bounded probe are Completed.
+            {
+                let transaction = conn.transaction()?;
+                ensure_column(
+                    &transaction,
+                    "provider_profile_models",
+                    "probe_status",
+                    "TEXT NOT NULL DEFAULT 'unprobed'",
+                )?;
+                ensure_column(
+                    &transaction,
+                    "provider_profile_models",
+                    "probe_version",
+                    "INTEGER NOT NULL DEFAULT 1",
+                )?;
+                ensure_column(
+                    &transaction,
+                    "provider_capabilities",
+                    "probe_status",
+                    "TEXT NOT NULL DEFAULT 'unprobed'",
+                )?;
+                ensure_column(
+                    &transaction,
+                    "provider_capabilities",
+                    "probe_version",
+                    "INTEGER NOT NULL DEFAULT 1",
+                )?;
+                transaction.execute_batch(
+                    r#"
+                    UPDATE provider_profile_models
+                       SET probe_status=CASE
+                         WHEN evidence LIKE 'bounded custom probe:%' AND length(trim(probed_at))>0 THEN 'completed'
+                         ELSE 'unprobed' END
+                     WHERE probe_status='unprobed';
+                    UPDATE provider_capabilities
+                       SET probe_status=CASE
+                         WHEN length(trim(probed_at))>0 THEN 'completed'
+                         ELSE 'unprobed' END
+                     WHERE probe_status='unprobed';
+                    INSERT OR IGNORE INTO schema_migrations(version) VALUES(19);
+                    "#,
+                )?;
+                transaction.commit()?;
+            }
+            // Reservation rows are the admission ledger. They are deliberately
+            // separate from attachment rows so an in-flight download cannot be
+            // admitted twice by concurrent callers.
+            {
+                let transaction = conn.transaction()?;
+                transaction.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS attachment_reservations(
+                      reservation_id TEXT PRIMARY KEY,
+                      owner_id TEXT NOT NULL,
+                      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                      bytes INTEGER NOT NULL CHECK(bytes>0),
+                      status TEXT NOT NULL CHECK(status IN ('active','finalized','released')),
+                      created_at TEXT NOT NULL,
+                      expires_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_attachment_reservations_owner_status
+                      ON attachment_reservations(owner_id,status,expires_at);
+                    CREATE INDEX IF NOT EXISTS idx_attachment_reservations_session_status
+                      ON attachment_reservations(owner_id,session_id,status,expires_at);
+                    CREATE INDEX IF NOT EXISTS idx_attachment_reservations_expiry
+                      ON attachment_reservations(status,expires_at);
+                    INSERT OR IGNORE INTO schema_migrations(version) VALUES(20);
+                    "#,
+                )?;
+                transaction.commit()?;
+            }
+            // Optional persisted semantic Telegram icon settings. The table is
+            // intentionally Telegram-specific; ProgressIcon remains domain data.
+            {
+                let transaction = conn.transaction()?;
+                transaction.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS telegram_progress_emoji(
+                      icon_key TEXT PRIMARY KEY,
+                      custom_emoji_id TEXT,
+                      fallback TEXT NOT NULL,
+                      validation_status TEXT NOT NULL DEFAULT 'unvalidated',
+                      validated_at TEXT
+                    );
+                    INSERT OR IGNORE INTO schema_migrations(version) VALUES(21);
+                    "#,
+                )?;
+                transaction.commit()?;
+            }
+            // v0.2.7 final hardening: older v0.2.7 databases could already
+            // contain an `attachments` table whose CHECK constraint rejected
+            // the explicit `blocked` processing state. SQLite cannot alter a
+            // CHECK constraint in place, so rebuild the parent and child
+            // tables together inside one transactional DDL operation. Row IDs,
+            // attachment chunks and FTS rowids are preserved.
+            {
+                let transaction = conn.transaction()?;
+                let attachment_sql: Option<String> = transaction
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type='table' AND name='attachments'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let needs_rebuild = attachment_sql
+                    .as_deref()
+                    .map(|sql| !sql.to_ascii_lowercase().contains("'blocked'"))
+                    .unwrap_or(false);
+                if needs_rebuild {
+                    transaction.execute_batch(
+                        r#"
+                        DROP TRIGGER IF EXISTS attachment_fts_insert;
+                        DROP TRIGGER IF EXISTS attachment_fts_update;
+                        DROP TRIGGER IF EXISTS attachment_fts_delete;
+                        DROP INDEX IF EXISTS idx_attachments_session_created;
+                        DROP INDEX IF EXISTS idx_attachments_hash;
+                        DROP INDEX IF EXISTS idx_attachments_telegram_unique;
+                        DROP INDEX IF EXISTS idx_attachment_chunks_attachment;
+                        ALTER TABLE attachment_chunks RENAME TO attachment_chunks_v22_old;
+                        ALTER TABLE attachments RENAME TO attachments_v22_old;
+                        CREATE TABLE attachments(
+                          attachment_id TEXT PRIMARY KEY,
+                          owner_id TEXT NOT NULL,
+                          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                          telegram_file_id TEXT,
+                          telegram_unique_id TEXT,
+                          original_name TEXT NOT NULL,
+                          declared_mime TEXT,
+                          detected_mime TEXT NOT NULL,
+                          kind TEXT NOT NULL CHECK(kind IN ('image','document')),
+                          size_bytes INTEGER NOT NULL CHECK(size_bytes>=0),
+                          sha256 TEXT NOT NULL,
+                          local_path TEXT NOT NULL,
+                          processing_status TEXT NOT NULL CHECK(processing_status IN ('downloaded','processing','ready','needs_ocr','blocked','rejected','failed')),
+                          summary TEXT,
+                          error TEXT,
+                          created_at TEXT NOT NULL,
+                          updated_at TEXT NOT NULL
+                        );
+                        INSERT INTO attachments(
+                          attachment_id,owner_id,session_id,telegram_file_id,telegram_unique_id,
+                          original_name,declared_mime,detected_mime,kind,size_bytes,sha256,
+                          local_path,processing_status,summary,error,created_at,updated_at
+                        )
+                        SELECT attachment_id,owner_id,session_id,telegram_file_id,telegram_unique_id,
+                          original_name,declared_mime,detected_mime,kind,size_bytes,sha256,
+                          local_path,processing_status,summary,error,created_at,updated_at
+                        FROM attachments_v22_old;
+                        CREATE TABLE attachment_chunks(
+                          id INTEGER PRIMARY KEY AUTOINCREMENT,
+                          attachment_id TEXT NOT NULL REFERENCES attachments(attachment_id) ON DELETE CASCADE,
+                          chunk_no INTEGER NOT NULL,
+                          page_no INTEGER,
+                          start_offset INTEGER,
+                          end_offset INTEGER,
+                          text TEXT NOT NULL,
+                          UNIQUE(attachment_id,chunk_no)
+                        );
+                        INSERT INTO attachment_chunks(id,attachment_id,chunk_no,page_no,start_offset,end_offset,text)
+                        SELECT id,attachment_id,chunk_no,page_no,start_offset,end_offset,text
+                        FROM attachment_chunks_v22_old;
+                        DROP TABLE attachment_chunks_v22_old;
+                        DROP TABLE attachments_v22_old;
+                        CREATE INDEX idx_attachments_session_created
+                          ON attachments(owner_id,session_id,created_at DESC);
+                        CREATE INDEX idx_attachments_hash
+                          ON attachments(owner_id,sha256);
+                        CREATE UNIQUE INDEX idx_attachments_telegram_unique
+                          ON attachments(owner_id,session_id,telegram_unique_id)
+                          WHERE telegram_unique_id IS NOT NULL;
+                        CREATE INDEX idx_attachment_chunks_attachment
+                          ON attachment_chunks(attachment_id,chunk_no);
+                        CREATE TRIGGER attachment_fts_insert AFTER INSERT ON attachment_chunks BEGIN
+                          INSERT INTO attachment_fts(rowid,owner_id,session_id,attachment_id,chunk_no,text)
+                          SELECT new.id,a.owner_id,a.session_id,new.attachment_id,new.chunk_no,new.text
+                            FROM attachments a WHERE a.attachment_id=new.attachment_id;
+                        END;
+                        CREATE TRIGGER attachment_fts_update AFTER UPDATE ON attachment_chunks BEGIN
+                          DELETE FROM attachment_fts WHERE rowid=old.id;
+                          INSERT INTO attachment_fts(rowid,owner_id,session_id,attachment_id,chunk_no,text)
+                          SELECT new.id,a.owner_id,a.session_id,new.attachment_id,new.chunk_no,new.text
+                            FROM attachments a WHERE a.attachment_id=new.attachment_id;
+                        END;
+                        CREATE TRIGGER attachment_fts_delete AFTER DELETE ON attachment_chunks BEGIN
+                          DELETE FROM attachment_fts WHERE rowid=old.id;
+                        END;
+                        INSERT OR IGNORE INTO attachment_fts(rowid,owner_id,session_id,attachment_id,chunk_no,text)
+                          SELECT c.id,a.owner_id,a.session_id,c.attachment_id,c.chunk_no,c.text
+                            FROM attachment_chunks c JOIN attachments a ON a.attachment_id=c.attachment_id;
+                        "#,
+                    )?;
+                }
+                transaction.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version) VALUES(22)",
+                    [],
+                )?;
+                transaction.commit()?;
+            }
+            // Reservation rows created before an attachment record exists need
+            // an explicit durable correlation so startup cleanup cannot mistake
+            // a live upload for an orphan. Existing rows remain nullable and
+            // are conservatively released by startup reconciliation.
+            {
+                let transaction = conn.transaction()?;
+                ensure_column(
+                    &transaction,
+                    "attachment_reservations",
+                    "attachment_id",
+                    "TEXT",
+                )?;
+                transaction.execute_batch(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_attachment_reservations_attachment
+                      ON attachment_reservations(attachment_id,status);
+                    INSERT OR IGNORE INTO schema_migrations(version) VALUES(23);
+                    "#,
+                )?;
+                transaction.commit()?;
+            }
+            // The compatibility TOML is imported at most once. A populated
+            // control row from an earlier v0.2.7 boot is already authoritative
+            // and must not be overwritten by a stale file on the next start.
+            {
+                let transaction = conn.transaction()?;
+                ensure_column(
+                    &transaction,
+                    "telegram_control_state",
+                    "legacy_config_imported",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+                transaction.execute(
+                    "UPDATE telegram_control_state SET legacy_config_imported=1 WHERE singleton=1 AND (enabled<>0 OR owner_user_id IS NOT NULL OR bot_token_ref IS NOT NULL OR bot_identity_json IS NOT NULL OR allowed_chat_ids_json<>'[]')",
+                    [],
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version) VALUES(24)",
+                    [],
+                )?;
+                transaction.commit()?;
+            }
+            // v0.2.8 makes Custom the only active runtime provider.  This
+            // policy row deliberately does not erase legacy provider accounts,
+            // sessions, credentials, messages, or audit history: historical
+            // conversations remain readable, while a new generation fails
+            // closed with provider_configuration_required until the owner
+            // selects an exact Custom profile/model.  The data update is
+            // conditional so repeated startup migrations are idempotent.
+            {
+                let transaction = conn.transaction()?;
+                transaction.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS provider_runtime_policy(
+                      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                      active_provider_kind TEXT NOT NULL CHECK(active_provider_kind='custom'),
+                      legacy_generation_behavior TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    INSERT OR IGNORE INTO provider_runtime_policy(
+                      singleton,active_provider_kind,legacy_generation_behavior,updated_at
+                    ) VALUES(1,'custom','provider_configuration_required',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+                    UPDATE provider_runtime_policy
+                       SET active_provider_kind='custom',
+                           legacy_generation_behavior='provider_configuration_required',
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE singleton=1
+                       AND (active_provider_kind<>'custom'
+                         OR legacy_generation_behavior<>'provider_configuration_required');
+                    INSERT OR IGNORE INTO schema_migrations(version) VALUES(25);
+                    "#,
+                )?;
+                transaction.commit()?;
+            }
+            // A database can be opened once before a legacy owner row is
+            // materialized by an older frontend (for example a v0.2.5
+            // session written after the first v0.2.7 boot). Re-scan on every
+            // startup so the migration is restart-safe and idempotent. A
+            // single candidate is deterministic; multiple candidates remain
+            // explicitly unresolved and are never guessed together.
+            refresh_owner_migration_candidates(conn)?;
             Ok(())
         })
     }
 
-    /// Resolve a Telegram user to Xiao's stable single-owner identity and
-    /// transactionally rekey any v0.2.5 chat-scoped principals. Canonical
-    /// USER.md/MEMORY.md and filesystem skills are reindexed by the caller
-    /// when `requires_file_reconcile` is true.
-    pub fn ensure_telegram_owner(&self, telegram_user_id: i64) -> Result<OwnerMigrationResult> {
-        if telegram_user_id == 0 {
-            return Err(anyhow::anyhow!("Telegram owner id must be non-zero"));
+    /// Return the immutable installation owner. An unresolved legacy state is
+    /// intentionally fail-closed until the setup surface explicitly resolves
+    /// it.
+    pub fn management_owner_id(&self) -> Result<String> {
+        self.with_conn(|connection| {
+            refresh_owner_migration_candidates(connection)?;
+            let unresolved: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM owner_migration_candidates",
+                [],
+                |row| row.get(0),
+            )?;
+            if unresolved > 0 {
+                return Err(anyhow::anyhow!(
+                    "multiple legacy owners require explicit owner resolution"
+                ));
+            }
+            connection
+                .query_row(
+                    "SELECT owner_id FROM installation_owner WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn installation_owner(&self) -> Result<OwnerIdentity> {
+        Ok(OwnerIdentity::from_owner_id(self.management_owner_id()?))
+    }
+
+    /// The migration-backed runtime provider policy is the durable source of
+    /// truth for whether an old conversation may start another generation.
+    /// It deliberately leaves legacy session rows and credentials readable.
+    pub fn active_provider_kind(&self) -> Result<String> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT active_provider_kind FROM provider_runtime_policy WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn owner_resolution_candidates(&self) -> Result<Vec<String>> {
+        self.with_conn(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT legacy_owner_id FROM owner_migration_candidates ORDER BY legacy_owner_id",
+            )?;
+            let candidates = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(candidates)
+        })
+    }
+
+    fn bind_telegram_owner_tx(
+        transaction: &rusqlite::Transaction<'_>,
+        owner_id: &str,
+        telegram_user_id: i64,
+        now: &str,
+    ) -> Result<bool> {
+        let previous: Option<String> = transaction
+            .query_row(
+                "SELECT external_id FROM owner_bindings WHERE owner_id=? AND binding_kind='telegram_user'",
+                params![owner_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        transaction.execute(
+            "INSERT INTO owner_bindings(id,owner_id,binding_kind,external_id,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(owner_id,binding_kind) DO UPDATE SET external_id=excluded.external_id,updated_at=excluded.updated_at",
+            params![Uuid::new_v4().to_string(), owner_id, "telegram_user", telegram_user_id.to_string(), now, now],
+        )?;
+        transaction.execute(
+            "UPDATE owners SET telegram_user_id=?,updated_at=? WHERE owner_id=?",
+            params![telegram_user_id, now, owner_id],
+        )?;
+        transaction.execute(
+            "UPDATE telegram_control_state SET owner_user_id=?,updated_at=? WHERE singleton=1",
+            params![telegram_user_id, now],
+        )?;
+        Ok(previous.as_deref() != Some(&telegram_user_id.to_string()))
+    }
+
+    fn bind_telegram_owner(&self, telegram_user_id: i64) -> Result<OwnerMigrationResult> {
+        if telegram_user_id <= 0 {
+            return Err(anyhow::anyhow!(
+                "Telegram owner id must be positive (got {telegram_user_id})"
+            ));
         }
-        let owner_id = format!("owner:telegram:{telegram_user_id}");
         self.with_conn(|connection| {
             let transaction = connection.transaction()?;
+            refresh_owner_migration_candidates_tx(&transaction)?;
+            let unresolved: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM owner_migration_candidates",
+                [],
+                |row| row.get(0),
+            )?;
+            if unresolved > 0 {
+                return Err(anyhow::anyhow!(
+                    "multiple legacy owners require explicit owner resolution"
+                ));
+            }
+            let owner_id: String = transaction.query_row(
+                "SELECT owner_id FROM installation_owner WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
             let now = Utc::now().to_rfc3339();
             transaction.execute(
-                "INSERT INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(owner_id) DO UPDATE SET telegram_user_id=excluded.telegram_user_id,updated_at=excluded.updated_at",
+                "INSERT OR IGNORE INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,?,?,?)",
                 params![owner_id, telegram_user_id, now, now],
             )?;
-            // v0.2.5 accounts were installation-global and had no owner
-            // binding. Xiao is single-owner, so the first stable owner claims
-            // those rows; chat/topic IDs never become account ownership.
             transaction.execute(
                 "UPDATE provider_accounts SET owner_id=? WHERE owner_id IS NULL",
                 params![owner_id],
             )?;
-
-            let suffix = format!("%:{telegram_user_id}");
-            let mut legacy = std::collections::BTreeSet::new();
-            for sql in [
-                "SELECT DISTINCT owner_principal FROM sessions WHERE owner_principal LIKE ? AND owner_principal LIKE 'telegram:%'",
-                "SELECT DISTINCT owner_principal FROM memories WHERE owner_principal LIKE ? AND owner_principal LIKE 'telegram:%'",
-                "SELECT DISTINCT owner_principal FROM skills WHERE owner_principal LIKE ? AND owner_principal LIKE 'telegram:%'",
-                "SELECT DISTINCT owner_principal FROM agent_runs WHERE owner_principal LIKE ? AND owner_principal LIKE 'telegram:%'",
-            ] {
-                let mut statement = transaction.prepare(sql)?;
-                let values = statement
-                    .query_map(params![suffix], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                legacy.extend(values);
-            }
-            // A headless/WebUI-first installation may have created its stable
-            // installation owner before Telegram was configured. That row is
-            // the same single human, not a second tenant, so claim all of its
-            // durable state when the configured Telegram identity appears.
-            let local_owner = "owner:local";
-            let local_exists: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM owners WHERE owner_id=?)",
-                params![local_owner],
-                |row| row.get(0),
-            )?;
-            if local_exists && local_owner != owner_id {
-                legacy.insert(local_owner.to_owned());
-            }
             transaction.execute(
                 "INSERT OR IGNORE INTO access_principals(principal,role,created_at,updated_at) VALUES(?,'owner',?,?)",
                 params![owner_id, now, now],
             )?;
-            if legacy.is_empty() {
-                transaction.commit()?;
-                return Ok(OwnerMigrationResult {
-                    owner_id,
-                    migrated_legacy_principals: 0,
-                    requires_file_reconcile: false,
-                });
-            }
-
-            // Active owner-global indexes are derived state. Canonical living
-            // files win conflicts, so remove only their active rows and force
-            // a clean file reconciliation after the transaction commits.
-            transaction.execute(
-                "DELETE FROM memories WHERE owner_principal=?",
-                params![owner_id],
+            let binding_changed = Self::bind_telegram_owner_tx(
+                &transaction,
+                &owner_id,
+                telegram_user_id,
+                &now,
             )?;
-            transaction.execute(
-                "DELETE FROM skills WHERE owner_principal=?",
-                params![owner_id],
-            )?;
-            for principal in &legacy {
-                // Preserve both sides if a partially migrated database already
-                // contains the same alias. Profile IDs are global; a stable
-                // hash suffix gives the legacy profile a bounded, valid,
-                // deterministic alias before owner rekeying.
-                let conflicts = {
-                    let mut statement = transaction.prepare(
-                        "SELECT legacy.profile_id,legacy.alias FROM provider_profiles legacy WHERE legacy.owner_id=? AND EXISTS(SELECT 1 FROM provider_profiles current WHERE current.owner_id=? AND current.alias=legacy.alias)",
-                    )?;
-                    let rows = statement
-                        .query_map(params![principal, owner_id], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    rows
-                };
-                for (profile_id, alias) in conflicts {
-                    let digest = format!("{:x}", Sha256::digest(profile_id.as_bytes()));
-                    let suffix = &digest[..12];
-                    let max_base = 64usize - "-legacy-".len() - suffix.len();
-                    let base = alias.chars().take(max_base).collect::<String>();
-                    let migrated_alias = format!("{base}-legacy-{suffix}");
-                    transaction.execute(
-                        "UPDATE provider_profiles SET alias=? WHERE owner_id=? AND profile_id=?",
-                        params![migrated_alias, principal, profile_id],
-                    )?;
-                }
-                transaction.execute(
-                    "UPDATE provider_accounts SET owner_id=? WHERE owner_id=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "UPDATE provider_profiles SET owner_id=? WHERE owner_id=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "UPDATE attachments SET owner_id=? WHERE owner_id=?",
-                    params![owner_id, principal],
-                )?;
-                // Attachment FTS denormalizes ownership and has no trigger on
-                // its parent row, so rekey its filter column explicitly.
-                transaction.execute(
-                    "UPDATE attachment_fts SET owner_id=? WHERE owner_id=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "UPDATE legacy_owner_principals SET owner_id=? WHERE owner_id=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "DELETE FROM memories WHERE owner_principal=?",
-                    params![principal],
-                )?;
-                transaction.execute(
-                    "DELETE FROM skills WHERE owner_principal=?",
-                    params![principal],
-                )?;
-                transaction.execute(
-                    "UPDATE memory_history SET owner_principal=? WHERE owner_principal=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "UPDATE skill_history SET owner_principal=? WHERE owner_principal=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "UPDATE session_summaries SET owner_principal=? WHERE owner_principal=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "UPDATE agent_runs SET owner_principal=? WHERE owner_principal=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "UPDATE audit_events SET principal=? WHERE principal=?",
-                    params![owner_id, principal],
-                )?;
-                // v0.2.5 grants lacked session/run/call binding. Preserve the
-                // audit row but make every unconsumed legacy grant unusable.
-                transaction.execute(
-                    "UPDATE approvals SET owner_principal=?,status=CASE WHEN status IN ('pending','approved') THEN 'expired' ELSE status END WHERE owner_principal=?",
-                    params![owner_id, principal],
-                )?;
-
-                // Scope rows preserve the original chat/topic namespace. Use
-                // upserts so an interrupted earlier migration is idempotent.
-                transaction.execute(
-                    "UPDATE telegram_session_scopes SET owner_principal=? WHERE owner_principal=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "INSERT INTO telegram_active_sessions(owner_principal,chat_id,thread_id_key,active_main_session_id,side_session_id,mode,updated_at) SELECT ?,chat_id,thread_id_key,active_main_session_id,side_session_id,mode,updated_at FROM telegram_active_sessions WHERE owner_principal=? ON CONFLICT(owner_principal,chat_id,thread_id_key) DO UPDATE SET active_main_session_id=excluded.active_main_session_id,side_session_id=excluded.side_session_id,mode=excluded.mode,updated_at=excluded.updated_at WHERE excluded.updated_at>telegram_active_sessions.updated_at",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "DELETE FROM telegram_active_sessions WHERE owner_principal=?",
-                    params![principal],
-                )?;
-                transaction.execute(
-                    "UPDATE sessions SET owner_principal=? WHERE owner_principal=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "INSERT OR IGNORE INTO frontend_state(principal,active_main_session_id,side_session_id,mode) SELECT ?,active_main_session_id,side_session_id,mode FROM frontend_state WHERE principal=?",
-                    params![owner_id, principal],
-                )?;
-                transaction.execute(
-                    "DELETE FROM frontend_state WHERE principal=?",
-                    params![principal],
-                )?;
-                transaction.execute(
-                    "DELETE FROM access_principals WHERE principal=?",
-                    params![principal],
-                )?;
-                transaction.execute(
-                    "INSERT OR REPLACE INTO legacy_owner_principals(legacy_principal,owner_id,migrated_at) VALUES(?,?,?)",
-                    params![principal, owner_id, now],
-                )?;
-            }
-            for principal in &legacy {
-                transaction.execute(
-                    "DELETE FROM owners WHERE owner_id=? AND owner_id<>?",
-                    params![principal, owner_id],
-                )?;
-            }
-            transaction.execute("DELETE FROM workspace_file_index", [])?;
             transaction.commit()?;
             Ok(OwnerMigrationResult {
                 owner_id,
-                migrated_legacy_principals: legacy.len(),
-                requires_file_reconcile: true,
+                migrated_legacy_principals: 0,
+                requires_file_reconcile: false,
+                binding_changed,
             })
+        })
+    }
+
+    /// Resolve an ambiguous historical database only when the caller has an
+    /// explicit operator decision. Every row is preserved; colliding memory,
+    /// skill and profile keys receive deterministic legacy suffixes.
+    pub fn resolve_legacy_owners(
+        &self,
+        telegram_user_id: i64,
+        explicit_confirmation: bool,
+    ) -> Result<OwnerMigrationResult> {
+        if !explicit_confirmation {
+            return Err(anyhow::anyhow!(
+                "explicit confirmation is required to merge legacy owner data"
+            ));
+        }
+        if telegram_user_id <= 0 {
+            return Err(anyhow::anyhow!("Telegram owner id must be positive"));
+        }
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            refresh_owner_migration_candidates_tx(&transaction)?;
+            let mut statement = transaction.prepare(
+                "SELECT legacy_owner_id FROM owner_migration_candidates ORDER BY legacy_owner_id",
+            )?;
+            let candidates = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let owner_id: String = transaction.query_row(
+                "SELECT owner_id FROM installation_owner WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            let now = Utc::now().to_rfc3339();
+            for legacy in &candidates {
+                rekey_owner_transaction(&transaction, legacy, &owner_id)?;
+                transaction.execute(
+                    "DELETE FROM owner_migration_candidates WHERE legacy_owner_id=?",
+                    params![legacy],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM workspace_file_index",
+                [],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,?,?,?)",
+                params![owner_id, telegram_user_id, now, now],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO access_principals(principal,role,created_at,updated_at) VALUES(?,'owner',?,?)",
+                params![owner_id, now, now],
+            )?;
+            let binding_changed = Self::bind_telegram_owner_tx(
+                &transaction,
+                &owner_id,
+                telegram_user_id,
+                &now,
+            )?;
+            transaction.commit()?;
+            Ok(OwnerMigrationResult {
+                owner_id,
+                migrated_legacy_principals: candidates.len(),
+                requires_file_reconcile: !candidates.is_empty(),
+                binding_changed,
+            })
+        })
+    }
+
+    /// Resolve a Telegram user to the immutable installation owner. Changing
+    /// the Telegram ID updates only `owner_bindings` and control state.
+    pub fn ensure_telegram_owner(&self, telegram_user_id: i64) -> Result<OwnerMigrationResult> {
+        self.bind_telegram_owner(telegram_user_id)
+    }
+
+    pub fn telegram_control_needs_legacy_import(&self) -> Result<bool> {
+        self.with_conn(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT COALESCE(legacy_config_imported,0)=0 FROM telegram_control_state WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(true))
+        })
+    }
+
+    /// Import the old TOML/legacy secret snapshot exactly once. This method
+    /// deliberately does not rekey ambiguous legacy rows. If ambiguity exists
+    /// the binding is recorded for display, but owner authorization remains
+    /// fail-closed until `commit_telegram_control_plane(..., resolve_legacy)`
+    /// receives an explicit operator decision.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_legacy_telegram_state(
+        &self,
+        enabled: bool,
+        owner_user_id: Option<i64>,
+        allowed_chat_ids: &[i64],
+        bot_token_ref: Option<&str>,
+        bot_identity_json: Option<&str>,
+    ) -> Result<()> {
+        if owner_user_id.is_some_and(|id| id <= 0) {
+            return Err(anyhow::anyhow!("Telegram owner id must be positive"));
+        }
+        // An empty/default compatibility projection is not an authoritative
+        // import. Keeping the marker unset lets a later first-run setup (for
+        // example a v0.2.5 config that is loaded after the database was
+        // created) import its owner binding and token exactly once. Once any
+        // real Telegram value exists, the row below becomes authoritative and
+        // stale TOML can no longer overwrite it.
+        let has_legacy_state = enabled
+            || owner_user_id.is_some()
+            || !allowed_chat_ids.is_empty()
+            || bot_token_ref.is_some()
+            || bot_identity_json.is_some();
+        if !has_legacy_state {
+            return Ok(());
+        }
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let already: bool = transaction
+                .query_row(
+                    "SELECT COALESCE(legacy_config_imported,0)<>0 FROM telegram_control_state WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if already {
+                transaction.commit()?;
+                return Ok(());
+            }
+            let unresolved: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM owner_migration_candidates",
+                [],
+                |row| row.get(0),
+            )?;
+            let now = Utc::now().to_rfc3339();
+            if let Some(user_id) = owner_user_id.filter(|_| unresolved == 0) {
+                let owner_id: String = transaction.query_row(
+                    "SELECT owner_id FROM installation_owner WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,?,?,?)",
+                    params![owner_id, user_id, now, now],
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO access_principals(principal,role,created_at,updated_at) VALUES(?,'owner',?,?)",
+                    params![owner_id, now, now],
+                )?;
+                Self::bind_telegram_owner_tx(&transaction, &owner_id, user_id, &now)?;
+            }
+            let effective_owner_user_id = owner_user_id.filter(|_| unresolved == 0);
+            let allowed_json = serde_json::to_string(allowed_chat_ids)?;
+            transaction.execute(
+                "UPDATE telegram_control_state SET enabled=?,owner_user_id=?,allowed_chat_ids_json=?,bot_token_ref=?,bot_identity_json=?,legacy_config_imported=1,updated_at=? WHERE singleton=1",
+                params![enabled as i32, effective_owner_user_id, allowed_json, bot_token_ref, bot_identity_json, now],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn set_telegram_bot_identity(&self, bot_identity_json: &str) -> Result<()> {
+        self.with_conn(|connection| {
+            let changed = connection.execute(
+                "UPDATE telegram_control_state SET bot_identity_json=?,updated_at=? WHERE singleton=1",
+                params![bot_identity_json, Utc::now().to_rfc3339()],
+            )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!("Telegram control state is missing"));
+            }
+            Ok(())
+        })
+    }
+
+    /// The authoritative Telegram setup commit. Secret refs are prepared by
+    /// the caller; this method switches binding and all mutable Telegram state
+    /// in one SQLite transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_telegram_control_plane(
+        &self,
+        enabled: bool,
+        owner_user_id: Option<i64>,
+        allowed_chat_ids: &[i64],
+        bot_token_ref: Option<&str>,
+        bot_identity_json: Option<&str>,
+        resolve_legacy: bool,
+    ) -> Result<OwnerMigrationResult> {
+        if owner_user_id.is_some_and(|id| id <= 0) {
+            return Err(anyhow::anyhow!("Telegram owner id must be positive"));
+        }
+        if allowed_chat_ids.contains(&0) {
+            return Err(anyhow::anyhow!("allowed chat ids cannot contain zero"));
+        }
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            refresh_owner_migration_candidates_tx(&transaction)?;
+            let mut statement = transaction.prepare(
+                "SELECT legacy_owner_id FROM owner_migration_candidates ORDER BY legacy_owner_id",
+            )?;
+            let candidates = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            if !candidates.is_empty() && !resolve_legacy {
+                return Err(anyhow::anyhow!(
+                    "multiple legacy owners require explicit owner resolution"
+                ));
+            }
+            let owner_id: String = transaction.query_row(
+                "SELECT owner_id FROM installation_owner WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            let now = Utc::now().to_rfc3339();
+            for legacy in &candidates {
+                rekey_owner_transaction(&transaction, legacy, &owner_id)?;
+                transaction.execute(
+                    "DELETE FROM owner_migration_candidates WHERE legacy_owner_id=?",
+                    params![legacy],
+                )?;
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,NULL,?,?)",
+                params![owner_id, now, now],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO access_principals(principal,role,created_at,updated_at) VALUES(?,'owner',?,?)",
+                params![owner_id, now, now],
+            )?;
+            let binding_changed = if let Some(user_id) = owner_user_id {
+                Self::bind_telegram_owner_tx(&transaction, &owner_id, user_id, &now)?
+            } else {
+                false
+            };
+            let allowed_json = serde_json::to_string(allowed_chat_ids)?;
+            transaction.execute(
+                "INSERT INTO telegram_control_state(singleton,enabled,owner_user_id,allowed_chat_ids_json,bot_token_ref,bot_identity_json,legacy_config_imported,updated_at) VALUES(1,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET enabled=excluded.enabled,owner_user_id=excluded.owner_user_id,allowed_chat_ids_json=excluded.allowed_chat_ids_json,bot_token_ref=excluded.bot_token_ref,bot_identity_json=excluded.bot_identity_json,legacy_config_imported=1,updated_at=excluded.updated_at",
+                params![enabled as i32, owner_user_id, allowed_json, bot_token_ref, bot_identity_json, 1i32, now],
+            )?;
+            transaction.execute(
+                "DELETE FROM workspace_file_index",
+                [],
+            )?;
+            transaction.commit()?;
+            Ok(OwnerMigrationResult {
+                owner_id,
+                migrated_legacy_principals: candidates.len(),
+                requires_file_reconcile: !candidates.is_empty(),
+                binding_changed,
+            })
+        })
+    }
+
+    pub fn telegram_control_state(&self) -> Result<Option<TelegramControlState>> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT enabled,owner_user_id,allowed_chat_ids_json,bot_token_ref,bot_identity_json,updated_at FROM telegram_control_state WHERE singleton=1",
+                    [],
+                    |row| {
+                        let allowed = row
+                            .get::<_, String>(2)
+                            .ok()
+                            .and_then(|raw| serde_json::from_str::<Vec<i64>>(&raw).ok())
+                            .unwrap_or_default();
+                        Ok(TelegramControlState {
+                            enabled: row.get::<_, i64>(0)? != 0,
+                            owner_user_id: row.get(1)?,
+                            allowed_chat_ids: allowed,
+                            bot_token_ref: row.get(3)?,
+                            bot_identity_json: row.get(4)?,
+                            updated_at: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(Into::into)
         })
     }
 
@@ -1124,35 +1815,6 @@ impl Storage {
                     |row| row.get(0),
                 )
                 .map_err(Into::into)
-        })
-    }
-
-    /// Resolve the installation's single management owner without deriving
-    /// identity from a chat/topic. A fresh non-Telegram installation gets a
-    /// stable local owner row; once a Telegram owner exists it takes priority.
-    pub fn management_owner_id(&self) -> Result<String> {
-        self.with_conn(|connection| {
-            if let Some(owner) = connection
-                .query_row(
-                    "SELECT owner_id FROM owners ORDER BY CASE WHEN telegram_user_id IS NULL THEN 1 ELSE 0 END,created_at LIMIT 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-            {
-                return Ok(owner);
-            }
-            let owner = "owner:local".to_owned();
-            let now = Utc::now().to_rfc3339();
-            connection.execute(
-                "INSERT INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,NULL,?,?)",
-                params![owner, now, now],
-            )?;
-            connection.execute(
-                "INSERT OR IGNORE INTO access_principals(principal,role,created_at,updated_at) VALUES(?,'owner',?,?)",
-                params![owner, now, now],
-            )?;
-            Ok(owner)
         })
     }
 
@@ -1212,8 +1874,8 @@ impl Storage {
         }
         self.with_conn(|connection| {
             connection.execute(
-                "INSERT INTO provider_capabilities(provider,model,tool_protocol,native_tool_calls,structured_output,continuation,probed_at,evidence) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(provider,model) DO UPDATE SET tool_protocol=excluded.tool_protocol,native_tool_calls=excluded.native_tool_calls,structured_output=excluded.structured_output,continuation=excluded.continuation,probed_at=excluded.probed_at,evidence=excluded.evidence",
-                params![record.provider, record.model, record.tool_protocol, record.native_tool_calls as i32, record.structured_output as i32, record.continuation as i32, record.probed_at, record.evidence],
+                "INSERT INTO provider_capabilities(provider,model,tool_protocol,native_tool_calls,structured_output,continuation,probe_status,probe_version,probed_at,evidence) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider,model) DO UPDATE SET tool_protocol=excluded.tool_protocol,native_tool_calls=excluded.native_tool_calls,structured_output=excluded.structured_output,continuation=excluded.continuation,probe_status=excluded.probe_status,probe_version=excluded.probe_version,probed_at=excluded.probed_at,evidence=excluded.evidence",
+                params![record.provider, record.model, record.tool_protocol, record.native_tool_calls as i32, record.structured_output as i32, record.continuation as i32, record.probe_status, record.probe_version, record.probed_at, record.evidence],
             )?;
             Ok(())
         })
@@ -1227,7 +1889,7 @@ impl Storage {
         self.with_conn(|connection| {
             connection
                 .query_row(
-                    "SELECT provider,model,tool_protocol,native_tool_calls,structured_output,continuation,probed_at,evidence FROM provider_capabilities WHERE provider=? AND model=?",
+                    "SELECT provider,model,tool_protocol,native_tool_calls,structured_output,continuation,probe_status,probe_version,probed_at,evidence FROM provider_capabilities WHERE provider=? AND model=?",
                     params![provider, model],
                     |row| {
                         Ok(ProviderCapabilityRecord {
@@ -1237,8 +1899,10 @@ impl Storage {
                             native_tool_calls: row.get::<_, i64>(3)? != 0,
                             structured_output: row.get::<_, i64>(4)? != 0,
                             continuation: row.get::<_, i64>(5)? != 0,
-                            probed_at: row.get(6)?,
-                            evidence: row.get(7)?,
+                            probe_status: row.get(6)?,
+                            probe_version: row.get::<_, i64>(7)? as u32,
+                            probed_at: row.get(8)?,
+                            evidence: row.get(9)?,
                         })
                     },
                 )
@@ -1826,6 +2490,256 @@ impl Storage {
             Ok(())
         })
     }
+
+    /// Delete a main session and all of its conversation-owned descendants in
+    /// one transaction. Owner-global memories, skills, provider profiles and
+    /// audit history are deliberately outside this transaction's delete set.
+    /// `scope` selects the Telegram frontend pointer when the operation comes
+    /// from Telegram; `None` uses the local/CLI frontend pointer.
+    pub fn delete_session_and_recover(
+        &self,
+        owner: &str,
+        id: &str,
+        scope: Option<TelegramScope>,
+    ) -> Result<SessionDeletionResult> {
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let target: Option<(i64, i64, Option<String>)> = transaction
+                .query_row(
+                    "SELECT is_side,archived,parent_id FROM sessions WHERE id=? AND owner_principal=?",
+                    params![id, owner],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((is_side, _archived, _parent)) = target else {
+                return Err(anyhow::anyhow!("session not found for principal"));
+            };
+            if is_side != 0 {
+                return Err(anyhow::anyhow!(
+                    "side sessions cannot be deleted from the main session manager"
+                ));
+            }
+            // A side conversation is a child of its main conversation. Use a
+            // recursive set rather than assuming a single level so an old or
+            // repaired database cannot leave a descendant run/attachment
+            // behind after the main session disappears.
+            let session_ids = {
+                let mut statement = transaction.prepare(
+                    "WITH RECURSIVE descendants(id) AS (
+                        SELECT ?1
+                        UNION
+                        SELECT s.id FROM sessions s
+                        JOIN descendants d ON s.parent_id=d.id
+                        WHERE s.owner_principal=?2
+                    ) SELECT id FROM descendants",
+                )?;
+                let rows = statement
+                    .query_map(params![id, owner], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            let running: bool = transaction.query_row(
+                "WITH RECURSIVE descendants(id) AS (
+                    SELECT ?1
+                    UNION
+                    SELECT s.id FROM sessions s
+                    JOIN descendants d ON s.parent_id=d.id
+                    WHERE s.owner_principal=?2
+                ) SELECT EXISTS(
+                    SELECT 1 FROM agent_runs
+                    WHERE owner_principal=?2
+                      AND session_id IN (SELECT id FROM descendants)
+                      AND status IN ('received','context_build','running','awaiting_approval','verifying')
+                )",
+                params![id, owner],
+                |row| row.get(0),
+            )?;
+            if running {
+                return Err(anyhow::anyhow!(
+                    "cannot delete a session with an active generation"
+                ));
+            }
+
+            let mut attachment_paths = Vec::new();
+            for session_id in &session_ids {
+                let mut statement = transaction.prepare(
+                    "SELECT local_path FROM attachments WHERE owner_id=? AND session_id=?",
+                )?;
+                let paths = statement
+                        .query_map(params![owner, session_id], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                attachment_paths.extend(paths);
+            }
+
+            let replacement_for_scope = |transaction: &rusqlite::Transaction<'_>,
+                                          scope: Option<TelegramScope>|
+             -> Result<Option<String>> {
+                let candidates = if let Some(scope) = scope {
+                    let mut statement = transaction.prepare(
+                        "SELECT s.id FROM sessions s JOIN telegram_session_scopes ts ON ts.session_id=s.id WHERE s.owner_principal=? AND ts.owner_principal=? AND ts.chat_id=? AND ts.thread_id_key=? AND s.is_side=0 AND s.archived=0 ORDER BY s.last_active_at DESC",
+                    )?;
+                    let rows = statement
+                        .query_map(
+                            params![owner, owner, scope.chat_id, scope.thread_key()],
+                            |row| row.get::<_, String>(0),
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    rows
+                } else {
+                    let mut statement = transaction.prepare(
+                        "SELECT id FROM sessions WHERE owner_principal=? AND is_side=0 AND archived=0 ORDER BY last_active_at DESC",
+                    )?;
+                    let rows = statement
+                        .query_map(params![owner], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    rows
+                };
+                Ok(candidates.into_iter().find(|candidate| {
+                    !session_ids.iter().any(|deleted| deleted == candidate)
+                }))
+            };
+
+            let new_replacement = |transaction: &rusqlite::Transaction<'_>,
+                                   scope: Option<TelegramScope>|
+             -> Result<String> {
+                let replacement = Uuid::new_v4().to_string();
+                let now = Utc::now().to_rfc3339();
+                transaction.execute(
+                    "INSERT INTO sessions(id,name,provider,account_id,model,archived,is_side,parent_id,yolo_mode,created_at,last_active_at,owner_principal) VALUES(?,?, 'custom',NULL,'default',0,0,NULL,0,?,?,?)",
+                    params![
+                        replacement,
+                        format!("Session {}", Utc::now().format("%d %b %H:%M")),
+                        now,
+                        now,
+                        owner
+                    ],
+                )?;
+                if let Some(scope) = scope {
+                    transaction.execute(
+                        "INSERT INTO telegram_session_scopes(session_id,owner_principal,chat_id,thread_id_key,is_side,created_at) VALUES(?,?,?,?,0,?)",
+                        params![replacement, owner, scope.chat_id, scope.thread_key(), now],
+                    )?;
+                }
+                Ok(replacement)
+            };
+
+            let state_references_deleted = |state: &(String, Option<String>, String)| {
+                session_ids.iter().any(|deleted| {
+                    deleted == &state.0 || state.1.as_deref() == Some(deleted.as_str())
+                })
+            };
+            let active_id = if let Some(scope) = scope {
+                let state: Option<(String, Option<String>, String)> = transaction
+                    .query_row(
+                        "SELECT active_main_session_id,side_session_id,mode FROM telegram_active_sessions WHERE owner_principal=? AND chat_id=? AND thread_id_key=?",
+                        params![owner, scope.chat_id, scope.thread_key()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                if state
+                    .as_ref()
+                    .map(state_references_deleted)
+                    .unwrap_or(true)
+                {
+                    let replacement = replacement_for_scope(&transaction, Some(scope))?
+                        .unwrap_or(new_replacement(&transaction, Some(scope))?);
+                    transaction.execute(
+                        "INSERT INTO telegram_active_sessions(owner_principal,chat_id,thread_id_key,active_main_session_id,side_session_id,mode,updated_at) VALUES(?,?,?,?,NULL,'main',?) ON CONFLICT(owner_principal,chat_id,thread_id_key) DO UPDATE SET active_main_session_id=excluded.active_main_session_id,side_session_id=NULL,mode='main',updated_at=excluded.updated_at",
+                        params![owner, scope.chat_id, scope.thread_key(), replacement, Utc::now().to_rfc3339()],
+                    )?;
+                    replacement
+                } else {
+                    state.expect("checked above").0
+                }
+            } else {
+                let state: Option<(String, Option<String>, String)> = transaction
+                    .query_row(
+                        "SELECT active_main_session_id,side_session_id,mode FROM frontend_state WHERE principal=?",
+                        params![owner],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                if state
+                    .as_ref()
+                    .map(state_references_deleted)
+                    .unwrap_or(true)
+                {
+                    let replacement = replacement_for_scope(&transaction, None)?
+                        .unwrap_or(new_replacement(&transaction, None)?);
+                    transaction.execute(
+                        "INSERT INTO frontend_state(principal,active_main_session_id,side_session_id,mode) VALUES(?,?,NULL,'main') ON CONFLICT(principal) DO UPDATE SET active_main_session_id=excluded.active_main_session_id,side_session_id=NULL,mode='main'",
+                        params![owner, replacement],
+                    )?;
+                    replacement
+                } else {
+                    state.expect("checked above").0
+                }
+            };
+
+            // Pending grants are exact one-shot records, not session content.
+            // Preserve their audit trail but make every unconsumed grant
+            // terminal before its corresponding run is removed.
+            for session_id in &session_ids {
+                transaction.execute(
+                    "UPDATE approvals SET status='denied',approval_mode='session_deleted',decided_at=? WHERE owner_principal=? AND session_id=? AND status IN ('pending','approved')",
+                    params![Utc::now().to_rfc3339(), owner, session_id],
+                )?;
+            }
+            // A malformed/legacy pointer must never prevent a committed
+            // deletion. The requested scope has already been atomically
+            // repointed above; any stale pointer is rebuilt lazily by its
+            // normal frontend context initializer.
+            for session_id in &session_ids {
+                transaction.execute(
+                    "DELETE FROM telegram_active_sessions WHERE owner_principal=? AND (active_main_session_id=? OR side_session_id=?)",
+                    params![owner, session_id, session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM frontend_state WHERE principal=? AND (active_main_session_id=? OR side_session_id=?)",
+                    params![owner, session_id, session_id],
+                )?;
+            }
+            for session_id in &session_ids {
+                transaction.execute(
+                    "DELETE FROM tool_runs WHERE agent_run_id IN (SELECT id FROM agent_runs WHERE owner_principal=? AND session_id=?)",
+                    params![owner, session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM agent_runs WHERE owner_principal=? AND session_id=?",
+                    params![owner, session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM attachments WHERE owner_id=? AND session_id=?",
+                    params![owner, session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM messages WHERE session_id=?",
+                    params![session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM provider_native_sessions WHERE session_id=?",
+                    params![session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM session_summaries WHERE session_id=?",
+                    params![session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM telegram_session_scopes WHERE session_id=?",
+                    params![session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM sessions WHERE id=? AND owner_principal=?",
+                    params![session_id, owner],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(SessionDeletionResult {
+                active_session_id: active_id,
+                attachment_paths,
+            })
+        })
+    }
     pub fn set_session_provider(
         &self,
         owner: &str,
@@ -2386,6 +3300,90 @@ impl Storage {
         })
     }
 
+    /// Raw bytes accounted to an owner. Failed/rejected rows remain counted when
+    /// an explicit retention policy kept their files. Rows are removed when raw
+    /// files are purged, so there is no unaccounted retained garbage.
+    pub fn owner_attachment_bytes(&self, owner: &str) -> Result<u64> {
+        self.with_conn(|connection| {
+            let value: i64 = connection.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM attachments WHERE owner_id=?",
+                params![owner],
+                |row| row.get(0),
+            )?;
+            Ok(value.max(0) as u64)
+        })
+    }
+
+    pub fn global_attachment_bytes(&self) -> Result<u64> {
+        self.with_conn(|connection| {
+            let value: i64 = connection.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM attachments",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(value.max(0) as u64)
+        })
+    }
+
+    pub fn all_attachment_paths(&self) -> Result<Vec<(String, String, String, String)>> {
+        self.with_conn(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT attachment_id,owner_id,session_id,local_path FROM attachments ORDER BY created_at",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn attachments_older_than(
+        &self,
+        owner: Option<&str>,
+        cutoff: &str,
+    ) -> Result<Vec<AttachmentRecord>> {
+        self.with_conn(|connection| {
+            let sql = if owner.is_some() {
+                ATTACHMENT_SELECT.to_owned()
+                    + " WHERE owner_id=? AND created_at<? ORDER BY created_at"
+            } else {
+                ATTACHMENT_SELECT.to_owned() + " WHERE created_at<? ORDER BY created_at"
+            };
+            let mut statement = connection.prepare(&sql)?;
+            let rows = if let Some(owner) = owner {
+                statement
+                    .query_map(params![owner, cutoff], row_attachment)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                statement
+                    .query_map(params![cutoff], row_attachment)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            Ok(rows)
+        })
+    }
+
+    pub fn session_has_active_run(&self, owner: &str, session_id: &str) -> Result<bool> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE owner_principal=? AND session_id=? AND status IN ('received','context_build','running','awaiting_approval','verifying'))",
+                    params![owner, session_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn delete_attachment(&self, owner: &str, attachment_id: &str) -> Result<bool> {
+        self.with_conn(|connection| {
+            Ok(connection.execute(
+                "DELETE FROM attachments WHERE owner_id=? AND attachment_id=?",
+                params![owner, attachment_id],
+            )? == 1)
+        })
+    }
+
     pub fn insert_attachment(&self, record: NewAttachmentRecord<'_>) -> Result<()> {
         if !matches!(record.kind, "image" | "document")
             || record.size_bytes > i64::MAX as u64
@@ -2412,6 +3410,373 @@ impl Storage {
         })
     }
 
+    /// Insert the durable attachment row and consume its reservation in one
+    /// SQLite transaction. The raw file is written before this call, but the
+    /// quota ledger cannot observe a durable attachment without also becoming
+    /// finalized, even if the process is interrupted immediately afterwards.
+    pub fn insert_attachment_and_finalize_reservation(
+        &self,
+        record: NewAttachmentRecord<'_>,
+        reservation_id: &str,
+    ) -> Result<()> {
+        if !matches!(record.kind, "image" | "document")
+            || record.size_bytes > i64::MAX as u64
+            || record.original_name.trim().is_empty()
+            || record.sha256.len() != 64
+        {
+            return Err(anyhow::anyhow!("invalid attachment metadata"));
+        }
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let owns: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=? AND owner_principal=?)",
+                params![record.session_id, record.owner_id],
+                |row| row.get(0),
+            )?;
+            if !owns {
+                return Err(anyhow::anyhow!("attachment session does not belong to owner"));
+            }
+            let now = Utc::now().to_rfc3339();
+            transaction.execute(
+                "INSERT INTO attachments(attachment_id,owner_id,session_id,telegram_file_id,telegram_unique_id,original_name,declared_mime,detected_mime,kind,size_bytes,sha256,local_path,processing_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'downloaded',?,?)",
+                params![record.attachment_id, record.owner_id, record.session_id, record.telegram_file_id, record.telegram_unique_id, record.original_name, record.declared_mime, record.detected_mime, record.kind, record.size_bytes as i64, record.sha256, record.local_path, now, now],
+            )?;
+            let reservation: (String, String, Option<String>, i64) = transaction.query_row(
+                "SELECT owner_id,session_id,attachment_id,bytes FROM attachment_reservations WHERE reservation_id=? AND status='active'",
+                params![reservation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            if reservation.0 != record.owner_id
+                || reservation.1 != record.session_id
+                || reservation.3 != record.size_bytes as i64
+                || reservation
+                    .2
+                    .as_deref()
+                    .is_some_and(|attachment_id| attachment_id != record.attachment_id)
+            {
+                return Err(anyhow::anyhow!(
+                    "attachment reservation does not match durable attachment"
+                ));
+            }
+            transaction.execute(
+                "UPDATE attachment_reservations SET attachment_id=?,status='finalized' WHERE reservation_id=? AND status='active'",
+                params![record.attachment_id, reservation_id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Reserve bytes before a download or processor writes anything durable.
+    /// Existing attachments and active reservations are checked in one
+    /// immediate transaction, so concurrent uploads cannot jointly exceed a
+    /// session, owner, or global quota.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_attachment_quota(
+        &self,
+        owner_id: &str,
+        session_id: &str,
+        bytes: u64,
+        max_session_bytes: u64,
+        max_owner_bytes: u64,
+        max_global_bytes: u64,
+        ttl: Duration,
+    ) -> Result<AttachmentReservation> {
+        self.reserve_attachment_quota_for_attachment(
+            owner_id,
+            session_id,
+            None,
+            bytes,
+            max_session_bytes,
+            max_owner_bytes,
+            max_global_bytes,
+            ttl,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_attachment_quota_for_attachment(
+        &self,
+        owner_id: &str,
+        session_id: &str,
+        attachment_id: Option<&str>,
+        bytes: u64,
+        max_session_bytes: u64,
+        max_owner_bytes: u64,
+        max_global_bytes: u64,
+        ttl: Duration,
+    ) -> Result<AttachmentReservation> {
+        if bytes == 0 || bytes > i64::MAX as u64 {
+            return Err(anyhow::anyhow!("attachment reservation size is invalid"));
+        }
+        self.with_conn(|connection| {
+            let transaction = connection.transaction_with_behavior(
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let now = Utc::now();
+            let now_text = now.to_rfc3339();
+            transaction.execute(
+                "UPDATE attachment_reservations SET status='released' WHERE status='active' AND expires_at<=?",
+                params![now_text],
+            )?;
+            let owns: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=? AND owner_principal=?)",
+                params![session_id, owner_id],
+                |row| row.get(0),
+            )?;
+            if !owns {
+                return Err(anyhow::anyhow!(
+                    "attachment session does not belong to owner"
+                ));
+            }
+            let session_bytes: i64 = transaction.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM attachments WHERE owner_id=? AND session_id=? AND processing_status NOT IN ('rejected','failed')",
+                params![owner_id, session_id],
+                |row| row.get(0),
+            )?;
+            let owner_bytes: i64 = transaction.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM attachments WHERE owner_id=?",
+                params![owner_id],
+                |row| row.get(0),
+            )?;
+            let global_bytes: i64 = transaction.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM attachments",
+                [],
+                |row| row.get(0),
+            )?;
+            let active_session: i64 = transaction.query_row(
+                "SELECT COALESCE(SUM(bytes),0) FROM attachment_reservations WHERE owner_id=? AND session_id=? AND status='active'",
+                params![owner_id, session_id],
+                |row| row.get(0),
+            )?;
+            let active_owner: i64 = transaction.query_row(
+                "SELECT COALESCE(SUM(bytes),0) FROM attachment_reservations WHERE owner_id=? AND status='active'",
+                params![owner_id],
+                |row| row.get(0),
+            )?;
+            let active_global: i64 = transaction.query_row(
+                "SELECT COALESCE(SUM(bytes),0) FROM attachment_reservations WHERE status='active'",
+                [],
+                |row| row.get(0),
+            )?;
+            let incoming = bytes;
+            if (session_bytes.max(0) as u64)
+                .saturating_add(active_session.max(0) as u64)
+                .saturating_add(incoming)
+                > max_session_bytes
+            {
+                return Err(anyhow::anyhow!(
+                    "attachment would exceed the session storage quota"
+                ));
+            }
+            if (owner_bytes.max(0) as u64)
+                .saturating_add(active_owner.max(0) as u64)
+                .saturating_add(incoming)
+                > max_owner_bytes
+            {
+                return Err(anyhow::anyhow!(
+                    "attachment would exceed the owner storage quota"
+                ));
+            }
+            if (global_bytes.max(0) as u64)
+                .saturating_add(active_global.max(0) as u64)
+                .saturating_add(incoming)
+                > max_global_bytes
+            {
+                return Err(anyhow::anyhow!(
+                    "attachment would exceed the global storage quota"
+                ));
+            }
+            let reservation_id = Uuid::new_v4().to_string();
+            let expires_at = (now
+                + chrono::Duration::from_std(ttl)
+                    .unwrap_or_else(|_| chrono::Duration::minutes(30)))
+            .to_rfc3339();
+            transaction.execute(
+                "INSERT INTO attachment_reservations(reservation_id,owner_id,session_id,attachment_id,bytes,status,created_at,expires_at) VALUES(?,?,?,?,?,'active',?,?)",
+                params![reservation_id, owner_id, session_id, attachment_id, bytes as i64, now_text, expires_at],
+            )?;
+            transaction.commit()?;
+            Ok(AttachmentReservation {
+                reservation_id,
+                owner_id: owner_id.to_owned(),
+                session_id: session_id.to_owned(),
+                attachment_id: attachment_id.map(str::to_owned),
+                bytes,
+                status: "active".into(),
+                created_at: now_text,
+                expires_at,
+            })
+        })
+    }
+
+    pub fn finalize_attachment_reservation(
+        &self,
+        owner_id: &str,
+        reservation_id: &str,
+        attachment_id: &str,
+    ) -> Result<()> {
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let reservation: (String, String, Option<String>, i64) = transaction.query_row(
+                "SELECT owner_id,session_id,attachment_id,bytes FROM attachment_reservations WHERE reservation_id=? AND status='active'",
+                params![reservation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let attachment: (String, i64) = transaction.query_row(
+                "SELECT session_id,size_bytes FROM attachments WHERE attachment_id=? AND owner_id=?",
+                params![attachment_id, owner_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if reservation.0 != owner_id
+                || reservation.1 != attachment.0
+                || reservation.3 != attachment.1
+                || reservation
+                    .2
+                    .as_deref()
+                    .is_some_and(|reserved| reserved != attachment_id)
+            {
+                return Err(anyhow::anyhow!(
+                    "attachment reservation does not match durable attachment"
+                ));
+            }
+            transaction.execute(
+                "UPDATE attachment_reservations SET attachment_id=?,status='finalized' WHERE reservation_id=? AND status='active'",
+                params![attachment_id, reservation_id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn release_attachment_reservation(&self, reservation_id: &str) -> Result<bool> {
+        self.with_conn(|connection| {
+            Ok(connection.execute(
+                "UPDATE attachment_reservations SET status='released' WHERE reservation_id=? AND status='active'",
+                params![reservation_id],
+            )? == 1)
+        })
+    }
+
+    pub fn cleanup_attachment_reservations(&self) -> Result<usize> {
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            // A process can die after the attachment row commit but before the
+            // caller observes the finalize result. Durable rows win: reconcile
+            // those reservations to finalized before releasing true orphans.
+            transaction.execute(
+                "UPDATE attachment_reservations AS r
+                    SET status='finalized'
+                  WHERE r.status='active'
+                    AND r.attachment_id IS NOT NULL
+                    AND EXISTS(
+                      SELECT 1 FROM attachments a
+                       WHERE a.attachment_id=r.attachment_id
+                         AND a.owner_id=r.owner_id
+                         AND a.session_id=r.session_id
+                         AND a.size_bytes=r.bytes
+                    )",
+                [],
+            )?;
+            let released = transaction.execute(
+                "UPDATE attachment_reservations AS r
+                    SET status='released'
+                  WHERE r.status='active'
+                    AND (r.expires_at<=?
+                         OR r.attachment_id IS NULL
+                         OR NOT EXISTS(
+                              SELECT 1 FROM attachments a
+                               WHERE a.attachment_id=r.attachment_id
+                                 AND a.owner_id=r.owner_id
+                                 AND a.session_id=r.session_id
+                                 AND a.size_bytes=r.bytes
+                         ))",
+                params![Utc::now().to_rfc3339()],
+            )?;
+            transaction.commit()?;
+            Ok(released)
+        })
+    }
+
+    /// A process restart cannot have a live in-flight upload. Release active
+    /// reservations that are not tied to a durable attachment, including rows
+    /// created by pre-v23 clients without an attachment correlation.
+    pub fn cleanup_orphan_attachment_reservations(&self) -> Result<usize> {
+        self.with_conn(|connection| {
+            Ok(connection.execute(
+                "UPDATE attachment_reservations AS r
+                    SET status='released'
+                  WHERE r.status='active'
+                    AND (r.attachment_id IS NULL OR NOT EXISTS(
+                      SELECT 1 FROM attachments a
+                       WHERE a.attachment_id=r.attachment_id
+                         AND a.owner_id=r.owner_id
+                         AND a.session_id=r.session_id
+                         AND a.size_bytes=r.bytes
+                    ))",
+                [],
+            )?)
+        })
+    }
+
+    /// Atomic reservation: quota checks and durable insertion are performed in a
+    /// single IMMEDIATE transaction so concurrent uploads cannot race past the
+    /// session/owner/global limits. The Storage mutex serializes connections;
+    /// the transaction provides the DB-level critical section.
+    pub fn insert_attachment_with_quota(
+        &self,
+        record: NewAttachmentRecord<'_>,
+        max_session_bytes: u64,
+        max_owner_bytes: u64,
+        max_global_bytes: u64,
+    ) -> Result<()> {
+        let reservation = self.reserve_attachment_quota_for_attachment(
+            record.owner_id,
+            record.session_id,
+            Some(record.attachment_id),
+            record.size_bytes,
+            max_session_bytes,
+            max_owner_bytes,
+            max_global_bytes,
+            Duration::from_secs(30 * 60),
+        )?;
+        if let Err(error) =
+            self.insert_attachment_and_finalize_reservation(record, &reservation.reservation_id)
+        {
+            let _ = self.release_attachment_reservation(&reservation.reservation_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Startup reconciliation for stale reservations: attachments that were
+    /// reserved as `downloaded` but never reached `processing`/`ready` and
+    /// whose raw file is missing are removed so quota is not leaked.
+    pub fn reconcile_stale_attachment_reservations(&self, root: &std::path::Path) -> Result<usize> {
+        let records = self.all_attachment_paths()?;
+        let mut removed = 0usize;
+        for (attachment_id, owner_id, _session_id, local_path) in records {
+            let path = std::path::Path::new(&local_path);
+            if path.starts_with(root) && !path.exists() {
+                let status: Option<String> = self.with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT processing_status FROM attachments WHERE attachment_id=? AND owner_id=?",
+                        params![attachment_id, owner_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(Into::into)
+                })?;
+                if matches!(status.as_deref(), Some("downloaded") | Some("processing"))
+                    && self.delete_attachment(&owner_id, &attachment_id)?
+                {
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn set_attachment_status(
         &self,
         owner: &str,
@@ -2422,7 +3787,7 @@ impl Storage {
     ) -> Result<()> {
         if !matches!(
             status,
-            "downloaded" | "processing" | "ready" | "needs_ocr" | "rejected" | "failed"
+            "downloaded" | "processing" | "ready" | "needs_ocr" | "blocked" | "rejected" | "failed"
         ) {
             return Err(anyhow::anyhow!("invalid attachment status"));
         }
@@ -2508,6 +3873,47 @@ impl Storage {
                 )
                 .optional()
                 .map_err(Into::into)
+        })
+    }
+
+    pub fn list_attachments(
+        &self,
+        owner: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AttachmentRecord>> {
+        self.with_conn(|connection| {
+            let (sql, bind_session) = if session_id.is_some() {
+                (
+                    ATTACHMENT_SELECT.to_owned()
+                        + " WHERE owner_id=? AND session_id=? ORDER BY created_at DESC LIMIT ?",
+                    true,
+                )
+            } else {
+                (
+                    ATTACHMENT_SELECT.to_owned()
+                        + " WHERE owner_id=? ORDER BY created_at DESC LIMIT ?",
+                    false,
+                )
+            };
+            let mut statement = connection.prepare(&sql)?;
+            let rows = if bind_session {
+                statement
+                    .query_map(
+                        params![
+                            owner,
+                            session_id.unwrap_or_default(),
+                            limit.clamp(1, 500) as i64
+                        ],
+                        row_attachment,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                statement
+                    .query_map(params![owner, limit.clamp(1, 500) as i64], row_attachment)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            Ok(rows)
         })
     }
 
@@ -2743,6 +4149,306 @@ fn row_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         created_at: r.get(11)?,
         last_active_at: r.get(12)?,
     })
+}
+
+fn refresh_owner_migration_candidates(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    refresh_owner_migration_candidates_tx(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn refresh_owner_migration_candidates_tx(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let stable: String = transaction.query_row(
+        "SELECT owner_id FROM installation_owner WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let unresolved_before: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM owner_migration_candidates",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut candidates = std::collections::BTreeSet::new();
+    for sql in [
+        "SELECT owner_id FROM owners",
+        "SELECT owner_principal FROM sessions",
+        "SELECT principal FROM frontend_state",
+        "SELECT principal FROM access_principals",
+        "SELECT owner_principal FROM memories",
+        "SELECT owner_principal FROM memory_history",
+        "SELECT owner_principal FROM skills",
+        "SELECT owner_principal FROM skill_history",
+        "SELECT owner_principal FROM session_summaries",
+        "SELECT owner_principal FROM agent_runs",
+        "SELECT owner_principal FROM approvals",
+        "SELECT principal FROM audit_events",
+        "SELECT owner_id FROM provider_accounts WHERE owner_id IS NOT NULL",
+        "SELECT owner_id FROM provider_profiles",
+        "SELECT owner_id FROM attachments",
+        "SELECT owner_id FROM attachment_reservations",
+        "SELECT owner_principal FROM telegram_session_scopes",
+        "SELECT owner_principal FROM telegram_active_sessions",
+    ] {
+        let mut statement = transaction.prepare(sql)?;
+        let values = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        candidates.extend(values.into_iter().filter(|value| {
+            value != &stable
+                && !value.starts_with("owner:installation:")
+                && is_legacy_owner_candidate(value)
+        }));
+    }
+    for candidate in candidates {
+        let mapped: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM legacy_owner_principals WHERE legacy_principal=?)",
+            params![candidate],
+            |row| row.get(0),
+        )?;
+        if !mapped {
+            transaction.execute(
+                "INSERT OR IGNORE INTO owner_migration_candidates(legacy_owner_id,reason,created_at) VALUES(?, 'legacy owner requires deterministic migration or explicit resolution', ?)",
+                params![candidate, Utc::now().to_rfc3339()],
+            )?;
+        }
+    }
+    if unresolved_before == 0 {
+        let mut statement = transaction.prepare(
+            "SELECT legacy_owner_id FROM owner_migration_candidates ORDER BY legacy_owner_id",
+        )?;
+        let unresolved = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        if unresolved.len() == 1 {
+            let legacy = &unresolved[0];
+            rekey_owner_transaction(transaction, legacy, &stable)?;
+            transaction.execute(
+                "DELETE FROM owner_migration_candidates WHERE legacy_owner_id=?",
+                params![legacy],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn is_legacy_owner_candidate(value: &str) -> bool {
+    value == "owner:local"
+        || value.starts_with("owner:telegram:")
+        || value.starts_with("telegram:")
+        || value.starts_with("legacy:")
+}
+
+fn rekey_owner_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    legacy: &str,
+    stable: &str,
+) -> Result<()> {
+    if legacy == stable {
+        return Ok(());
+    }
+
+    // Preserve colliding owner-global memories by making the explicit merge
+    // observable in the key. The migration never silently discards one
+    // historical value.
+    let memory_rows = {
+        let mut statement = transaction.prepare(
+            "SELECT id,scope,category,key FROM memories WHERE owner_principal=? ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![legacy], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (id, scope, category, key) in memory_rows {
+        let collision: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memories WHERE owner_principal=? AND scope=? AND category=? AND key=?)",
+            params![stable, scope, category, key],
+            |row| row.get(0),
+        )?;
+        let next_key = if collision {
+            let digest = format!("{:x}", Sha256::digest(format!("{legacy}:{id}").as_bytes()));
+            format!("legacy-{}-{key}", &digest[..12])
+        } else {
+            key
+        };
+        transaction.execute(
+            "UPDATE memories SET owner_principal=?,key=? WHERE id=? AND owner_principal=?",
+            params![stable, next_key, id, legacy],
+        )?;
+    }
+
+    let skill_rows = {
+        let mut statement = transaction
+            .prepare("SELECT id,name FROM skills WHERE owner_principal=? ORDER BY id")?;
+        let rows = statement
+            .query_map(params![legacy], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (id, name) in skill_rows {
+        let collision: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM skills WHERE owner_principal=? AND name=?)",
+            params![stable, name],
+            |row| row.get(0),
+        )?;
+        let next_name = if collision {
+            let digest = format!("{:x}", Sha256::digest(format!("{legacy}:{id}").as_bytes()));
+            format!("{name}-legacy-{}", &digest[..12])
+        } else {
+            name
+        };
+        transaction.execute(
+            "UPDATE skills SET owner_principal=?,name=? WHERE id=? AND owner_principal=?",
+            params![stable, next_name, id, legacy],
+        )?;
+    }
+
+    // Alias collisions are preserved as separate profiles with deterministic
+    // labels. Secrets remain referenced by the same profile ID and therefore
+    // cannot cross profile boundaries during this rekey.
+    let profile_rows = {
+        let mut statement = transaction.prepare(
+            "SELECT profile_id,alias FROM provider_profiles WHERE owner_id=? ORDER BY profile_id",
+        )?;
+        let rows = statement
+            .query_map(params![legacy], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (profile_id, alias) in profile_rows {
+        let collision: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provider_profiles WHERE owner_id=? AND alias=?)",
+            params![stable, alias],
+            |row| row.get(0),
+        )?;
+        if collision {
+            let digest = format!("{:x}", Sha256::digest(profile_id.as_bytes()));
+            let suffix = &digest[..12];
+            let base = alias.chars().take(48).collect::<String>();
+            transaction.execute(
+                "UPDATE provider_profiles SET alias=? WHERE owner_id=? AND profile_id=?",
+                params![format!("{base}-legacy-{suffix}"), legacy, profile_id],
+            )?;
+        }
+    }
+
+    transaction.execute(
+        "UPDATE provider_accounts SET owner_id=? WHERE owner_id=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "UPDATE provider_profiles SET owner_id=? WHERE owner_id=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "UPDATE attachments SET owner_id=? WHERE owner_id=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "UPDATE attachment_fts SET owner_id=? WHERE owner_id=?",
+        params![stable, legacy],
+    )?;
+    let reservations_table: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='attachment_reservations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if reservations_table {
+        transaction.execute(
+            "UPDATE attachment_reservations SET owner_id=? WHERE owner_id=?",
+            params![stable, legacy],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE memory_history SET owner_principal=? WHERE owner_principal=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "UPDATE skill_history SET owner_principal=? WHERE owner_principal=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "UPDATE session_summaries SET owner_principal=? WHERE owner_principal=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "UPDATE agent_runs SET owner_principal=? WHERE owner_principal=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "UPDATE audit_events SET principal=? WHERE principal=?",
+        params![stable, legacy],
+    )?;
+    // Approval history is durable owner state too. Rekeying must preserve the
+    // status and exact binding; expiring pending/approved rows here would
+    // silently discard an operator decision during an identity migration.
+    transaction.execute(
+        "UPDATE approvals SET owner_principal=? WHERE owner_principal=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "UPDATE telegram_session_scopes SET owner_principal=? WHERE owner_principal=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "INSERT INTO telegram_active_sessions(owner_principal,chat_id,thread_id_key,active_main_session_id,side_session_id,mode,updated_at) SELECT ?,chat_id,thread_id_key,active_main_session_id,side_session_id,mode,updated_at FROM telegram_active_sessions WHERE owner_principal=? ON CONFLICT(owner_principal,chat_id,thread_id_key) DO UPDATE SET active_main_session_id=excluded.active_main_session_id,side_session_id=excluded.side_session_id,mode=excluded.mode,updated_at=excluded.updated_at WHERE excluded.updated_at>telegram_active_sessions.updated_at",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "DELETE FROM telegram_active_sessions WHERE owner_principal=?",
+        params![legacy],
+    )?;
+    transaction.execute(
+        "UPDATE sessions SET owner_principal=? WHERE owner_principal=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO frontend_state(principal,active_main_session_id,side_session_id,mode) SELECT ?,active_main_session_id,side_session_id,mode FROM frontend_state WHERE principal=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "DELETE FROM frontend_state WHERE principal=?",
+        params![legacy],
+    )?;
+    let now = Utc::now().to_rfc3339();
+    transaction.execute(
+        "INSERT OR IGNORE INTO access_principals(principal,role,created_at,updated_at) SELECT ?,role,created_at,? FROM access_principals WHERE principal=?",
+        params![stable, now, legacy],
+    )?;
+    transaction.execute(
+        "DELETE FROM access_principals WHERE principal=?",
+        params![legacy],
+    )?;
+    // `legacy_owner_principals.owner_id` references `owners.owner_id`. Move
+    // that historical mapping before deleting the old owner row; otherwise
+    // a real v0.2.7 database that already recorded the v0.2.6 mapping fails
+    // the installation-owner migration with SQLITE_CONSTRAINT_FOREIGNKEY.
+    transaction.execute(
+        "UPDATE legacy_owner_principals SET owner_id=? WHERE owner_id=?",
+        params![stable, legacy],
+    )?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO legacy_owner_principals(legacy_principal,owner_id,migrated_at) VALUES(?,?,?)",
+        params![legacy, stable, Utc::now().to_rfc3339()],
+    )?;
+    transaction.execute(
+        "DELETE FROM owners WHERE owner_id=? AND owner_id<>?",
+        params![legacy, stable],
+    )?;
+    Ok(())
 }
 
 fn ensure_column(
@@ -3045,6 +4751,146 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_quota_reservations_cannot_exceed_session_quota() {
+        use std::sync::{Arc, Barrier};
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let session = storage
+            .create_session("owner:quota", "quota", "custom", None, "m", false, None)
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let handles = (0..2)
+                .map(|_| {
+                    let storage = storage.clone();
+                    let barrier = barrier.clone();
+                    let session_id = session.id.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        storage.reserve_attachment_quota(
+                            "owner:quota",
+                            &session_id,
+                            60,
+                            100,
+                            200,
+                            200,
+                            Duration::from_secs(60),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    }
+
+    #[test]
+    fn concurrent_quota_reservations_cannot_exceed_owner_or_global_quota() {
+        use std::sync::{Arc, Barrier};
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let sessions = [
+            storage
+                .create_session("owner:quota", "one", "custom", None, "m", false, None)
+                .unwrap(),
+            storage
+                .create_session("owner:quota", "two", "custom", None, "m", false, None)
+                .unwrap(),
+        ];
+        let barrier = Arc::new(Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let handles = sessions
+                .iter()
+                .map(|session| {
+                    let storage = storage.clone();
+                    let barrier = barrier.clone();
+                    let session_id = session.id.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        storage.reserve_attachment_quota(
+                            "owner:quota",
+                            &session_id,
+                            60,
+                            200,
+                            100,
+                            100,
+                            Duration::from_secs(60),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    }
+
+    #[test]
+    fn quota_reservation_release_and_orphan_cleanup_are_durable() {
+        let storage = Storage::open_memory().unwrap();
+        let session = storage
+            .create_session("owner:quota", "cleanup", "custom", None, "m", false, None)
+            .unwrap();
+        let expired = storage
+            .reserve_attachment_quota(
+                "owner:quota",
+                &session.id,
+                10,
+                100,
+                100,
+                100,
+                Duration::from_secs(0),
+            )
+            .unwrap();
+        assert!(storage
+            .release_attachment_reservation(&expired.reservation_id)
+            .unwrap());
+        assert!(!storage
+            .release_attachment_reservation(&expired.reservation_id)
+            .unwrap());
+
+        let orphan = storage
+            .reserve_attachment_quota_for_attachment(
+                "owner:quota",
+                &session.id,
+                Some("missing-attachment"),
+                10,
+                100,
+                100,
+                100,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(storage.cleanup_orphan_attachment_reservations().unwrap(), 1);
+        assert!(!storage
+            .release_attachment_reservation(&orphan.reservation_id)
+            .unwrap());
+
+        let released = storage
+            .reserve_attachment_quota(
+                "owner:quota",
+                &session.id,
+                10,
+                100,
+                100,
+                100,
+                Duration::from_secs(0),
+            )
+            .unwrap();
+        assert_eq!(storage.cleanup_attachment_reservations().unwrap(), 1);
+        assert!(!storage
+            .release_attachment_reservation(&released.reservation_id)
+            .unwrap());
+    }
+
+    #[test]
     fn v020_migration_is_fresh_and_idempotent_with_consistent_fts() {
         let db = Storage::open_memory().unwrap();
         let session = db
@@ -3059,7 +4905,7 @@ mod tests {
                 connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                     row.get(0)
                 })?;
-            assert_eq!(latest, 16);
+            assert_eq!(latest, 25);
             for table in [
                 "agent_runs",
                 "tool_runs",
@@ -3085,6 +4931,13 @@ mod tests {
                 "attachments",
                 "attachment_chunks",
                 "attachment_fts",
+                "installation_owner",
+                "owner_bindings",
+                "telegram_control_state",
+                "owner_migration_candidates",
+                "attachment_reservations",
+                "telegram_progress_emoji",
+                "provider_runtime_policy",
             ] {
                 let exists: bool = connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)",
@@ -3108,6 +4961,15 @@ mod tests {
                 ("tool_runs", "policy_original"),
                 ("dependency_installs", "source"),
                 ("dependency_installs", "validated"),
+                ("provider_profile_models", "native_tools_state"),
+                ("provider_profile_models", "structured_output_state"),
+                ("provider_profile_models", "continuation_state"),
+                ("provider_profile_models", "vision_state"),
+                ("provider_profile_models", "file_input_state"),
+                ("provider_profile_models", "probe_status"),
+                ("provider_profile_models", "probe_version"),
+                ("provider_capabilities", "probe_status"),
+                ("provider_capabilities", "probe_version"),
             ] {
                 let present: bool = connection.query_row(
                     &format!(
@@ -3158,20 +5020,12 @@ mod tests {
                 .unwrap();
         }
         let upgraded = Arc::new(Storage::open(&path).unwrap());
-        let session = upgraded
-            .session("legacy:owner", "legacy-session")
-            .unwrap()
-            .unwrap();
-        assert_eq!(session.owner_principal, "legacy:owner");
-        assert_eq!(
-            upgraded
-                .messages("legacy:owner", &session.id)
-                .unwrap()
-                .len(),
-            1
-        );
+        let owner = upgraded.management_owner_id().unwrap();
+        let session = upgraded.session(&owner, "legacy-session").unwrap().unwrap();
+        assert_eq!(session.owner_principal, owner);
+        assert_eq!(upgraded.messages(&owner, &session.id).unwrap().len(), 1);
         let hits = SessionHistoryStore::new(upgraded.clone())
-            .search("legacy:owner", "upgrade sentinel", 10)
+            .search(&owner, "upgrade sentinel", 10)
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(SessionHistoryStore::new(upgraded)
@@ -3208,6 +5062,76 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].id, tool_id);
         assert_eq!(tools[0].status, "interrupted");
+    }
+
+    #[test]
+    fn multiple_legacy_owner_rows_fail_closed_until_explicit_telegram_resolution() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .with_conn(|connection| {
+                connection.execute(
+                    "INSERT INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES('owner:telegram:41',41,'a','a')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES('owner:telegram:42',42,'b','b')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let error = storage.management_owner_id().unwrap_err().to_string();
+        assert!(error.contains("multiple legacy owners require explicit owner resolution"));
+
+        let migration = storage.resolve_legacy_owners(42, true).unwrap();
+        assert!(migration.owner_id.starts_with("owner:installation:"));
+        assert_eq!(storage.management_owner_id().unwrap(), migration.owner_id);
+        storage
+            .with_conn(|connection| {
+                let count: i64 =
+                    connection.query_row("SELECT COUNT(*) FROM owners", [], |row| row.get(0))?;
+                assert_eq!(count, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn owner_rekey_moves_legacy_foreign_key_mapping_before_deleting_old_owner() {
+        let storage = Storage::open_memory().unwrap();
+        let stable = storage.management_owner_id().unwrap();
+        let legacy = "owner:telegram:5385399301";
+        storage
+            .with_conn(|connection| {
+                let now = Utc::now().to_rfc3339();
+                connection.execute(
+                    "INSERT INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,?,?,?)",
+                    params![legacy, 5385399301i64, now, now],
+                )?;
+                connection.execute(
+                    "INSERT INTO legacy_owner_principals(legacy_principal,owner_id,migrated_at) VALUES(?,?,?)",
+                    params!["owner:local", legacy, now],
+                )?;
+                let transaction = connection.unchecked_transaction()?;
+                rekey_owner_transaction(&transaction, legacy, &stable)?;
+                transaction.commit()?;
+                let mapped: String = connection.query_row(
+                    "SELECT owner_id FROM legacy_owner_principals WHERE legacy_principal='owner:local'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(mapped, stable);
+                let old_owner: Option<String> = connection
+                    .query_row(
+                        "SELECT owner_id FROM owners WHERE owner_id=?",
+                        params![legacy],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                assert!(old_owner.is_none());
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

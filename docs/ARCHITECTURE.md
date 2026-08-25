@@ -1,4 +1,8 @@
-# Xiao v0.2.6 Architecture
+# Xiao v0.2.7 Architecture
+
+## v0.2.7 control-plane unification
+
+Telegram, CLI, and KernelSU WebUI are adapters over the same `xiaod` application services. One stable `owner_user_id` is the authorization identity; chat allowlists restrict location only. CLI sessions remain independent unless explicitly targeted; provider/session, memory, skills, approvals, attachments, Custom capability probing/editing, scanned-PDF processing, and Doctor diagnostics share the same control-plane semantics. Secrets remain write-only/masked.
 
 ## Runtime ownership
 
@@ -83,7 +87,7 @@ output bound. Providers only translate those canonical definitions to wire
 schemas. Runtime `ToolPolicy` evaluates risk and call arguments; a skill is
 guidance and cannot grant a tool or bypass policy.
 
-The v0.2.6 built-ins are:
+The v0.2.7 built-ins are:
 
 - `context_stats`
 - `memory_search`, `memory_set`, `memory_delete`
@@ -261,7 +265,7 @@ mask another subsystem's failure.
 ## Storage and migrations
 
 SQLite keeps WAL, foreign keys, a short mutex boundary, and graceful-shutdown
-checkpointing. v0.2.6 migrations are additive and idempotent and retain every
+checkpointing. v0.2.7 migrations are additive and idempotent and retain every
 v0.1.0 table. Schema versions add:
 
 - version 6: `agent_runs`, `tool_runs` and lookup indexes;
@@ -300,6 +304,6 @@ in `SecretStore`; snapshot surfaces presence only. The managed Termux wrapper
 elevates only fixed module binaries. KernelSU/WebUI lifecycle shell paths are
 fixed administrative code and are never reachable from model tool calls.
 
-v0.2.6 deliberately does not add MCP, remote/device nodes, subagents, vector
+v0.2.7 deliberately does not add MCP, remote/device nodes, subagents, vector
 databases, autonomous cron, browser automation, a plugin ecosystem, dynamic
 native plugins, or unrestricted root execution.

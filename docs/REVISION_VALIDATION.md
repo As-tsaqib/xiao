@@ -1,5 +1,7 @@
 # First-patch validation record — 2026-08-22
 
+> Current Xiao v0.2.7 release-gate evidence: `docs/V027_VALIDATION.md`.
+
 > Historical v0.1.0 device evidence. Xiao v0.2.6 host validation and its
 > still-pending device/provider checks are tracked in `docs/ACCEPTANCE.md`.
 

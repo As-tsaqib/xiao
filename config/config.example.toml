@@ -30,7 +30,7 @@ transport = "long_polling"
 
 [telegram.access]
 allowed_chat_ids = []
-allowed_user_ids = []
+# owner_user_id = 123456789 # required for Telegram; one canonical owner
 
 [telegram.ui]
 menu_ttl_seconds = 900

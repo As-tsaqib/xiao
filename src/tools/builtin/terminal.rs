@@ -209,7 +209,11 @@ mod tests {
 
     #[async_trait]
     impl TrustedPackageRepository for FakeRepository {
-        async fn search(&self, binary: &str) -> Result<Vec<PackageCandidate>> {
+        async fn search(
+            &self,
+            binary: &str,
+            _: CancellationToken,
+        ) -> Result<Vec<PackageCandidate>> {
             Ok(vec![PackageCandidate {
                 package: binary.into(),
                 source: "termux_repository_fake_index".into(),

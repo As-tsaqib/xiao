@@ -1,20 +1,28 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     io::{Cursor, Read},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
 use image::GenericImageView;
 use quick_xml::{events::Event, Reader};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zip::ZipArchive;
 
 use crate::{
     config::AttachmentConfig,
+    runtime::{
+        CapabilityRegistry, CapabilityStatus, DependencyResolver, ExecutionPurpose,
+        ProcessExecutor, TermuxCommand, TermuxExecutor, TermuxPackageBackend,
+    },
     security::redact::redact_text,
     storage::{AttachmentChunkRecord, AttachmentRecord, NewAttachmentRecord, Storage},
 };
@@ -60,11 +68,635 @@ pub struct NormalizedImage {
     pub caption: String,
 }
 
+/// Provider-neutral file input. Provider adapters decide how to serialize the
+/// bounded bytes; Telegram wire types and local paths never cross this seam.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedFile {
+    pub attachment_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    #[serde(skip)]
+    pub bytes: Vec<u8>,
+    pub caption: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentUsage {
+    pub owner_bytes: u64,
+    pub owner_quota_bytes: u64,
+    pub global_bytes: u64,
+    pub global_quota_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedPdfPage {
+    pub page_no: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedPdfPage {
+    pub page_no: usize,
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PdfFallbackRequest {
+    pub session_id: String,
+    pub attachment_id: String,
+    pub original_name: String,
+    pub prompt: String,
+    pub provider: String,
+    pub account_or_profile_id: Option<String>,
+    pub model: String,
+    pub pdf: Vec<u8>,
+    pub rendered_pages: Vec<RenderedPdfPage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfProcessingPath {
+    EmbeddedText,
+    LocalOcr,
+    ProviderFileInput,
+    ProviderVision,
+    Blocked,
+}
+
+#[async_trait]
+pub trait PdfFallbackProvider: Send + Sync {
+    async fn file_input(
+        &self,
+        request: &PdfFallbackRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<String>;
+
+    async fn vision(
+        &self,
+        request: &PdfFallbackRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<String>;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PdfFallbackCapabilities {
+    pub file_input: bool,
+    pub vision: bool,
+}
+
+pub trait PdfPageRenderer: Send + Sync {
+    fn render(
+        &self,
+        pdf: &[u8],
+        scratch_root: &Path,
+        config: &AttachmentConfig,
+    ) -> Result<Option<Vec<RenderedPdfPage>>>;
+
+    fn render_with_cancellation(
+        &self,
+        pdf: &[u8],
+        scratch_root: &Path,
+        config: &AttachmentConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<RenderedPdfPage>>> {
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("attachment processing cancelled"));
+        }
+        let pages = self.render(pdf, scratch_root, config)?;
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("attachment processing cancelled"));
+        }
+        Ok(pages)
+    }
+}
+
+pub trait ScannedPdfProcessor: Send + Sync {
+    /// Returns `Ok(None)` when no bounded OCR implementation is available on
+    /// this host. Tests inject a deterministic fake; production uses local
+    /// `pdftoppm` + `tesseract` only and never downloads executables/scripts.
+    fn extract(
+        &self,
+        pdf: &[u8],
+        scratch_root: &Path,
+        config: &AttachmentConfig,
+    ) -> Result<Option<Vec<ScannedPdfPage>>>;
+
+    fn extract_with_cancellation(
+        &self,
+        pdf: &[u8],
+        scratch_root: &Path,
+        config: &AttachmentConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<ScannedPdfPage>>> {
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("attachment processing cancelled"));
+        }
+        let result = self.extract(pdf, scratch_root, config)?;
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("attachment processing cancelled"));
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Default)]
+struct LocalScannedPdfProcessor;
+
+impl ScannedPdfProcessor for LocalScannedPdfProcessor {
+    fn extract(
+        &self,
+        pdf: &[u8],
+        scratch_root: &Path,
+        config: &AttachmentConfig,
+    ) -> Result<Option<Vec<ScannedPdfPage>>> {
+        // Handle blocking work off async: heavy PDF decode/render/OCR must not block the
+        // async runtime. Wrap the entire operation in spawn_blocking when a tokio runtime
+        // is present, otherwise run inline. Fallback to vision provider when bounded OCR
+        // is unavailable.
+        let pdf_owned = pdf.to_vec();
+        let scratch = scratch_root.to_path_buf();
+        let cfg = config.clone();
+        let run = move || -> Result<Option<Vec<ScannedPdfPage>>> {
+            extract_via_termux(&pdf_owned, &scratch, &cfg, CancellationToken::new())
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    tokio::task::spawn_blocking(run)
+                        .await
+                        .context("spawn_blocking join for OCR")?
+                })
+            })
+        } else {
+            run()
+        }
+    }
+
+    fn extract_with_cancellation(
+        &self,
+        pdf: &[u8],
+        scratch_root: &Path,
+        config: &AttachmentConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<ScannedPdfPage>>> {
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("attachment processing cancelled"));
+        }
+        let pdf_owned = pdf.to_vec();
+        let scratch = scratch_root.to_path_buf();
+        let cfg = config.clone();
+        let cancellation = cancellation.clone();
+        let run = move || -> Result<Option<Vec<ScannedPdfPage>>> {
+            extract_via_termux(&pdf_owned, &scratch, &cfg, cancellation)
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    tokio::task::spawn_blocking(run)
+                        .await
+                        .context("spawn_blocking join for OCR")?
+                })
+            })
+        } else {
+            run()
+        }
+    }
+}
+
+#[derive(Default)]
+struct LocalPdfPageRenderer;
+
+impl PdfPageRenderer for LocalPdfPageRenderer {
+    fn render(
+        &self,
+        pdf: &[u8],
+        scratch_root: &Path,
+        config: &AttachmentConfig,
+    ) -> Result<Option<Vec<RenderedPdfPage>>> {
+        render_pdf_via_termux(pdf, scratch_root, config, CancellationToken::new())
+    }
+
+    fn render_with_cancellation(
+        &self,
+        pdf: &[u8],
+        scratch_root: &Path,
+        config: &AttachmentConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<RenderedPdfPage>>> {
+        render_pdf_via_termux(pdf, scratch_root, config, cancellation.clone())
+    }
+}
+
+fn render_pdf_via_termux(
+    pdf: &[u8],
+    scratch_root: &Path,
+    config: &AttachmentConfig,
+    cancellation: CancellationToken,
+) -> Result<Option<Vec<RenderedPdfPage>>> {
+    use crate::runtime::{EnvironmentProbe, TermuxRepositoryBackend};
+
+    if cancellation.is_cancelled() {
+        return Err(anyhow!("attachment processing cancelled"));
+    }
+    let probe = EnvironmentProbe::real();
+    let env = probe.probe(scratch_root);
+    let Some(termux_env) = env.termux.clone() else {
+        return Ok(None);
+    };
+    let capabilities = Arc::new(CapabilityRegistry::from_environment(&env));
+    let resolution = capabilities.resolve("binary.pdftoppm");
+    if matches!(
+        resolution.status,
+        CapabilityStatus::Forbidden | CapabilityStatus::Unsupported
+    ) {
+        return Ok(None);
+    }
+    let workspace_root = termux_env.home.clone();
+    let executor = Arc::new(TermuxExecutor::new(
+        termux_env.clone(),
+        workspace_root.clone(),
+    ));
+    let backend = Arc::new(TermuxPackageBackend::new(
+        executor.clone() as Arc<dyn crate::runtime::ProcessExecutor>,
+        termux_env.clone(),
+        workspace_root.clone(),
+    ));
+    let repository = Arc::new(TermuxRepositoryBackend::new(
+        executor.clone() as Arc<dyn crate::runtime::ProcessExecutor>,
+        &termux_env,
+        workspace_root.clone(),
+    ));
+    let resolver = DependencyResolver::with_trusted_repository(
+        capabilities,
+        backend as Arc<dyn crate::runtime::PackageBackend>,
+        None,
+        repository as Arc<dyn crate::runtime::TrustedPackageRepository>,
+    );
+    let ensure = |binary: &str| -> Result<()> {
+        let future = resolver.ensure_binary(binary, None, cancellation.clone(), None);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.block_on(future).map(|_| ())
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(future)
+                .map(|_| ())
+        }
+    };
+    if ensure("pdftoppm").is_err() {
+        return Ok(None);
+    }
+    let base_scratch = if termux_env.home.exists() {
+        termux_env.home.join(".cache").join("xiao").join("pdf")
+    } else {
+        scratch_root.join("pdf-scratch")
+    };
+    create_private_dir(&base_scratch)?;
+    let work = base_scratch.join(format!("render-{}", Uuid::new_v4().simple()));
+    create_private_dir(&work)?;
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        if let (Some(uid), Some(gid)) = (termux_env.uid, termux_env.gid) {
+            let _ = std::os::unix::fs::chown(&base_scratch, Some(uid), Some(gid));
+            let _ = std::os::unix::fs::chown(&work, Some(uid), Some(gid));
+        }
+    }
+    let result: Result<Vec<RenderedPdfPage>> = (|| {
+        let source = work.join("source.pdf");
+        atomic_private_write(&source, pdf)?;
+        let prefix = work.join("page");
+        let command = TermuxCommand {
+            program: "pdftoppm".into(),
+            args: vec![
+                "-png".into(),
+                "-r".into(),
+                "150".into(),
+                "-f".into(),
+                "1".into(),
+                "-l".into(),
+                (config.max_pdf_pages + 1).to_string(),
+                source.display().to_string(),
+                prefix.display().to_string(),
+            ],
+            cwd: work.clone(),
+            environment: Default::default(),
+            timeout_ms: config.processing_timeout_seconds * 1_000,
+            max_output_chars: 16_384,
+            purpose: ExecutionPurpose::Verification,
+        };
+        let outcome = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.block_on(executor.execute(command, cancellation.clone()))
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(executor.execute(command, cancellation.clone()))
+        }?;
+        if !outcome.succeeded() {
+            if outcome.cancelled || outcome.timed_out {
+                return Err(anyhow!("PDF rendering cancelled or timed out"));
+            }
+            return Err(anyhow!(
+                "PDF renderer failed: {}",
+                outcome.observable_summary()
+            ));
+        }
+        let mut paths = fs::read_dir(&work)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("page-") && name.ends_with(".png"))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        if paths.is_empty() || paths.len() > config.max_pdf_pages {
+            return Err(anyhow!("PDF page count exceeds the configured bound"));
+        }
+        paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let bytes = fs::read(path)?;
+                let (width, height) = validate_image(&bytes, config.max_pdf_page_pixels)?;
+                Ok(RenderedPdfPage {
+                    page_no: index + 1,
+                    bytes,
+                    mime_type: "image/png".into(),
+                    width,
+                    height,
+                })
+            })
+            .collect()
+    })();
+    let _ = fs::remove_dir_all(&work);
+    match result {
+        Ok(pages) => Ok(Some(pages)),
+        Err(error) if error.to_string().contains("not installed") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Production OCR path: CapabilityResolver -> TermuxExecutor structured argv
+/// -> safe dependency install/reprobe -> bounded render+OCR. Never uses raw
+/// root shell; vision provider fallback is returned as Ok(None).
+fn extract_via_termux(
+    pdf: &[u8],
+    scratch_root: &Path,
+    config: &AttachmentConfig,
+    cancellation: CancellationToken,
+) -> Result<Option<Vec<ScannedPdfPage>>> {
+    use crate::runtime::{EnvironmentProbe, TermuxRepositoryBackend};
+
+    if cancellation.is_cancelled() {
+        return Err(anyhow!("attachment processing cancelled"));
+    }
+
+    // Probe runtime and build CapabilityResolver
+    let probe = EnvironmentProbe::real();
+    // Use scratch_root parent as data_root hint for probe; termux detection relies on env
+    let env = probe.probe(scratch_root);
+    let Some(termux_env) = env.termux.clone() else {
+        // No Termux: bounded OCR unavailable -> fallback to vision provider
+        return Ok(None);
+    };
+    let capabilities = Arc::new(CapabilityRegistry::from_environment(&env));
+    // CapabilityResolver checks for binary.pdftoppm and binary.tesseract
+    for binary in ["pdftoppm", "tesseract"] {
+        let resolution = capabilities.resolve(&format!("binary.{binary}"));
+        match resolution.status {
+            CapabilityStatus::Available => {}
+            CapabilityStatus::MissingInstallable | CapabilityStatus::Unknown => {
+                // Will be handled via safe dependency install below
+            }
+            _ => {
+                // Forbidden/Unsupported etc -> fallback to vision provider, never raw root shell
+                return Ok(None);
+            }
+        }
+    }
+    let workspace_root = termux_env.home.clone();
+    let executor = Arc::new(TermuxExecutor::new(
+        termux_env.clone(),
+        workspace_root.clone(),
+    ));
+    let backend = Arc::new(TermuxPackageBackend::new(
+        executor.clone() as Arc<dyn crate::runtime::ProcessExecutor>,
+        termux_env.clone(),
+        workspace_root.clone(),
+    ));
+    let repository = Arc::new(TermuxRepositoryBackend::new(
+        executor.clone() as Arc<dyn crate::runtime::ProcessExecutor>,
+        &termux_env,
+        workspace_root.clone(),
+    ));
+    let resolver = DependencyResolver::with_trusted_repository(
+        capabilities.clone(),
+        backend.clone() as Arc<dyn crate::runtime::PackageBackend>,
+        None,
+        repository.clone() as Arc<dyn crate::runtime::TrustedPackageRepository>,
+    );
+    // Execute with timeout/cancel/output bounds via TermuxExecutor structured argv
+    let rt_handle = tokio::runtime::Handle::try_current().ok();
+    let ensure = |binary: &str| -> Result<()> {
+        let resolver = resolver.clone();
+        let binary = binary.to_owned();
+        let fut = resolver.ensure_binary(&binary, None, cancellation.clone(), None);
+        if let Some(handle) = &rt_handle {
+            handle.block_on(fut).map(|_| ())
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(fut)
+                .map(|_| ())
+        }
+    };
+    // Safe dependency install/reprobe for required binaries
+    for binary in ["pdftoppm", "tesseract"] {
+        if ensure(binary).is_err() {
+            // Install failed or still missing -> vision fallback, not error
+            return Ok(None);
+        }
+    }
+    // Reprobe capability registry after install
+    let refreshed_env = probe.probe(scratch_root);
+    let refreshed_caps = CapabilityRegistry::from_environment(&refreshed_env);
+    for binary in ["pdftoppm", "tesseract"] {
+        if refreshed_caps.resolve(&format!("binary.{binary}")).status != CapabilityStatus::Available
+        {
+            return Ok(None);
+        }
+    }
+
+    // P0-3: Dedicated bounded OCR execution workspace accessible to Termux UID.
+    // If running as root, set ownership to Termux UID/GID so privilege-dropped
+    // child process can chdir into work, read source.pdf, write PNGs and text.
+    let base_scratch = if termux_env.home.exists() {
+        termux_env.home.join(".cache").join("xiao").join("ocr")
+    } else {
+        scratch_root.join("ocr-scratch")
+    };
+    let _ = fs::create_dir_all(&base_scratch);
+    let work = base_scratch.join(format!("ocr-{}", Uuid::new_v4().simple()));
+    create_private_dir(&work)?;
+
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } == 0 {
+            if let (Some(uid), Some(gid)) = (termux_env.uid, termux_env.gid) {
+                let _ = std::os::unix::fs::chown(&base_scratch, Some(uid), Some(gid));
+                let _ = std::os::unix::fs::chown(&work, Some(uid), Some(gid));
+            }
+        }
+    }
+
+    let result: Result<Vec<ScannedPdfPage>> = (|| {
+        let pdf_path = work.join("source.pdf");
+        atomic_private_write(&pdf_path, pdf)?;
+        #[cfg(unix)]
+        {
+            if unsafe { libc::geteuid() } == 0 {
+                if let (Some(uid), Some(gid)) = (termux_env.uid, termux_env.gid) {
+                    let _ = std::os::unix::fs::chown(&pdf_path, Some(uid), Some(gid));
+                }
+            }
+        }
+        let prefix = work.join("page");
+        let run_cmd = |program: &str,
+                       args: Vec<String>,
+                       timeout_ms: u64,
+                       max_out: usize|
+         -> Result<crate::runtime::CommandOutcome> {
+            let cmd = TermuxCommand {
+                program: program.to_owned(),
+                args,
+                cwd: work.clone(),
+                environment: Default::default(),
+                timeout_ms,
+                max_output_chars: max_out,
+                purpose: ExecutionPurpose::Verification,
+            };
+            if let Some(handle) = &rt_handle {
+                handle.block_on(executor.execute(cmd, cancellation.clone()))
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(executor.execute(cmd, cancellation.clone()))
+            }
+        };
+        // Structured argv for pdftoppm, never raw shell string, via TermuxExecutor
+        let outcome = run_cmd(
+            "pdftoppm",
+            vec![
+                "-png".into(),
+                "-r".into(),
+                "150".into(),
+                "-f".into(),
+                "1".into(),
+                "-l".into(),
+                (config.max_pdf_pages + 1).to_string(),
+                pdf_path.display().to_string(),
+                prefix.display().to_string(),
+            ],
+            config.processing_timeout_seconds * 1000,
+            16_384,
+        )?;
+        if !outcome.succeeded() {
+            if outcome.timed_out || outcome.cancelled {
+                return Err(anyhow!("PDF renderer timed out or cancelled"));
+            }
+            return Err(anyhow!(
+                "PDF renderer failed: {}",
+                outcome.observable_summary()
+            ));
+        }
+        let mut pages = fs::read_dir(&work)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("page-") && name.ends_with(".png"))
+            })
+            .collect::<Vec<_>>();
+        pages.sort();
+        if pages.is_empty() {
+            return Err(anyhow!("PDF renderer produced no pages"));
+        }
+        if pages.len() > config.max_pdf_pages {
+            return Err(anyhow!("PDF exceeds the configured page limit"));
+        }
+        let mut output = Vec::with_capacity(pages.len());
+        let mut total_chars = 0usize;
+        for (index, page) in pages.iter().enumerate() {
+            let bytes = fs::read(page)?;
+            // Validate rendered page bounds inside spawn_blocking style (already off async)
+            validate_image(&bytes, config.max_pdf_page_pixels)
+                .with_context(|| format!("validate rendered PDF page {}", index + 1))?;
+            let outbase = work.join(format!("ocr-{}", index + 1));
+            let ocr_outcome = run_cmd(
+                "tesseract",
+                vec![
+                    page.display().to_string(),
+                    outbase.display().to_string(),
+                    "txt".into(),
+                ],
+                config.ocr_page_timeout_seconds * 1000,
+                config.max_extracted_text_chars.min(65_536),
+            )?;
+            if !ocr_outcome.succeeded() {
+                if ocr_outcome.timed_out || ocr_outcome.cancelled {
+                    return Err(anyhow!(
+                        "PDF OCR timed out or cancelled on page {}",
+                        index + 1
+                    ));
+                }
+                return Err(anyhow!(
+                    "PDF OCR failed: {}",
+                    ocr_outcome.observable_summary()
+                ));
+            }
+            let text_path = outbase.with_extension("txt");
+            let text = fs::read_to_string(&text_path)
+                .with_context(|| format!("read OCR page {}", index + 1))?;
+            total_chars = total_chars.saturating_add(text.chars().count());
+            if total_chars > config.max_extracted_text_chars {
+                return Err(anyhow!("OCR text exceeds configured extraction limit"));
+            }
+            output.push(ScannedPdfPage {
+                page_no: index + 1,
+                text: normalize_text(&text),
+            });
+        }
+        Ok(output)
+    })();
+    let _ = fs::remove_dir_all(&work);
+    match result {
+        Ok(pages) => Ok(Some(pages)),
+        Err(e) => {
+            // If Termux execution is unavailable in this host, fallback to vision provider
+            let msg = e.to_string();
+            if msg.contains("not installed") || msg.contains("not detected") {
+                return Ok(None);
+            }
+            Err(e)
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AttachmentManager {
     storage: Arc<Storage>,
     root: Arc<PathBuf>,
     config: AttachmentConfig,
+    scanned_pdf: Arc<dyn ScannedPdfProcessor>,
+    pdf_renderer: Arc<dyn PdfPageRenderer>,
+    active_ingests: Arc<Mutex<HashMap<String, Vec<CancellationToken>>>>,
 }
 
 impl AttachmentManager {
@@ -79,11 +711,38 @@ impl AttachmentManager {
             storage,
             root: Arc::new(root),
             config,
+            scanned_pdf: Arc::new(LocalScannedPdfProcessor),
+            pdf_renderer: Arc::new(LocalPdfPageRenderer),
+            active_ingests: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_scanned_pdf_processor(
+        mut self,
+        processor: Arc<dyn ScannedPdfProcessor>,
+    ) -> Self {
+        self.scanned_pdf = processor;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pdf_page_renderer(mut self, renderer: Arc<dyn PdfPageRenderer>) -> Self {
+        self.pdf_renderer = renderer;
+        self
     }
 
     pub fn root(&self) -> &Path {
         self.root.as_path()
+    }
+
+    pub fn usage(&self, owner: &str) -> Result<AttachmentUsage> {
+        Ok(AttachmentUsage {
+            owner_bytes: self.storage.owner_attachment_bytes(owner)?,
+            owner_quota_bytes: self.config.max_owner_bytes,
+            global_bytes: self.storage.global_attachment_bytes()?,
+            global_quota_bytes: self.config.max_global_bytes,
+        })
     }
 
     pub fn max_download_bytes(&self, kind: AttachmentKind) -> u64 {
@@ -98,8 +757,83 @@ impl AttachmentManager {
     }
 
     pub fn ingest(&self, input: AttachmentIngest) -> Result<AttachmentRecord> {
+        self.ingest_with_cancellation(input, CancellationToken::new())
+    }
+
+    fn ingest_key(owner: &str, session_id: &str) -> String {
+        format!("{owner}\n{session_id}")
+    }
+
+    fn register_ingest(&self, owner: &str, session_id: &str, token: &CancellationToken) {
+        if let Ok(mut active) = self.active_ingests.lock() {
+            active
+                .entry(Self::ingest_key(owner, session_id))
+                .or_default()
+                .push(token.clone());
+        }
+    }
+
+    fn unregister_ingest(&self, owner: &str, session_id: &str, token: &CancellationToken) {
+        if let Ok(mut active) = self.active_ingests.lock() {
+            let key = Self::ingest_key(owner, session_id);
+            if let Some(tokens) = active.get_mut(&key) {
+                if let Some(index) = tokens.iter().position(|registered| registered == token) {
+                    tokens.remove(index);
+                }
+                if tokens.is_empty() {
+                    active.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Cancel the attachment download/processing currently associated with a
+    /// session. Telegram uses this before an agent run exists, so the run
+    /// cancellation registry alone is insufficient.
+    pub fn cancel_ingest(&self, owner: &str, session_id: &str) -> bool {
+        self.active_ingests
+            .lock()
+            .ok()
+            .and_then(|active| active.get(&Self::ingest_key(owner, session_id)).cloned())
+            .map(|tokens| {
+                for token in tokens {
+                    token.cancel();
+                }
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn active_ingest_count(&self) -> usize {
+        self.active_ingests
+            .lock()
+            .map(|active| active.values().map(Vec::len).sum())
+            .unwrap_or_default()
+    }
+
+    pub fn ingest_with_cancellation(
+        &self,
+        input: AttachmentIngest,
+        cancellation: CancellationToken,
+    ) -> Result<AttachmentRecord> {
+        let owner = input.owner_id.clone();
+        let session_id = input.session_id.clone();
+        self.register_ingest(&owner, &session_id, &cancellation);
+        let result = self.ingest_inner(input, &cancellation);
+        self.unregister_ingest(&owner, &session_id, &cancellation);
+        result
+    }
+
+    fn ingest_inner(
+        &self,
+        input: AttachmentIngest,
+        cancellation: &CancellationToken,
+    ) -> Result<AttachmentRecord> {
         if input.bytes.is_empty() {
             return Err(anyhow!("Telegram attachment is empty"));
+        }
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("attachment processing cancelled"));
         }
         if let Some(unique_id) = input.telegram_unique_id.as_deref() {
             if let Some(existing) = self.storage.attachment_by_telegram_unique(
@@ -114,13 +848,6 @@ impl AttachmentManager {
         if input.bytes.len() as u64 > byte_limit {
             return Err(anyhow!("attachment exceeds the {} byte limit", byte_limit));
         }
-        let current = self
-            .storage
-            .session_attachment_bytes(&input.owner_id, &input.session_id)?;
-        if current.saturating_add(input.bytes.len() as u64) > self.config.max_session_bytes {
-            return Err(anyhow!("attachment would exceed the session storage quota"));
-        }
-
         let detection = detect_content(&input.bytes, &input.original_name)?;
         let actual_kind = if detection.mime.starts_with("image/") {
             AttachmentKind::Image
@@ -140,34 +867,67 @@ impl AttachmentManager {
         }
 
         let attachment_id = Uuid::new_v4().to_string();
+        let reservation = self.storage.reserve_attachment_quota_for_attachment(
+            &input.owner_id,
+            &input.session_id,
+            Some(&attachment_id),
+            input.bytes.len() as u64,
+            self.config.max_session_bytes,
+            self.config.max_owner_bytes,
+            self.config.max_global_bytes,
+            self.processing_timeout() + std::time::Duration::from_secs(30),
+        )?;
+        let reservation_id = reservation.reservation_id.clone();
+        if cancellation.is_cancelled() {
+            let _ = self.storage.release_attachment_reservation(&reservation_id);
+            return Err(anyhow!("attachment processing cancelled"));
+        }
+
         let owner_dir = self.root.join(short_hash(&input.owner_id));
         let session_dir = owner_dir.join(short_hash(&input.session_id));
-        create_private_dir(&owner_dir)?;
-        create_private_dir(&session_dir)?;
+        if let Err(error) = create_private_dir(&owner_dir) {
+            let _ = self.storage.release_attachment_reservation(&reservation_id);
+            return Err(error);
+        }
+        if let Err(error) = create_private_dir(&session_dir) {
+            let _ = self.storage.release_attachment_reservation(&reservation_id);
+            return Err(error);
+        }
         let final_path = session_dir.join(format!("{attachment_id}.bin"));
-        atomic_private_write(&final_path, &input.bytes)?;
+        if let Err(error) = atomic_private_write(&final_path, &input.bytes) {
+            let _ = self.storage.release_attachment_reservation(&reservation_id);
+            return Err(error);
+        }
 
         let sha256 = format!("{:x}", Sha256::digest(&input.bytes));
         let original_name = safe_filename(&input.original_name);
-        let local_path = final_path
-            .to_str()
-            .ok_or_else(|| anyhow!("attachment path is not valid UTF-8"))?
-            .to_owned();
-        let insert = self.storage.insert_attachment(NewAttachmentRecord {
-            attachment_id: &attachment_id,
-            owner_id: &input.owner_id,
-            session_id: &input.session_id,
-            telegram_file_id: input.telegram_file_id.as_deref(),
-            telegram_unique_id: input.telegram_unique_id.as_deref(),
-            original_name: &original_name,
-            declared_mime: input.declared_mime.as_deref(),
-            detected_mime: &detection.mime,
-            kind: actual_kind.as_str(),
-            size_bytes: input.bytes.len() as u64,
-            sha256: &sha256,
-            local_path: &local_path,
-        });
+        let local_path = match final_path.to_str() {
+            Some(path) => path.to_owned(),
+            None => {
+                let _ = self.storage.release_attachment_reservation(&reservation_id);
+                let _ = fs::remove_file(&final_path);
+                return Err(anyhow!("attachment path is not valid UTF-8"));
+            }
+        };
+        let insert = self.storage.insert_attachment_and_finalize_reservation(
+            NewAttachmentRecord {
+                attachment_id: &attachment_id,
+                owner_id: &input.owner_id,
+                session_id: &input.session_id,
+                telegram_file_id: input.telegram_file_id.as_deref(),
+                telegram_unique_id: input.telegram_unique_id.as_deref(),
+                original_name: &original_name,
+                declared_mime: input.declared_mime.as_deref(),
+                detected_mime: &detection.mime,
+                kind: actual_kind.as_str(),
+                size_bytes: input.bytes.len() as u64,
+                sha256: &sha256,
+                local_path: &local_path,
+            },
+            &reservation_id,
+        );
         if let Err(error) = insert {
+            let _ = self.storage.release_attachment_reservation(&reservation_id);
             let _ = fs::remove_file(&final_path);
             if let Some(unique_id) = input.telegram_unique_id.as_deref() {
                 if let Some(existing) = self.storage.attachment_by_telegram_unique(
@@ -180,8 +940,15 @@ impl AttachmentManager {
             }
             return Err(error);
         }
-
-        let processing = self.process(&input.owner_id, &attachment_id, &input.bytes, &detection);
+        let processing = self.process(
+            &input.owner_id,
+            &input.session_id,
+            &attachment_id,
+            &input.original_name,
+            &input.bytes,
+            &detection,
+            cancellation,
+        );
         if let Err(error) = processing {
             let safe = bound(&redact_text(&error.to_string()), 1_000);
             self.storage.set_attachment_status(
@@ -191,6 +958,9 @@ impl AttachmentManager {
                 None,
                 Some(&safe),
             )?;
+            if !self.config.retain_failed {
+                self.delete_raw_and_record(&input.owner_id, &attachment_id, &final_path)?;
+            }
             return Err(anyhow!(safe));
         }
         self.storage
@@ -198,13 +968,20 @@ impl AttachmentManager {
             .ok_or_else(|| anyhow!("ingested attachment metadata disappeared"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process(
         &self,
         owner: &str,
+        session_id: &str,
         attachment_id: &str,
+        original_name: &str,
         bytes: &[u8],
         detection: &DetectedContent,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("attachment processing cancelled"));
+        }
         self.storage
             .set_attachment_status(owner, attachment_id, "processing", None, None)?;
         if detection.mime.starts_with("image/") {
@@ -235,15 +1012,84 @@ impl AttachmentManager {
             < 8
         {
             if detection.mime == "application/pdf" {
-                return self.storage.set_attachment_status(
-                    owner,
-                    attachment_id,
-                    "needs_ocr",
-                    Some("PDF has no meaningful embedded text; OCR or a vision-capable model is required"),
-                    None,
-                );
+                match self.scanned_pdf.extract_with_cancellation(
+                    bytes,
+                    self.root(),
+                    &self.config,
+                    cancellation,
+                ) {
+                    Err(error) if !cancellation.is_cancelled() => {
+                        // A missing/uninstallable local OCR tool is represented by
+                        // `Ok(None)`. A bounded capability/runtime failure is also
+                        // eligible for the explicit provider planner; cancellation
+                        // remains a hard failure and never pretends to have read the PDF.
+                        self.process_pdf_fallback(
+                            owner,
+                            session_id,
+                            attachment_id,
+                            original_name,
+                            bytes,
+                            cancellation,
+                            &format!("local OCR unavailable: {}", redact_text(&error.to_string())),
+                        )
+                    }
+                    Err(error) => Err(error),
+                    Ok(result) => match result {
+                        Some(pages) => {
+                            let chunks =
+                                chunk_scanned_pages(attachment_id, &pages, self.config.chunk_chars);
+                            let useful = chunks
+                                .iter()
+                                .map(|chunk| {
+                                    chunk.text.chars().filter(|c| !c.is_whitespace()).count()
+                                })
+                                .sum::<usize>();
+                            if useful >= 8 {
+                                self.storage.replace_attachment_chunks(
+                                    owner,
+                                    attachment_id,
+                                    &chunks,
+                                )?;
+                                return self.storage.set_attachment_status(
+                                    owner,
+                                    attachment_id,
+                                    "ready",
+                                    Some(&format!(
+                                        "Scanned PDF; OCR indexed {} pages in {} chunks",
+                                        pages.len(),
+                                        chunks.len()
+                                    )),
+                                    None,
+                                );
+                            }
+                            self.process_pdf_fallback(
+                                owner,
+                                session_id,
+                                attachment_id,
+                                original_name,
+                                bytes,
+                                cancellation,
+                                "local OCR produced no meaningful text",
+                            )
+                        }
+                        None => {
+                            return self.process_pdf_fallback(
+                                owner,
+                                session_id,
+                                attachment_id,
+                                original_name,
+                                bytes,
+                                cancellation,
+                                "local OCR is unavailable",
+                            )
+                        }
+                    },
+                }?
             }
             return Err(anyhow!("document contains no meaningful extractable text"));
+        }
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("attachment processing cancelled"));
         }
         let chunks = chunk_text(attachment_id, &normalized, self.config.chunk_chars);
         self.storage
@@ -257,6 +1103,288 @@ impl AttachmentManager {
         );
         self.storage
             .set_attachment_status(owner, attachment_id, "ready", Some(&summary), None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_pdf_fallback(
+        &self,
+        owner: &str,
+        session_id: &str,
+        attachment_id: &str,
+        original_name: &str,
+        bytes: &[u8],
+        cancellation: &CancellationToken,
+        reason: &str,
+    ) -> Result<()> {
+        let _ = (session_id, original_name, bytes, cancellation);
+        self.storage.set_attachment_status(
+            owner,
+            attachment_id,
+            "needs_ocr",
+            Some(&bound(reason, 700)),
+            None,
+        )
+    }
+
+    /// Complete the provider side of the scanned-PDF planner after the active
+    /// run has selected an exact model. `Unknown` is represented by false at
+    /// this boundary and therefore cannot grant a file or vision operation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_pending_pdf_with_fallback(
+        &self,
+        owner: &str,
+        session_id: &str,
+        attachment_id: &str,
+        prompt: &str,
+        provider_name: &str,
+        account_or_profile_id: Option<&str>,
+        model: &str,
+        capabilities: PdfFallbackCapabilities,
+        provider: &dyn PdfFallbackProvider,
+        cancellation: &CancellationToken,
+    ) -> Result<PdfProcessingPath> {
+        let Some(record) = self.storage.attachment(owner, attachment_id)? else {
+            return Err(anyhow!("attachment not found for owner"));
+        };
+        if record.session_id != session_id {
+            return Err(anyhow!("attachment is not in the selected session"));
+        }
+        if record.detected_mime != "application/pdf"
+            || !matches!(record.processing_status.as_str(), "needs_ocr" | "blocked")
+        {
+            return Ok(if record.processing_status == "ready" {
+                PdfProcessingPath::EmbeddedText
+            } else {
+                PdfProcessingPath::Blocked
+            });
+        }
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("attachment processing cancelled"));
+        }
+        let path = Path::new(&record.local_path);
+        if !path.starts_with(self.root()) {
+            return Err(anyhow!("attachment path escaped the controlled store"));
+        }
+        let bytes = fs::read(path)?;
+        if bytes.len() as u64 != record.size_bytes
+            || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
+        {
+            return Err(anyhow!("attachment integrity verification failed"));
+        }
+        let request_base = PdfFallbackRequest {
+            session_id: session_id.to_owned(),
+            attachment_id: attachment_id.to_owned(),
+            original_name: record.original_name.clone(),
+            prompt: bound(prompt, 2_000),
+            provider: provider_name.to_owned(),
+            account_or_profile_id: account_or_profile_id.map(str::to_owned),
+            model: model.to_owned(),
+            pdf: bytes.clone(),
+            rendered_pages: Vec::new(),
+        };
+        let mut errors = Vec::new();
+        if capabilities.file_input {
+            match provider.file_input(&request_base, cancellation).await {
+                Ok(text) if meaningful_text(&text) => {
+                    self.finish_provider_pdf_text(
+                        owner,
+                        attachment_id,
+                        &text,
+                        "provider file input",
+                    )?;
+                    return Ok(PdfProcessingPath::ProviderFileInput);
+                }
+                Ok(_) => errors.push("provider file input returned no meaningful text".into()),
+                Err(error) if error.to_string().contains("cancelled") => return Err(error),
+                Err(error) => errors.push(redact_text(&error.to_string())),
+            }
+        }
+        if capabilities.vision {
+            let rendered = tokio::task::spawn_blocking({
+                let renderer = self.pdf_renderer.clone();
+                let bytes = bytes.clone();
+                let root = self.root().to_path_buf();
+                let config = self.config.clone();
+                let cancellation = cancellation.clone();
+                move || renderer.render_with_cancellation(&bytes, &root, &config, &cancellation)
+            })
+            .await
+            .map_err(|_| anyhow!("PDF renderer terminated unexpectedly"))??;
+            if let Some(rendered_pages) = rendered {
+                if rendered_pages.is_empty() {
+                    errors.push("PDF renderer produced no bounded pages".into());
+                } else {
+                    let mut request = request_base;
+                    request.rendered_pages = rendered_pages;
+                    match provider.vision(&request, cancellation).await {
+                        Ok(text) if meaningful_text(&text) => {
+                            self.finish_provider_pdf_text(
+                                owner,
+                                attachment_id,
+                                &text,
+                                "provider vision",
+                            )?;
+                            return Ok(PdfProcessingPath::ProviderVision);
+                        }
+                        Ok(_) => errors.push("provider vision returned no meaningful text".into()),
+                        Err(error) if error.to_string().contains("cancelled") => return Err(error),
+                        Err(error) => errors.push(redact_text(&error.to_string())),
+                    }
+                }
+            } else {
+                errors.push("bounded PDF rendering is unavailable".into());
+            }
+        }
+        let detail = if errors.is_empty() {
+            "PDF has no embedded text and the selected model has no explicitly supported fallback path".into()
+        } else {
+            format!("PDF fallback blocked: {}", bound(&errors.join("; "), 700))
+        };
+        self.storage
+            .set_attachment_status(owner, attachment_id, "blocked", Some(&detail), None)?;
+        Ok(PdfProcessingPath::Blocked)
+    }
+
+    fn finish_provider_pdf_text(
+        &self,
+        owner: &str,
+        attachment_id: &str,
+        text: &str,
+        path: &str,
+    ) -> Result<()> {
+        let normalized = normalize_text(text);
+        if !meaningful_text(&normalized) {
+            return self.storage.set_attachment_status(
+                owner,
+                attachment_id,
+                "blocked",
+                Some("provider PDF fallback returned no meaningful text"),
+                None,
+            );
+        }
+        let chunks = chunk_text(attachment_id, &normalized, self.config.chunk_chars);
+        self.storage
+            .replace_attachment_chunks(owner, attachment_id, &chunks)?;
+        self.storage.set_attachment_status(
+            owner,
+            attachment_id,
+            "ready",
+            Some(&format!(
+                "Scanned PDF; {} indexed {} characters in {} chunks",
+                path,
+                normalized.chars().count(),
+                chunks.len()
+            )),
+            None,
+        )
+    }
+
+    fn delete_raw_and_record(&self, owner: &str, attachment_id: &str, raw: &Path) -> Result<()> {
+        if !raw.starts_with(self.root()) {
+            return Err(anyhow!(
+                "refusing to remove attachment outside private store"
+            ));
+        }
+        match fs::remove_file(raw) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.storage.delete_attachment(owner, attachment_id)?;
+        Ok(())
+    }
+
+    pub fn remove(&self, owner: &str, attachment_id: &str) -> Result<bool> {
+        let Some(record) = self.storage.attachment(owner, attachment_id)? else {
+            return Ok(false);
+        };
+        if self
+            .storage
+            .session_has_active_run(owner, &record.session_id)?
+        {
+            return Err(anyhow!("attachment is protected by an active run"));
+        }
+        self.delete_raw_and_record(owner, attachment_id, Path::new(&record.local_path))?;
+        Ok(true)
+    }
+
+    pub fn cleanup_retention(&self, owner: Option<&str>) -> Result<usize> {
+        let cutoff =
+            (Utc::now() - ChronoDuration::days(self.config.retention_days as i64)).to_rfc3339();
+        let mut removed = 0usize;
+        for record in self.storage.attachments_older_than(owner, &cutoff)? {
+            if self
+                .storage
+                .session_has_active_run(&record.owner_id, &record.session_id)?
+            {
+                continue;
+            }
+            self.delete_raw_and_record(
+                &record.owner_id,
+                &record.attachment_id,
+                Path::new(&record.local_path),
+            )?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Reconcile the private store against DB references. Only regular `.bin`
+    /// files under Xiao's attachment root can be removed; active-run referenced
+    /// files are never touched.
+    pub fn cleanup_orphans(&self) -> Result<usize> {
+        let records = self.storage.all_attachment_paths()?;
+        let referenced = records
+            .iter()
+            .map(|(_, _, _, path)| PathBuf::from(path))
+            .collect::<HashSet<_>>();
+        let mut removed = 0usize;
+        for path in attachment_files(self.root())? {
+            if referenced.contains(&path) {
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("bin") {
+                continue;
+            }
+            fs::remove_file(&path)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Remove raw files whose owning session was already deleted by the
+    /// transactional SessionService. The database row is deleted first; this
+    /// post-commit cleanup therefore cannot roll back a committed session
+    /// deletion and only accepts paths inside the private attachment store.
+    pub fn cleanup_deleted_session_paths(&self, paths: &[String]) -> Result<usize> {
+        let root = self
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| self.root().to_path_buf());
+        let mut removed = 0usize;
+        for raw in paths {
+            let path = Path::new(raw);
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow!("deleted attachment path has no parent"))?
+                .canonicalize()
+                .map_err(|_| anyhow!("deleted attachment parent is unavailable"))?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| anyhow!("deleted attachment path has no file name"))?;
+            // Check canonical parent rather than a lexical prefix. A stored
+            // `root/../outside` path or a parent symlink must never reach
+            // post-commit file cleanup outside Xiao's private store.
+            if !parent.starts_with(&root) {
+                return Err(anyhow!("deleted attachment path escaped the private store"));
+            }
+            match fs::remove_file(parent.join(name)) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(removed)
     }
 
     pub fn recent_for_prompt(
@@ -379,6 +1507,31 @@ impl AttachmentManager {
         })?;
         Ok(format!("store={} FTS5 readable", self.root.display()))
     }
+}
+
+fn attachment_files(root: &Path) -> Result<Vec<PathBuf>> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.starts_with(root) {
+                continue;
+            }
+            let ty = entry.file_type()?;
+            if ty.is_symlink() {
+                continue;
+            }
+            if ty.is_dir() {
+                walk(&path, root, out)?;
+            } else if ty.is_file() {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out)?;
+    Ok(out)
 }
 
 #[derive(Debug)]
@@ -552,6 +1705,22 @@ fn chunk_text(attachment_id: &str, text: &str, max_chars: usize) -> Vec<Attachme
     chunks
 }
 
+fn chunk_scanned_pages(
+    attachment_id: &str,
+    pages: &[ScannedPdfPage],
+    max_chars: usize,
+) -> Vec<AttachmentChunkRecord> {
+    let mut output = Vec::new();
+    for page in pages {
+        for mut chunk in chunk_text(attachment_id, &normalize_text(&page.text), max_chars) {
+            chunk.chunk_no = output.len();
+            chunk.page_no = Some(page.page_no);
+            output.push(chunk);
+        }
+    }
+    output
+}
+
 fn normalize_text(value: &str) -> String {
     value
         .replace("\r\n", "\n")
@@ -565,6 +1734,14 @@ fn normalize_text(value: &str) -> String {
         .join("\n\n")
         .trim()
         .to_owned()
+}
+
+fn meaningful_text(value: &str) -> bool {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
+        >= 8
 }
 
 fn references_attachment(prompt: &str) -> bool {
@@ -743,6 +1920,466 @@ mod tests {
         )
         .unwrap();
         (manager, directory, storage, session.id)
+    }
+
+    #[derive(Default)]
+    struct FakeScannedPdf;
+
+    impl ScannedPdfProcessor for FakeScannedPdf {
+        fn extract(
+            &self,
+            _pdf: &[u8],
+            _scratch_root: &Path,
+            _config: &AttachmentConfig,
+        ) -> Result<Option<Vec<ScannedPdfPage>>> {
+            Ok(Some(vec![
+                ScannedPdfPage {
+                    page_no: 1,
+                    text: "Invoice alpha marker cedar-summit".into(),
+                },
+                ScannedPdfPage {
+                    page_no: 2,
+                    text: "Second page contains verified OCR evidence".into(),
+                },
+            ]))
+        }
+    }
+
+    #[derive(Default)]
+    struct NoLocalOcr;
+
+    impl ScannedPdfProcessor for NoLocalOcr {
+        fn extract(
+            &self,
+            _pdf: &[u8],
+            _scratch_root: &Path,
+            _config: &AttachmentConfig,
+        ) -> Result<Option<Vec<ScannedPdfPage>>> {
+            Ok(None)
+        }
+    }
+
+    struct FakePdfRenderer {
+        pages: Vec<RenderedPdfPage>,
+    }
+
+    impl PdfPageRenderer for FakePdfRenderer {
+        fn render(
+            &self,
+            _pdf: &[u8],
+            _scratch_root: &Path,
+            _config: &AttachmentConfig,
+        ) -> Result<Option<Vec<RenderedPdfPage>>> {
+            Ok(Some(self.pages.clone()))
+        }
+    }
+
+    struct RecordingPdfProvider {
+        calls: Arc<Mutex<Vec<(String, usize)>>>,
+        response: String,
+        started: Option<Arc<tokio::sync::Notify>>,
+        wait_for_cancellation: bool,
+    }
+
+    impl RecordingPdfProvider {
+        fn new(response: &str) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                response: response.into(),
+                started: None,
+                wait_for_cancellation: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PdfFallbackProvider for RecordingPdfProvider {
+        async fn file_input(
+            &self,
+            request: &PdfFallbackRequest,
+            cancellation: &CancellationToken,
+        ) -> Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("file_input".into(), request.rendered_pages.len()));
+            if let Some(started) = &self.started {
+                started.notify_one();
+            }
+            if self.wait_for_cancellation {
+                cancellation.cancelled().await;
+                return Err(anyhow!("attachment provider file input cancelled"));
+            }
+            Ok(self.response.clone())
+        }
+
+        async fn vision(
+            &self,
+            request: &PdfFallbackRequest,
+            cancellation: &CancellationToken,
+        ) -> Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("vision".into(), request.rendered_pages.len()));
+            if let Some(started) = &self.started {
+                started.notify_one();
+            }
+            if self.wait_for_cancellation {
+                cancellation.cancelled().await;
+                return Err(anyhow!("attachment provider vision cancelled"));
+            }
+            Ok(self.response.clone())
+        }
+    }
+
+    fn pending_pdf() -> (
+        AttachmentManager,
+        tempfile::TempDir,
+        Arc<Storage>,
+        String,
+        String,
+    ) {
+        let (manager, directory, storage, session) = manager();
+        let manager = manager.with_scanned_pdf_processor(Arc::new(NoLocalOcr));
+        let record = manager
+            .ingest(AttachmentIngest {
+                owner_id: "owner:test".into(),
+                session_id: session.clone(),
+                telegram_file_id: None,
+                telegram_unique_id: Some(Uuid::new_v4().to_string()),
+                original_name: "scan.pdf".into(),
+                declared_mime: Some("application/pdf".into()),
+                expected_kind: AttachmentKind::Document,
+                bytes: text_pdf(""),
+            })
+            .unwrap();
+        assert_eq!(record.processing_status, "needs_ocr");
+        (manager, directory, storage, session, record.attachment_id)
+    }
+
+    #[tokio::test]
+    async fn scanned_pdf_provider_file_input_path_is_durable_and_real() {
+        let (manager, _directory, storage, session, attachment_id) = pending_pdf();
+        let provider = RecordingPdfProvider::new("provider extracted scanned PDF text");
+        let calls = provider.calls.clone();
+        let result = manager
+            .process_pending_pdf_with_fallback(
+                "owner:test",
+                &session,
+                &attachment_id,
+                "summarize this document",
+                "custom",
+                Some("profile-a"),
+                "model-a",
+                PdfFallbackCapabilities {
+                    file_input: true,
+                    vision: true,
+                },
+                &provider,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, PdfProcessingPath::ProviderFileInput);
+        assert_eq!(calls.lock().unwrap().as_slice(), [("file_input".into(), 0)]);
+        assert_eq!(
+            storage
+                .attachment("owner:test", &attachment_id)
+                .unwrap()
+                .unwrap()
+                .processing_status,
+            "ready"
+        );
+        assert!(!storage
+            .search_attachment_chunks("owner:test", &session, "provider extracted", 5)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn scanned_pdf_provider_vision_renders_pages_before_calling_provider() {
+        let (manager, _directory, storage, session, attachment_id) = pending_pdf();
+        let manager = manager.with_pdf_page_renderer(Arc::new(FakePdfRenderer {
+            pages: vec![RenderedPdfPage {
+                page_no: 1,
+                bytes: b"bounded-rendered-page".to_vec(),
+                mime_type: "image/png".into(),
+                width: 100,
+                height: 100,
+            }],
+        }));
+        let provider = RecordingPdfProvider::new("vision extracted scanned PDF text");
+        let calls = provider.calls.clone();
+        let result = manager
+            .process_pending_pdf_with_fallback(
+                "owner:test",
+                &session,
+                &attachment_id,
+                "read this scan",
+                "custom",
+                Some("profile-a"),
+                "model-vision",
+                PdfFallbackCapabilities {
+                    file_input: false,
+                    vision: true,
+                },
+                &provider,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, PdfProcessingPath::ProviderVision);
+        assert_eq!(calls.lock().unwrap().as_slice(), [("vision".into(), 1)]);
+        assert_eq!(
+            storage
+                .attachment("owner:test", &attachment_id)
+                .unwrap()
+                .unwrap()
+                .processing_status,
+            "ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn scanned_pdf_unknown_or_unsupported_capabilities_are_blocked_explicitly() {
+        let (manager, _directory, storage, session, attachment_id) = pending_pdf();
+        let provider = RecordingPdfProvider::new("must not be called");
+        let result = manager
+            .process_pending_pdf_with_fallback(
+                "owner:test",
+                &session,
+                &attachment_id,
+                "read this scan",
+                "custom",
+                Some("profile-a"),
+                "model-unknown",
+                PdfFallbackCapabilities::default(),
+                &provider,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, PdfProcessingPath::Blocked);
+        assert!(provider.calls.lock().unwrap().is_empty());
+        let record = storage
+            .attachment("owner:test", &attachment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.processing_status, "blocked");
+        assert!(record
+            .summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no explicitly supported fallback path"));
+    }
+
+    #[tokio::test]
+    async fn scanned_pdf_provider_fallback_honors_run_cancellation() {
+        let (manager, _directory, storage, session, attachment_id) = pending_pdf();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = RecordingPdfProvider {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            response: "never returned".into(),
+            started: Some(started.clone()),
+            wait_for_cancellation: true,
+        };
+        let cancellation = CancellationToken::new();
+        let task_session = session.clone();
+        let task_attachment_id = attachment_id.clone();
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                manager
+                    .process_pending_pdf_with_fallback(
+                        "owner:test",
+                        &task_session,
+                        &task_attachment_id,
+                        "cancel this scan",
+                        "custom",
+                        Some("profile-a"),
+                        "model-a",
+                        PdfFallbackCapabilities {
+                            file_input: true,
+                            vision: false,
+                        },
+                        &provider,
+                        &cancellation,
+                    )
+                    .await
+            }
+        });
+        started.notified().await;
+        cancellation.cancel();
+        let error = task.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("cancelled"));
+        assert_eq!(
+            storage
+                .attachment("owner:test", &attachment_id)
+                .unwrap()
+                .unwrap()
+                .processing_status,
+            "needs_ocr"
+        );
+    }
+
+    #[test]
+    fn scanned_pdf_uses_bounded_processor_and_indexes_page_chunks() {
+        let (manager, _directory, storage, session) = manager();
+        let manager = manager.with_scanned_pdf_processor(Arc::new(FakeScannedPdf));
+        let record = manager
+            .ingest(AttachmentIngest {
+                owner_id: "owner:test".into(),
+                session_id: session.clone(),
+                telegram_file_id: None,
+                telegram_unique_id: Some("scan-1".into()),
+                original_name: "scan.pdf".into(),
+                declared_mime: Some("application/pdf".into()),
+                expected_kind: AttachmentKind::Document,
+                bytes: text_pdf(""),
+            })
+            .unwrap();
+        assert_eq!(record.processing_status, "ready");
+        let hits = storage
+            .search_attachment_chunks("owner:test", &session, "cedar summit", 5)
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].page_no, Some(1));
+        assert!(hits[0].text.contains("cedar-summit"));
+    }
+
+    #[test]
+    fn malformed_failed_attachment_is_deleted_when_failed_retention_is_off() {
+        let (manager, _directory, storage, session) = manager();
+        let result = manager.ingest(AttachmentIngest {
+            owner_id: "owner:test".into(),
+            session_id: session.clone(),
+            telegram_file_id: None,
+            telegram_unique_id: None,
+            original_name: "broken.pdf".into(),
+            declared_mime: Some("application/pdf".into()),
+            expected_kind: AttachmentKind::Document,
+            bytes: b"%PDF-1.7 definitely not a valid pdf body".to_vec(),
+        });
+        assert!(result.is_err());
+        assert!(storage
+            .recent_attachments("owner:test", &session, 10)
+            .unwrap()
+            .is_empty());
+        assert!(attachment_files(manager.root()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn owner_and_global_quota_are_accounted_from_durable_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let session_a = storage
+            .create_session("owner:test", "A", "custom", None, "m", false, None)
+            .unwrap();
+        let session_b = storage
+            .create_session("owner:test", "B", "custom", None, "m", false, None)
+            .unwrap();
+        let config = AttachmentConfig {
+            max_owner_bytes: 70,
+            max_global_bytes: 80,
+            max_session_bytes: 80,
+            ..AttachmentConfig::default()
+        };
+        let manager = AttachmentManager::new(storage.clone(), directory.path(), config).unwrap();
+        let first = b"first durable attachment has enough meaningful text".to_vec();
+        manager
+            .ingest(AttachmentIngest {
+                owner_id: "owner:test".into(),
+                session_id: session_a.id,
+                telegram_file_id: None,
+                telegram_unique_id: None,
+                original_name: "a.txt".into(),
+                declared_mime: Some("text/plain".into()),
+                expected_kind: AttachmentKind::Document,
+                bytes: first.clone(),
+            })
+            .unwrap();
+        let usage = manager.usage("owner:test").unwrap();
+        assert_eq!(usage.owner_bytes, first.len() as u64);
+        assert_eq!(usage.global_bytes, first.len() as u64);
+        let second = manager.ingest(AttachmentIngest {
+            owner_id: "owner:test".into(),
+            session_id: session_b.id,
+            telegram_file_id: None,
+            telegram_unique_id: None,
+            original_name: "b.txt".into(),
+            declared_mime: Some("text/plain".into()),
+            expected_kind: AttachmentKind::Document,
+            bytes: b"second attachment pushes owner storage over quota".to_vec(),
+        });
+        assert!(second
+            .unwrap_err()
+            .to_string()
+            .contains("owner storage quota"));
+    }
+
+    #[test]
+    fn orphan_cleanup_only_removes_unreferenced_bin_files() {
+        let (manager, _directory, _storage, _session) = manager();
+        let orphan = manager.root().join("orphan.bin");
+        let keep = manager.root().join("note.txt");
+        fs::write(&orphan, b"orphan").unwrap();
+        fs::write(&keep, b"not managed raw attachment").unwrap();
+        assert_eq!(manager.cleanup_orphans().unwrap(), 1);
+        assert!(!orphan.exists());
+        assert!(keep.exists());
+    }
+
+    #[test]
+    fn deleted_session_cleanup_rejects_lexically_prefixed_escape_paths() {
+        let (manager, directory, _storage, _session) = manager();
+        let outside = directory.path().join("outside.bin");
+        fs::write(&outside, b"must survive").unwrap();
+        let escape = manager.root().join("..").join("outside.bin");
+
+        assert!(manager
+            .cleanup_deleted_session_paths(&[escape.display().to_string()])
+            .is_err());
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn active_run_protects_attachment_from_manual_and_retention_cleanup() {
+        let (mut manager, _directory, storage, session) = manager();
+        manager.config.retention_days = 1;
+        let record = manager
+            .ingest(AttachmentIngest {
+                owner_id: "owner:test".into(),
+                session_id: session.clone(),
+                telegram_file_id: None,
+                telegram_unique_id: None,
+                original_name: "protected.txt".into(),
+                declared_mime: Some("text/plain".into()),
+                expected_kind: AttachmentKind::Document,
+                bytes: b"active run attachment protection sentinel".to_vec(),
+            })
+            .unwrap();
+        storage
+            .with_conn(|connection| {
+                connection.execute(
+                    "UPDATE attachments SET created_at='2000-01-01T00:00:00Z' WHERE attachment_id=?",
+                    rusqlite::params![record.attachment_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .create_agent_run(
+                "owner:test",
+                &session,
+                "custom",
+                "m",
+                Some("protect attachment"),
+            )
+            .unwrap();
+        assert!(manager.remove("owner:test", &record.attachment_id).is_err());
+        assert_eq!(manager.cleanup_retention(Some("owner:test")).unwrap(), 0);
+        assert!(Path::new(&record.local_path).exists());
     }
 
     #[test]

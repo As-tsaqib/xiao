@@ -37,8 +37,13 @@ impl AppConfig {
             return Ok(Self::default());
         }
         let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let config: Self =
+        let mut config: Self =
             toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        // v0.2.7 config migration: a single legacy allowed_user_ids entry is
+        // unambiguous and becomes the canonical owner. Multiple entries are
+        // intentionally preserved as a resolution-required state; Xiao must
+        // never silently choose one.
+        config.telegram.access.migrate_legacy_owner();
         config.validate()?;
         Ok(config)
     }
@@ -76,6 +81,14 @@ impl AppConfig {
         if self.telegram.transport != "long_polling" {
             return Err(anyhow!("telegram.transport must be long_polling"));
         }
+        if self.telegram.access.owner_user_id.is_some_and(|id| id <= 0) {
+            return Err(anyhow!("telegram.access.owner_user_id must be positive"));
+        }
+        if self.telegram.access.allowed_chat_ids.contains(&0) {
+            return Err(anyhow!(
+                "telegram.access.allowed_chat_ids cannot contain zero"
+            ));
+        }
         if self.telegram.ui.menu_ttl_seconds == 0 {
             return Err(anyhow!("telegram.ui.menu_ttl_seconds must be > 0"));
         }
@@ -111,6 +124,9 @@ impl AppConfig {
             || !(64 * 1024..=200 * 1024 * 1024).contains(&self.attachments.max_document_bytes)
             || self.attachments.max_session_bytes < self.attachments.max_document_bytes
             || self.attachments.max_session_bytes > 1024 * 1024 * 1024
+            || self.attachments.max_owner_bytes < self.attachments.max_session_bytes
+            || self.attachments.max_global_bytes < self.attachments.max_owner_bytes
+            || self.attachments.max_global_bytes > 16 * 1024 * 1024 * 1024
         {
             return Err(anyhow!("attachment byte limits are invalid"));
         }
@@ -118,6 +134,10 @@ impl AppConfig {
             || !(512..=16_384).contains(&self.attachments.chunk_chars)
             || !(1..=20).contains(&self.attachments.retrieval_chunks)
             || !(1..=120).contains(&self.attachments.processing_timeout_seconds)
+            || !(1..=200).contains(&self.attachments.max_pdf_pages)
+            || !(1_000_000..=100_000_000).contains(&self.attachments.max_pdf_page_pixels)
+            || !(1..=120).contains(&self.attachments.ocr_page_timeout_seconds)
+            || !(1..=3650).contains(&self.attachments.retention_days)
         {
             return Err(anyhow!("attachment processing limits are invalid"));
         }
@@ -241,6 +261,20 @@ pub struct AttachmentConfig {
     pub max_document_bytes: u64,
     #[serde(default = "default_attachment_session_bytes")]
     pub max_session_bytes: u64,
+    #[serde(default = "default_attachment_owner_bytes")]
+    pub max_owner_bytes: u64,
+    #[serde(default = "default_attachment_global_bytes")]
+    pub max_global_bytes: u64,
+    #[serde(default = "default_attachment_retention_days")]
+    pub retention_days: u64,
+    #[serde(default)]
+    pub retain_failed: bool,
+    #[serde(default = "default_attachment_pdf_pages")]
+    pub max_pdf_pages: usize,
+    #[serde(default = "default_attachment_pdf_page_pixels")]
+    pub max_pdf_page_pixels: u64,
+    #[serde(default = "default_attachment_ocr_timeout")]
+    pub ocr_page_timeout_seconds: u64,
     #[serde(default = "default_attachment_image_pixels")]
     pub max_image_pixels: u64,
     #[serde(default = "default_attachment_text_chars")]
@@ -259,6 +293,13 @@ impl Default for AttachmentConfig {
             max_image_bytes: default_attachment_image_bytes(),
             max_document_bytes: default_attachment_document_bytes(),
             max_session_bytes: default_attachment_session_bytes(),
+            max_owner_bytes: default_attachment_owner_bytes(),
+            max_global_bytes: default_attachment_global_bytes(),
+            retention_days: default_attachment_retention_days(),
+            retain_failed: false,
+            max_pdf_pages: default_attachment_pdf_pages(),
+            max_pdf_page_pixels: default_attachment_pdf_page_pixels(),
+            ocr_page_timeout_seconds: default_attachment_ocr_timeout(),
             max_image_pixels: default_attachment_image_pixels(),
             max_extracted_text_chars: default_attachment_text_chars(),
             chunk_chars: default_attachment_chunk_chars(),
@@ -355,10 +396,41 @@ impl Default for TelegramConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TelegramAccess {
+    /// Canonical Xiao owner. Telegram authorization is always bound to this
+    /// user id; chat ids only constrain where this owner may interact.
+    #[serde(default)]
+    pub owner_user_id: Option<i64>,
     #[serde(default)]
     pub allowed_chat_ids: Vec<i64>,
-    #[serde(default)]
+    /// Legacy v0.2.6 migration input. Never emit it again. Zero means setup is
+    /// required, one is migrated automatically, and multiple require explicit
+    /// owner resolution via the shared setup service.
+    #[serde(default, skip_serializing)]
     pub allowed_user_ids: Vec<i64>,
+}
+
+impl TelegramAccess {
+    pub fn migrate_legacy_owner(&mut self) {
+        self.allowed_chat_ids.sort_unstable();
+        self.allowed_chat_ids.dedup();
+        self.allowed_user_ids.sort_unstable();
+        self.allowed_user_ids.dedup();
+        if self.owner_user_id.is_none() && self.allowed_user_ids.len() == 1 {
+            self.owner_user_id = self.allowed_user_ids.first().copied();
+            self.allowed_user_ids.clear();
+        } else if self.owner_user_id.is_some() {
+            // An explicit canonical owner resolves any stale legacy list.
+            self.allowed_user_ids.clear();
+        }
+    }
+
+    pub fn owner_resolution_required(&self) -> bool {
+        self.owner_user_id.is_none() && self.allowed_user_ids.len() > 1
+    }
+
+    pub fn setup_required(&self) -> bool {
+        self.owner_user_id.is_none() && self.allowed_user_ids.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -633,6 +705,24 @@ fn default_attachment_document_bytes() -> u64 {
 fn default_attachment_session_bytes() -> u64 {
     200 * 1024 * 1024
 }
+fn default_attachment_owner_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_attachment_global_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+fn default_attachment_retention_days() -> u64 {
+    30
+}
+fn default_attachment_pdf_pages() -> usize {
+    40
+}
+fn default_attachment_pdf_page_pixels() -> u64 {
+    20_000_000
+}
+fn default_attachment_ocr_timeout() -> u64 {
+    20
+}
 fn default_attachment_image_pixels() -> u64 {
     40_000_000
 }
@@ -737,6 +827,48 @@ mod tests {
             PathBuf::from("/tmp/xiao-user/data/xiao.db")
         );
         assert!(!c.telegram.enabled);
+    }
+
+    #[test]
+    fn legacy_owner_migration_requires_exactly_one_or_explicit_resolution() {
+        let mut zero = TelegramAccess::default();
+        zero.migrate_legacy_owner();
+        assert!(zero.setup_required());
+        assert!(!zero.owner_resolution_required());
+
+        let mut one = TelegramAccess {
+            owner_user_id: None,
+            allowed_user_ids: vec![42],
+            allowed_chat_ids: vec![-100],
+        };
+        one.migrate_legacy_owner();
+        assert_eq!(one.owner_user_id, Some(42));
+        assert!(one.allowed_user_ids.is_empty());
+        assert_eq!(one.allowed_chat_ids, vec![-100]);
+
+        let mut many = TelegramAccess {
+            owner_user_id: None,
+            allowed_user_ids: vec![42, 43],
+            allowed_chat_ids: vec![-100],
+        };
+        many.migrate_legacy_owner();
+        assert_eq!(many.owner_user_id, None);
+        assert!(many.owner_resolution_required());
+        assert!(!many.setup_required());
+        assert_eq!(many.allowed_user_ids, vec![42, 43]);
+    }
+
+    #[test]
+    fn explicit_owner_clears_legacy_owner_candidates() {
+        let mut access = TelegramAccess {
+            owner_user_id: Some(99),
+            allowed_user_ids: vec![42, 43],
+            allowed_chat_ids: vec![-100],
+        };
+        access.migrate_legacy_owner();
+        assert_eq!(access.owner_user_id, Some(99));
+        assert!(access.allowed_user_ids.is_empty());
+        assert!(!access.owner_resolution_required());
     }
 
     #[test]

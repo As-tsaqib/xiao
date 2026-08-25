@@ -1,4 +1,6 @@
-use crate::presentation::{Block, ProgressActivity, ProgressItem, ProgressState, RichText, View};
+use std::collections::HashMap;
+
+use crate::presentation::{Block, ProgressIcon, ProgressItem, ProgressState, RichText, View};
 use serde_json::{json, Value};
 
 const AI_ACTION_THINKING: &str = "5535034915403333642";
@@ -10,7 +12,92 @@ const AI_ACTION_CODING: &str = "5537247356136718385";
 const AI_ACTION_MEDIA: &str = "5537727026674270220";
 const AI_ACTION_WRITING: &str = "5537203062138994712";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramEmoji {
+    pub custom_emoji_id: Option<String>,
+    pub fallback: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct TelegramEmojiRegistry {
+    entries: HashMap<ProgressIcon, TelegramEmoji>,
+}
+
+impl Default for TelegramEmojiRegistry {
+    fn default() -> Self {
+        let mut entries = HashMap::new();
+        for (icon, id, fallback) in [
+            (ProgressIcon::Thinking, AI_ACTION_THINKING, "💭"),
+            (ProgressIcon::Analyzing, AI_ACTION_ANALYZING, "🧠"),
+            (ProgressIcon::WebSearch, AI_ACTION_SEARCHING, "🔎"),
+            (ProgressIcon::FileSearch, AI_ACTION_SEARCHING, "📁"),
+            (ProgressIcon::Fetching, AI_ACTION_FETCHING, "🌐"),
+            (ProgressIcon::DocumentRead, AI_ACTION_ANALYZING, "📄"),
+            (ProgressIcon::ImageInspect, AI_ACTION_MEDIA, "🖼️"),
+            (ProgressIcon::Terminal, AI_ACTION_TOOL, "⌘"),
+            (ProgressIcon::Coding, AI_ACTION_CODING, "💻"),
+            (ProgressIcon::Editing, AI_ACTION_CODING, "✎"),
+            (ProgressIcon::Installing, AI_ACTION_TOOL, "📦"),
+            (ProgressIcon::Testing, AI_ACTION_TOOL, "🧪"),
+            (ProgressIcon::Tool, AI_ACTION_TOOL, "⚙️"),
+            (ProgressIcon::Writing, AI_ACTION_WRITING, "✨"),
+            (ProgressIcon::Audio, AI_ACTION_MEDIA, "🔊"),
+            (ProgressIcon::Video, AI_ACTION_MEDIA, "🎬"),
+        ] {
+            entries.insert(
+                icon,
+                TelegramEmoji {
+                    custom_emoji_id: Some(id.to_owned()),
+                    fallback,
+                },
+            );
+        }
+        Self { entries }
+    }
+}
+
+impl TelegramEmojiRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_verified_custom_emoji(
+        &mut self,
+        icon: ProgressIcon,
+        custom_emoji_id: Option<&str>,
+        validated: bool,
+    ) {
+        let fallback = self
+            .entries
+            .get(&icon)
+            .map(|entry| entry.fallback)
+            .unwrap_or("•");
+        let custom_emoji_id = custom_emoji_id
+            .map(str::trim)
+            .filter(|id| validated && !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+            .map(str::to_owned);
+        self.entries.insert(
+            icon,
+            TelegramEmoji {
+                custom_emoji_id,
+                fallback,
+            },
+        );
+    }
+
+    fn get(&self, icon: ProgressIcon) -> TelegramEmoji {
+        self.entries.get(&icon).cloned().unwrap_or(TelegramEmoji {
+            custom_emoji_id: None,
+            fallback: "•",
+        })
+    }
+}
+
 pub fn render(view: &View, draft: bool) -> Value {
+    render_with_registry(view, draft, &TelegramEmojiRegistry::default())
+}
+
+pub fn render_with_registry(view: &View, draft: bool, registry: &TelegramEmojiRegistry) -> Value {
     let mut blocks = Vec::new();
     if view.side_mode {
         blocks.push(json!({"type":"heading","text":"SIDE CHAT SESSION","size":3}));
@@ -19,11 +106,11 @@ pub fn render(view: &View, draft: bool) -> Value {
         blocks.push(json!({"type":"heading","text":title,"size":2}));
     }
     for block in &view.blocks {
-        blocks.extend(render_block(block, draft));
+        blocks.extend(render_block(block, draft, registry));
     }
-    json!({"blocks":blocks})
+    json!({ "blocks": blocks })
 }
-fn render_block(block: &Block, draft: bool) -> Vec<Value> {
+fn render_block(block: &Block, draft: bool, registry: &TelegramEmojiRegistry) -> Vec<Value> {
     match block {
         Block::Heading { level, text } => {
             vec![json!({"type":"heading","text":text,"size":(*level).clamp(1,6)})]
@@ -76,11 +163,11 @@ fn render_block(block: &Block, draft: bool) -> Vec<Value> {
             json!({"type":"list","items":items.iter().map(|x|{if *ordered{json!({"blocks":[{"type":"paragraph","text":rich_text(x)}],"type":"1"})}else{json!({"blocks":[{"type":"paragraph","text":rich_text(x)}]})}}).collect::<Vec<_>>()}),
         ],
         Block::Details { title, blocks } => vec![
-            json!({"type":"details","summary":title,"blocks":blocks.iter().flat_map(|b|render_block(b,draft)).collect::<Vec<_>>()}),
+            json!({"type":"details","summary":title,"blocks":blocks.iter().flat_map(|b|render_block(b,draft,registry)).collect::<Vec<_>>()}),
         ],
         Block::Progress { items } => {
             if draft {
-                vec![json!({"type":"thinking","text":progress_text(items)})]
+                vec![json!({"type":"thinking","text":progress_text(items, registry)})]
             } else {
                 vec![]
             }
@@ -122,14 +209,14 @@ fn rich_text(items: &[RichText]) -> Value {
     }
 }
 
-fn progress_text(items: &[ProgressItem]) -> Value {
+fn progress_text(items: &[ProgressItem], registry: &TelegramEmojiRegistry) -> Value {
     let mut text = Vec::new();
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
             text.push(json!("\n"));
         }
         if item.state == ProgressState::Active {
-            text.push(activity_icon(item.activity));
+            text.push(activity_icon(item.icon, registry));
             text.push(json!(format!(" {}", item.label)));
         } else {
             text.push(json!(format!("{} {}", icon(&item.state), item.label)));
@@ -138,22 +225,17 @@ fn progress_text(items: &[ProgressItem]) -> Value {
     Value::Array(text)
 }
 
-fn activity_icon(activity: ProgressActivity) -> Value {
-    let (custom_emoji_id, alternative_text) = match activity {
-        ProgressActivity::Thinking => (AI_ACTION_THINKING, "💭"),
-        ProgressActivity::Analyzing => (AI_ACTION_ANALYZING, "🧠"),
-        ProgressActivity::Searching => (AI_ACTION_SEARCHING, "🔎"),
-        ProgressActivity::Fetching => (AI_ACTION_FETCHING, "🌐"),
-        ProgressActivity::Tool => (AI_ACTION_TOOL, "⚙️"),
-        ProgressActivity::Coding => (AI_ACTION_CODING, "💻"),
-        ProgressActivity::Media => (AI_ACTION_MEDIA, "🖼️"),
-        ProgressActivity::Writing => (AI_ACTION_WRITING, "✨"),
-    };
-    json!({
-        "type": "custom_emoji",
-        "custom_emoji_id": custom_emoji_id,
-        "alternative_text": alternative_text,
-    })
+fn activity_icon(icon: ProgressIcon, registry: &TelegramEmojiRegistry) -> Value {
+    let emoji = registry.get(icon);
+    if let Some(custom_emoji_id) = emoji.custom_emoji_id {
+        json!({
+            "type": "custom_emoji",
+            "custom_emoji_id": custom_emoji_id,
+            "alternative_text": emoji.fallback,
+        })
+    } else {
+        json!(emoji.fallback)
+    }
 }
 
 fn icon(s: &ProgressState) -> &'static str {
@@ -246,6 +328,7 @@ pub fn plain(view: &View) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::presentation::ProgressActivity;
 
     #[test]
     fn side_marker_is_native_heading() {
@@ -275,8 +358,13 @@ mod tests {
             title: None,
             blocks: vec![Block::Progress {
                 items: vec![ProgressItem {
+                    id: 1,
                     state: ProgressState::Active,
                     activity: ProgressActivity::Searching,
+                    icon: ProgressIcon::WebSearch,
+                    action_key: Some("web_search".into()),
+                    correlation_id: None,
+                    summary: None,
                     label: "Searching the web".into(),
                 }],
             }],
@@ -299,8 +387,13 @@ mod tests {
             title: None,
             blocks: vec![Block::Progress {
                 items: vec![ProgressItem {
+                    id: 1,
                     state: ProgressState::Done,
                     activity: ProgressActivity::Fetching,
+                    icon: ProgressIcon::Fetching,
+                    action_key: Some("web_fetch".into()),
+                    correlation_id: None,
+                    summary: Some("completed".into()),
                     label: "Fetched the page".into(),
                 }],
             }],
@@ -309,5 +402,39 @@ mod tests {
         };
         let rendered = render(&view, true);
         assert_eq!(rendered["blocks"][0]["text"], json!(["✓ Fetched the page"]));
+    }
+
+    #[test]
+    fn invalid_custom_emoji_id_falls_back_to_unicode_without_broken_draft() {
+        let mut registry = TelegramEmojiRegistry::new();
+        registry.set_verified_custom_emoji(ProgressIcon::WebSearch, Some("not-verified"), true);
+        let view = View {
+            title: None,
+            blocks: vec![Block::Progress {
+                items: vec![ProgressItem {
+                    id: 1,
+                    state: ProgressState::Active,
+                    activity: ProgressActivity::Searching,
+                    icon: ProgressIcon::WebSearch,
+                    action_key: Some("web_search".into()),
+                    correlation_id: Some("call-1".into()),
+                    summary: None,
+                    label: "Searching the web".into(),
+                }],
+            }],
+            actions: vec![],
+            side_mode: false,
+        };
+        let rendered = render_with_registry(&view, true, &registry);
+        assert_eq!(rendered["blocks"][0]["text"][0], "🔎");
+        assert!(!rendered.to_string().contains("not-verified"));
+
+        registry.set_verified_custom_emoji(
+            ProgressIcon::WebSearch,
+            Some("5537511986251694100"),
+            false,
+        );
+        let rendered = render_with_registry(&view, true, &registry);
+        assert_eq!(rendered["blocks"][0]["text"][0], "🔎");
     }
 }

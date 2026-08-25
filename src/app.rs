@@ -14,6 +14,7 @@ use crate::{
     owner::OwnerIdentity,
     providers::{ProviderProfileStore, ProviderRegistry, ProviderState},
     runtime::{EnvironmentProbe, RuntimeState},
+    security::secrets::SecretStore,
     session::SessionManager,
     skills::{FilesystemSkills, SkillStore},
     storage::Storage,
@@ -148,13 +149,45 @@ impl AppState {
     }
 
     async fn build_inner(
-        config: AppConfig,
+        mut config: AppConfig,
         config_path: Option<Arc<std::path::PathBuf>>,
     ) -> Result<Self> {
+        config.telegram.access.migrate_legacy_owner();
         config.validate()?;
         let config = Arc::new(RwLock::new(config));
-        let cfg = config.read().await.clone();
+        let mut cfg = config.read().await.clone();
         let storage = Arc::new(Storage::open(&cfg.storage.database)?);
+        // Import legacy file/config Telegram state once into the authoritative
+        // control-plane row. Subsequent setup changes use only SQLite plus
+        // immutable secret references; the TOML remains a compatibility
+        // snapshot rather than a second mutable authority.
+        if storage.telegram_control_needs_legacy_import()? {
+            let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
+            let reference = secrets
+                .get("telegram-bot-token")?
+                .map(|token| secrets.put_versioned("telegram-bot-token", &token))
+                .transpose()?;
+            let identity = storage.setting("telegram_bot_identity")?;
+            storage.import_legacy_telegram_state(
+                cfg.telegram.enabled,
+                cfg.telegram.access.owner_user_id,
+                &cfg.telegram.access.allowed_chat_ids,
+                reference.as_deref(),
+                identity.as_deref(),
+            )?;
+        }
+        // SQLite is the authoritative control plane after the one-time legacy
+        // import above. Refresh the in-memory compatibility config from that
+        // row so a failed/stale TOML snapshot cannot disable Telegram or
+        // reintroduce an old owner binding after restart. This does not make
+        // the TOML a second authority; it is only a runtime projection.
+        if let Some(control) = storage.telegram_control_state()? {
+            cfg.telegram.enabled = control.enabled;
+            cfg.telegram.access.owner_user_id = control.owner_user_id;
+            cfg.telegram.access.allowed_chat_ids = control.allowed_chat_ids;
+            cfg.telegram.access.allowed_user_ids.clear();
+            *config.write().await = cfg.clone();
+        }
         let identity = Arc::new(IdentityWorkspace::new(cfg.paths.data_dir.clone()));
         let runtime = Arc::new(RuntimeState::initialize(
             identity.clone(),
@@ -171,24 +204,45 @@ impl AppState {
             cfg.paths.data_dir.clone(),
             cfg.attachments.clone(),
         )?);
+        // Startup reconciliation is safe after Storage::open has quarantined any
+        // interrupted runs. Retention/orphan cleanup never crosses the private
+        // attachment root and protects sessions with live runs.
+        if let Err(error) = attachments.cleanup_retention(None) {
+            tracing::warn!(error = %error, "attachment retention cleanup failed");
+        }
+        if let Err(error) = attachments.cleanup_orphans() {
+            tracing::warn!(error = %error, "attachment orphan cleanup failed");
+        }
+        if let Err(error) = storage.cleanup_attachment_reservations() {
+            tracing::warn!(error = %error, "attachment reservation cleanup failed");
+        }
+        if let Err(error) = storage.cleanup_orphan_attachment_reservations() {
+            tracing::warn!(error = %error, "orphan attachment reservation cleanup failed");
+        }
         let auth = Arc::new(AuthManager::with_config(
             storage.clone(),
             cfg.paths.secrets_dir.clone(),
             config.clone(),
         ));
         let profiles = ProviderProfileStore::new(storage.clone());
-        for telegram_user_id in &cfg.telegram.access.allowed_user_ids {
-            let migration = storage.ensure_telegram_owner(*telegram_user_id)?;
+        // Migrate the singleton Custom compatibility profile only for the
+        // already-authoritative Telegram binding. Do not consult the TOML
+        // owner field here: changing that file must never rekey or rebind an
+        // installation. Ambiguous legacy data remains fail-closed until the
+        // setup service receives an explicit resolution decision.
+        if storage.owner_resolution_candidates()?.is_empty()
+            && storage
+                .telegram_control_state()?
+                .is_some_and(|control| control.owner_user_id.is_some())
+        {
+            let owner_id = storage.management_owner_id()?;
             let legacy_credential = auth
                 .accounts(Some("custom"))?
                 .into_iter()
                 .find(|account| account.status == "connected")
                 .map(|account| account.id);
-            let _ = profiles.migrate_singleton(
-                &migration.owner_id,
-                &cfg.providers.custom,
-                legacy_credential,
-            )?;
+            let _ =
+                profiles.migrate_singleton(&owner_id, &cfg.providers.custom, legacy_credential)?;
         }
         let providers = Arc::new(ProviderRegistry::new(cfg.clone(), auth.clone()));
         for provider_id in providers.list() {
@@ -209,6 +263,8 @@ impl AppState {
                                 == crate::providers::ToolProtocol::Native,
                             structured_output: capabilities.structured_output,
                             continuation: capabilities.continuation,
+                            probe_status: "completed".into(),
+                            probe_version: 1,
                             probed_at: chrono::Utc::now().to_rfc3339(),
                             evidence: capabilities.evidence,
                         },
@@ -275,9 +331,8 @@ impl AppState {
     /// Resolve Telegram authorization identity separately from conversation
     /// scope and reconcile owner-global living state after any legacy rekey.
     pub fn resolve_telegram_owner(&self, telegram_user_id: i64) -> Result<OwnerIdentity> {
-        let owner = OwnerIdentity::telegram(telegram_user_id);
         let migration = self.storage.ensure_telegram_owner(telegram_user_id)?;
-        debug_assert_eq!(migration.owner_id, owner.owner_id);
+        let owner = OwnerIdentity::from_owner_id(migration.owner_id);
         MemoryStore::with_workspace(self.storage.clone(), self.identity.clone())
             .reconcile(owner.as_str())?;
         FilesystemSkills::new(
@@ -405,6 +460,43 @@ mod tests {
                 .len(),
             1
         );
+
+        // Telegram authentication is a replaceable binding. Replacing it
+        // must leave the durable installation owner and every owner-scoped
+        // record under the same key.
+        let replacement = app.resolve_telegram_owner(43).unwrap();
+        assert_eq!(replacement, owner);
+        assert_eq!(app.storage.management_owner_id().unwrap(), owner.owner_id);
+        assert_eq!(
+            memory.list(replacement.as_str(), None, 10).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            SkillStore::new(app.storage.clone())
+                .list_all(replacement.as_str(), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            ProviderProfileStore::new(app.storage.clone())
+                .list(replacement.as_str())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(app
+            .storage
+            .with_conn(|connection| {
+                let binding: String = connection.query_row(
+                    "SELECT external_id FROM owner_bindings WHERE owner_id=? AND binding_kind='telegram_user'",
+                    rusqlite::params![replacement.owner_id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(binding, "43");
+                Ok(())
+            })
+            .is_ok());
     }
 
     #[tokio::test]
@@ -417,7 +509,7 @@ mod tests {
         config.paths.secrets_dir = directory.path().join("secrets");
         let app = AppState::build(config).await.unwrap();
         let local = app.storage.management_owner_id().unwrap();
-        assert_eq!(local, "owner:local");
+        assert!(local.starts_with("owner:installation:"));
 
         let credential = app
             .auth
@@ -531,7 +623,7 @@ mod tests {
             .unwrap();
 
         let owner = app.resolve_telegram_owner(42).unwrap();
-        assert_eq!(owner.as_str(), "owner:telegram:42");
+        assert_eq!(owner.as_str(), local);
         assert_eq!(app.storage.management_owner_id().unwrap(), owner.as_str());
         assert!(app
             .storage

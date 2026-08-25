@@ -17,7 +17,10 @@ use crate::{
     context::{ContextEngine, SessionHistoryStore},
     learning::{LearningEvaluator, LearningTrace, SafeToolObservation},
     memory::{MemoryEvaluator, MemoryStore},
-    providers::{AgentEvent, ProviderRegistry, ProviderRequest, ProviderStep, ToolProtocol},
+    providers::{
+        AgentEvent, ProviderPdfFallback, ProviderRegistry, ProviderRequest, ProviderStep,
+        ToolProtocol,
+    },
     runtime::{
         DependencyResolver, ProcessExecutor, RuntimeState, SystemAndroidBroker, TermuxExecutor,
         TermuxPackageBackend, TermuxRepositoryBackend,
@@ -265,6 +268,8 @@ impl AgentEngine {
                 runtime.clone(),
                 attachments.clone(),
             )
+        } else if let Some(attachments) = &attachments {
+            ContextEngine::with_attachments(storage.clone(), config.clone(), attachments.clone())
         } else {
             ContextEngine::new(storage.clone(), config.clone())
         };
@@ -304,7 +309,7 @@ impl AgentEngine {
         self.active
             .lock()
             .unwrap()
-            .get(&run_key(principal, scope))
+            .get(&run_key(principal, scope, None))
             .map(|t| {
                 t.cancel();
                 true
@@ -315,7 +320,26 @@ impl AgentEngine {
     pub fn is_active_in_scope(&self, principal: &str, scope: Option<TelegramScope>) -> bool {
         self.active
             .lock()
-            .map(|active| active.contains_key(&run_key(principal, scope)))
+            .map(|active| active.contains_key(&run_key(principal, scope, None)))
+            .unwrap_or(false)
+    }
+
+    pub fn cancel_session(&self, principal: &str, session_id: &str) -> bool {
+        self.active
+            .lock()
+            .unwrap()
+            .get(&run_key(principal, None, Some(session_id)))
+            .map(|token| {
+                token.cancel();
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn is_active_session(&self, principal: &str, session_id: &str) -> bool {
+        self.active
+            .lock()
+            .map(|active| active.contains_key(&run_key(principal, None, Some(session_id))))
             .unwrap_or(false)
     }
 
@@ -325,7 +349,8 @@ impl AgentEngine {
         prompt: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        self.run(principal, None, prompt, true, progress).await
+        self.run(principal, None, None, prompt, true, progress, None)
+            .await
     }
 
     pub async fn submit_with_progress_in_scope(
@@ -335,8 +360,73 @@ impl AgentEngine {
         prompt: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        self.run(principal, Some(scope), prompt, true, progress)
+        self.run(principal, Some(scope), None, prompt, true, progress, None)
             .await
+    }
+
+    /// Run a Telegram request under the caller's cancellation lineage.  The
+    /// adapter uses one parent token for download, ingestion, provider work
+    /// and tools so `/stop` can interrupt the whole message work item.
+    pub async fn submit_with_progress_in_scope_with_cancellation(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        prompt: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        cancellation: CancellationToken,
+    ) -> Result<AgentAnswer> {
+        self.run(
+            principal,
+            Some(scope),
+            None,
+            prompt,
+            true,
+            progress,
+            Some(cancellation),
+        )
+        .await
+    }
+
+    pub async fn submit_to_session_with_progress(
+        &self,
+        principal: &str,
+        session_id: &str,
+        prompt: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<AgentAnswer> {
+        self.run(
+            principal,
+            None,
+            Some(session_id),
+            prompt,
+            true,
+            progress,
+            None,
+        )
+        .await
+    }
+
+    pub async fn retry_to_session_with_progress(
+        &self,
+        principal: &str,
+        session_id: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<AgentAnswer> {
+        let ctx = self.sessions.context_for_session(principal, session_id)?;
+        let prompt = self
+            .storage
+            .latest_user_message(principal, &ctx.active.id)?
+            .ok_or_else(|| anyhow!("no user request available to retry"))?;
+        self.run(
+            principal,
+            None,
+            Some(session_id),
+            &prompt,
+            false,
+            progress,
+            None,
+        )
+        .await
     }
 
     pub async fn retry_with_progress(
@@ -362,19 +452,49 @@ impl AgentEngine {
             .storage
             .latest_user_message(principal, &ctx.active.id)?
             .ok_or_else(|| anyhow!("no user request available to retry"))?;
-        self.run(principal, scope, &prompt, false, progress).await
+        self.run(principal, scope, None, &prompt, false, progress, None)
+            .await
     }
 
+    pub async fn retry_with_progress_in_scope_with_cancellation(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        cancellation: CancellationToken,
+    ) -> Result<AgentAnswer> {
+        let ctx = self.sessions.context_for_telegram(principal, scope)?;
+        let prompt = self
+            .storage
+            .latest_user_message(principal, &ctx.active.id)?
+            .ok_or_else(|| anyhow!("no user request available to retry"))?;
+        self.run(
+            principal,
+            Some(scope),
+            None,
+            &prompt,
+            false,
+            progress,
+            Some(cancellation),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         principal: &str,
         scope: Option<TelegramScope>,
+        explicit_session: Option<&str>,
         prompt: &str,
         append_user: bool,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        parent_cancellation: Option<CancellationToken>,
     ) -> Result<AgentAnswer> {
-        let token = CancellationToken::new();
-        let active_key = run_key(principal, scope);
+        let token = parent_cancellation
+            .map(|parent| parent.child_token())
+            .unwrap_or_default();
+        let active_key = run_key(principal, scope, explicit_session);
         {
             let mut active = self.active.lock().unwrap();
             if active.contains_key(&active_key) {
@@ -383,20 +503,13 @@ impl AgentEngine {
             active.insert(active_key.clone(), token.clone());
         }
 
-        if append_user {
-            let appended = match scope {
-                Some(scope) => self.sessions.append_user_telegram(principal, scope, prompt),
-                None => self.sessions.append_user(principal, prompt),
-            };
-            if let Err(error) = appended {
-                self.active.lock().unwrap().remove(&active_key);
-                return Err(error);
+        let ctx = if let Some(session_id) = explicit_session {
+            self.sessions.context_for_session(principal, session_id)
+        } else {
+            match scope {
+                Some(scope) => self.sessions.context_for_telegram(principal, scope),
+                None => self.sessions.context_for(principal),
             }
-        }
-
-        let ctx = match scope {
-            Some(scope) => self.sessions.context_for_telegram(principal, scope),
-            None => self.sessions.context_for(principal),
         };
         let ctx = match ctx {
             Ok(ctx) => ctx,
@@ -406,6 +519,24 @@ impl AgentEngine {
             }
         };
 
+        let active_provider = match self.storage.active_provider_kind() {
+            Ok(provider) if provider == "custom" => provider,
+            Ok(_) => {
+                self.active.lock().unwrap().remove(&active_key);
+                return Err(anyhow!("provider runtime policy is invalid"));
+            }
+            Err(error) => {
+                self.active.lock().unwrap().remove(&active_key);
+                return Err(anyhow!("provider runtime policy is unavailable: {error}"));
+            }
+        };
+        if ctx.active.provider != active_provider {
+            self.active.lock().unwrap().remove(&active_key);
+            return Err(anyhow!(
+                "provider_configuration_required: session uses legacy provider '{}'; select a supported Custom profile and exact model before generating",
+                ctx.active.provider
+            ));
+        }
         let provider = match self.providers.get(&ctx.active.provider) {
             Ok(provider) => provider,
             Err(error) => {
@@ -424,6 +555,20 @@ impl AgentEngine {
                 return Err(error);
             }
         };
+        // Resolve and validate the captured session before recording a new
+        // request. A legacy Codex/Antigravity history stays readable, but a
+        // rejected generation must not mutate it with an unserviceable user
+        // message. Writing to the captured id also prevents a concurrent UI
+        // session switch from redirecting this request.
+        if append_user {
+            if let Err(error) =
+                self.sessions
+                    .append_user_to_session(principal, &ctx.active.id, prompt)
+            {
+                self.active.lock().unwrap().remove(&active_key);
+                return Err(error);
+            }
+        }
         let semantic = Arc::new(
             if provider
                 .supports_semantic_evaluation_for(&resolved_model, ctx.active.account_id.as_deref())
@@ -492,10 +637,6 @@ impl AgentEngine {
         }
 
         let result = async {
-            let context = self
-                .context_engine
-                .build(principal, &ctx, prompt)?
-                .messages;
             if resolved_model != ctx.active.model {
                 self.storage.set_session_provider(
                     principal,
@@ -516,15 +657,6 @@ impl AgentEngine {
                     }
                 }
             });
-            let tool_context = ToolContext {
-                principal: principal.to_owned(),
-                session_id: ctx.active.id.clone(),
-                agent_run_id: agent_run_id.clone(),
-                yolo_mode: ctx.active.yolo_mode,
-                messages: context.clone(),
-                cancellation: token.clone(),
-                progress: Some(tool_progress_tx),
-            };
             let provider_capabilities = provider.capabilities_for(
                 &resolved_model,
                 ctx.active.account_id.as_deref(),
@@ -536,13 +668,62 @@ impl AgentEngine {
                     prompt,
                     4,
                 )?;
+                for document in referenced.iter().filter(|attachment| {
+                    attachment.detected_mime == "application/pdf"
+                        && matches!(
+                            attachment.processing_status.as_str(),
+                            "needs_ocr" | "blocked"
+                        )
+                }) {
+                    let pdf_provider = ProviderPdfFallback::new(provider.as_ref());
+                    let path = attachments
+                        .process_pending_pdf_with_fallback(
+                            principal,
+                            &ctx.active.id,
+                            &document.attachment_id,
+                            prompt,
+                            &ctx.active.provider,
+                            ctx.active.account_id.as_deref(),
+                            &resolved_model,
+                            provider.pdf_fallback_capabilities(
+                                &resolved_model,
+                                ctx.active.account_id.as_deref(),
+                            ),
+                            &pdf_provider,
+                            &token,
+                        )
+                        .await?;
+                    if matches!(path, crate::attachments::PdfProcessingPath::Blocked) {
+                        let detail = attachments
+                            .recent_for_prompt(principal, &ctx.active.id, prompt, 4)?
+                            .into_iter()
+                            .find(|item| item.attachment_id == document.attachment_id)
+                            .and_then(|item| item.error.or(item.summary))
+                            .unwrap_or_else(|| {
+                                "no explicit local OCR, file-input, or vision path succeeded"
+                                    .into()
+                            });
+                        return Err(anyhow!(
+                            "{} could not be processed safely: {}. Xiao will not pretend the document was read.",
+                            document.original_name,
+                            detail
+                        ));
+                    }
+                }
+                let referenced = attachments.recent_for_prompt(
+                    principal,
+                    &ctx.active.id,
+                    prompt,
+                    4,
+                )?;
                 if let Some(document) = referenced
                     .iter()
-                    .find(|attachment| attachment.processing_status == "needs_ocr")
+                    .find(|attachment| attachment.processing_status != "ready")
                 {
                     return Err(anyhow!(
-                        "{} has no meaningful embedded text. OCR or an explicit PDF-to-image vision path is required; Xiao will not pretend the document was read.",
-                        document.original_name
+                        "{} is not ready for safe processing (status: {}). Xiao will not pretend the document was read.",
+                        document.original_name,
+                        document.processing_status
                     ));
                 }
                 let images = attachments.normalized_images(principal, &ctx.active.id, prompt)?;
@@ -554,6 +735,24 @@ impl AgentEngine {
                 images
             } else {
                 Vec::new()
+            };
+            // A scanned PDF may have been admitted as `needs_ocr` and completed
+            // through provider file/vision fallback above. Build the provider
+            // context after that planner so the same turn can retrieve the
+            // newly indexed extracted text instead of requiring a follow-up
+            // prompt.
+            let context = self
+                .context_engine
+                .build(principal, &ctx, prompt)?
+                .messages;
+            let tool_context = ToolContext {
+                principal: principal.to_owned(),
+                session_id: ctx.active.id.clone(),
+                agent_run_id: agent_run_id.clone(),
+                yolo_mode: ctx.active.yolo_mode,
+                messages: context.clone(),
+                cancellation: token.clone(),
+                progress: Some(tool_progress_tx),
             };
             if provider_capabilities.tool_protocol == ToolProtocol::ChatOnly
                 && tokio::select! {
@@ -578,6 +777,7 @@ impl AgentEngine {
                 messages: context,
                 tools: available_tools,
                 images,
+                files: Vec::new(),
             };
             let started = AgentEvent::GenerationStarted;
             if let Some(tx) = &progress { let _ = tx.send(started.clone()); }
@@ -768,7 +968,13 @@ impl AgentEngine {
                                     verification: blocked,
                                 });
                             }
-                            let started=AgentEvent::ToolStarted(call.name.clone()); if let Some(tx)=&progress{let _=tx.send(started.clone());} provider_events.push(started);
+                            let started=AgentEvent::ToolStartedWithId { tool: call.name.clone(), call_id: call.call_id.clone() }; if let Some(tx)=&progress{let _=tx.send(started.clone());}
+                            // Keep the historical, correlation-free event in the
+                            // durable answer for API compatibility. The live
+                            // transport receives only the identity-bearing event
+                            // so a late completion cannot close another tool.
+                            provider_events.push(AgentEvent::ToolStarted(call.name.clone()));
+                            provider_events.push(started);
                             let risk = self.tools.spec(&call.name).map(|spec| spec.risk.as_str()).unwrap_or("unknown");
                             let arguments = bounded_json(&redact_json(&call.arguments), 16_384);
                             let redacted_call_id = bound_text(redact_text(&call.call_id), 256);
@@ -817,11 +1023,16 @@ impl AgentEngine {
                                     output: message.into(),
                                     is_error: true,
                                 };
-                                let completed = AgentEvent::ToolCompleted {
+                                let completed = AgentEvent::ToolCompletedWithId {
                                     tool: call.name.clone(),
+                                    call_id: call.call_id.clone(),
                                     summary: message.into(),
                                 };
                                 if let Some(tx) = &progress { let _ = tx.send(completed.clone()); }
+                                provider_events.push(AgentEvent::ToolCompleted {
+                                    tool: call.name.clone(),
+                                    summary: message.into(),
+                                });
                                 provider_events.push(completed);
                                 next.push(result);
                                 if identical_failure_repeats
@@ -878,11 +1089,25 @@ impl AgentEngine {
                                     "awaiting_approval",
                                     None,
                                 )?;
+                                if let Some(approval_id) = execution.approval_id.clone() {
+                                    let requested = AgentEvent::ApprovalRequested {
+                                        approval_id,
+                                        tool: call.name.clone(),
+                                        call_id: call.call_id.clone(),
+                                        summary: bound_text(
+                                            redact_text(&execution.result.output),
+                                            1_024,
+                                        ),
+                                    };
+                                    if let Some(tx) = &progress {
+                                        let _ = tx.send(requested.clone());
+                                    }
+                                    provider_events.push(requested);
+                                }
                                 let approval_status = AgentEvent::Status(format!(
                                     "Owner approval required before continuing: {}",
                                     execution.result.output
                                 ));
-                                if let Some(tx) = &progress { let _ = tx.send(approval_status.clone()); }
                                 provider_events.push(approval_status);
                                 let wait_for = tool_remaining.min(std::time::Duration::from_secs(15 * 60));
                                 match self.tools.wait_for_exact_approval(
@@ -941,7 +1166,9 @@ impl AgentEngine {
                                 }
                             }
                             let summary=if result.is_error { format!("failed: {}",result.output) } else { "completed".into() };
-                            let completed=AgentEvent::ToolCompleted{tool:call.name.clone(),summary}; if let Some(tx)=&progress{let _=tx.send(completed.clone());} provider_events.push(completed);
+                            let completed=AgentEvent::ToolCompletedWithId{tool:call.name.clone(),call_id:call.call_id.clone(),summary:summary.clone()}; if let Some(tx)=&progress{let _=tx.send(completed.clone());}
+                            provider_events.push(AgentEvent::ToolCompleted { tool: call.name.clone(), summary });
+                            provider_events.push(completed);
                             next.push(result);
                         }
                         tool_results=next;
@@ -1104,7 +1331,14 @@ impl AgentEngine {
     }
 }
 
-fn run_key(principal: &str, scope: Option<TelegramScope>) -> String {
+fn run_key(
+    principal: &str,
+    scope: Option<TelegramScope>,
+    explicit_session: Option<&str>,
+) -> String {
+    if let Some(session_id) = explicit_session {
+        return format!("{principal}:cli-session:{session_id}");
+    }
     scope
         .map(|scope| {
             format!(
@@ -1113,7 +1347,7 @@ fn run_key(principal: &str, scope: Option<TelegramScope>) -> String {
                 scope.thread_key()
             )
         })
-        .unwrap_or_else(|| principal.to_owned())
+        .unwrap_or_else(|| format!("{principal}:cli-active"))
 }
 
 fn bound_text(value: String, max_chars: usize) -> String {
@@ -1247,11 +1481,14 @@ fn automatic_title(prompt: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
+        attachments::{AttachmentIngest, AttachmentKind, ScannedPdfProcessor},
         auth::AuthManager,
+        config::AttachmentConfig,
         providers::{Provider, ProviderCapabilities, ProviderResponse, ProviderStep, ProviderTurn},
         tools::{Tool, ToolCall, ToolRisk, ToolSpec},
     };
     use async_trait::async_trait;
+    use std::path::Path;
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
@@ -1312,6 +1549,77 @@ mod tests {
             Ok(ProviderResponse {
                 events: vec![AgentEvent::Status("safe status".into())],
                 final_answer: format!("answer:{text}"),
+            })
+        }
+    }
+
+    struct NoLocalOcr;
+
+    impl ScannedPdfProcessor for NoLocalOcr {
+        fn extract(
+            &self,
+            _pdf: &[u8],
+            _scratch_root: &Path,
+            _config: &AttachmentConfig,
+        ) -> Result<Option<Vec<crate::attachments::ScannedPdfPage>>> {
+            Ok(None)
+        }
+    }
+
+    struct AgentPdfProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for AgentPdfProvider {
+        fn id(&self) -> &'static str {
+            "pdf-agent"
+        }
+        fn models(&self) -> Vec<String> {
+            vec!["m".into()]
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                text: true,
+                vision: false,
+                file_input: true,
+                native_tools: false,
+                tool_protocol: ToolProtocol::ChatOnly,
+                model_discovery: false,
+                structured_output: false,
+                continuation: false,
+                evidence: "deterministic provider file-input fixture".into(),
+            }
+        }
+        async fn run(
+            &self,
+            request: ProviderRequest,
+            _progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                assert_eq!(request.files.len(), 1);
+                assert_eq!(request.files[0].mime_type, "application/pdf");
+                assert!(request.files[0].bytes.starts_with(b"%PDF-"));
+                return Ok(ProviderResponse {
+                    events: vec![],
+                    final_answer: "provider extracted the scanned PDF text".into(),
+                });
+            }
+            assert!(request.files.is_empty());
+            assert!(request.messages.iter().any(|message| {
+                message.content.contains("SESSION_ATTACHMENTS")
+                    && message
+                        .content
+                        .contains("provider extracted the scanned PDF text")
+            }));
+            Ok(ProviderResponse {
+                events: vec![],
+                final_answer: "The scanned PDF says: provider extracted the scanned PDF text"
+                    .into(),
             })
         }
     }
@@ -1891,24 +2199,112 @@ mod tests {
     }
 
     fn engine(
-        provider_id: &str,
+        _provider_id: &str,
         provider: Arc<dyn Provider>,
     ) -> (Arc<AgentEngine>, Arc<Storage>, String, tempfile::TempDir) {
         let db = Arc::new(Storage::open_memory().unwrap());
         let sessions = Arc::new(SessionManager::new(db.clone()));
         let main = sessions.ensure_default_session("u").unwrap();
-        db.set_session_provider("u", &main.id, provider_id, None, "m")
+        // Normal v0.3 runtime admits only the Custom provider key. Individual
+        // fake provider ids still exercise their protocol behavior behind that
+        // key; legacy-session tests opt into a legacy key explicitly.
+        db.set_session_provider("u", &main.id, "custom", None, "m")
             .unwrap();
         sessions.switch_main("u", &main.id).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let auth = Arc::new(AuthManager::new(db.clone(), tmp.path().join("secrets")));
-        let providers = Arc::new(ProviderRegistry::from_single(provider_id, provider, auth));
+        let providers = Arc::new(ProviderRegistry::from_single("custom", provider, auth));
         (
             Arc::new(AgentEngine::new(sessions, db.clone(), providers)),
             db,
             main.id,
             tmp,
         )
+    }
+
+    fn empty_pdf() -> Vec<u8> {
+        let stream = "BT /F1 14 Tf 72 760 Td () Tj ET";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_owned(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+            format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
+        ];
+        let mut pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[tokio::test]
+    async fn agent_engine_runs_scanned_pdf_provider_file_fallback_before_final_answer() {
+        let provider = Arc::new(AgentPdfProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (base, db, session, _fixture) = engine("pdf-agent", provider.clone());
+        let attachment_root = tempfile::tempdir().unwrap();
+        let attachments = Arc::new(
+            AttachmentManager::new(
+                db.clone(),
+                attachment_root.path(),
+                AttachmentConfig::default(),
+            )
+            .unwrap()
+            .with_scanned_pdf_processor(Arc::new(NoLocalOcr)),
+        );
+        let record = attachments
+            .ingest(AttachmentIngest {
+                owner_id: "u".into(),
+                session_id: session.clone(),
+                telegram_file_id: None,
+                telegram_unique_id: Some("agent-pdf-1".into()),
+                original_name: "scan.pdf".into(),
+                declared_mime: Some("application/pdf".into()),
+                expected_kind: AttachmentKind::Document,
+                bytes: empty_pdf(),
+            })
+            .unwrap();
+        assert_eq!(record.processing_status, "needs_ocr");
+
+        let agent = AgentEngine::with_registry_runtime(
+            base.sessions.clone(),
+            db.clone(),
+            base.providers.clone(),
+            AgentConfig::default(),
+            base.tools.clone(),
+            None,
+            Some(attachments.clone()),
+        );
+        let answer = agent
+            .submit_with_progress("u", "What does the attached document say?", None)
+            .await
+            .unwrap();
+        assert!(answer.final_answer.contains("provider extracted"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let stored = db.attachment("u", &record.attachment_id).unwrap().unwrap();
+        assert_eq!(stored.processing_status, "ready");
+        assert!(db
+            .search_attachment_chunks("u", &session, "provider extracted", 5)
+            .unwrap()
+            .iter()
+            .any(|chunk| chunk.text.contains("provider extracted")));
     }
 
     #[tokio::test]
@@ -1923,6 +2319,26 @@ mod tests {
         assert!(error.contains("cancelled"));
         assert_eq!(db.messages("u", &session).unwrap().len(), 1);
         assert_eq!(db.agent_runs("u", 10).unwrap()[0].status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn legacy_provider_history_is_read_only_until_custom_is_selected() {
+        let (engine, db, session, _tmp) = engine("codex", Arc::new(EchoProvider));
+        db.set_session_provider("u", &session, "codex", None, "m")
+            .unwrap();
+        db.append_message("u", &session, "assistant", "legacy answer")
+            .unwrap();
+
+        let error = engine
+            .submit_with_progress("u", "new request", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider_configuration_required"));
+        let messages = db.messages("u", &session).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "legacy answer");
+        assert!(db.agent_runs("u", 10).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2291,7 +2707,9 @@ mod tests {
             tokio::spawn(
                 async move { running.submit_with_progress("u", "keep target", None).await },
             );
-        started.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("provider did not start through the active Custom runtime key");
         let switched = engine.sessions.create_and_switch("u").unwrap();
         assert_ne!(captured_session, switched.id);
         release.notify_one();

@@ -75,6 +75,7 @@ impl SemanticBackend for ProviderSemanticBackend {
             messages: semantic_messages(request),
             tools: Vec::new(),
             images: Vec::new(),
+            files: Vec::new(),
         };
         semantic_worker().evaluate(
             self.provider.clone(),

@@ -216,13 +216,10 @@ impl ToolRegistry {
                                 summary: &reason,
                             }) {
                                 Ok(approval) => {
-                                    return self.error(
+                                    return self.awaiting_approval(
                                         call,
-                                        ToolRunStatus::AwaitingApproval,
-                                        &format!(
-                                            "approval required: {}. Approve request {} then retry",
-                                            approval.summary, approval.id
-                                        ),
+                                        &approval.id,
+                                        &approval.summary,
                                     );
                                 }
                                 Err(error) => {
@@ -265,6 +262,7 @@ impl ToolRegistry {
                     is_error: false,
                 },
                 status: ToolRunStatus::Succeeded,
+                approval_id: None,
                 approval_mode,
                 policy_original,
             },
@@ -360,8 +358,35 @@ impl ToolRegistry {
                 is_error: true,
             },
             status,
+            approval_id: None,
             approval_mode: None,
             policy_original: None,
+        }
+    }
+
+    fn awaiting_approval(
+        &self,
+        call: &ToolCall,
+        approval_id: &str,
+        summary: &str,
+    ) -> ToolExecution {
+        ToolExecution {
+            result: ToolResult {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                output: bound(
+                    redact_text(&format!(
+                        "approval required: {}. Awaiting this owner's decision",
+                        summary
+                    )),
+                    self.max_output_chars,
+                ),
+                is_error: true,
+            },
+            status: ToolRunStatus::AwaitingApproval,
+            approval_id: Some(approval_id.to_owned()),
+            approval_mode: None,
+            policy_original: Some("ask".into()),
         }
     }
 }

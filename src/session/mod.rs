@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use chrono::Local;
 
-use crate::storage::{MessageRecord, SessionRecord, Storage};
+use crate::storage::{MessageRecord, SessionDeletionResult, SessionRecord, Storage};
 use crate::telegram::TelegramScope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +95,51 @@ impl SessionManager {
             active: main,
             mode: ChatMode::Main,
         })
+    }
+
+    /// Resolve one exact non-archived session without reading or mutating any
+    /// frontend active-session pointer. This is used by CLI `--session` so a
+    /// terminal request can never silently inherit Telegram state.
+    pub fn context_for_session(&self, principal: &str, id: &str) -> Result<SessionContext> {
+        let active = self
+            .storage
+            .session(principal, id)?
+            .ok_or_else(|| anyhow!("session not found"))?;
+        if active.archived {
+            return Err(anyhow!("session is archived"));
+        }
+        if active.is_side {
+            let parent_id = active
+                .parent_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("side session is missing its parent"))?;
+            let main = self
+                .storage
+                .session(principal, parent_id)?
+                .ok_or_else(|| anyhow!("side session parent not found"))?;
+            return Ok(SessionContext {
+                main,
+                active,
+                mode: ChatMode::Side,
+            });
+        }
+        Ok(SessionContext {
+            main: active.clone(),
+            active,
+            mode: ChatMode::Main,
+        })
+    }
+
+    pub fn append_user_to_session(
+        &self,
+        principal: &str,
+        session_id: &str,
+        text: &str,
+    ) -> Result<SessionContext> {
+        let context = self.context_for_session(principal, session_id)?;
+        self.storage
+            .append_message(principal, &context.active.id, "user", text)?;
+        Ok(context)
     }
 
     pub fn switch_main(&self, principal: &str, id: &str) -> Result<SessionRecord> {
@@ -412,6 +457,43 @@ impl SessionManager {
         Ok(fallback)
     }
 
+    /// Typed real-delete operation used by Telegram, CLI and WebUI adapters.
+    /// The storage transaction updates the relevant frontend pointer and
+    /// returns the raw attachment paths for post-commit lifecycle cleanup.
+    pub fn delete_and_recover(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> Result<(SessionRecord, SessionDeletionResult)> {
+        let result = self
+            .storage
+            .delete_session_and_recover(principal, id, None)?;
+        let active = self
+            .storage
+            .session(principal, &result.active_session_id)?
+            .ok_or_else(|| anyhow!("replacement session disappeared after deletion"))?;
+        Ok((active, result))
+    }
+
+    pub fn delete_and_recover_telegram(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        id: &str,
+    ) -> Result<(SessionRecord, SessionDeletionResult)> {
+        if !self.session_in_scope(principal, id, scope)? {
+            return Err(anyhow!("session is not in this Telegram topic"));
+        }
+        let result = self
+            .storage
+            .delete_session_and_recover(principal, id, Some(scope))?;
+        let active = self
+            .storage
+            .session(principal, &result.active_session_id)?
+            .ok_or_else(|| anyhow!("replacement Telegram session disappeared after deletion"))?;
+        Ok((active, result))
+    }
+
     pub fn list_telegram_page(
         &self,
         principal: &str,
@@ -494,6 +576,100 @@ mod tests {
         let recovered = sm.archive_and_recover("x", &second.id).unwrap();
         assert_ne!(recovered.id, second.id);
         assert!(db.session("x", &second.id).unwrap().unwrap().archived);
+    }
+
+    #[test]
+    fn delete_active_main_removes_descendants_and_preserves_owner_global_state() {
+        let db = Arc::new(Storage::open_memory().unwrap());
+        let manager = SessionManager::new(db.clone());
+        let owner = "owner:delete";
+        let main = manager.ensure_default_session(owner).unwrap();
+        manager.switch_main(owner, &main.id).unwrap();
+        let side = manager.toggle_side(owner).unwrap().active;
+        manager.toggle_side(owner).unwrap();
+
+        crate::memory::MemoryStore::new(db.clone())
+            .upsert(
+                owner,
+                crate::memory::MemoryScope::User,
+                "preferences",
+                "delete_regression",
+                "preserve this",
+                1.0,
+                "test",
+                None,
+            )
+            .unwrap();
+        crate::skills::SkillStore::new(db.clone())
+            .create_or_update(
+                owner,
+                crate::skills::SkillCandidate {
+                    name: "preserve skill".into(),
+                    summary: "owner-global skill".into(),
+                    when_to_use: "during deletion tests".into(),
+                    prerequisites: String::new(),
+                    procedure: "verify the owner-global record survives".into(),
+                    pitfalls: String::new(),
+                    verification: "assert the record remains".into(),
+                },
+                Some(&main.id),
+            )
+            .unwrap();
+        let profile = crate::providers::ProviderProfileStore::new(db.clone())
+            .create(crate::storage::ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner.into(),
+                alias: "preserve-profile".into(),
+                endpoint: "https://example.test/v1".into(),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: None,
+                safe_headers_json: "{}".into(),
+            })
+            .unwrap();
+
+        let (replacement, _deleted) = manager.delete_and_recover(owner, &main.id).unwrap();
+        assert_ne!(replacement.id, main.id);
+        assert!(!replacement.is_side);
+        assert!(!replacement.yolo_mode);
+        assert!(db.session(owner, &main.id).unwrap().is_none());
+        assert!(db.session(owner, &side.id).unwrap().is_none());
+        assert_eq!(
+            crate::memory::MemoryStore::new(db.clone())
+                .list(owner, Some(crate::memory::MemoryScope::User), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            crate::skills::SkillStore::new(db.clone())
+                .list(owner, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(crate::providers::ProviderProfileStore::new(db)
+            .get(owner, &profile.profile_id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn telegram_session_manager_paginates_thirteen_main_sessions_as_five_five_three() {
+        let db = Arc::new(Storage::open_memory().unwrap());
+        let manager = SessionManager::new(db);
+        let owner = "owner:pages";
+        let scope = TelegramScope::new(100, Some(10));
+        manager.ensure_telegram_session(owner, scope).unwrap();
+        for _ in 1..13 {
+            manager.create_and_switch_telegram(owner, scope).unwrap();
+        }
+
+        let first = manager.list_telegram_page(owner, scope, 1, 5).unwrap();
+        let second = manager.list_telegram_page(owner, scope, 2, 5).unwrap();
+        let third = manager.list_telegram_page(owner, scope, 3, 5).unwrap();
+        assert_eq!((first.0.len(), first.1, first.2), (5, 3, 1));
+        assert_eq!((second.0.len(), second.1, second.2), (5, 3, 2));
+        assert_eq!((third.0.len(), third.1, third.2), (3, 3, 3));
     }
 
     #[test]

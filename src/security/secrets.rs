@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct SecretStore {
@@ -25,6 +26,16 @@ impl SecretStore {
         set_0600(&path)?;
         Ok(())
     }
+
+    /// Store a value under a fresh immutable reference. Callers update their
+    /// authoritative SQLite row to this returned ref in the same logical
+    /// control-plane operation; old refs can then be garbage-collected after
+    /// commit without overwriting a live secret in place.
+    pub fn put_versioned(&self, namespace: &str, value: &str) -> Result<String> {
+        let reference = format!("{namespace}:{}", Uuid::new_v4().simple());
+        self.put(&reference, value)?;
+        Ok(reference)
+    }
     pub fn get(&self, key: &str) -> Result<Option<String>> {
         let path = self.path(key);
         if !path.exists() {
@@ -36,6 +47,33 @@ impl SecretStore {
         let p = self.path(key);
         if p.exists() {
             fs::remove_file(p)?;
+        }
+        Ok(())
+    }
+    pub fn exists(&self, key: &str) -> Result<bool> {
+        Ok(self.path(key).exists())
+    }
+    pub fn staged_key(key: &str) -> String {
+        format!("{key}:staged")
+    }
+    pub fn put_staged(&self, key: &str, value: &str) -> Result<()> {
+        self.put(&Self::staged_key(key), value)
+    }
+    pub fn commit_staged(&self, key: &str) -> Result<()> {
+        let staged = self.path(&Self::staged_key(key));
+        if staged.exists() {
+            let dest = self.path(key);
+            fs::create_dir_all(&self.root)?;
+            fs::rename(&staged, &dest)
+                .with_context(|| format!("commit staged {}", dest.display()))?;
+            set_0600(&dest)?;
+        }
+        Ok(())
+    }
+    pub fn rollback_staged(&self, key: &str) -> Result<()> {
+        let staged = self.path(&Self::staged_key(key));
+        if staged.exists() {
+            fs::remove_file(staged)?;
         }
         Ok(())
     }

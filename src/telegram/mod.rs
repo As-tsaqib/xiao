@@ -22,15 +22,16 @@ use tokio::{
     sync::{mpsc, Mutex as AsyncMutex},
     time::{interval, sleep, MissedTickBehavior},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::AgentAnswer,
     app::AppState,
     attachments::{AttachmentIngest, AttachmentKind},
-    auth::{AuthChallenge, AuthEvent},
     command::CommandResult,
     presentation::{
-        Action, ActionTarget, Block, ProgressActivity, ProgressItem, ProgressState, View,
+        Action, ActionTarget, Block, ProgressActivity, ProgressIcon, ProgressItem, ProgressState,
+        View,
     },
     providers::AgentEvent,
     security::secrets::SecretStore,
@@ -53,6 +54,10 @@ pub struct TelegramAdapter {
     /// two callbacks/commands cannot race a multi-step UI/state transition. Long
     /// generation deliberately does not hold this lane; `/stop` remains a fast path.
     principal_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    /// One parent cancellation token per in-flight Telegram message work item.
+    /// It spans bot download, attachment processing and the resulting agent
+    /// run; the keyed list tolerates an already-accepted concurrent update.
+    active_work: Arc<Mutex<HashMap<String, Vec<CancellationToken>>>>,
 }
 
 struct CustomInputContext<'a> {
@@ -66,14 +71,20 @@ struct CustomInputContext<'a> {
 impl TelegramAdapter {
     pub async fn from_app(app: AppState) -> Result<Self> {
         let cfg = app.config.read().await.clone();
-        let token = SecretStore::new(cfg.paths.secrets_dir.clone())
-            .get("telegram-bot-token")?
+        let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
+        let control = app.storage.telegram_control_state()?;
+        let token = control
+            .as_ref()
+            .and_then(|state| state.bot_token_ref.as_deref())
+            .map(|reference| secrets.get(reference))
+            .transpose()?
+            .flatten()
             .ok_or_else(|| anyhow!("Telegram is enabled but bot token is not configured"))?;
         let client = TelegramClient::new(token)?;
         if let Ok(bot) = client.get_me().await {
             let _ = app
                 .storage
-                .put_setting("telegram_bot_identity", &serde_json::to_string(&bot)?);
+                .set_telegram_bot_identity(&serde_json::to_string(&bot)?);
         }
         client
             .set_my_commands(&TelegramCommandRegistry::bot_commands())
@@ -88,6 +99,7 @@ impl TelegramAdapter {
                 cfg.telegram.ui.menu_ttl_seconds,
             ))),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -115,7 +127,13 @@ impl TelegramAdapter {
             }
         }
         loop {
-            let enabled = self.app.config.read().await.telegram.enabled;
+            // SQLite control state is authoritative. The in-memory TOML is a
+            // compatibility projection and may lag after a failed snapshot.
+            let enabled = self
+                .app
+                .storage
+                .telegram_control_state()?
+                .is_some_and(|state| state.enabled);
             if !enabled {
                 self.app.health.set_telegram_polling(false).await;
                 sleep(Duration::from_secs(2)).await;
@@ -176,14 +194,32 @@ impl TelegramAdapter {
     }
 
     async fn policy(&self) -> AccessPolicy {
-        AccessPolicy::from(&self.app.config.read().await.telegram.access)
+        if let Ok(Some(control)) = self.app.storage.telegram_control_state() {
+            return AccessPolicy {
+                allowed_chat_ids: control.allowed_chat_ids,
+                owner_user_id: control.owner_user_id,
+                owner_resolution_required: self
+                    .app
+                    .storage
+                    .owner_resolution_candidates()
+                    .map(|candidates| !candidates.is_empty())
+                    .unwrap_or(true),
+            };
+        }
+        AccessPolicy {
+            allowed_chat_ids: Vec::new(),
+            owner_user_id: None,
+            owner_resolution_required: true,
+        }
     }
     async fn allowed(&self, chat_id: i64, user_id: Option<i64>, kind: &str) -> bool {
         self.policy().await.allows(chat_id, user_id, kind)
     }
     #[cfg(test)]
-    fn principal(user_id: i64) -> String {
-        crate::owner::OwnerIdentity::telegram(user_id).owner_id
+    fn principal(app: &AppState, user_id: i64) -> String {
+        app.storage
+            .management_owner_id()
+            .unwrap_or_else(|_| app.resolve_telegram_owner(user_id).unwrap().owner_id)
     }
     fn principal_lock(&self, principal: &str) -> Arc<AsyncMutex<()>> {
         let mut lanes = self
@@ -194,6 +230,49 @@ impl TelegramAdapter {
             .entry(principal.to_owned())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
+    }
+
+    fn work_key(principal: &str, scope: TelegramScope) -> String {
+        format!("{principal}:{}:{}", scope.chat_id, scope.thread_key())
+    }
+
+    fn begin_work(&self, principal: &str, scope: TelegramScope) -> CancellationToken {
+        let token = CancellationToken::new();
+        if let Ok(mut active) = self.active_work.lock() {
+            active
+                .entry(Self::work_key(principal, scope))
+                .or_default()
+                .push(token.clone());
+        }
+        token
+    }
+
+    fn finish_work(&self, principal: &str, scope: TelegramScope, token: &CancellationToken) {
+        if let Ok(mut active) = self.active_work.lock() {
+            let key = Self::work_key(principal, scope);
+            if let Some(tokens) = active.get_mut(&key) {
+                if let Some(index) = tokens.iter().position(|registered| registered == token) {
+                    tokens.remove(index);
+                }
+                if tokens.is_empty() {
+                    active.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn cancel_work(&self, principal: &str, scope: TelegramScope) -> bool {
+        self.active_work
+            .lock()
+            .ok()
+            .and_then(|active| active.get(&Self::work_key(principal, scope)).cloned())
+            .map(|tokens| {
+                for token in tokens {
+                    token.cancel();
+                }
+                true
+            })
+            .unwrap_or(false)
     }
     async fn execute_serialized(
         &self,
@@ -206,6 +285,20 @@ impl TelegramAdapter {
         self.app
             .commands
             .execute_text_in_telegram_scope(principal, scope, input, None)
+            .await
+    }
+
+    async fn execute_internal_serialized(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        input: &str,
+    ) -> Result<CommandResult> {
+        let lane = self.principal_lock(principal);
+        let _guard = lane.lock().await;
+        self.app
+            .commands
+            .execute_callback_in_telegram_scope(principal, scope, input, None)
             .await
     }
 
@@ -238,6 +331,37 @@ impl TelegramAdapter {
         }
         let scope = message.scope();
         let principal = self.app.resolve_telegram_owner(user.id)?.owner_id;
+
+        // `/stop` is deliberately evaluated before pending rename/login input
+        // and before the principal UI lane.  A running task must remain
+        // cancellable even while a scoped menu is waiting for text.
+        if message.text.as_deref().is_some_and(is_stop_command) {
+            self.cancel_work(&principal, scope);
+            return match self
+                .app
+                .commands
+                .execute_text_in_telegram_scope(
+                    &principal,
+                    scope,
+                    message.text.as_deref().unwrap_or_default(),
+                    None,
+                )
+                .await
+            {
+                Ok(result) => self.send_result(scope, user.id, result).await,
+                Err(error) => self
+                    .send_view(
+                        scope,
+                        &View::info(
+                            "ERROR",
+                            crate::security::redact::redact_text(&error.to_string()),
+                        ),
+                        None,
+                    )
+                    .await
+                    .map(|_| ()),
+            };
+        }
 
         // UI capture is checked after ACL but before slash parsing or agent dispatch.
         if let Some(menu) = self.menus.pending_for_scope(scope, user.id) {
@@ -276,7 +400,10 @@ impl TelegramAdapter {
                         return Ok(());
                     }
                     let command = format!("{} {}", prefix, text.trim());
-                    match self.execute_serialized(&principal, scope, &command).await {
+                    match self
+                        .execute_internal_serialized(&principal, scope, &command)
+                        .await
+                    {
                         Ok(result) => {
                             let next = result_view(result)?;
                             guard.current_view = next;
@@ -303,62 +430,62 @@ impl TelegramAdapter {
             }
         }
 
-        let attachment_prompt = match self
-            .ingest_telegram_attachment(&principal, scope, &message)
-            .await
-        {
-            Ok(prompt) => prompt,
-            Err(error) => {
-                self.send_view(
-                    scope,
-                    &View::info(
-                        "ATTACHMENT ERROR",
-                        crate::security::redact::redact_text(&error.to_string()),
-                    ),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-        let text = match attachment_prompt.as_deref().or(message.text.as_deref()) {
-            Some(text) => text,
-            None => return Ok(()),
-        };
+        let work = self.begin_work(&principal, scope);
+        let result = async {
+            let attachment_prompt = match self
+                .ingest_telegram_attachment(&principal, scope, &message, &work)
+                .await
+            {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    self.send_view(
+                        scope,
+                        &View::info(
+                            "ATTACHMENT ERROR",
+                            crate::security::redact::redact_text(&error.to_string()),
+                        ),
+                        None,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let text = match attachment_prompt.as_deref().or(message.text.as_deref()) {
+                Some(text) => text,
+                None => return Ok(()),
+            };
 
-        let is_agent_request =
-            !text.trim_start().starts_with('/') || text.trim_start().starts_with("/retry");
-        let result = if is_agent_request {
-            if message.chat.kind == "private" {
-                self.execute_with_draft(&principal, scope, update_id, text)
-                    .await
+            let is_agent_request =
+                !text.trim_start().starts_with('/') || text.trim_start().starts_with("/retry");
+            let result = if is_agent_request {
+                // Every Telegram generation receives observable live events so an
+                // exact ASK decision can surface as a scoped inline card. Private
+                // chats retain the existing draft transport; topics intentionally
+                // receive no draft updates but do receive the same approval card.
+                self.execute_with_live_events(
+                    &principal,
+                    scope,
+                    update_id,
+                    user.id,
+                    text,
+                    (message.chat.kind == "private").then_some(update_id),
+                    work.child_token(),
+                )
+                .await
             } else {
-                // Generation is cancellable and owns a captured immutable session id;
-                // never hold the principal mutation lane across provider latency.
-                self.app
-                    .commands
-                    .execute_text_in_telegram_scope(&principal, scope, text, None)
+                self.execute_serialized(&principal, scope, text).await
+            };
+            match result {
+                Ok(value) => self.send_result(scope, user.id, value).await,
+                Err(error) => self
+                    .send_view(scope, &View::info("ERROR", error.to_string()), None)
                     .await
+                    .map(|_| ()),
             }
-        } else if text
-            .split_whitespace()
-            .next()
-            .is_some_and(|x| matches!(x.split('@').next(), Some("/stop") | Some("/cancel")))
-        {
-            self.app
-                .commands
-                .execute_text_in_telegram_scope(&principal, scope, text, None)
-                .await
-        } else {
-            self.execute_serialized(&principal, scope, text).await
-        };
-        match result {
-            Ok(value) => self.send_result(scope, user.id, value).await,
-            Err(error) => self
-                .send_view(scope, &View::info("ERROR", error.to_string()), None)
-                .await
-                .map(|_| ()),
         }
+        .await;
+        self.finish_work(&principal, scope, &work);
+        result
     }
 
     async fn ingest_telegram_attachment(
@@ -366,6 +493,7 @@ impl TelegramAdapter {
         principal: &str,
         scope: TelegramScope,
         message: &Message,
+        cancellation: &CancellationToken,
     ) -> Result<Option<String>> {
         let selected = if let Some(photo) = message
             .photo
@@ -407,7 +535,10 @@ impl TelegramAdapter {
                 max_bytes
             ));
         }
-        let file = self.client.get_file(file_id).await?;
+        let file = self
+            .client
+            .get_file_with_cancellation(file_id, cancellation)
+            .await?;
         if file.file_size.is_some_and(|size| size > max_bytes) {
             return Err(anyhow!(
                 "Telegram attachment exceeds the configured {} byte limit",
@@ -416,7 +547,7 @@ impl TelegramAdapter {
         }
         let bytes = self
             .client
-            .download_file_bounded(&file.file_path, max_bytes)
+            .download_file_bounded_with_cancellation(&file.file_path, max_bytes, cancellation)
             .await?;
         let context = self.app.sessions.context_for_telegram(principal, scope)?;
         let manager = self.app.attachments.clone();
@@ -425,22 +556,34 @@ impl TelegramAdapter {
         let session_id = context.active.id;
         let telegram_file_id = file_id.to_owned();
         let telegram_unique_id = unique_id.to_owned();
-        let processing = tokio::task::spawn_blocking(move || {
-            manager.ingest(AttachmentIngest {
-                owner_id: owner,
-                session_id,
-                telegram_file_id: Some(telegram_file_id),
-                telegram_unique_id: Some(telegram_unique_id),
-                original_name,
-                declared_mime,
-                expected_kind: kind,
-                bytes,
-            })
+        let processing_token = cancellation.child_token();
+        let mut processing = tokio::task::spawn_blocking(move || {
+            manager.ingest_with_cancellation(
+                AttachmentIngest {
+                    owner_id: owner,
+                    session_id,
+                    telegram_file_id: Some(telegram_file_id),
+                    telegram_unique_id: Some(telegram_unique_id),
+                    original_name,
+                    declared_mime,
+                    expected_kind: kind,
+                    bytes,
+                },
+                processing_token,
+            )
         });
-        let record = tokio::time::timeout(processing_timeout, processing)
-            .await
-            .map_err(|_| anyhow!("attachment processing exceeded the configured timeout"))?
-            .map_err(|_| anyhow!("attachment processor terminated unexpectedly"))??;
+        let record = match tokio::time::timeout(processing_timeout, &mut processing).await {
+            Ok(result) => {
+                result.map_err(|_| anyhow!("attachment processor terminated unexpectedly"))??
+            }
+            Err(_) => {
+                cancellation.cancel();
+                let _ = processing.await;
+                return Err(anyhow!(
+                    "attachment processing exceeded the configured timeout"
+                ));
+            }
+        };
         let caption = message
             .caption
             .as_deref()
@@ -464,12 +607,16 @@ impl TelegramAdapter {
         )))
     }
 
-    async fn execute_with_draft(
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_with_live_events(
         &self,
         principal: &str,
         scope: TelegramScope,
-        draft_id: i64,
+        update_id: i64,
+        user_id: i64,
         text: &str,
+        draft_id: Option<i64>,
+        cancellation: CancellationToken,
     ) -> Result<CommandResult> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let is_retry = text.trim_start().starts_with("/retry");
@@ -477,12 +624,23 @@ impl TelegramAdapter {
             if is_retry {
                 self.app
                     .commands
-                    .retry_with_progress_in_telegram_scope(principal, scope, Some(tx))
+                    .retry_with_progress_in_telegram_scope_with_cancellation(
+                        principal,
+                        scope,
+                        Some(tx),
+                        cancellation.child_token(),
+                    )
                     .await
             } else {
                 self.app
                     .commands
-                    .execute_text_in_telegram_scope(principal, scope, text, Some(tx))
+                    .execute_text_in_telegram_scope_with_cancellation(
+                        principal,
+                        scope,
+                        text,
+                        Some(tx),
+                        cancellation.child_token(),
+                    )
                     .await
             }
         };
@@ -511,24 +669,75 @@ impl TelegramAdapter {
             tokio::select! {
                 result = &mut future => {
                     if dirty {
-                        let view = aggregator.view();
-                        let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
+                        if let Some(draft_id) = draft_id {
+                            let view = aggregator.view();
+                            let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
+                        }
                     }
                     return result;
                 }
                 event = rx.recv() => {
-                    if let Some(event) = event { aggregator.push(event); dirty = true; }
+                    if let Some(event) = event {
+                        if let AgentEvent::ApprovalRequested {
+                            approval_id,
+                            tool,
+                            summary,
+                            ..
+                        } = &event
+                        {
+                            if let Err(error) = self
+                                .send_approval_card(scope, user_id, approval_id, tool, summary)
+                                .await
+                            {
+                                tracing::warn!(%error, update_id, "failed to send Telegram approval card");
+                            }
+                        }
+                        aggregator.push(event);
+                        dirty = true;
+                    }
                 }
                 _ = ticker.tick() => {
                     if dirty || last_sent.elapsed() >= HEARTBEAT {
-                        let view = aggregator.view();
-                        let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
-                        dirty = false;
-                        last_sent = std::time::Instant::now();
+                        if let Some(draft_id) = draft_id {
+                            let view = aggregator.view();
+                            let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
+                            dirty = false;
+                            last_sent = std::time::Instant::now();
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Emit a one-shot approval card through the normal scoped menu system.
+    /// The opaque approval id remains in memory behind callback indirection;
+    /// it is never made a public Telegram command or exposed in message text.
+    async fn send_approval_card(
+        &self,
+        scope: TelegramScope,
+        user_id: i64,
+        approval_id: &str,
+        tool: &str,
+        summary: &str,
+    ) -> Result<()> {
+        let safe_tool = safe_progress(tool);
+        let safe_summary = safe_progress(summary);
+        let view = View {
+            title: Some("APPROVAL REQUIRED".into()),
+            blocks: vec![Block::Paragraph {
+                text: format!(
+                    "{safe_tool} is waiting for your one-time decision.\n{safe_summary}\n\nThis approval is bound to this owner, chat/topic, run, tool call, arguments and expiry."
+                ),
+            }],
+            actions: vec![vec![
+                Action::command("Approve once", format!("/_approval:approve:{approval_id}")),
+                Action::command("Deny", format!("/_approval:deny:{approval_id}")),
+            ]],
+            side_mode: false,
+        };
+        self.send_menu(scope, user_id, view).await?;
+        Ok(())
     }
 
     async fn send_view(
@@ -571,12 +780,6 @@ impl TelegramAdapter {
                             .await?;
                     }
                 }
-                Ok(())
-            }
-            CommandResult::StartedAuth(challenge) => {
-                let view = auth_view(&challenge);
-                let menu = self.send_menu(scope, user_id, view).await?;
-                self.watch_auth(challenge, menu);
                 Ok(())
             }
             CommandResult::StartCustomLogin => {
@@ -712,7 +915,13 @@ impl TelegramAdapter {
                 menu.current_view = login::alias_view(&wizard.id);
             }
             "alias" if wizard.phase == CustomLoginPhase::Alias => {
-                wizard.alias = validate_custom_alias(text)?;
+                let alias = validate_custom_alias(text)?;
+                if self.custom_alias_exists(context.principal, &alias)? {
+                    menu.pending_input = Some(format!("custom:{}:alias", wizard.id));
+                    menu.current_view = login::alias_collision_view(&wizard.id, &alias);
+                    return Ok(());
+                }
+                wizard.alias = alias;
                 menu.current_view = View::info(
                     "CUSTOM LOGIN",
                     "Validating endpoint and discovering models…",
@@ -722,6 +931,21 @@ impl TelegramAdapter {
                 menu.current_view = login::model_view(&wizard);
             }
             _ => return Err(anyhow!("custom login input is stale or out of sequence")),
+        }
+        Ok(())
+    }
+
+    fn custom_alias_exists(&self, principal: &str, alias: &str) -> Result<bool> {
+        let store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
+        Ok(store.get_by_alias(principal, alias)?.is_some())
+    }
+
+    #[allow(dead_code)]
+    fn ensure_custom_alias_available(&self, principal: &str, alias: &str) -> Result<()> {
+        if self.custom_alias_exists(principal, alias)? {
+            return Err(anyhow!(
+                "Custom profile alias `{alias}` already exists. Choose a different alias."
+            ));
         }
         Ok(())
     }
@@ -798,6 +1022,11 @@ impl TelegramAdapter {
                 menu.current_view = login::alias_view(wizard_id);
             }
             "default_alias" if wizard.phase == CustomLoginPhase::Alias => {
+                if self.custom_alias_exists(principal, "custom")? {
+                    menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                    menu.current_view = login::alias_collision_view(wizard_id, "custom");
+                    return Ok(());
+                }
                 wizard.alias = "custom".into();
                 self.discover_custom_models(&mut wizard).await?;
                 menu.pending_input = None;
@@ -830,7 +1059,7 @@ impl TelegramAdapter {
                     None => None,
                 };
                 wizard.capability = Some(
-                    crate::providers::probe_custom_tool_capability(
+                    crate::providers::probe_custom_capabilities(
                         endpoint,
                         &headers,
                         api_key.as_deref(),
@@ -843,7 +1072,25 @@ impl TelegramAdapter {
                 menu.current_view = login::confirmation_view(&wizard);
             }
             "confirm" if wizard.phase == CustomLoginPhase::Confirm => {
-                self.commit_custom_login(principal, &wizard).await?;
+                if self.custom_alias_exists(principal, &wizard.alias)? {
+                    wizard.phase = CustomLoginPhase::Alias;
+                    menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                    menu.current_view = login::alias_collision_view(wizard_id, &wizard.alias);
+                    return Ok(());
+                }
+                if let Err(error) = self.commit_custom_login(principal, &wizard).await {
+                    let msg = error.to_string().to_ascii_lowercase();
+                    if (msg.contains("already exists") && msg.contains("alias"))
+                        || (msg.contains("unique") && msg.contains("alias"))
+                    {
+                        wizard.phase = CustomLoginPhase::Alias;
+                        let alias = wizard.alias.clone();
+                        menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                        menu.current_view = login::alias_collision_view(wizard_id, &alias);
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
                 let model = wizard
                     .selected_index
                     .and_then(|index| wizard.models.get(index))
@@ -877,7 +1124,25 @@ impl TelegramAdapter {
                     menu.current_view = login::model_view(&wizard);
                 }
                 CustomLoginPhase::Confirm => {
-                    self.commit_custom_login(principal, &wizard).await?;
+                    if self.custom_alias_exists(principal, &wizard.alias)? {
+                        wizard.phase = CustomLoginPhase::Alias;
+                        menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                        menu.current_view = login::alias_collision_view(wizard_id, &wizard.alias);
+                        return Ok(());
+                    }
+                    if let Err(error) = self.commit_custom_login(principal, &wizard).await {
+                        let msg = error.to_string().to_ascii_lowercase();
+                        if (msg.contains("already exists") && msg.contains("alias"))
+                            || (msg.contains("unique") && msg.contains("alias"))
+                        {
+                            wizard.phase = CustomLoginPhase::Alias;
+                            let alias = wizard.alias.clone();
+                            menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                            menu.current_view = login::alias_collision_view(wizard_id, &alias);
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
                     let model = wizard
                         .selected_index
                         .and_then(|index| wizard.models.get(index))
@@ -946,100 +1211,69 @@ impl TelegramAdapter {
             .and_then(|index| wizard.models.get(index))
             .cloned()
             .ok_or_else(|| anyhow!("select a model before confirmation"))?;
-        let capability = wizard
+        let probe = wizard
             .capability
             .as_ref()
             .ok_or_else(|| anyhow!("selected model capability was not probed"))?;
+        let probed_at = chrono::Utc::now().to_rfc3339();
         let context = self
             .app
             .sessions
             .context_for_telegram(principal, wizard.scope)?;
-        let previous_selection = (
-            context.active.provider.clone(),
-            context.active.account_id.clone(),
-            context.active.model.clone(),
+        let profile_service = crate::providers::CustomProfileService::new(
+            self.app.storage.clone(),
+            self.app.auth.secrets().clone(),
         );
-        let profile_store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
-        let profile = profile_store.create(crate::storage::ProviderProfileInput {
-            profile_id: None,
-            owner_id: principal.into(),
-            alias: wizard.alias.clone(),
-            endpoint: wizard
-                .endpoint
-                .clone()
-                .ok_or_else(|| anyhow!("custom endpoint is missing"))?,
-            protocol: wizard.protocol.clone(),
-            credential_ref: wizard.credential_ref.clone(),
-            safe_headers_json: "{}".into(),
-        })?;
         let profile_models = wizard
             .models
             .iter()
             .map(|candidate| {
-                let selected = candidate == &model;
-                crate::storage::ProviderProfileModelRecord {
-                    profile_id: profile.profile_id.clone(),
-                    model_id: candidate.clone(),
-                    text_capable: true,
-                    vision_capable: false,
-                    file_input_capable: false,
-                    native_tools: selected
-                        && capability.tool_protocol == crate::providers::ToolProtocol::Native,
-                    structured_output: selected && capability.structured_output,
-                    continuation: selected && capability.continuation,
-                    model_discovery: true,
-                    tool_protocol: if selected {
-                        capability.tool_protocol.as_str().into()
-                    } else {
-                        "chat_only".into()
-                    },
-                    evidence: if selected {
-                        capability.evidence.clone()
-                    } else {
-                        "discovered but not capability-probed".into()
-                    },
-                    probed_at: chrono::Utc::now().to_rfc3339(),
+                if candidate == &model {
+                    crate::providers::profile_model_from_probe(
+                        "pending-custom-profile",
+                        candidate,
+                        probe,
+                        &probed_at,
+                    )
+                } else {
+                    crate::storage::ProviderProfileModelRecord {
+                        profile_id: "pending-custom-profile".into(),
+                        model_id: candidate.clone(),
+                        text_capable: true,
+                        vision_capable: false,
+                        file_input_capable: false,
+                        native_tools: false,
+                        structured_output: false,
+                        continuation: false,
+                        native_tools_state: "unknown".into(),
+                        structured_output_state: "unknown".into(),
+                        continuation_state: "unknown".into(),
+                        vision_state: "unknown".into(),
+                        file_input_state: "unknown".into(),
+                        model_discovery: true,
+                        tool_protocol: "chat_only".into(),
+                        evidence: "discovered but not capability-probed".into(),
+                        probe_status: "unprobed".into(),
+                        probe_version: 1,
+                        probed_at: probed_at.clone(),
+                    }
                 }
             })
             .collect::<Vec<_>>();
-        let commit = (|| -> Result<()> {
-            profile_store.replace_models(principal, &profile.profile_id, &profile_models)?;
-            self.app.storage.set_session_provider(
-                principal,
-                &context.active.id,
-                "custom",
-                Some(&profile.profile_id),
-                &model,
-            )?;
-            self.app.storage.audit(
-                principal,
-                "custom_provider_configured",
-                &format!(
-                    "session_id={};profile_id={};model={model}",
-                    context.active.id, profile.profile_id
-                ),
-            )?;
-            Ok(())
-        })();
-        if let Err(error) = commit {
-            // Compensate the cross-table wizard commit. The transient
-            // credential remains owned by the wizard so Retry can safely
-            // resume instead of silently losing the owner's key.
-            let restore = self.app.storage.set_session_provider(
-                principal,
-                &context.active.id,
-                &previous_selection.0,
-                previous_selection.1.as_deref(),
-                &previous_selection.2,
-            );
-            let remove = profile_store.delete(principal, &profile.profile_id);
-            if let Err(rollback) = restore.and(remove.map(|_| ())) {
-                return Err(anyhow!(
-                    "Custom profile commit failed ({error}); rollback also failed ({rollback})"
-                ));
-            }
-            return Err(anyhow!("commit Custom profile selection: {error}"));
-        }
+        profile_service.create_profile_with_models_and_activate_session_with_credential_ref(
+            principal,
+            &wizard.alias,
+            wizard
+                .endpoint
+                .as_deref()
+                .ok_or_else(|| anyhow!("custom endpoint is missing"))?,
+            &wizard.protocol,
+            std::collections::BTreeMap::new(),
+            wizard.credential_ref.as_deref(),
+            &profile_models,
+            &context.active.id,
+            &model,
+        )?;
         Ok(())
     }
 
@@ -1203,6 +1437,38 @@ impl TelegramAdapter {
                     .app
                     .resolve_telegram_owner(guard.owner_user_id)?
                     .owner_id;
+                if let Some((approve, approval_id)) = parse_internal_approval_command(&command) {
+                    let decided =
+                        self.app
+                            .storage
+                            .decide_approval(&principal, approval_id, approve)?;
+                    if decided {
+                        self.app.storage.audit(
+                            &principal,
+                            "telegram_contextual_approval_decided",
+                            &format!(
+                                "approval_id={approval_id};decision={}",
+                                if approve { "approved" } else { "denied" }
+                            ),
+                        )?;
+                    }
+                    guard.current_view = View::info(
+                        "APPROVAL",
+                        if decided {
+                            if approve {
+                                "Approved once. The active run may now continue."
+                            } else {
+                                "Denied. The active run will receive the denial."
+                            }
+                        } else {
+                            "This approval is no longer pending or has expired."
+                        },
+                    );
+                    guard.pending_input = None;
+                    guard.revision += 1;
+                    self.edit_first(&mut guard).await?;
+                    return Ok(());
+                }
                 if command.starts_with("/_custom:") {
                     if let Err(error) = self
                         .handle_custom_action(&mut guard, &principal, &command)
@@ -1213,43 +1479,88 @@ impl TelegramAdapter {
                             .split(':')
                             .next()
                             .unwrap_or_default();
-                        let endpoint = self
-                            .custom_logins
-                            .get(wizard_id)
-                            .and_then(|wizard| wizard.try_lock().ok()?.endpoint.clone());
-                        guard.current_view = login::failure_view(
-                            wizard_id,
-                            endpoint.as_deref(),
-                            &classify_custom_error(&error),
-                        );
+                        let msg = error.to_string().to_ascii_lowercase();
+                        let is_alias_collision = (msg.contains("already exists")
+                            && msg.contains("alias"))
+                            || (msg.contains("unique") && msg.contains("alias"));
+                        if is_alias_collision {
+                            if let Some(wizard) = self.custom_logins.get(wizard_id) {
+                                if let Ok(mut state) = wizard.try_lock() {
+                                    state.phase = login::CustomLoginPhase::Alias;
+                                    let alias = state.alias.clone();
+                                    guard.pending_input = Some(format!("custom:{wizard_id}:alias"));
+                                    guard.current_view =
+                                        login::alias_collision_view(wizard_id, &alias);
+                                } else {
+                                    let endpoint = self
+                                        .custom_logins
+                                        .get(wizard_id)
+                                        .and_then(|w| w.try_lock().ok()?.endpoint.clone());
+                                    guard.current_view = login::failure_view(
+                                        wizard_id,
+                                        endpoint.as_deref(),
+                                        &classify_custom_error(&error),
+                                    );
+                                }
+                            } else {
+                                let endpoint = self
+                                    .custom_logins
+                                    .get(wizard_id)
+                                    .and_then(|wizard| wizard.try_lock().ok()?.endpoint.clone());
+                                guard.current_view = login::failure_view(
+                                    wizard_id,
+                                    endpoint.as_deref(),
+                                    &classify_custom_error(&error),
+                                );
+                            }
+                        } else {
+                            let endpoint = self
+                                .custom_logins
+                                .get(wizard_id)
+                                .and_then(|wizard| wizard.try_lock().ok()?.endpoint.clone());
+                            guard.current_view = login::failure_view(
+                                wizard_id,
+                                endpoint.as_deref(),
+                                &classify_custom_error(&error),
+                            );
+                        }
                     }
                     guard.revision += 1;
                     self.advance_menu_prompt(&mut guard).await?;
                     return Ok(());
                 }
-                let fast = command.split_whitespace().next().is_some_and(|x| {
-                    matches!(
-                        x.split('@').next(),
-                        Some("/stop") | Some("/cancel") | Some("/retry")
-                    )
-                });
+                let fast = command
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|x| matches!(x.split('@').next(), Some("/stop") | Some("/retry")));
                 let result = if fast {
                     self.app
                         .commands
-                        .execute_text_in_telegram_scope(&principal, callback_scope, &command, None)
+                        .execute_callback_in_telegram_scope(
+                            &principal,
+                            callback_scope,
+                            &command,
+                            None,
+                        )
                         .await?
                 } else {
-                    self.execute_serialized(&principal, callback_scope, &command)
+                    let lane = self.principal_lock(&principal);
+                    let _guard = lane.lock().await;
+                    self.app
+                        .commands
+                        .execute_callback_in_telegram_scope(
+                            &principal,
+                            callback_scope,
+                            &command,
+                            None,
+                        )
                         .await?
                 };
-                let (next, auth, pending) = match result {
-                    CommandResult::StartedAuth(challenge) => {
-                        (auth_view(&challenge), Some(challenge), None)
-                    }
+                let (next, pending) = match result {
                     CommandResult::InputRequest {
                         view,
                         command_prefix,
-                    } => (view, None, Some(command_prefix)),
+                    } => (view, Some(command_prefix)),
                     CommandResult::StartCustomLogin => {
                         let wizard = self.custom_logins.begin(
                             callback_scope,
@@ -1259,22 +1570,17 @@ impl TelegramAdapter {
                         let id = wizard.lock().await.id.clone();
                         (
                             login::endpoint_view(&id),
-                            None,
                             Some(format!("custom:{id}:endpoint")),
                         )
                     }
-                    CommandResult::Agent(answer) => (agent_final_view(answer), None, None),
-                    other => (result_view(other)?, None, None),
+                    CommandResult::Agent(answer) => (agent_final_view(answer), None),
+                    other => (result_view(other)?, None),
                 };
                 let previous = std::mem::replace(&mut guard.current_view, next);
                 guard.history.push(previous);
                 guard.pending_input = pending;
                 guard.revision += 1;
                 self.edit_first(&mut guard).await?;
-                drop(guard);
-                if let Some(challenge) = auth {
-                    self.watch_auth(challenge, menu.clone());
-                }
             }
         }
         Ok(())
@@ -1306,60 +1612,6 @@ impl TelegramAdapter {
             .send_view(scope, &guard.current_view, Some(markup))
             .await?;
         Ok(())
-    }
-
-    fn watch_auth(&self, challenge: AuthChallenge, menu: Arc<tokio::sync::Mutex<MenuSession>>) {
-        let transaction_id = match &challenge {
-            AuthChallenge::BrowserUrl { transaction_id, .. } => Some(transaction_id.clone()),
-            AuthChallenge::ApiKey { .. } => None,
-        };
-        let Some(transaction_id) = transaction_id else {
-            return;
-        };
-        let mut events = self.app.auth.subscribe();
-        let client = self.client.clone();
-        let watched = transaction_id.clone();
-        let watched_menu = menu.clone();
-        tokio::spawn(async move {
-            let deadline = sleep(Duration::from_secs(900));
-            tokio::pin!(deadline);
-            loop {
-                tokio::select! {
-                    _ = &mut deadline => break,
-                    event = events.recv() => match event {
-                        Ok(AuthEvent::Completed { transaction_id, account }) if transaction_id == watched => {
-                            let mut guard = watched_menu.lock().await;
-                            if guard.expires_at <= std::time::Instant::now() { break; }
-                            guard.current_view = View {
-                                title: Some(account.provider.to_ascii_uppercase()),
-                                blocks: vec![Block::Paragraph { text: format!("CONNECTED\n{}", account.email.clone().unwrap_or_else(|| account.label.clone())) }],
-                                actions: vec![vec![Action::command("Use Account", format!("/account use {}", account.id)), Action::command("Accounts", "/account")], vec![Action::close()]],
-                                side_mode: false,
-                            };
-                            guard.revision += 1;
-                            let markup = keyboard(&guard.current_view, &guard.id, guard.revision);
-                            let rendered = rich::render(&guard.current_view, false);
-                            let plain = rich::plain(&guard.current_view);
-                            let _ = menu::edit_first(&client, &mut guard, rendered, plain, markup).await;
-                            break;
-                        }
-                        Ok(AuthEvent::Failed { transaction_id, error, .. }) if transaction_id == watched => {
-                            let mut guard = watched_menu.lock().await;
-                            if guard.expires_at <= std::time::Instant::now() { break; }
-                            guard.current_view = View { title: Some("LOGIN FAILED".into()), blocks: vec![Block::Paragraph { text: error }], actions: vec![vec![Action::command("Login", "/login"), Action::back()]], side_mode: false };
-                            guard.revision += 1;
-                            let markup = keyboard(&guard.current_view, &guard.id, guard.revision);
-                            let rendered = rich::render(&guard.current_view, false);
-                            let plain = rich::plain(&guard.current_view);
-                            let _ = menu::edit_first(&client, &mut guard, rendered, plain, markup).await;
-                            break;
-                        }
-                        Ok(_) => continue,
-                        Err(_) => break,
-                    }
-                }
-            }
-        });
     }
 }
 
@@ -1510,23 +1762,26 @@ fn paginate_final_view(view: &View, max_chars: usize) -> Vec<View> {
 
 struct ProgressAggregator {
     items: Vec<ProgressItem>,
-    active_tool: Option<String>,
+    next_id: u64,
     detail: String,
     stream_chunks: usize,
 }
 
 struct ToolProgress {
     activity: ProgressActivity,
+    icon: ProgressIcon,
     active: String,
     completed: String,
     failed: String,
 }
 
+const PROGRESS_CHAR_BUDGET: usize = 3_500;
+
 impl ProgressAggregator {
     fn new(detail: String) -> Self {
         Self {
             items: vec![],
-            active_tool: None,
+            next_id: 1,
             detail,
             stream_chunks: 0,
         }
@@ -1543,11 +1798,28 @@ impl ProgressAggregator {
             }
             AgentEvent::ToolStarted(tool) => {
                 let progress = tool_progress(&tool);
-                self.set_active_for_tool(progress.active, progress.activity, tool);
+                self.set_active_for_tool(progress.active, progress.activity, tool, None);
+            }
+            AgentEvent::ToolStartedWithId { tool, call_id } => {
+                let progress = tool_progress(&tool);
+                self.set_active_for_tool(progress.active, progress.activity, tool, Some(call_id));
             }
             AgentEvent::ToolCompleted { tool, summary } => {
-                self.complete_tool(&tool, &summary);
+                self.complete_tool(&tool, None, &summary);
             }
+            AgentEvent::ToolCompletedWithId {
+                tool,
+                call_id,
+                summary,
+            } => {
+                self.complete_tool(&tool, Some(call_id), &summary);
+            }
+            AgentEvent::ApprovalRequested {
+                tool,
+                call_id,
+                summary,
+                ..
+            } => self.await_approval(&tool, &call_id, &summary),
             AgentEvent::StreamChunk { .. } => self.stream_chunk(),
             AgentEvent::GenerationCompleted => {
                 self.set_active("Finishing response".into(), ProgressActivity::Writing)
@@ -1557,69 +1829,117 @@ impl ProgressAggregator {
     }
 
     fn set_active(&mut self, label: String, activity: ProgressActivity) {
-        self.set_active_entry(label, activity, None);
+        self.set_active_entry(
+            label,
+            activity,
+            ProgressIcon::from_activity(activity),
+            None,
+            None,
+        );
     }
 
-    fn set_active_for_tool(&mut self, label: String, activity: ProgressActivity, tool: String) {
-        self.set_active_entry(label, activity, Some(normalize_tool_name(&tool)));
+    fn set_active_for_tool(
+        &mut self,
+        label: String,
+        activity: ProgressActivity,
+        tool: String,
+        correlation: Option<String>,
+    ) {
+        let progress = tool_progress(&tool);
+        self.set_active_entry(
+            label,
+            activity,
+            progress.icon,
+            Some(normalize_tool_name(&tool)),
+            correlation,
+        );
     }
 
     fn set_active_entry(
         &mut self,
         label: String,
         activity: ProgressActivity,
+        icon: ProgressIcon,
         tool: Option<String>,
+        correlation: Option<String>,
     ) {
-        if self
-            .items
-            .last()
-            .is_some_and(|item| item.state == ProgressState::Active)
-        {
-            if self
-                .items
-                .last()
-                .is_some_and(|item| item.activity == activity)
-            {
-                self.items.last_mut().expect("active item exists").label = label;
-                self.active_tool = tool;
-                return;
-            }
-            let retain = self.items.last().is_some_and(|item| {
-                !matches!(
-                    item.activity,
-                    ProgressActivity::Thinking | ProgressActivity::Writing
-                )
-            });
-            if retain {
-                let previous_tool = self.active_tool.take();
-                let item = self.items.last_mut().expect("active item exists");
-                item.state = ProgressState::Done;
-                if let Some(previous_tool) = previous_tool {
-                    item.label = tool_progress(&previous_tool).completed;
+        let same_action = self.items.iter().rposition(|item| {
+            item.state == ProgressState::Active
+                && match (
+                    item.action_key.as_deref(),
+                    tool.as_deref(),
+                    item.correlation_id.as_deref(),
+                    correlation.as_deref(),
+                ) {
+                    (Some(current), Some(next), Some(current_id), Some(next_id)) => {
+                        current == next && current_id == next_id
+                    }
+                    (Some(current), Some(next), None, None) => current == next,
+                    (None, None, None, None) => item.activity == activity,
+                    _ => false,
                 }
-            } else {
-                self.items.pop();
-                self.active_tool = None;
+        });
+        if let Some(index) = same_action {
+            let item = &mut self.items[index];
+            item.label = label;
+            item.activity = activity;
+            item.icon = icon;
+            item.action_key = tool;
+            item.correlation_id = correlation;
+            return;
+        }
+
+        // A timeline has one current active row. Starting a genuinely new
+        // action closes the previous row in place; it never removes history.
+        if let Some(index) = self
+            .items
+            .iter()
+            .rposition(|item| item.state == ProgressState::Active)
+        {
+            let previous_tool = self.items[index].action_key.clone();
+            let item = &mut self.items[index];
+            item.state = ProgressState::Done;
+            if let Some(previous_tool) = previous_tool {
+                item.label = tool_progress(&previous_tool).completed;
             }
         }
         self.items.push(ProgressItem {
+            id: self.next_id,
             state: ProgressState::Active,
             activity,
+            icon,
+            action_key: tool,
+            correlation_id: correlation,
+            summary: None,
             label,
         });
-        self.active_tool = tool;
+        self.next_id = self.next_id.saturating_add(1);
         self.trim();
     }
 
-    fn complete_tool(&mut self, tool: &str, summary: &str) {
+    fn complete_tool(&mut self, tool: &str, correlation: Option<String>, summary: &str) {
         let progress = tool_progress(tool);
         let safe_summary = safe_progress(summary);
-        let failed = safe_summary.to_ascii_lowercase().starts_with("failed");
+        let lower = safe_summary.to_ascii_lowercase();
+        let failed = lower.starts_with("failed")
+            || lower.starts_with("error")
+            || lower.starts_with("cancelled");
         let mut label = if failed {
             progress.failed
         } else {
             progress.completed
         };
+        if failed {
+            let detail = safe_summary
+                .strip_prefix("failed: ")
+                .or_else(|| safe_summary.strip_prefix("error: "))
+                .or_else(|| safe_summary.strip_prefix("cancelled: "))
+                .unwrap_or(&safe_summary);
+            if !detail.is_empty() && detail != "failed" {
+                label.push_str(" · ");
+                label.push_str(detail);
+            }
+        }
         if self.detail == "detailed" && !matches!(safe_summary.as_str(), "completed" | "failed") {
             let detail = safe_summary
                 .strip_prefix("failed: ")
@@ -1633,46 +1953,54 @@ impl ProgressAggregator {
             ProgressState::Done
         };
         let tool_key = normalize_tool_name(tool);
-        if self.active_tool.as_deref() == Some(tool_key.as_str()) {
-            let Some(active) = self
-                .items
-                .last_mut()
-                .filter(|item| item.state == ProgressState::Active)
-            else {
-                self.active_tool = None;
-                return;
-            };
-            active.state = state;
-            active.activity = progress.activity;
-            active.label = label;
-            self.active_tool = None;
-        } else if self.active_tool.is_some() {
-            // A late completion from an older or parallel tool must never
-            // complete the tool that is currently shown as active.
-            return;
+        let index = if let Some(correlation) = correlation.as_deref() {
+            // Correlation IDs are the only safe way to complete an older row
+            // after another action has started. The tool name is checked too
+            // so a malformed provider event cannot cross tool boundaries.
+            self.items.iter().position(|item| {
+                item.action_key.as_deref() == Some(tool_key.as_str())
+                    && item.correlation_id.as_deref() == Some(correlation)
+            })
         } else {
-            if let Some(active) = self
-                .items
-                .last()
-                .filter(|item| item.state == ProgressState::Active)
-            {
-                if matches!(
-                    active.activity,
-                    ProgressActivity::Thinking | ProgressActivity::Writing
-                ) {
-                    self.items.pop();
-                } else {
-                    return;
-                }
-            }
-            self.items.push(ProgressItem {
-                state,
-                activity: progress.activity,
-                label,
-            });
+            // Legacy events without a call ID are intentionally limited to
+            // the current active row. They cannot complete a newer/different
+            // action or guess at a historical row.
+            self.items.iter().rposition(|item| {
+                item.state == ProgressState::Active
+                    && item.action_key.as_deref() == Some(tool_key.as_str())
+                    && item.correlation_id.is_none()
+            })
+        };
+        let Some(index) = index else {
+            return;
+        };
+        if let Some(item) = self.items.get_mut(index) {
+            item.state = state;
+            item.activity = progress.activity;
+            item.icon = progress.icon;
+            item.label = label;
+            item.summary = Some(safe_summary.clone());
         }
         self.trim();
-        self.set_active("Thinking".into(), ProgressActivity::Thinking);
+    }
+
+    fn await_approval(&mut self, tool: &str, call_id: &str, summary: &str) {
+        let progress = tool_progress(tool);
+        let detail = safe_progress(summary);
+        let label = if detail.is_empty() {
+            format!("Awaiting approval · {}", progress.active)
+        } else {
+            safe_progress(&format!(
+                "Awaiting approval · {} · {detail}",
+                progress.active
+            ))
+        };
+        self.set_active_for_tool(
+            label,
+            progress.activity,
+            tool.to_owned(),
+            Some(call_id.to_owned()),
+        );
     }
 
     fn stream_chunk(&mut self) {
@@ -1687,6 +2015,20 @@ impl ProgressAggregator {
             return;
         }
         if let Some(active) = self.items.last_mut().filter(|item| {
+            item.state == ProgressState::Active && item.activity == ProgressActivity::Thinking
+        }) {
+            // The first provider chunk is the same generation action changing
+            // phase, not a new row. This keeps streaming as one Writing item.
+            active.activity = ProgressActivity::Writing;
+            active.icon = ProgressIcon::Writing;
+            active.label = if self.detail == "detailed" {
+                format!("Writing response · {} chunks", self.stream_chunks)
+            } else {
+                "Writing response".into()
+            };
+            return;
+        }
+        if let Some(active) = self.items.last_mut().filter(|item| {
             item.state == ProgressState::Active && item.activity == ProgressActivity::Writing
         }) {
             if self.detail == "detailed" && self.stream_chunks.is_multiple_of(8) {
@@ -1698,7 +2040,6 @@ impl ProgressAggregator {
     }
 
     fn fail(&mut self, error: &str) {
-        self.active_tool = None;
         let label = if self.detail == "detailed" {
             format!("Request failed · {}", safe_progress(error))
         } else {
@@ -1706,17 +2047,25 @@ impl ProgressAggregator {
         };
         if let Some(active) = self
             .items
-            .last_mut()
-            .filter(|item| item.state == ProgressState::Active)
+            .iter_mut()
+            .rev()
+            .find(|item| item.state == ProgressState::Active)
         {
             active.state = ProgressState::Failed;
             active.label = label;
+            active.summary = Some(safe_progress(error));
         } else {
             self.items.push(ProgressItem {
+                id: self.next_id,
                 state: ProgressState::Failed,
                 activity: ProgressActivity::Thinking,
+                icon: ProgressIcon::Thinking,
+                action_key: None,
+                correlation_id: None,
+                summary: Some(safe_progress(error)),
                 label,
             });
+            self.next_id = self.next_id.saturating_add(1);
         }
         self.trim();
     }
@@ -1724,11 +2073,12 @@ impl ProgressAggregator {
     fn trim(&mut self) {
         let max = match self.detail.as_str() {
             "minimal" => 1,
-            "detailed" => 6,
-            _ => 3,
+            "detailed" => 30,
+            _ => 24,
         };
         if self.items.len() > max {
-            drop(self.items.drain(..self.items.len() - max));
+            let remove = self.items.len() - max;
+            self.items.drain(..remove);
         }
     }
 
@@ -1736,10 +2086,37 @@ impl ProgressAggregator {
         let mut items = self.items.clone();
         if items.is_empty() {
             items.push(ProgressItem {
+                id: self.next_id,
                 state: ProgressState::Active,
                 activity: ProgressActivity::Thinking,
+                icon: ProgressIcon::Thinking,
+                action_key: Some("generation".into()),
+                correlation_id: None,
+                summary: None,
                 label: "Thinking".into(),
             });
+        }
+        // Keep the current active row and the newest history while satisfying
+        // the Telegram draft budget. Labels are already bounded, so this is
+        // only reached for an unusually long timeline.
+        while items.len() > 1 && progress_text_length(&items) > PROGRESS_CHAR_BUDGET {
+            let active_index = items
+                .iter()
+                .rposition(|item| item.state == ProgressState::Active)
+                .unwrap_or(items.len().saturating_sub(1));
+            if active_index == 0 {
+                break;
+            }
+            items.remove(0);
+        }
+        if progress_text_length(&items) > PROGRESS_CHAR_BUDGET {
+            let index = items
+                .iter()
+                .rposition(|item| item.state == ProgressState::Active)
+                .unwrap_or_else(|| items.len().saturating_sub(1));
+            if let Some(active) = items.get_mut(index) {
+                active.label = safe_progress(&active.label);
+            }
         }
         View {
             title: None,
@@ -1748,6 +2125,14 @@ impl ProgressAggregator {
             side_mode: false,
         }
     }
+}
+
+fn progress_text_length(items: &[ProgressItem]) -> usize {
+    items
+        .iter()
+        .map(|item| item.label.chars().count() + 4)
+        .sum::<usize>()
+        .saturating_add(items.len().saturating_sub(1))
 }
 
 fn status_progress(value: &str) -> (String, ProgressActivity) {
@@ -1788,6 +2173,11 @@ fn tool_progress(tool: &str) -> ToolProgress {
         let scope = if web { "the web" } else { "files" };
         ToolProgress {
             activity: ProgressActivity::Searching,
+            icon: if web {
+                ProgressIcon::WebSearch
+            } else {
+                ProgressIcon::FileSearch
+            },
             active: format!("Searching {scope}"),
             completed: format!("Searched {scope}"),
             failed: if web {
@@ -1803,6 +2193,11 @@ fn tool_progress(tool: &str) -> ToolProgress {
     {
         ToolProgress {
             activity: ProgressActivity::Fetching,
+            icon: if normalized.contains("read") || normalized.contains("document") {
+                ProgressIcon::DocumentRead
+            } else {
+                ProgressIcon::Fetching
+            },
             active: "Fetching a page".into(),
             completed: "Fetched the page".into(),
             failed: "Page fetch failed".into(),
@@ -1814,6 +2209,13 @@ fn tool_progress(tool: &str) -> ToolProgress {
     {
         ToolProgress {
             activity: ProgressActivity::Media,
+            icon: if normalized.contains("audio") {
+                ProgressIcon::Audio
+            } else if normalized.contains("video") {
+                ProgressIcon::Video
+            } else {
+                ProgressIcon::ImageInspect
+            },
             active: "Processing media".into(),
             completed: "Processed media".into(),
             failed: "Media processing failed".into(),
@@ -1829,6 +2231,17 @@ fn tool_progress(tool: &str) -> ToolProgress {
     {
         ToolProgress {
             activity: ProgressActivity::Coding,
+            icon: if normalized.contains("edit") || normalized.contains("patch") {
+                ProgressIcon::Editing
+            } else if normalized.contains("shell")
+                || normalized.contains("exec")
+                || normalized.contains("terminal")
+                || normalized.contains("command")
+            {
+                ProgressIcon::Terminal
+            } else {
+                ProgressIcon::Coding
+            },
             active: "Working with code".into(),
             completed: "Finished code work".into(),
             failed: "Code work failed".into(),
@@ -1841,6 +2254,11 @@ fn tool_progress(tool: &str) -> ToolProgress {
     {
         ToolProgress {
             activity: ProgressActivity::Analyzing,
+            icon: if normalized.contains("read") || normalized.contains("inspect") {
+                ProgressIcon::DocumentRead
+            } else {
+                ProgressIcon::Analyzing
+            },
             active: "Checking conversation context".into(),
             completed: "Checked conversation context".into(),
             failed: "Context check failed".into(),
@@ -1849,6 +2267,13 @@ fn tool_progress(tool: &str) -> ToolProgress {
         let name = humanize_tool_name(tool);
         ToolProgress {
             activity: ProgressActivity::Tool,
+            icon: if normalized.contains("install") {
+                ProgressIcon::Installing
+            } else if normalized.contains("test") {
+                ProgressIcon::Testing
+            } else {
+                ProgressIcon::Tool
+            },
             active: format!("Running {name}"),
             completed: format!("Ran {name}"),
             failed: format!("{name} failed"),
@@ -1871,6 +2296,31 @@ fn humanize_tool_name(tool: &str) -> String {
 
 fn normalize_tool_name(tool: &str) -> String {
     tool.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn parse_internal_approval_command(command: &str) -> Option<(bool, &str)> {
+    let parts = command.trim().split(':').collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0] != "/_approval" {
+        return None;
+    }
+    let approve = match parts[1] {
+        "approve" => true,
+        "deny" => false,
+        _ => return None,
+    };
+    let id = parts[2];
+    let valid = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-');
+    valid.then_some((approve, id))
+}
+
+fn is_stop_command(text: &str) -> bool {
+    text.split_whitespace()
+        .next()
+        .is_some_and(|command| matches!(command.split('@').next(), Some("/stop")))
 }
 
 fn safe_progress(value: &str) -> String {
@@ -1896,32 +2346,10 @@ fn result_view(result: CommandResult) -> Result<View> {
     }
 }
 
-fn auth_view(challenge: &AuthChallenge) -> View {
-    match challenge {
-        AuthChallenge::BrowserUrl { provider, url, transaction_id } => View {
-            title: Some(format!("{} LOGIN", if provider == "codex" { "CODEX" } else { "AGY" })),
-            blocks: vec![Block::Paragraph {
-                text: concat!(
-                    "Open the login page on this Android device. The localhost OAuth callback ",
-                    "returns to xiao and this same menu updates automatically."
-                )
-                .into(),
-            }],
-            actions: vec![vec![Action::url("Open Login Page", url)], vec![Action::command("Cancel", format!("/login cancel {transaction_id}")), Action::back()]],
-            side_mode: false,
-        },
-        AuthChallenge::ApiKey { .. } => View {
-            title: Some("CUSTOM PROVIDER".into()),
-            blocks: vec![Block::Paragraph { text: "Configure the Custom API key in KernelSU WebUI/local admin API. It is never requested through Telegram.".into() }],
-            actions: vec![vec![Action::back(), Action::close()]],
-            side_mode: false,
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{ToolContext, ToolEffect, ToolOrigin, ToolPolicy, ToolRisk, ToolSpec};
     use axum::{
         body::Bytes,
         extract::State,
@@ -2111,6 +2539,66 @@ mod tests {
         }).await.unwrap_or_else(|_|panic!("Telegram update {id} was not processed promptly"));
     }
 
+    #[tokio::test]
+    async fn stop_preempts_pending_rename_and_custom_login_input() {
+        let telegram_base = serve(Router::new().fallback(post(telegram_stub))).await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.storage.database = temp.path().join("xiao.db");
+        cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.logs_dir = temp.path().join("logs");
+        cfg.paths.secrets_dir = temp.path().join("secrets");
+        cfg.telegram.enabled = true;
+        cfg.telegram.access.allowed_chat_ids = vec![100];
+        cfg.telegram.access.owner_user_id = Some(10);
+        let app = AppState::build(cfg).await.unwrap();
+        let scope = TelegramScope::new(100, None);
+        let menus = Arc::new(MenuStore::new(Duration::from_secs(60)));
+        let menu = menus.prepare_scoped(scope, 10, View::info("RENAME", "pending"));
+        let menu_id = menu.lock().await.id.clone();
+        menus.insert(menu.clone(), menu_id.clone());
+        let custom_logins = Arc::new(CustomLoginStore::new(Duration::from_secs(60)));
+        let adapter = TelegramAdapter {
+            app,
+            client: TelegramClient::with_base("test-token".into(), telegram_base).unwrap(),
+            menus,
+            custom_logins: custom_logins.clone(),
+            principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        menu.lock().await.pending_input = Some("/sessions rename session-a".into());
+        adapter
+            .handle_update(message(1, 100, 10, "/stop"))
+            .await
+            .unwrap();
+        assert_eq!(
+            menu.lock().await.pending_input.as_deref(),
+            Some("/sessions rename session-a")
+        );
+
+        let wizard = custom_logins.begin(scope, 10, menu_id);
+        let wizard_id = wizard.lock().await.id.clone();
+        menu.lock().await.pending_input = Some(format!("custom:{wizard_id}:endpoint"));
+        adapter
+            .handle_update(message(2, 100, 10, "/stop@xiao_test_bot"))
+            .await
+            .unwrap();
+        assert_eq!(
+            menu.lock().await.pending_input.as_deref(),
+            Some(format!("custom:{wizard_id}:endpoint").as_str())
+        );
+        assert!(custom_logins.get(&wizard_id).is_some());
+    }
+
+    #[test]
+    fn stop_detection_accepts_only_the_canonical_command_head() {
+        assert!(is_stop_command("/stop"));
+        assert!(is_stop_command("  /stop@xiao_test_bot extra"));
+        assert!(!is_stop_command("/s"));
+        assert!(!is_stop_command("/stop-now"));
+    }
+
     #[test]
     fn final_surface_excludes_progress_and_keeps_side_marker() {
         let view = agent_final_view(AgentAnswer {
@@ -2176,7 +2664,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_tool_becomes_quiet_history_then_thinking_resumes() {
+    fn completed_tool_remains_visible_without_synthetic_thinking() {
         let mut progress = ProgressAggregator::new("normal".into());
         progress.push(AgentEvent::GenerationStarted);
         progress.push(AgentEvent::ToolStarted("web_search".into()));
@@ -2192,10 +2680,9 @@ mod tests {
         let items = progress_items(&view);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].state, ProgressState::Done);
-        assert_eq!(items[0].label, "Searched the web");
-        assert_eq!(items[1].state, ProgressState::Active);
-        assert_eq!(items[1].activity, ProgressActivity::Thinking);
-        assert_eq!(items[1].label, "Thinking");
+        assert_eq!(items[0].label, "Thinking");
+        assert_eq!(items[1].state, ProgressState::Done);
+        assert_eq!(items[1].label, "Searched the web");
     }
 
     #[test]
@@ -2216,7 +2703,7 @@ mod tests {
     }
 
     #[test]
-    fn minimal_progress_keeps_only_the_current_animation() {
+    fn minimal_progress_keeps_the_completed_action_visible() {
         let mut progress = ProgressAggregator::new("minimal".into());
         progress.push(AgentEvent::GenerationStarted);
         progress.push(AgentEvent::ToolStarted("web_fetch".into()));
@@ -2232,10 +2719,7 @@ mod tests {
         });
         let resumed = progress.view();
         assert_eq!(progress_items(&resumed).len(), 1);
-        assert_eq!(
-            progress_items(&resumed)[0].activity,
-            ProgressActivity::Thinking
-        );
+        assert_eq!(progress_items(&resumed)[0].state, ProgressState::Done);
     }
 
     #[test]
@@ -2260,6 +2744,165 @@ mod tests {
         let active = items.last().unwrap();
         assert_eq!(active.activity, ProgressActivity::Coding);
         assert_eq!(active.label, "Working with code");
+    }
+
+    #[test]
+    fn normal_timeline_retains_24_append_oriented_rows() {
+        let mut progress = ProgressAggregator::new("normal".into());
+        for index in 0..40 {
+            progress.push(AgentEvent::ToolStartedWithId {
+                tool: format!("operation_{index}"),
+                call_id: format!("call-{index}"),
+            });
+        }
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(items.len(), 24);
+        assert!(items[..23]
+            .iter()
+            .all(|item| item.state == ProgressState::Done));
+        assert_eq!(items.last().unwrap().state, ProgressState::Active);
+        assert_eq!(
+            items.last().unwrap().correlation_id.as_deref(),
+            Some("call-39")
+        );
+    }
+
+    #[test]
+    fn detailed_timeline_retains_30_append_oriented_rows() {
+        let mut progress = ProgressAggregator::new("detailed".into());
+        for index in 0..40 {
+            progress.push(AgentEvent::ToolStartedWithId {
+                tool: format!("operation_{index}"),
+                call_id: format!("call-{index}"),
+            });
+        }
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(items.len(), 30);
+        assert!(items[..29]
+            .iter()
+            .all(|item| item.state == ProgressState::Done));
+        assert_eq!(items.last().unwrap().state, ProgressState::Active);
+        assert_eq!(
+            items.last().unwrap().correlation_id.as_deref(),
+            Some("call-39")
+        );
+    }
+
+    #[test]
+    fn correlation_id_completes_exact_tool_row_and_rejects_wrong_id() {
+        let mut progress = ProgressAggregator::new("normal".into());
+        progress.push(AgentEvent::ToolStartedWithId {
+            tool: "web_search".into(),
+            call_id: "old-call".into(),
+        });
+        progress.push(AgentEvent::ToolStartedWithId {
+            tool: "web_search".into(),
+            call_id: "new-call".into(),
+        });
+        progress.push(AgentEvent::ToolCompletedWithId {
+            tool: "web_search".into(),
+            call_id: "wrong-call".into(),
+            summary: "completed".into(),
+        });
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(items[0].state, ProgressState::Done);
+        assert_eq!(items[1].state, ProgressState::Active);
+        progress.push(AgentEvent::ToolCompletedWithId {
+            tool: "web_search".into(),
+            call_id: "old-call".into(),
+            summary: "completed".into(),
+        });
+        progress.push(AgentEvent::ToolCompletedWithId {
+            tool: "web_search".into(),
+            call_id: "new-call".into(),
+            summary: "completed".into(),
+        });
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert!(items.iter().all(|item| item.state == ProgressState::Done));
+        assert_eq!(items[0].correlation_id.as_deref(), Some("old-call"));
+        assert_eq!(items[1].correlation_id.as_deref(), Some("new-call"));
+    }
+
+    #[test]
+    fn failed_tool_stays_visible_with_redacted_error_and_failure_icon() {
+        let mut progress = ProgressAggregator::new("detailed".into());
+        progress.push(AgentEvent::ToolStartedWithId {
+            tool: "terminal".into(),
+            call_id: "terminal-1".into(),
+        });
+        progress.push(AgentEvent::ToolCompletedWithId {
+            tool: "terminal".into(),
+            call_id: "terminal-1".into(),
+            summary: "failed: Authorization: very-secret-token".into(),
+        });
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state, ProgressState::Failed);
+        let rendered = rich::render(&view, true).to_string();
+        assert!(rendered.contains("✗"));
+        assert!(!rendered.contains("very-secret-token"));
+    }
+
+    #[test]
+    fn hard_progress_budget_preserves_active_and_recent_rows() {
+        let mut progress = ProgressAggregator::new("detailed".into());
+        for index in 0..30 {
+            progress.push(AgentEvent::ToolStartedWithId {
+                tool: format!("operation_{index}_{}", "x".repeat(180)),
+                call_id: format!("call-{index}"),
+            });
+        }
+        let view = progress.view();
+        let items = progress_items(&view);
+        assert!(progress_text_length(items) <= PROGRESS_CHAR_BUDGET);
+        assert_eq!(items.last().unwrap().state, ProgressState::Active);
+        assert_eq!(
+            items.last().unwrap().correlation_id.as_deref(),
+            Some("call-29")
+        );
+        assert!(items.len() >= 2);
+        assert_eq!(
+            items[items.len() - 2].correlation_id.as_deref(),
+            Some("call-28")
+        );
+    }
+
+    #[test]
+    fn action_classifier_is_presentation_only_and_does_not_relax_policy() {
+        let classified = tool_progress("termux_terminal");
+        assert_eq!(classified.icon, ProgressIcon::Terminal);
+        let spec = ToolSpec {
+            name: "termux_terminal".into(),
+            description: "test".into(),
+            parameters: serde_json::json!({"type":"object"}),
+            risk: ToolRisk::SideEffect,
+            origin: ToolOrigin::Termux,
+            effect: ToolEffect::NonIdempotent,
+            required_capabilities: Vec::new(),
+            timeout_ms: 1_000,
+        };
+        let context = ToolContext {
+            principal: "owner".into(),
+            session_id: "session".into(),
+            agent_run_id: "run".into(),
+            yolo_mode: false,
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+            progress: None,
+        };
+        assert!(matches!(
+            ToolPolicy::default().evaluate_call(
+                &spec,
+                &serde_json::json!({"program":"rm","args":["file"]}),
+                &context,
+            ),
+            crate::tools::PolicyDecision::RequireApproval(_)
+        ));
     }
 
     #[test]
@@ -2290,7 +2933,7 @@ mod tests {
         cfg.paths.secrets_dir = temp.path().join("secrets");
         cfg.telegram.enabled = true;
         cfg.telegram.access.allowed_chat_ids = vec![100, 200];
-        cfg.telegram.access.allowed_user_ids = vec![10, 20];
+        cfg.telegram.access.owner_user_id = Some(10);
         cfg.providers.codex.enabled = false;
         cfg.providers.antigravity.enabled = false;
         cfg.providers.custom.enabled = true;
@@ -2308,12 +2951,14 @@ mod tests {
                 native_tool_calls: true,
                 structured_output: false,
                 continuation: true,
+                probe_status: "completed".into(),
+                probe_version: 1,
                 probed_at: chrono::Utc::now().to_rfc3339(),
                 evidence: "fixture isolates native agent cancellation from semantic evaluation"
                     .into(),
             })
             .unwrap();
-        let principal_a = TelegramAdapter::principal(10);
+        let principal_a = TelegramAdapter::principal(&app, 10);
         let main = app.sessions.ensure_default_session(&principal_a).unwrap();
         app.storage
             .set_session_provider(&principal_a, &main.id, "custom", None, "m")
@@ -2326,6 +2971,7 @@ mod tests {
             menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
             custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let first = message(1, 100, 10, "run a long request");
@@ -2342,8 +2988,9 @@ mod tests {
         .await
         .expect("fake provider never started");
 
-        // A different principal remains responsive while principal A is generating.
-        let status = message(2, 200, 20, "/status");
+        // Another allowed chat for the same single owner remains responsive while
+        // generation is active; no second owner/principal exists in Xiao.
+        let status = message(2, 200, 10, "/status");
         assert!(app
             .storage
             .enqueue_telegram_update(2, &serde_json::to_string(&status).unwrap())
@@ -2441,6 +3088,7 @@ mod tests {
             menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
             custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
         adapter
             .handle_update(topic_message(1, 100, 10, 10, "/status"))
@@ -2451,7 +3099,7 @@ mod tests {
             .await
             .unwrap();
 
-        let principal = TelegramAdapter::principal(10);
+        let principal = TelegramAdapter::principal(&app, 10);
         let topic_10 = app
             .sessions
             .context_for_telegram(&principal, TelegramScope::new(100, Some(10)))
@@ -2492,19 +3140,31 @@ mod tests {
             .route(
                 "/v1/chat/completions",
                 post(|Json(body): Json<serde_json::Value>| async move {
-                    let content = body["messages"][0]["content"].as_str().unwrap();
-                    let nonce = content
-                        .split("nonce ")
+                    // Hidden vision challenge: extract from image_url fragment (#VISION-...), not from text prompt.
+                    let body_str = serde_json::to_string(&body).unwrap();
+                    let nonce = body_str
+                        .split("VISION-")
                         .nth(1)
-                        .unwrap()
-                        .split('.')
+                        .and_then(|tail| tail.split(['"', '#', '\'', ' ', '}']).next())
+                        .unwrap_or("")
+                        .split(['\\', '"'])
                         .next()
-                        .unwrap();
+                        .unwrap()
+                        .trim();
+                    // Fallback to legacy text extraction for compatibility (should not happen after P0-2).
+                    let fallback = body["messages"][0]["content"].as_str().unwrap_or("").to_string();
+                    let challenge = if !nonce.is_empty() {
+                        format!("VISION-{nonce}")
+                    } else if let Some(n) = fallback.split("nonce ").nth(1).and_then(|s| s.split('.').next()) {
+                        n.to_string()
+                    } else {
+                        "VISION-missing".to_string()
+                    };
                     Json(json!({
-                        "choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
+                        "choices":[{"message":{"role":"assistant","content":challenge.clone(),"tool_calls":[{
                             "id":"probe","type":"function","function":{
                                 "name":"xiao_capability_probe",
-                                "arguments":json!({"nonce":nonce}).to_string()
+                                "arguments":json!({"nonce":challenge.clone()}).to_string()
                             }
                         }]}}]
                     }))
@@ -2527,7 +3187,7 @@ mod tests {
         cfg.paths.secrets_dir = temp.path().join("secrets");
         cfg.telegram.enabled = true;
         cfg.telegram.access.allowed_chat_ids = vec![100];
-        cfg.telegram.access.allowed_user_ids = vec![10, 11];
+        cfg.telegram.access.owner_user_id = Some(10);
         cfg.save_atomic(&config_path).unwrap();
         let app = AppState::build_from_path(cfg, &config_path).await.unwrap();
         let adapter = TelegramAdapter {
@@ -2536,20 +3196,16 @@ mod tests {
             menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
             custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
 
         adapter
             .handle_update(topic_message(1, 100, 10, 10, "/login"))
             .await
             .unwrap();
-        let custom = last_callbacks(&telegram_probe)[2].clone();
-        adapter
-            .handle_update(callback(2, 100, 10, 10, custom))
-            .await
-            .unwrap();
         adapter
             .handle_update(topic_message(
-                3,
+                2,
                 100,
                 10,
                 10,
@@ -2559,46 +3215,45 @@ mod tests {
             .unwrap();
 
         let skip = last_callbacks(&telegram_probe)[0].clone();
-        // An otherwise authorized different owner cannot mutate this menu or
-        // its custom-login state.
+        // A non-owner cannot mutate this menu or its custom-login state.
         adapter
-            .handle_update(callback(4, 100, 10, 11, skip.clone()))
+            .handle_update(callback(3, 100, 10, 11, skip.clone()))
             .await
             .unwrap();
         // Same owner/chat but wrong topic cannot mutate the wizard/menu.
         adapter
-            .handle_update(callback(5, 100, 20, 10, skip.clone()))
+            .handle_update(callback(4, 100, 20, 10, skip.clone()))
             .await
             .unwrap();
         adapter
-            .handle_update(callback(6, 100, 10, 10, skip))
+            .handle_update(callback(5, 100, 10, 10, skip))
             .await
             .unwrap();
         let default_alias = last_callbacks(&telegram_probe)[0].clone();
         adapter
-            .handle_update(callback(7, 100, 10, 10, default_alias))
+            .handle_update(callback(6, 100, 10, 10, default_alias))
             .await
             .unwrap();
 
         let model_page_one = last_callbacks(&telegram_probe);
-        assert_eq!(model_page_one.len(), 9);
+        assert_eq!(model_page_one.len(), 10);
         let next = model_page_one[7].clone();
         adapter
-            .handle_update(callback(8, 100, 10, 10, next))
+            .handle_update(callback(7, 100, 10, 10, next))
             .await
             .unwrap();
         let select_page_two_first = last_callbacks(&telegram_probe)[0].clone();
         adapter
-            .handle_update(callback(9, 100, 10, 10, select_page_two_first))
+            .handle_update(callback(8, 100, 10, 10, select_page_two_first))
             .await
             .unwrap();
         let confirm = last_callbacks(&telegram_probe)[0].clone();
         adapter
-            .handle_update(callback(10, 100, 10, 10, confirm))
+            .handle_update(callback(9, 100, 10, 10, confirm))
             .await
             .unwrap();
 
-        let principal = TelegramAdapter::principal(10);
+        let principal = TelegramAdapter::principal(&app, 10);
         let session = app
             .sessions
             .context_for_telegram(&principal, TelegramScope::new(100, Some(10)))
@@ -2674,6 +3329,7 @@ mod tests {
             menus,
             custom_logins,
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
         let principal = app.resolve_telegram_owner(10).unwrap().owner_id;
 
@@ -2838,9 +3494,14 @@ mod tests {
             state.alias = "rollback-profile".into();
             state.models = vec!["model-a".into()];
             state.selected_index = Some(0);
-            state.capability = Some(crate::providers::ProviderCapabilities::native(
-                "rollback fixture",
-            ));
+            state.capability = Some(crate::providers::CustomCapabilityProbe {
+                capabilities: crate::providers::ProviderCapabilities::native("rollback fixture"),
+                native_tools: crate::providers::CapabilityState::Supported,
+                structured_output: crate::providers::CapabilityState::Supported,
+                continuation: crate::providers::CapabilityState::Supported,
+                vision: crate::providers::CapabilityState::Unsupported,
+                file_input: crate::providers::CapabilityState::Unsupported,
+            });
             state.id.clone()
         };
         let adapter = TelegramAdapter {
@@ -2850,6 +3511,7 @@ mod tests {
             menus,
             custom_logins: custom_logins.clone(),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
         {
             let mut guard = menu.lock().await;
@@ -2928,8 +3590,8 @@ mod tests {
         async fn photo_download() -> Vec<u8> {
             vec![
                 137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
-                1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 252,
-                255, 31, 0, 3, 3, 2, 0, 238, 254, 95, 91, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+                1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100,
+                248, 15, 0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
                 130,
             ]
         }
@@ -2954,7 +3616,7 @@ mod tests {
         cfg.paths.logs_dir = temp.path().join("logs");
         cfg.paths.secrets_dir = temp.path().join("secrets");
         cfg.telegram.enabled = true;
-        cfg.telegram.access.allowed_user_ids = vec![10];
+        cfg.telegram.access.owner_user_id = Some(10);
         cfg.telegram.access.allowed_chat_ids = vec![100];
         let app = AppState::build(cfg).await.unwrap();
         let adapter = TelegramAdapter {
@@ -2963,6 +3625,7 @@ mod tests {
             menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
             custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let mut document = topic_message(70, 100, 7, 10, "");

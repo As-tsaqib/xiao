@@ -142,7 +142,7 @@ pub(super) fn antigravity_body(
             })
         })
         .collect::<Vec<_>>();
-    let mut request = json!({"contents": contents});
+    let mut request = json!({ "contents": contents });
     if let Some(instructions) = conversation.instructions {
         request["systemInstruction"] = json!({"parts": [{"text": instructions}]});
     }

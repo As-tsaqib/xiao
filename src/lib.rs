@@ -5,12 +5,14 @@ pub mod auth;
 pub mod command;
 pub mod config;
 pub mod context;
+pub mod control_plane;
 pub mod event;
 pub mod identity;
 pub mod ipc;
 pub mod learning;
 pub mod memory;
 pub mod owner;
+#[allow(dead_code)]
 pub mod providers;
 pub mod runtime;
 pub mod security;
@@ -23,4 +25,5 @@ pub mod telegram;
 pub mod tools;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub mod cli_contract;
 pub mod presentation;

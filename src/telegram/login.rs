@@ -8,7 +8,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::presentation::{Action, Block, View};
-use crate::providers::ProviderCapabilities;
+use crate::providers::CustomCapabilityProbe;
 
 use super::{paginator::Paginator, TelegramScope};
 
@@ -36,7 +36,7 @@ pub struct CustomLoginWizard {
     pub alias: String,
     pub models: Vec<String>,
     pub selected_index: Option<usize>,
-    pub capability: Option<ProviderCapabilities>,
+    pub capability: Option<CustomCapabilityProbe>,
     pub page: usize,
 }
 
@@ -182,6 +182,22 @@ pub fn alias_view(id: &str) -> View {
     }
 }
 
+pub fn alias_collision_view(id: &str, alias: &str) -> View {
+    View {
+        title: Some("CUSTOM LOGIN · ALIAS".into()),
+        blocks: vec![Block::Paragraph {
+            text: format!(
+                "Alias `{alias}` already exists. Send a different alias or use Back to keep the current.",
+            ),
+        }],
+        actions: vec![vec![
+            Action::command("Back", format!("/_custom:{id}:wizard_back")),
+            Action::close(),
+        ]],
+        side_mode: false,
+    }
+}
+
 pub fn model_view(wizard: &CustomLoginWizard) -> View {
     let paginator = Paginator::new(wizard.models.len(), wizard.page, 5);
     let indexes = paginator.range().collect::<Vec<_>>();
@@ -216,7 +232,10 @@ pub fn model_view(wizard: &CustomLoginWizard) -> View {
             format!("/_custom:{}:page:{}", wizard.id, paginator.next()),
         ),
     ]);
-    actions.push(vec![Action::close()]);
+    actions.push(vec![
+        Action::command("Back", format!("/_custom:{}:wizard_back", wizard.id)),
+        Action::close(),
+    ]);
     View {
         title: Some("CUSTOM LOGIN · MODELS".into()),
         blocks: vec![Block::Table {
@@ -258,7 +277,7 @@ pub fn confirmation_view(wizard: &CustomLoginWizard) -> View {
                     wizard
                         .capability
                         .as_ref()
-                        .map(|capability| capability.tool_protocol.as_str().to_owned())
+                        .map(|probe| probe.capabilities.tool_protocol.as_str().to_owned())
                         .unwrap_or_else(|| "not probed".into()),
                 ],
             ],

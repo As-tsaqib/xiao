@@ -1,0 +1,48 @@
+Private single-owner Xiao terminal control plane.
+
+Usage: xiao [--json] [--quiet] [--session ID] [--timeout SEC] [--no-color] COMMAND
+
+Core:
+  xiao chat [--file PATH] [--image PATH] "..."
+  xiao ask "..."
+  xiao setup
+  xiao status
+  xiao context
+  xiao doctor
+  xiao tools
+
+Telegram:
+  xiao telegram status
+  xiao telegram configure [--owner ID] [--allowed-chat ID] [--token-file PATH] [--enable|--disable] [--test]
+  xiao telegram set-owner ID [--confirm-owner-change]
+  xiao telegram set-token-file PATH
+  xiao telegram test
+
+Providers / models:
+  xiao login [custom]
+  xiao model show|list|use MODEL
+  xiao model custom list|add|show|edit|test|probe|models|use|delete ...
+
+Sessions:
+  xiao sessions list|new|show|use|rename|delete ...
+  xiao btw
+  xiao yolo status|on|off
+  xiao stop
+  xiao retry
+
+Owner data / execution:
+  xiao memory list|search|get|set|forget ...
+  xiao skills list|search|show|enable|disable|delete ...
+  xiao approvals list|approve|deny ...
+  xiao attachments list|show|remove ...
+  xiao runs list|show|cancel ...
+
+Runtime:
+  xiao daemon start|foreground|stop|restart|status|logs [N]
+  xiao logs [N]
+  xiao config path|check|show
+
+Exit codes: 0 success, 1 generic error, 2 usage, 3 daemon unavailable,
+4 rejected, 5 not found, 6 local I/O/config. Unknown commands are never treated as chat.
+Secrets are accepted from hidden TTY input, stdin, or files; provider/Telegram
+secrets are not accepted as public argv values.

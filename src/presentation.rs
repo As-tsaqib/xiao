@@ -77,10 +77,63 @@ impl RichText {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProgressItem {
+    /// Stable only within one live execution timeline. Adapters must not use
+    /// Telegram message/custom-emoji identifiers as domain identity.
+    #[serde(default)]
+    pub id: u64,
     pub state: ProgressState,
     #[serde(default)]
     pub activity: ProgressActivity,
+    /// Semantic icon/action classification; presentation adapters map this
+    /// to their own visual vocabulary.
+    #[serde(default)]
+    pub icon: ProgressIcon,
+    /// Presentation-safe action key, useful to correlate updates without
+    /// exposing provider reasoning or tool arguments.
+    #[serde(default)]
+    pub action_key: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
     pub label: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressIcon {
+    #[default]
+    Thinking,
+    Analyzing,
+    WebSearch,
+    FileSearch,
+    Fetching,
+    DocumentRead,
+    ImageInspect,
+    Terminal,
+    Coding,
+    Editing,
+    Installing,
+    Testing,
+    Tool,
+    Writing,
+    Audio,
+    Video,
+}
+
+impl ProgressIcon {
+    pub const fn from_activity(activity: ProgressActivity) -> Self {
+        match activity {
+            ProgressActivity::Thinking => Self::Thinking,
+            ProgressActivity::Analyzing => Self::Analyzing,
+            ProgressActivity::Searching => Self::WebSearch,
+            ProgressActivity::Fetching => Self::Fetching,
+            ProgressActivity::Tool => Self::Tool,
+            ProgressActivity::Coding => Self::Coding,
+            ProgressActivity::Media => Self::ImageInspect,
+            ProgressActivity::Writing => Self::Writing,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

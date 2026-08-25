@@ -6,6 +6,12 @@ pub struct TelegramCommandDefinition {
     pub description: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelegramCommandAlias {
+    pub alias: &'static str,
+    pub canonical: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BotCommand {
     pub command: String,
@@ -15,7 +21,7 @@ pub struct BotCommand {
 pub struct TelegramCommandRegistry;
 
 impl TelegramCommandRegistry {
-    pub const PUBLIC: [TelegramCommandDefinition; 17] = [
+    pub const PUBLIC: [TelegramCommandDefinition; 14] = [
         TelegramCommandDefinition {
             name: "start",
             description: "Start Xiao",
@@ -26,7 +32,7 @@ impl TelegramCommandRegistry {
         },
         TelegramCommandDefinition {
             name: "login",
-            description: "Connect or configure an AI provider",
+            description: "Configure the Custom AI endpoint",
         },
         TelegramCommandDefinition {
             name: "model",
@@ -53,36 +59,43 @@ impl TelegramCommandRegistry {
             description: "Show current context usage/composition",
         },
         TelegramCommandDefinition {
-            name: "cancel",
-            description: "Cancel the current task",
-        },
-        TelegramCommandDefinition {
             name: "retry",
             description: "Retry the latest request",
         },
         TelegramCommandDefinition {
             name: "yolo",
-            description: "Manage approval-free mode for this session",
+            description: "Toggle YOLO for this session",
         },
         TelegramCommandDefinition {
-            name: "memory",
-            description: "View/manage Xiao memory",
+            name: "stop",
+            description: "Stop the current task",
         },
         TelegramCommandDefinition {
             name: "skills",
-            description: "View/manage Xiao skills",
+            description: "View skills Xiao learned successfully",
         },
         TelegramCommandDefinition {
             name: "tools",
-            description: "Show available/installable capabilities",
+            description: "Show available capabilities",
         },
-        TelegramCommandDefinition {
-            name: "doctor",
-            description: "Diagnose Xiao runtime",
+    ];
+
+    pub const ALIASES: [TelegramCommandAlias; 4] = [
+        TelegramCommandAlias {
+            alias: "n",
+            canonical: "new",
         },
-        TelegramCommandDefinition {
-            name: "approvals",
-            description: "Review pending approvals",
+        TelegramCommandAlias {
+            alias: "s",
+            canonical: "sessions",
+        },
+        TelegramCommandAlias {
+            alias: "r",
+            canonical: "retry",
+        },
+        TelegramCommandAlias {
+            alias: "y",
+            canonical: "yolo",
         },
     ];
 
@@ -90,36 +103,39 @@ impl TelegramCommandRegistry {
         &Self::PUBLIC
     }
 
-    /// Canonicalize only supported public commands and intentional hidden
-    /// compatibility/internal commands. `/provider`, `/settings`, `/usage`,
-    /// `/env`, `/about`, and `/logout` deliberately have no route.
+    pub fn aliases() -> &'static [TelegramCommandAlias] {
+        &Self::ALIASES
+    }
+
+    /// Canonicalize only the supported Telegram registry. Management and
+    /// historical compatibility routes intentionally do not live here: the
+    /// Telegram parser must be able to prove that they are unknown.
     pub fn canonical(name: &str) -> Option<&'static str> {
-        match name {
-            "session" => Some("sessions"),
-            "stop" => Some("cancel"),
-            "account" => Some("account"),
-            "approve" => Some("approve"),
-            "deny" => Some("deny"),
-            candidate
-                if Self::PUBLIC
+        Self::PUBLIC
+            .iter()
+            .find(|definition| definition.name == name)
+            .map(|definition| definition.name)
+            .or_else(|| {
+                Self::ALIASES
                     .iter()
-                    .any(|definition| definition.name == candidate) =>
-            {
-                Self::PUBLIC
-                    .iter()
-                    .find(|definition| definition.name == candidate)
-                    .map(|definition| definition.name)
-            }
-            _ => None,
-        }
+                    .find(|alias| alias.alias == name)
+                    .map(|alias| alias.canonical)
+            })
     }
 
     pub fn help_text() -> String {
-        Self::PUBLIC
+        let primary = Self::PUBLIC
             .iter()
-            .map(|definition| format!("/{} — {}", definition.name, definition.description))
-            .collect::<Vec<_>>()
-            .join("\n")
+            .map(|definition| {
+                let alias = Self::ALIASES
+                    .iter()
+                    .find(|alias| alias.canonical == definition.name)
+                    .map(|alias| format!(" (/{})", alias.alias))
+                    .unwrap_or_default();
+                format!("/{}{} — {}", definition.name, alias, definition.description)
+            })
+            .collect::<Vec<_>>();
+        primary.join("\n")
     }
 
     pub fn bot_commands() -> Vec<BotCommand> {
@@ -146,33 +162,32 @@ mod tests {
         assert_eq!(
             names,
             [
-                "start",
-                "help",
-                "login",
-                "model",
-                "new",
-                "sessions",
-                "btw",
-                "status",
-                "context",
-                "cancel",
-                "retry",
-                "yolo",
-                "memory",
-                "skills",
-                "tools",
-                "doctor",
-                "approvals"
+                "start", "help", "login", "model", "new", "sessions", "btw", "status", "context",
+                "retry", "yolo", "stop", "skills", "tools",
             ]
         );
-        for removed in ["provider", "settings", "usage", "env", "about", "logout"] {
+        for removed in [
+            "cancel",
+            "memory",
+            "doctor",
+            "approvals",
+            "approve",
+            "deny",
+            "session",
+            "account",
+            "provider",
+            "settings",
+            "usage",
+            "env",
+            "about",
+            "logout",
+        ] {
             assert!(TelegramCommandRegistry::canonical(removed).is_none());
         }
-        assert_eq!(
-            TelegramCommandRegistry::canonical("session"),
-            Some("sessions")
-        );
-        assert_eq!(TelegramCommandRegistry::canonical("stop"), Some("cancel"));
+        assert_eq!(TelegramCommandRegistry::canonical("n"), Some("new"));
+        assert_eq!(TelegramCommandRegistry::canonical("s"), Some("sessions"));
+        assert_eq!(TelegramCommandRegistry::canonical("r"), Some("retry"));
+        assert_eq!(TelegramCommandRegistry::canonical("y"), Some("yolo"));
     }
 
     #[test]
@@ -180,8 +195,10 @@ mod tests {
         let help = TelegramCommandRegistry::help_text();
         let native = TelegramCommandRegistry::bot_commands();
         assert_eq!(native.len(), TelegramCommandRegistry::PUBLIC.len());
-        for command in native {
-            assert_eq!(help.matches(&format!("/{} —", command.command)).count(), 1);
+        for command in &native {
+            assert_eq!(help.matches(&format!("/{} ", command.command)).count(), 1);
         }
+        assert_eq!(native.len(), 14);
+        assert!(!native.iter().any(|command| command.command == "n"));
     }
 }
