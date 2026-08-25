@@ -255,7 +255,7 @@ pub struct ProviderProfileModelRecord {
     pub probed_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProviderProfileInput {
     pub profile_id: Option<String>,
     pub owner_id: String,

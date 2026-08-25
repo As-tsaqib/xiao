@@ -2985,7 +2985,9 @@ mod tests {
                 endpoint: "https://a.example/v1".into(),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: Some(credential.id),
+                api_key_ref: None,
                 safe_headers_json: r#"{"X-Profile-A":"HEADER_A"}"#.into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         profiles
@@ -3007,7 +3009,9 @@ mod tests {
                 endpoint: format!("http://{address}/v1"),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: None,
+                api_key_ref: None,
                 safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         profiles
@@ -3089,7 +3093,9 @@ mod tests {
                 endpoint: format!("http://{address}/v1"),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: None,
+                api_key_ref: None,
                 safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         profiles
@@ -3195,7 +3201,9 @@ mod tests {
                 endpoint: format!("http://{address}/v1"),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: None,
+                api_key_ref: None,
                 safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         let mut vision = profile_model(&profile.profile_id, "vision-m", ToolProtocol::ChatOnly);

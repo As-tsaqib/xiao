@@ -600,7 +600,9 @@ impl ProviderProfileStore {
             endpoint: endpoint.into(),
             protocol: config.protocol.clone(),
             credential_ref,
+            api_key_ref: None,
             safe_headers_json: serde_json::to_string(&config.headers)?,
+            secret_headers_ref: None,
         })?;
         let capabilities = config
             .models
@@ -943,7 +945,9 @@ impl CustomProfileService {
                     endpoint: endpoint.into(),
                     protocol: protocol.into(),
                     credential_ref: existing_credential_ref.map(str::to_owned),
+                    api_key_ref: None,
                     safe_headers_json: serde_json::to_string(&safe_headers)?,
+                    secret_headers_ref: None,
                 },
                 models,
                 session_id,
@@ -1529,7 +1533,9 @@ mod tests {
                 endpoint: "https://a.example/v1".into(),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: Some("credential-a".into()),
+                api_key_ref: None,
                 safe_headers_json: r#"{"X-Workspace":"A"}"#.into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         store

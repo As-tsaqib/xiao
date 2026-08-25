@@ -624,6 +624,7 @@ mod tests {
                 protocol: "openai_chat_completions".into(),
                 credential_ref: None,
                 safe_headers_json: "{}".into(),
+                ..Default::default()
             })
             .unwrap();
 

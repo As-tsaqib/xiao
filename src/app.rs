@@ -449,7 +449,9 @@ mod tests {
                 endpoint: "https://example.invalid/v1".into(),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: None,
+                api_key_ref: None,
                 safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         assert_eq!(profile.owner_id, owner.owner_id);
@@ -526,7 +528,9 @@ mod tests {
                 endpoint: "https://local-first.example/v1".into(),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: Some(credential.id.clone()),
+                api_key_ref: None,
                 safe_headers_json: r#"{"x-client":"local-first"}"#.into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         let session = app
