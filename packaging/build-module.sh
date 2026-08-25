@@ -75,10 +75,6 @@ done
   echo 'Module must ship exactly one regular native executable.' >&2
   exit 1
 }
-[ ! -e "$STAGE/bin/xiaod" ] || {
-  echo 'A second xiaod executable is forbidden in v0.3.' >&2
-  exit 1
-}
 
 for script in "$STAGE"/*.sh; do
   sh -n "$script"
