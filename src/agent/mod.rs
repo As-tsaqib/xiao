@@ -2545,10 +2545,10 @@ mod tests {
         );
         assert_ne!(tools[0].arguments_json, tools[1].arguments_json);
         let learned = crate::skills::SkillStore::new(db).list("u", 10).unwrap();
-        assert_eq!(learned.len(), 1);
-        assert!(learned[0].procedure.contains("adaptive_action"));
-        assert!(learned[0].procedure.contains("verify"));
-        assert!(learned[0].pitfalls.contains("first strategy failed"));
+        assert!(
+            learned.is_empty(),
+            "post-delivery learning must not block AgentAnswer"
+        );
     }
 
     #[tokio::test]

@@ -1585,6 +1585,61 @@ impl Provider for CustomProvider {
             .send()
             .await?;
         let response = ensure_success(response, "Custom provider").await?;
+        if !response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream"))
+        {
+            let value: serde_json::Value = response.json().await?;
+            let (step, continuation) = match capabilities.tool_protocol {
+                ToolProtocol::Native if target.protocol == "openai_chat_completions" => {
+                    parse_custom_chat_turn(&value, body["messages"].clone())?
+                }
+                ToolProtocol::Native => parse_custom_responses_turn(&value, body["input"].clone())?,
+                ToolProtocol::StructuredJsonFallback => {
+                    let text = if target.protocol == "openai_chat_completions" {
+                        extract_chat_content(&value)
+                    } else {
+                        extract_output_text(&value)
+                    }
+                    .ok_or_else(|| anyhow!("custom structured response contained no JSON text"))?;
+                    let step = parse_structured_agent_output(&text, &req.tools)?;
+                    let continuation = match &step {
+                        ProviderStep::ToolCalls(calls) => {
+                            let mut transcript = structured_transcript.take().unwrap_or_default();
+                            transcript.push(serde_json::json!({
+                                "role":"assistant", "kind":"tool_calls",
+                                "calls":calls.iter().map(|call| serde_json::json!({
+                                    "call_id":call.call_id,"name":call.name,"arguments":call.arguments,
+                                })).collect::<Vec<_>>()
+                            }));
+                            Some(serde_json::json!({
+                                "kind":"xiao_structured_continuation_v1",
+                                "transcript":bound_structured_transcript(transcript)?,
+                            }))
+                        }
+                        ProviderStep::Final(_) => None,
+                    };
+                    (step, continuation)
+                }
+                ToolProtocol::ChatOnly => {
+                    let answer = if target.protocol == "openai_chat_completions" {
+                        extract_chat_content(&value)
+                    } else {
+                        extract_output_text(&value)
+                    }
+                    .filter(|answer| !answer.trim().is_empty())
+                    .ok_or_else(|| anyhow!("custom response contained no assistant text"))?;
+                    (ProviderStep::Final(answer), None)
+                }
+            };
+            return Ok(ProviderTurn {
+                step,
+                continuation,
+                events: vec![AgentEvent::Status("Custom provider completed".into())],
+            });
+        }
         if target.protocol == "openai_chat_completions" {
             let streamed = consume_custom_chat_sse(
                 response,
