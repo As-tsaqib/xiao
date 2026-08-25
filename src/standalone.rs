@@ -705,7 +705,7 @@ impl LifecycleLock {
         {
             use std::os::unix::io::AsRawFd;
             let fd = file.as_raw_fd();
-            let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
                 bail!("failed to acquire lifecycle lock: {err}");
