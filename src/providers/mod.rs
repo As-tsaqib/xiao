@@ -3368,7 +3368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_custom_vision_serializes_normalized_image_and_rejects_nonvision_model() {
+    async fn production_custom_vision_serializes_supported_and_unknown_images() {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
         let app = Router::new().route(
             "/v1/chat/completions",
@@ -3444,8 +3444,14 @@ mod tests {
         assert!(serialized.contains("What is visible?"));
 
         req.model = "text-m".into();
-        let error = provider.run(req, None).await.unwrap_err().to_string();
-        assert!(error.contains("does not declare vision capability"));
+        assert_eq!(
+            provider.run(req, None).await.unwrap().final_answer,
+            "visible"
+        );
+        let optimistic = captured_rx.recv().await.unwrap();
+        assert!(serde_json::to_string(&optimistic)
+            .unwrap()
+            .contains("image_url"));
         server.abort();
     }
 
