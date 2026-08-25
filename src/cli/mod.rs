@@ -167,6 +167,7 @@ impl CliPresenter {
 struct DaemonClient {
     http: reqwest::Client,
     endpoint: String,
+    principal: String,
     client_token: String,
     admin_token: String,
 }
@@ -206,6 +207,7 @@ impl DaemonClient {
         Ok(Self {
             http,
             endpoint,
+            principal: client.principal,
             client_token: client.token,
             admin_token,
         })
@@ -562,7 +564,7 @@ async fn chat(
             .post_client(
                 "/v1/session-chat",
                 &SessionExecuteRequest {
-                    principal: client.principal.clone(),
+                    principal: String::new(),
                     session_id,
                     input: prompt,
                     retry: false,
@@ -574,7 +576,7 @@ async fn chat(
             .post_client(
                 "/v1/chat",
                 &ExecuteRequest {
-                    principal: client.principal.clone(),
+                    principal: String::new(),
                     input: prompt,
                 },
             )
@@ -613,7 +615,7 @@ async fn ingest_cli_attachment(
         .post_client(
             "/v1/attachments/ingest",
             &AttachmentIngestRequest {
-                principal: client.principal.clone(),
+                principal: String::new(),
                 session_id: session_id.to_owned(),
                 name,
                 mime: None,
