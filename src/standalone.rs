@@ -482,8 +482,7 @@ async fn probe_daemon(_config: &AppConfig, runtime: &RuntimeLayout) -> bool {
             req = req.bearer_auth(t);
         }
         req.send().await.is_ok_and(|response| {
-            response.status().is_success()
-                || response.status() == reqwest::StatusCode::UNAUTHORIZED
+            response.status().is_success() || response.status() == reqwest::StatusCode::UNAUTHORIZED
         })
     }
     #[cfg(not(unix))]
@@ -677,8 +676,7 @@ impl RuntimeLock {
 }
 
 impl Drop for RuntimeLock {
-    fn drop(&mut self) {
-    }
+    fn drop(&mut self) {}
 }
 
 fn resolve_cli_paths(
