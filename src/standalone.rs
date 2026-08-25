@@ -140,6 +140,7 @@ impl ClientConfig {
         Ok(())
     }
 
+    #[cfg(test)]
     fn to_toml(&self) -> Result<String> {
         self.validate()?;
         Ok(toml::to_string_pretty(&ClientConfigFile {
