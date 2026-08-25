@@ -314,9 +314,8 @@ pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let addr = cfg.ipc.socket_addr()?;
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, router).await?;
+        let _ = router;
+        anyhow::bail!("xiao control socket requires a unix-like platform");
     }
     Ok(())
 }
