@@ -2474,6 +2474,7 @@ Owner data / execution:
   xiao runs list|show|cancel ...
 
 Runtime:
+  xiao daemon
   xiao daemon start|foreground|stop|restart|status|logs [N]
   xiao logs [N]
   xiao config path|check|show
