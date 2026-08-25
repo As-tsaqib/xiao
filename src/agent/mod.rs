@@ -812,7 +812,7 @@ impl AgentEngine {
                     if remaining > 10 {
                         request.messages.drain(0..(remaining - 10));
                     }
-                    keep.extend(request.messages.drain(..));
+                    keep.append(&mut request.messages);
                     request.messages = keep;
                 }
                 let turn = tokio::select! {
@@ -2754,5 +2754,5 @@ mod tests {
 #[tokio::test]
 async fn ping_pong_and_compaction_test() {
     // Just a dummy test to ensure the compiler sees it.
-    assert!(true);
+    let _ = 1;
 }
