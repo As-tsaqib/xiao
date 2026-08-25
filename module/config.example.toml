@@ -6,13 +6,20 @@ auto_restart = true
 log_level = "info"
 
 [agent]
-max_turns = 8
-max_tool_calls = 32
-max_no_progress_repeats = 2
-max_runtime_seconds = 600
+max_turns = 150
+max_tool_calls = 256
+max_no_progress_repeats = 3
+max_runtime_seconds = 1800
 context_max_chars = 32000
 summary_threshold_chars = 24000
 tool_output_max_chars = 4096
+max_parallel_readonly_tools = 8
+max_execution_plan_steps = 32
+provider_streaming = true
+parallel_readonly_tools = true
+execution_plan_enabled = true
+plan_cache_enabled = true
+background_learning = true
 
 [attachments]
 max_image_bytes = 20971520
