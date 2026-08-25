@@ -95,7 +95,10 @@ impl Tool for TermuxTerminalTool {
         let session_workspace = if context.session_id.is_empty() {
             self.default_cwd.clone()
         } else {
-            let dir = self.default_cwd.join(".xiao/workspaces").join(&context.session_id);
+            let dir = self
+                .default_cwd
+                .join(".xiao/workspaces")
+                .join(&context.session_id);
             let _ = std::fs::create_dir_all(&dir);
             dir
         };
