@@ -18,13 +18,12 @@ XIAO_IPC_DIR=$XIAO_DATA_DIR/ipc
 XIAO_TMP_DIR=$XIAO_DATA_DIR/tmp
 XIAO_DAEMON_LOG=$XIAO_LOG_DIR/daemon.log
 XIAO_WATCHDOG_LOG=$XIAO_LOG_DIR/watchdog.log
-XIAO_DAEMON_PID=$XIAO_RUN_DIR/xiaod.pid
+XIAO_DAEMON_PID=$XIAO_RUN_DIR/xiao.pid
 XIAO_WATCHDOG_PID=$XIAO_RUN_DIR/watchdog.pid
 XIAO_STOP=$XIAO_RUN_DIR/stop
 XIAO_RESTART=$XIAO_RUN_DIR/restart
 XIAO_DISABLE=$XIAO_DATA_DIR/disable
 XIAO_BINARY=$MODDIR/bin/xiao
-XIAOD_BINARY=$MODDIR/bin/xiaod
 XIAO_WATCHDOG=$MODDIR/watchdog.sh
 
 xiao_log() {
@@ -78,7 +77,7 @@ pid_from_file() {
 
 daemon_is_running() {
   daemon_pid=$(pid_from_file "$XIAO_DAEMON_PID" 2>/dev/null) || return 1
-  pid_matches "$daemon_pid" "$XIAOD_BINARY"
+  pid_matches "$daemon_pid" "$XIAO_BINARY"
 }
 
 watchdog_is_running() {

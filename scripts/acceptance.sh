@@ -13,6 +13,16 @@ if [ ! -f Cargo.toml ] || [ ! -f src/main.rs ]; then
   fail 'Rust project layout'
 fi
 pass 'Rust project layout'
+{
+  [ "$(rg -n '^\[\[bin\]\]' Cargo.toml | wc -l)" -eq 1 ] &&
+    rg -q '^name = "xiao"$' Cargo.toml &&
+    rg -q '^version = "0\.3\.0"$' Cargo.toml &&
+    [ -f src/cli/mod.rs ] &&
+    [ -f src/runtime/host.rs ] &&
+    [ ! -e src/bin_cli.rs ] &&
+    ! rg -q 'bin/xiaod|--bin xiaod|XIAOD_BINARY' module packaging scripts/device-custom-e2e.sh .github/workflows
+} || fail 'v0.3 single executable layout'
+pass 'v0.3 ships one xiao executable with daemon and CLI modes'
 rg -q 'GITHUB_ACTIONS' packaging/build-module.sh || fail 'GitHub-Actions-only packaging guard'
 pass 'Module packaging is guarded to GitHub Actions'
 {
@@ -338,17 +348,17 @@ pass 'Termux wrapper is installed automatically and removed/restored safely'
 pass 'Snapshot exposes secret presence only and logs/errors are redacted'
 pass 'No unrestricted AI root shell'
 {
-  rg -q 'const TOP_LEVEL' src/bin_cli.rs &&
-    rg -q 'unknown_command' src/bin_cli.rs &&
-    rg -q '"chat"' src/bin_cli.rs &&
-    rg -q '"ask"' src/bin_cli.rs &&
-    rg -q 'Chat is explicit' src/bin_cli.rs &&
-    rg -q 'typo_is_usage_and_never_chat' src/bin_cli.rs &&
-    ! rg -q 'normalize_cli' src/bin_cli.rs
+  rg -q 'const TOP_LEVEL' src/cli/mod.rs &&
+    rg -q 'unknown_command' src/cli/mod.rs &&
+    rg -q '"chat"' src/cli/mod.rs &&
+    rg -q '"ask"' src/cli/mod.rs &&
+    rg -q 'Chat is explicit' src/cli/mod.rs &&
+    rg -q 'typo_is_usage_and_never_chat' src/cli/mod.rs &&
+    ! rg -q 'normalize_cli' src/cli/mod.rs
 } || fail 'Structured CLI command tree and explicit chat'
 pass 'CLI uses structured commands; unknown commands are usage errors and chat is explicit'
 {
-  rg -q 'quickstart' src/bin_cli.rs &&
+  rg -q 'quickstart' src/cli/mod.rs &&
     rg -q 'configure_detached' src/standalone.rs &&
     rg -q 'libc::setsid' src/standalone.rs
 } || fail 'Standalone quickstart/lifecycle'
@@ -358,7 +368,7 @@ pass 'CLI uses structured commands; unknown commands are usage errors and chat i
 } || fail 'Standalone lifecycle regression coverage'
 {
   rg -q 'provision_client_config' src/standalone.rs &&
-    ! rg -n 'println!.*token|dbg!.*token' src/bin_cli.rs src/standalone.rs >/dev/null
+    ! rg -n 'println!.*token|dbg!.*token' src/cli/mod.rs src/standalone.rs >/dev/null
 } || fail 'Standalone secret provisioning'
 pass 'Standalone quickstart is idempotent, detached, identity-guarded and secret-safe'
 {
@@ -379,8 +389,8 @@ pass 'No fake /compact command is exposed'
     [ -f module/webroot/assets/ksu-bridge.js ] &&
     rg -q "outDir: '../module/webroot'" webui/vite.config.js &&
     rg -q "const ACTION = '/data/adb/modules/xiao/action.sh'" webui/src/bridge.js &&
-    rg -q 'manager-get-base64' webui/src/bridge.js module/action.sh src/bin_cli.rs &&
-    rg -q 'manager-post-base64' webui/src/bridge.js module/action.sh src/bin_cli.rs &&
+    rg -q 'manager-get-base64' webui/src/bridge.js module/action.sh src/cli/mod.rs &&
+    rg -q 'manager-post-base64' webui/src/bridge.js module/action.sh src/cli/mod.rs &&
     rg -q "\['dashboard', 'Overview'" webui/src/App.jsx &&
     rg -q "\['setup', 'Telegram'" webui/src/App.jsx &&
     rg -q "\['providers', 'Custom AI'" webui/src/App.jsx &&
@@ -402,7 +412,7 @@ pass 'No fake /compact command is exposed'
 } || fail 'Xiao Manager WebUI surfaces'
 pass 'Xiao Manager React source builds to the module and uses only typed daemon actions'
 {
-  rg -q '/v1/admin/custom/models' src/ipc/mod.rs src/bin_cli.rs &&
+  rg -q '/v1/admin/custom/models' src/ipc/mod.rs src/cli/mod.rs &&
     rg -q 'custom_model_catalog_is_sorted_deduplicated' src/ipc/mod.rs &&
     rg -q 'provider_api_key' src/auth/mod.rs src/providers/mod.rs
 } || fail 'Custom provider model discovery'

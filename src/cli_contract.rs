@@ -1,6 +1,6 @@
 //! P1-9 Stable CLI success JSON contracts.
 //!
-//! The outer envelope `{status:"ok", data: <Dto>}` is stable in `bin_cli::CliPresenter`.
+//! The outer envelope `{status:"ok", data: <Dto>}` is stable in `cli::CliPresenter`.
 //! This module defines stable, application-facing DTOs / projections for the
 //! *success data* payloads.  It is the contract between the daemon's raw admin
 //! JSON (which may evolve) and the CLI's public JSON output.
@@ -680,7 +680,7 @@ pub fn project_generic(raw: Value) -> Value {
 
 // ---------------------------------------------------------------------------
 // Human rendering helpers — intentional formatting, not generic nested-JSON.
-// Each returns a String; bin_cli prints it line-by-line.
+// Each returns a String; the CLI presenter prints it line-by-line.
 // ---------------------------------------------------------------------------
 
 pub fn human_status(value: &Value) -> String {

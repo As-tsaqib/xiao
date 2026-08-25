@@ -68,8 +68,8 @@ impl RuntimeLayout {
         let database = resolve_from(&base, &config.storage.database);
         Self {
             daemon_log: logs_dir.join("daemon.log"),
-            managed_state: data_dir.join("xiaod-managed.toml"),
-            lifecycle_lock: data_dir.join("xiaod-lifecycle.lock"),
+            managed_state: data_dir.join("xiao-daemon.toml"),
+            lifecycle_lock: data_dir.join("xiao-lifecycle.lock"),
             data_dir,
             logs_dir,
             secrets_dir,
@@ -256,7 +256,7 @@ pub async fn start_daemon(paths: &CliPaths, init: &InitResult) -> Result<StartRe
                 client_config_created,
             });
         }
-        bail!("managed xiaod PID {pid} exists but its IPC endpoint is not ready");
+        bail!("managed xiao daemon PID {pid} exists but its control endpoint is not ready");
     }
     if probe_daemon(&init.config, &init.runtime).await {
         let client_config_created = provision_client_config(paths, &init.config, &init.runtime)?;
@@ -282,6 +282,7 @@ pub async fn start_daemon(paths: &CliPaths, init: &InitResult) -> Result<StartRe
         .unwrap_or_else(|| init.runtime.data_dir.clone());
     let mut command = Command::new(&executable);
     command
+        .arg("daemon")
         .env("XIAO_CONFIG", &paths.config)
         .current_dir(working_dir)
         .stdin(Stdio::null())
@@ -340,7 +341,7 @@ pub async fn stop_daemon(paths: &CliPaths, init: &InitResult) -> Result<StopResu
     } else {
         terminate_record(&record, libc::SIGKILL)?;
         if !wait_for_exit(&record, Duration::from_secs(2)).await {
-            bail!("xiaod PID {} did not exit after SIGKILL", record.pid);
+            bail!("xiao daemon PID {} did not exit after SIGKILL", record.pid);
         }
         true
     };
@@ -364,10 +365,11 @@ pub async fn daemon_status(paths: &CliPaths, init: &InitResult) -> Result<Daemon
 pub fn run_daemon_foreground(paths: &CliPaths, init: &InitResult) -> Result<ExitStatus> {
     let _lock = LifecycleLock::acquire(&init.runtime)?;
     if valid_managed_pid(paths, &init.runtime)?.is_some() {
-        bail!("xiaod is already running for this config");
+        bail!("xiao daemon is already running for this config");
     }
     let executable = find_daemon()?;
     let mut child = Command::new(&executable)
+        .arg("daemon")
         .env("XIAO_CONFIG", &paths.config)
         .current_dir(
             paths
@@ -409,15 +411,7 @@ pub fn tail_daemon_log(runtime: &RuntimeLayout, lines: usize) -> Result<Vec<Stri
 }
 
 pub fn find_daemon() -> Result<PathBuf> {
-    let current = env::current_exe().context("locate the xiao CLI executable")?;
-    discover_daemon(
-        nonempty_env("XIAOD_BIN").as_deref(),
-        &current,
-        env::var_os("PATH").as_deref(),
-    )
-    .ok_or_else(|| {
-        anyhow!("cannot find xiaod; install it next to xiao, put it on PATH, or set XIAOD_BIN")
-    })
+    env::current_exe().context("locate the xiao executable")
 }
 
 async fn wait_until_ready(
@@ -429,7 +423,7 @@ async fn wait_until_ready(
     loop {
         if let Some(status) = child.try_wait()? {
             bail!(
-                "xiaod exited during startup with {status}; inspect {}",
+                "xiao daemon exited during startup with {status}; inspect {}",
                 runtime.daemon_log.display()
             );
         }
@@ -438,7 +432,7 @@ async fn wait_until_ready(
         }
         if Instant::now() >= deadline {
             bail!(
-                "xiaod did not become ready within {} seconds; inspect {}",
+                "xiao daemon did not become ready within {} seconds; inspect {}",
                 DAEMON_START_TIMEOUT.as_secs(),
                 runtime.daemon_log.display()
             );
@@ -551,7 +545,7 @@ fn terminate_record(record: &ManagedProcess, signal: i32) -> Result<()> {
         if error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(());
         }
-        Err(error).with_context(|| format!("signal xiaod PID {}", record.pid))
+        Err(error).with_context(|| format!("signal xiao daemon PID {}", record.pid))
     }
     #[cfg(not(unix))]
     {
@@ -696,49 +690,6 @@ fn resolve_cli_paths(
     }
 }
 
-fn discover_daemon(
-    override_path: Option<&OsStr>,
-    current_exe: &Path,
-    path: Option<&OsStr>,
-) -> Option<PathBuf> {
-    if let Some(value) = override_path {
-        let candidate = PathBuf::from(value);
-        if is_executable(&candidate) {
-            return Some(normalized(&candidate));
-        }
-        return None;
-    }
-    if let Some(parent) = current_exe.parent() {
-        let sibling = parent.join("xiaod");
-        if is_executable(&sibling) {
-            return Some(normalized(&sibling));
-        }
-    }
-    path.and_then(|value| {
-        env::split_paths(value)
-            .map(|part| part.join("xiaod"))
-            .find(|candidate| is_executable(candidate))
-            .map(|candidate| normalized(&candidate))
-    })
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
 
 fn nonempty_env(name: &str) -> Option<OsString> {
     env::var_os(name).filter(|value| !value.is_empty())
@@ -978,39 +929,5 @@ mod tests {
         assert!(!init.runtime.managed_state.exists());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn daemon_discovery_prefers_explicit_then_sibling_then_path() {
-        use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
-        let explicit = temp.path().join("explicit-xiaod");
-        let sibling_dir = temp.path().join("sibling");
-        let path_dir = temp.path().join("path");
-        fs::create_dir_all(&sibling_dir).unwrap();
-        fs::create_dir_all(&path_dir).unwrap();
-        for candidate in [
-            explicit.clone(),
-            sibling_dir.join("xiaod"),
-            path_dir.join("xiaod"),
-        ] {
-            fs::write(&candidate, b"binary").unwrap();
-            fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let current = sibling_dir.join("xiao");
-        let path = env::join_paths([path_dir.clone()]).unwrap();
-        assert_eq!(
-            discover_daemon(Some(explicit.as_os_str()), &current, Some(&path)),
-            Some(normalized(&explicit))
-        );
-        assert_eq!(
-            discover_daemon(None, &current, Some(&path)),
-            Some(normalized(&sibling_dir.join("xiaod")))
-        );
-        fs::remove_file(sibling_dir.join("xiaod")).unwrap();
-        assert_eq!(
-            discover_daemon(None, &current, Some(&path)),
-            Some(normalized(&path_dir.join("xiaod")))
-        );
-    }
 }

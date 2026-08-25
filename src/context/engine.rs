@@ -735,7 +735,7 @@ mod tests {
                 SkillCandidate {
                     name: "diagnose-xiao-service".into(),
                     summary: "Diagnose an unhealthy Xiao daemon".into(),
-                    when_to_use: "When xiaod fails to start".into(),
+                    when_to_use: "When xiao daemon fails to start".into(),
                     prerequisites: "Service inspection capability.".into(),
                     procedure: "Inspect status, then bounded logs.".into(),
                     pitfalls: "Do not expose secrets.".into(),

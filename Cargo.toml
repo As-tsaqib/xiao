@@ -1,6 +1,6 @@
 [package]
-name = "xiao-gateway"
-version = "0.2.7"
+name = "xiao"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Xiao private Telegram-first personal AI agent for rooted Android"
@@ -11,12 +11,8 @@ name = "xiao"
 path = "src/lib.rs"
 
 [[bin]]
-name = "xiaod"
-path = "src/main.rs"
-
-[[bin]]
 name = "xiao"
-path = "src/bin_cli.rs"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

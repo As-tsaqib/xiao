@@ -54,7 +54,13 @@ fn android_launchers_use_xiao_daemon_without_a_second_binary() {
         let source = fs::read_to_string(root.join(path)).unwrap();
         assert!(!source.contains("bin/xiaod"), "{path} still ships xiaod");
         assert!(!source.contains("--bin xiaod"), "{path} still builds xiaod");
+        assert!(
+            !source.contains("XIAOD_BINARY"),
+            "{path} still references a second binary"
+        );
     }
     let watchdog = fs::read_to_string(root.join("module/watchdog.sh")).unwrap();
     assert!(watchdog.contains("\"$XIAO_BINARY\" daemon"));
+    let packaging = fs::read_to_string(root.join("packaging/build-module.sh")).unwrap();
+    assert!(packaging.contains("exactly one regular native executable"));
 }

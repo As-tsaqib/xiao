@@ -8,7 +8,7 @@ TEST_PORT=38931
 TEST_MODEL=${XIAO_E2E_MODEL:-gpt-5.6-luna}
 
 [ "$(id -u)" -eq 0 ] || { echo 'Run this test as root.' >&2; exit 1; }
-[ -x "$XIAO_MODULE/bin/xiaod" ] || { echo 'Installed xiaod binary not found.' >&2; exit 1; }
+[ -x "$XIAO_MODULE/bin/xiao" ] || { echo 'Installed xiao binary not found.' >&2; exit 1; }
 [ -x "$CURL" ] || { echo 'Termux curl not found.' >&2; exit 1; }
 [ -r "$CLIPROXY_CONFIG" ] || { echo 'CLIProxyAPI config not found.' >&2; exit 1; }
 case "$TEST_MODEL" in
@@ -58,7 +58,7 @@ chmod 0600 "$test_dir/config.toml"
 HOME="$test_dir" XIAO_HOME="$test_dir" \
   XIAO_CONFIG="$test_dir/config.toml" XIAO_CLIENT_CONFIG="$test_dir/client.toml" \
   TMPDIR="$test_dir/tmp" XIAO_BOOT_START=1 \
-  "$XIAO_MODULE/bin/xiaod" > "$test_dir/logs/daemon.log" 2>&1 &
+  "$XIAO_MODULE/bin/xiao" daemon > "$test_dir/logs/daemon.log" 2>&1 &
 daemon_pid=$!
 
 attempt=0
@@ -70,7 +70,7 @@ while [ "$attempt" -lt 30 ] && [ ! -s "$test_dir/secrets/ipc-admin-token.secret"
   sleep 1
   attempt=$((attempt + 1))
 done
-[ -s "$test_dir/secrets/ipc-admin-token.secret" ] || { echo 'xiaod admin token was not created.' >&2; exit 1; }
+[ -s "$test_dir/secrets/ipc-admin-token.secret" ] || { echo 'xiao daemon admin token was not created.' >&2; exit 1; }
 admin_token=$(cat "$test_dir/secrets/ipc-admin-token.secret")
 
 models_payload=$(printf '{"base_url":"http://127.0.0.1:8317/v1","api_key":"%s"}' "$api_key")
@@ -103,6 +103,6 @@ printf '%s' "$chat_response" | grep -Fq 'XIAO_E2E_OK' || {
   exit 1
 }
 
-printf 'PASS  xiaod boot-style environment started successfully\n'
+printf 'PASS  xiao daemon boot-style environment started successfully\n'
 printf 'PASS  xiao discovered custom model %s through CLIProxyAPI /v1/models\n' "$TEST_MODEL"
 printf 'PASS  CLIProxyAPI custom model %s returned XIAO_E2E_OK through xiao CommandCore\n' "$TEST_MODEL"

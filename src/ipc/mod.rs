@@ -2644,10 +2644,10 @@ mod tests {
     }
 
     #[test]
-    fn webui_uses_only_typed_xiaod_manager_actions() {
+    fn webui_uses_only_typed_xiao_daemon_manager_actions() {
         // Keep the source contract explicit and let CI prove that the checked-in
         // Vite bundle is regenerated from it. The browser may transport only
-        // typed manager resources; all authority remains in xiaod.
+        // typed manager resources; all authority remains in xiao daemon.
         let javascript = include_str!("../../module/webroot/assets/app.js");
         let html = include_str!("../../module/webroot/index.html");
         let app = include_str!("../../webui/src/App.jsx");

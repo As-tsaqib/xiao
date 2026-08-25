@@ -8,7 +8,7 @@ use std::{
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::{json, Value};
-use xiao::{
+use crate::{
     config::AppConfig,
     ipc::{AttachmentIngestRequest, ExecuteRequest, SessionExecuteRequest},
     security::{redact::redact_text, secrets::SecretStore},
@@ -187,7 +187,7 @@ impl DaemonClient {
             .map_err(|error| CliFailure::local(error.to_string()))?
             .ok_or_else(|| CliFailure {
                 code: EXIT_DAEMON_UNAVAILABLE,
-                message: "admin IPC token missing; start xiaod first".into(),
+                message: "admin IPC token missing; start xiao daemon first".into(),
             })?;
         let timeout = Duration::from_secs(options.timeout_seconds.unwrap_or(300).clamp(1, 3600));
         let http = reqwest::Client::builder()
@@ -257,7 +257,7 @@ impl DaemonClient {
             .map(str::to_owned)
             .ok_or_else(|| CliFailure {
                 code: EXIT_REJECTED,
-                message: "xiaod did not return the new CLI session".into(),
+                message: "xiao daemon did not return the new CLI session".into(),
             })
     }
 
@@ -287,9 +287,7 @@ impl DaemonClient {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let raw = std::env::args().skip(1).collect::<Vec<_>>();
+pub async fn run_process(raw: Vec<String>) -> i32 {
     let json_requested = raw.iter().any(|arg| arg == "--json");
     let (options, args) = match parse_global_options(raw) {
         Ok(value) => value,
@@ -299,16 +297,15 @@ async fn main() {
                 ..GlobalOptions::default()
             });
             presenter.error(&failure);
-            std::process::exit(failure.code);
+            return failure.code;
         }
     };
     let presenter = CliPresenter::new(options.clone());
-    let result = run(options, args, &presenter).await;
-    match result {
-        Ok(()) => std::process::exit(EXIT_OK),
+    match run(options, args, &presenter).await {
+        Ok(()) => EXIT_OK,
         Err(failure) => {
             presenter.error(&failure);
-            std::process::exit(failure.code);
+            failure.code
         }
     }
 }
@@ -373,7 +370,7 @@ async fn run(options: GlobalOptions, args: Vec<String>, presenter: &CliPresenter
         args.first().map(String::as_str),
         Some("-V" | "--version" | "version")
     ) {
-        presenter.line(format!("xiao {}", xiao::VERSION));
+        presenter.line(format!("xiao {}", crate::VERSION));
         return Ok(());
     }
     let command = args[0].as_str();
@@ -869,7 +866,7 @@ async fn custom_command(
             let raw = custom_by_id(client, &args[1]).await?;
             presenter.success(
                 "model custom show",
-                xiao::cli_contract::project_custom_profile(raw),
+                crate::cli_contract::project_custom_profile(raw),
             )
         }
         Some("add") => custom_add(client, &args[1..], presenter).await,
@@ -1579,7 +1576,7 @@ async fn daemon(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -> 
             if !status.success() {
                 return Err(CliFailure {
                     code: EXIT_ERROR,
-                    message: format!("xiaod exited with {status}"),
+                    message: format!("xiao daemon exited with {status}"),
                 });
             }
             presenter.success(
@@ -1600,7 +1597,7 @@ async fn daemon(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -> 
                 presenter.success("daemon status", value)?;
                 return Err(CliFailure {
                     code: EXIT_DAEMON_UNAVAILABLE,
-                    message: "xiaod is not ready".into(),
+                    message: "xiao daemon is not ready".into(),
                 });
             }
             presenter.success("daemon status", value)
@@ -1627,7 +1624,7 @@ async fn daemon(paths: &CliPaths, args: &[String], presenter: &CliPresenter) -> 
             if matches!(stop, StopResult::UnmanagedRunning) {
                 return Err(CliFailure {
                     code: EXIT_REJECTED,
-                    message: "xiaod is running outside this lifecycle".into(),
+                    message: "xiao daemon is running outside this lifecycle".into(),
                 });
             }
             let start = standalone::start_daemon(paths, &init).await?;
@@ -1972,14 +1969,14 @@ async fn parse_response(response: reqwest::Response) -> CliResult<Value> {
     }
     serde_json::from_str(&text).map_err(|error| CliFailure {
         code: EXIT_ERROR,
-        message: format!("parse xiaod JSON response: {error}"),
+        message: format!("parse xiao daemon JSON response: {error}"),
     })
 }
 
 fn connection_failure(error: reqwest::Error) -> CliFailure {
     CliFailure {
         code: EXIT_DAEMON_UNAVAILABLE,
-        message: format!("connect to xiaod failed: {error}; run `xiao daemon status`"),
+        message: format!("connect to xiao daemon failed: {error}; run `xiao daemon status`"),
     }
 }
 
@@ -1988,66 +1985,66 @@ fn connection_failure(error: reqwest::Error) -> CliFailure {
 // ---------------------------------------------------------------------------
 
 fn dto_status(value: Value) -> Value {
-    xiao::cli_contract::project_status(value)
+    crate::cli_contract::project_status(value)
 }
 fn dto_telegram(value: Value) -> Value {
-    xiao::cli_contract::project_telegram(value)
+    crate::cli_contract::project_telegram(value)
 }
 fn dto_sessions(value: Value) -> Value {
-    xiao::cli_contract::project_sessions(value)
+    crate::cli_contract::project_sessions(value)
 }
 fn dto_context(value: Value) -> Value {
-    xiao::cli_contract::project_context(value)
+    crate::cli_contract::project_context(value)
 }
 fn dto_memory(value: Value) -> Value {
-    xiao::cli_contract::project_memory(value)
+    crate::cli_contract::project_memory(value)
 }
 fn dto_skills(value: Value) -> Value {
-    xiao::cli_contract::project_skills(value)
+    crate::cli_contract::project_skills(value)
 }
 fn dto_approvals(value: Value) -> Value {
-    xiao::cli_contract::project_approvals(value)
+    crate::cli_contract::project_approvals(value)
 }
 fn dto_attachments(value: Value) -> Value {
-    xiao::cli_contract::project_attachments(value)
+    crate::cli_contract::project_attachments(value)
 }
 fn dto_runs(value: Value) -> Value {
-    xiao::cli_contract::project_runs(value)
+    crate::cli_contract::project_runs(value)
 }
 fn dto_doctor(value: Value) -> Value {
-    xiao::cli_contract::project_doctor(value)
+    crate::cli_contract::project_doctor(value)
 }
 fn dto_tools(value: Value) -> Value {
-    xiao::cli_contract::project_tools(value)
+    crate::cli_contract::project_tools(value)
 }
 fn dto_model_custom(value: Value) -> Value {
-    xiao::cli_contract::project_custom_profiles(value)
+    crate::cli_contract::project_custom_profiles(value)
 }
 #[allow(dead_code)]
 fn dto_model_list(value: Value) -> Value {
-    xiao::cli_contract::project_model_list_for_session(value)
+    crate::cli_contract::project_model_list_for_session(value)
 }
 fn dto_session_item(value: Value) -> Value {
-    xiao::cli_contract::project_session_item(value)
+    crate::cli_contract::project_session_item(value)
 }
 
 fn render_status_human(value: &Value) {
-    for line in xiao::cli_contract::human_status(value).lines() {
+    for line in crate::cli_contract::human_status(value).lines() {
         println!("{line}");
     }
 }
 fn render_sessions_human(value: &Value) {
-    for line in xiao::cli_contract::human_sessions(value).lines() {
+    for line in crate::cli_contract::human_sessions(value).lines() {
         println!("{line}");
     }
 }
 fn render_doctor_human(value: &Value) {
-    for line in xiao::cli_contract::human_doctor(value).lines() {
+    for line in crate::cli_contract::human_doctor(value).lines() {
         println!("{line}");
     }
 }
 fn render_model_human(value: &Value) {
-    for line in xiao::cli_contract::human_model(value).lines() {
+    for line in crate::cli_contract::human_model(value).lines() {
         println!("{line}");
     }
 }
@@ -2485,7 +2482,7 @@ Exit codes: 0 success, 1 generic error, 2 usage, 3 daemon unavailable,
 4 rejected, 5 not found, 6 local I/O/config. Unknown commands are never treated as chat.
 Secrets are accepted from hidden TTY input, stdin, or files; provider/Telegram
 secrets are not accepted as public argv values."#,
-        version = xiao::VERSION
+        version = crate::VERSION
     )
 }
 
