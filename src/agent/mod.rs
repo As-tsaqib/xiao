@@ -2198,18 +2198,21 @@ mod tests {
     }
 
     fn engine(
-        provider_id: &str,
+        _provider_id: &str,
         provider: Arc<dyn Provider>,
     ) -> (Arc<AgentEngine>, Arc<Storage>, String, tempfile::TempDir) {
         let db = Arc::new(Storage::open_memory().unwrap());
         let sessions = Arc::new(SessionManager::new(db.clone()));
         let main = sessions.ensure_default_session("u").unwrap();
-        db.set_session_provider("u", &main.id, provider_id, None, "m")
+        // Normal v0.3 runtime admits only the Custom provider key. Individual
+        // fake provider ids still exercise their protocol behavior behind that
+        // key; legacy-session tests opt into a legacy key explicitly.
+        db.set_session_provider("u", &main.id, "custom", None, "m")
             .unwrap();
         sessions.switch_main("u", &main.id).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let auth = Arc::new(AuthManager::new(db.clone(), tmp.path().join("secrets")));
-        let providers = Arc::new(ProviderRegistry::from_single(provider_id, provider, auth));
+        let providers = Arc::new(ProviderRegistry::from_single("custom", provider, auth));
         (
             Arc::new(AgentEngine::new(sessions, db.clone(), providers)),
             db,
@@ -2320,6 +2323,8 @@ mod tests {
     #[tokio::test]
     async fn legacy_provider_history_is_read_only_until_custom_is_selected() {
         let (engine, db, session, _tmp) = engine("codex", Arc::new(EchoProvider));
+        db.set_session_provider("u", &session, "codex", None, "m")
+            .unwrap();
         db.append_message("u", &session, "assistant", "legacy answer")
             .unwrap();
 
@@ -2701,7 +2706,9 @@ mod tests {
             tokio::spawn(
                 async move { running.submit_with_progress("u", "keep target", None).await },
             );
-        started.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("provider did not start through the active Custom runtime key");
         let switched = engine.sessions.create_and_switch("u").unwrap();
         assert_ne!(captured_session, switched.id);
         release.notify_one();
