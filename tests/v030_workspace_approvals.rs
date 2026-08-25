@@ -6,10 +6,7 @@ use xiao::{
         PackageCandidate, ProcessExecutor, RuntimeEnvironment, SelinuxState, TermuxCommand,
         TrustedPackageRepository,
     },
-    tools::{
-        builtin::TermuxTerminalTool, Tool, ToolCall, ToolContext, ToolPolicy, ToolRegistry,
-        ToolRunStatus,
-    },
+    tools::{builtin::TermuxTerminalTool, Tool, ToolCall, ToolContext, ToolPolicy, ToolRegistry},
 };
 
 #[derive(Clone)]
@@ -77,14 +74,17 @@ fn test_capabilities() -> Arc<CapabilityRegistry> {
         android_version: Some("14".into()),
         device_model: None,
         architecture: "aarch64".into(),
-        xiao_version: "0.3.0".into(),
-        effective_uid: 1000,
+        xiao_version: crate::VERSION.into(),
+        effective_uid: 10234,
         root_available: false,
+        root_evidence: None,
         selinux: SelinuxState::Enforcing,
+        data_root: PathBuf::from("/data/adb/xiao"),
+        workspace_writable: true,
         termux: None,
-        installed_binaries: BTreeMap::new(),
-        execution_backend: ExecutionBackend::Termux,
-        created_at: "now".into(),
+        binaries: BTreeMap::new(),
+        execution_backends: vec![ExecutionBackend::Termux],
+        probed_at: "now".into(),
     }))
 }
 
@@ -146,11 +146,11 @@ async fn yolo_mode_converts_ask_to_allow_but_never_bypasses_hard_deny() {
     };
 
     let call = ToolCall {
-        id: "call-1".into(),
+        call_id: "call-1".into(),
         name: "unregistered_tool".into(),
         arguments: serde_json::json!({}),
     };
 
     let execution = registry.execute(&call, &context_yolo).await;
-    assert_eq!(execution.result.status, ToolRunStatus::Failed);
+    assert!(execution.result.is_error);
 }

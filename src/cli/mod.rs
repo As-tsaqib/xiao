@@ -167,7 +167,6 @@ impl CliPresenter {
 struct DaemonClient {
     http: reqwest::Client,
     endpoint: String,
-    principal: String,
     client_token: String,
     admin_token: String,
 }
@@ -190,7 +189,7 @@ impl DaemonClient {
                 message: "admin IPC token missing; start xiao daemon first".into(),
             })?;
         let timeout = Duration::from_secs(options.timeout_seconds.unwrap_or(300).clamp(1, 3600));
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(timeout);
         #[cfg(unix)]
@@ -202,20 +201,11 @@ impl DaemonClient {
             (builder.unix_socket(sock), "http://localhost".to_string())
         };
         #[cfg(not(unix))]
-        let (builder, endpoint) = {
-            let ep = client
-                .endpoint
-                .as_deref()
-                .unwrap_or("http://localhost")
-                .trim_end_matches('/')
-                .to_owned();
-            (builder, ep)
-        };
+        let (builder, endpoint) = (builder, "http://localhost".to_string());
         let http = builder.build().map_err(anyhow::Error::from)?;
         Ok(Self {
             http,
             endpoint,
-            principal: client.principal,
             client_token: client.token,
             admin_token,
         })
@@ -502,7 +492,7 @@ async fn public_daemon_command(
                 .post_client(
                     "/v1/session-chat",
                     &SessionExecuteRequest {
-                        principal: client.principal.clone(),
+                        principal: String::new(),
                         session_id: session,
                         input: String::new(),
                         retry: true,
