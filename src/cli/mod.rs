@@ -194,16 +194,24 @@ impl DaemonClient {
             .connect_timeout(Duration::from_secs(10))
             .timeout(timeout);
         #[cfg(unix)]
-        if let Some(sock) = &client.control_socket {
-            builder = builder.unix_socket(sock.clone());
-        }
+        let (builder, endpoint) = {
+            let sock = client
+                .control_socket
+                .clone()
+                .unwrap_or_else(|| init.runtime.control_socket.clone());
+            (builder.unix_socket(sock), "http://localhost".to_string())
+        };
+        #[cfg(not(unix))]
+        let (builder, endpoint) = {
+            let ep = client
+                .endpoint
+                .as_deref()
+                .unwrap_or("http://localhost")
+                .trim_end_matches('/')
+                .to_owned();
+            (builder, ep)
+        };
         let http = builder.build().map_err(anyhow::Error::from)?;
-        let endpoint = client
-            .endpoint
-            .as_deref()
-            .unwrap_or("http://localhost")
-            .trim_end_matches('/')
-            .to_owned();
         Ok(Self {
             http,
             endpoint,
