@@ -24,6 +24,59 @@ impl ProviderProfileStore {
         Self { storage }
     }
 
+    pub fn set_capability_override(
+        &self,
+        owner_id: &str,
+        profile_id: &str,
+        model_id: &str,
+        capability: &str,
+        owner_override: &str,
+    ) -> Result<()> {
+        if !matches!(capability, "vision" | "file_input") {
+            return Err(anyhow!("capability must be vision or file_input"));
+        }
+        if !matches!(
+            owner_override,
+            "auto" | "force_supported" | "force_unsupported"
+        ) {
+            return Err(anyhow!("invalid capability override"));
+        }
+        let profile = self
+            .get(owner_id, profile_id)?
+            .ok_or_else(|| anyhow!("Custom profile not found"))?;
+        let model = self
+            .model(profile_id, model_id)?
+            .ok_or_else(|| anyhow!("Custom model not found"))?;
+        let state = if capability == "vision" {
+            &model.vision_state
+        } else {
+            &model.file_input_state
+        };
+        let now = Utc::now().to_rfc3339();
+        self.storage.with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET owner_override=excluded.owner_override,source=excluded.source,observed_at=excluded.observed_at",
+                params![profile_id, model_id, profile.protocol, capability, state, owner_override, "owner_override", now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn capability_override(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        protocol: &str,
+        capability: &str,
+    ) -> Result<String> {
+        self.storage.with_conn(|connection| {
+            Ok(connection.query_row(
+                "SELECT owner_override FROM provider_capability_evidence WHERE profile_id=? AND model_id=? AND protocol=? AND capability=?",
+                params![profile_id, model_id, protocol, capability], |row| row.get(0),
+            ).optional()?.unwrap_or_else(|| "auto".into()))
+        })
+    }
+
     pub fn create(&self, mut input: ProviderProfileInput) -> Result<ProviderProfileRecord> {
         input.alias = canonical_alias(&input.alias)?;
         input.endpoint = validate_endpoint(&input.endpoint)?;
@@ -367,6 +420,7 @@ impl ProviderProfileStore {
                 params![next_alias, next_protocol, next_headers, Utc::now().to_rfc3339(), owner_id, profile_id],
             )?;
             if protocol.is_some_and(|value| value != current.1) {
+                transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
                 transaction.execute(
                     "DELETE FROM provider_profile_models WHERE profile_id=?",
                     params![profile_id],
@@ -395,6 +449,7 @@ impl ProviderProfileStore {
                 "DELETE FROM provider_profile_models WHERE profile_id=?",
                 params![profile_id],
             )?;
+            transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
             transaction.commit()?;
             Ok(())
         })
@@ -434,6 +489,7 @@ impl ProviderProfileStore {
                 "DELETE FROM provider_profile_models WHERE profile_id=?",
                 params![profile_id],
             )?;
+            transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
             transaction.commit()?;
             Ok(())
         })?;
@@ -1140,6 +1196,7 @@ impl CustomProfileService {
                 params![next_alias, next_endpoint, next_protocol, next_safe_headers, next_secret_ref, next_credential_ref, Utc::now().to_rfc3339(), owner_id, profile_id],
             )?;
             if endpoint_changed || protocol_changed {
+                transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
                 transaction.execute(
                     "DELETE FROM provider_profile_models WHERE profile_id=?",
                     params![profile_id],

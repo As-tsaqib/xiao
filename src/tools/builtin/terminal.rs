@@ -157,6 +157,7 @@ impl Tool for TermuxTerminalTool {
 pub struct TermuxJobTool {
     terminal: TermuxTerminalTool,
     max_steps: usize,
+    storage: Option<Arc<crate::storage::Storage>>,
 }
 
 impl TermuxJobTool {
@@ -164,6 +165,19 @@ impl TermuxJobTool {
         Self {
             terminal,
             max_steps: max_steps.clamp(1, 64),
+            storage: None,
+        }
+    }
+
+    pub fn with_storage(
+        terminal: TermuxTerminalTool,
+        max_steps: usize,
+        storage: Arc<crate::storage::Storage>,
+    ) -> Self {
+        Self {
+            terminal,
+            max_steps: max_steps.clamp(1, 64),
+            storage: Some(storage),
         }
     }
 }
@@ -230,11 +244,30 @@ impl Tool for TermuxJobTool {
         }
         let mut results = Vec::with_capacity(job.steps.len());
         for (index, step) in job.steps.into_iter().enumerate() {
+            if context.cancellation.is_cancelled() {
+                return Err(anyhow!("termux_job cancelled"));
+            }
             let call = json!({"program":step.program,"args":step.args,"cwd":step.cwd});
+            let audit_id = self
+                .storage
+                .as_ref()
+                .map(|storage| {
+                    storage.create_tool_run_step(
+                        &context.agent_run_id,
+                        index,
+                        &step.id,
+                        &step.program,
+                        &call,
+                    )
+                })
+                .transpose()?;
             match crate::tools::policy::termux_call_policy(&call) {
                 crate::tools::PolicyDecision::Allow => {}
                 crate::tools::PolicyDecision::Deny(reason)
                 | crate::tools::PolicyDecision::RequireApproval(reason) => {
+                    if let (Some(storage), Some(id)) = (&self.storage, audit_id.as_deref()) {
+                        storage.finish_tool_run_step(id, "denied", None, Some(&reason))?;
+                    }
                     results
                         .push(json!({"index":index,"id":step.id,"status":"denied","error":reason}));
                     if !step.continue_on_error {
@@ -244,10 +277,27 @@ impl Tool for TermuxJobTool {
                 }
             }
             match self.terminal.execute(context, call).await {
-                Ok(output) => results.push(
-                    json!({"index":index,"id":step.id,"status":"succeeded","summary":output}),
-                ),
+                Ok(output) => {
+                    if let (Some(storage), Some(id)) = (&self.storage, audit_id.as_deref()) {
+                        storage.finish_tool_run_step(id, "succeeded", Some(&output), None)?;
+                    }
+                    results.push(
+                        json!({"index":index,"id":step.id,"status":"succeeded","summary":output}),
+                    );
+                }
                 Err(error) => {
+                    if let (Some(storage), Some(id)) = (&self.storage, audit_id.as_deref()) {
+                        storage.finish_tool_run_step(
+                            id,
+                            if context.cancellation.is_cancelled() {
+                                "interrupted"
+                            } else {
+                                "failed"
+                            },
+                            None,
+                            Some(&error.to_string()),
+                        )?;
+                    }
                     results.push(json!({"index":index,"id":step.id,"status":"failed","error":error.to_string()}));
                     if !step.continue_on_error {
                         break;

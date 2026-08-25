@@ -181,6 +181,8 @@ struct CustomProfileActionRequest {
     clear_secret_headers: bool,
     session_id: Option<String>,
     model: Option<String>,
+    capability: Option<String>,
+    owner_override: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -926,7 +928,31 @@ async fn manager_providers(
         .map(|profile| {
             let models = profiles_store
                 .models(&profile.profile_id)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .map(|model| {
+                    let vision_override = profiles_store
+                        .capability_override(
+                            &profile.profile_id,
+                            &model.model_id,
+                            &profile.protocol,
+                            "vision",
+                        )
+                        .unwrap_or_else(|_| "auto".into());
+                    let file_input_override = profiles_store
+                        .capability_override(
+                            &profile.profile_id,
+                            &model.model_id,
+                            &profile.protocol,
+                            "file_input",
+                        )
+                        .unwrap_or_else(|_| "auto".into());
+                    let mut value = serde_json::to_value(model).unwrap_or_default();
+                    value["vision_override"] = json!(vision_override);
+                    value["file_input_override"] = json!(file_input_override);
+                    value
+                })
+                .collect::<Vec<_>>();
             // Header values are write-only just like API keys. The manager may expose
             // names for inspection, but never returns stored values to a frontend.
             // P1-4: safe_headers -> DB, secret_headers -> SecretStore, only names in JSON.
@@ -1223,6 +1249,30 @@ async fn manager_custom_profile_action(
                 .replace_models(&owner, profile_id, &models)
                 .map_err(bad)?;
             Ok(Json(json!({"ok":true,"models":models})))
+        }
+        "capability_override" => {
+            let profile_id = req
+                .profile_id
+                .as_deref()
+                .ok_or_else(|| bad("profile_id is required"))?;
+            let model = req
+                .model
+                .as_deref()
+                .ok_or_else(|| bad("model is required"))?;
+            let capability = req
+                .capability
+                .as_deref()
+                .ok_or_else(|| bad("capability is required"))?;
+            let owner_override = req
+                .owner_override
+                .as_deref()
+                .ok_or_else(|| bad("owner_override is required"))?;
+            profiles
+                .set_capability_override(&owner, profile_id, model, capability, owner_override)
+                .map_err(bad)?;
+            Ok(Json(
+                json!({"ok":true,"profile_id":profile_id,"model":model,"capability":capability,"owner_override":owner_override}),
+            ))
         }
         "probe" => {
             // P0-4 WebUI exact-model probe: bounded single-model probe -> persist, no catalog discovery.
@@ -1753,6 +1803,11 @@ async fn manager_runs(
                 .storage
                 .dependency_installs(&run.id)
                 .unwrap_or_default();
+            let timings = state
+                .app
+                .storage
+                .agent_run_events(&run.id)
+                .unwrap_or_default();
             let result = state
                 .app
                 .storage
@@ -1783,6 +1838,7 @@ async fn manager_runs(
                 },
                 "tools": tools,
                 "dependency_installs": dependencies,
+                "timings": timings,
             })
         })
         .collect::<Vec<_>>();

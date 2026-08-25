@@ -97,6 +97,14 @@ pub struct AgentRunRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunEventRecord {
+    pub event_kind: String,
+    pub elapsed_ms: u64,
+    pub metadata: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolRunRecord {
     pub id: String,
     pub agent_run_id: String,
@@ -2340,6 +2348,44 @@ impl Storage {
         })
     }
 
+    pub fn record_agent_run_event(
+        &self,
+        run_id: &str,
+        event_kind: &str,
+        elapsed_ms: u64,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        if !matches!(
+            event_kind,
+            "pre_provider_overhead"
+                | "provider_request_start"
+                | "first_byte"
+                | "first_visible_text_delta"
+                | "provider_completion"
+                | "tool_group"
+                | "verification"
+                | "final_answer_ready"
+                | "final_frontend_delivery"
+                | "background_learning"
+        ) {
+            return Err(anyhow::anyhow!("invalid agent timing event"));
+        }
+        let metadata = serde_json::to_string(&crate::security::redact::redact_json(metadata))?;
+        self.with_conn(|connection| {
+            connection.execute("INSERT INTO agent_run_events(agent_run_id,event_kind,elapsed_ms,metadata_json,created_at) VALUES(?,?,?,?,?)", params![run_id,event_kind,elapsed_ms.min(86_400_000) as i64,metadata,Utc::now().to_rfc3339()])?;
+            connection.execute("DELETE FROM agent_run_events WHERE agent_run_id=? AND id NOT IN (SELECT id FROM agent_run_events WHERE agent_run_id=? ORDER BY id DESC LIMIT 128)", params![run_id,run_id])?;
+            Ok(())
+        })
+    }
+
+    pub fn agent_run_events(&self, run_id: &str) -> Result<Vec<AgentRunEventRecord>> {
+        self.with_conn(|connection| {
+            let mut statement=connection.prepare("SELECT event_kind,elapsed_ms,metadata_json,created_at FROM agent_run_events WHERE agent_run_id=? ORDER BY id")?;
+            let rows=statement.query_map(params![run_id], |row| Ok(AgentRunEventRecord { event_kind:row.get(0)?, elapsed_ms:row.get::<_,i64>(1)?.max(0) as u64, metadata:serde_json::from_str(&row.get::<_,String>(2)?).unwrap_or_default(), created_at:row.get(3)? }))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
     /// Return an assistant result persisted within this run's observable time
     /// window, so a later answer in the same session is never misattributed.
     pub fn agent_run_result(&self, owner: &str, run: &AgentRunRecord) -> Result<Option<String>> {
@@ -2380,6 +2426,45 @@ impl Storage {
             Ok(())
         })?;
         Ok(id)
+    }
+
+    pub fn create_tool_run_step(
+        &self,
+        agent_run_id: &str,
+        step_index: usize,
+        step_id: &str,
+        program: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let arguments = serde_json::to_string(&crate::security::redact::redact_json(arguments))?;
+        self.with_conn(|connection| {
+            let parent:String=connection.query_row("SELECT id FROM tool_runs WHERE agent_run_id=? AND tool_name='termux_job' AND status='running' ORDER BY started_at DESC LIMIT 1", params![agent_run_id], |row| row.get(0))?;
+            connection.execute("INSERT INTO tool_run_steps(id,parent_tool_run_id,step_index,step_id,program,arguments_json,status,created_at) VALUES(?,?,?,?,?,?,'running',?)", params![id,parent,step_index as i64,step_id,program,arguments,Utc::now().to_rfc3339()])?;
+            Ok(id.clone())
+        })
+    }
+
+    pub fn finish_tool_run_step(
+        &self,
+        id: &str,
+        status: &str,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn(|connection| {
+            connection.execute(
+                "UPDATE tool_run_steps SET status=?,output=?,error=?,completed_at=? WHERE id=?",
+                params![
+                    status,
+                    output.map(crate::security::redact::redact_text),
+                    error.map(crate::security::redact::redact_text),
+                    Utc::now().to_rfc3339(),
+                    id
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn set_tool_run_status(

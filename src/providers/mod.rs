@@ -1442,7 +1442,8 @@ impl Provider for CustomProvider {
         let Some(profile_id) = profile_id else {
             return self.capabilities(model);
         };
-        self.profiles
+        let mut capabilities = self
+            .profiles
             .model(profile_id, model)
             .ok()
             .flatten()
@@ -1451,7 +1452,24 @@ impl Provider for CustomProvider {
                 ProviderCapabilities::chat_only(
                     "selected Custom profile/model has not passed capability probing",
                 )
-            })
+            });
+        if let Ok(Some(profile)) = self.profiles.get_by_id(profile_id) {
+            for (capability, target) in [
+                ("vision", &mut capabilities.vision),
+                ("file_input", &mut capabilities.file_input),
+            ] {
+                match self
+                    .profiles
+                    .capability_override(profile_id, model, &profile.protocol, capability)
+                    .as_deref()
+                {
+                    Ok("force_supported") => *target = true,
+                    Ok("force_unsupported") => *target = false,
+                    _ => {}
+                }
+            }
+        }
+        capabilities
     }
     fn supports_semantic_evaluation(&self, model: &str) -> bool {
         (self

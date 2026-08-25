@@ -193,9 +193,10 @@ impl AgentEngine {
             skill_dependency_resolver = Some(resolver.clone());
             let terminal = TermuxTerminalTool::new(executor, resolver, termux_home);
             tools
-                .register(TermuxJobTool::new(
+                .register(TermuxJobTool::with_storage(
                     terminal.clone(),
                     config.max_execution_plan_steps,
+                    storage.clone(),
                 ))
                 .expect("register termux_job tool");
             tools
@@ -616,6 +617,7 @@ impl AgentEngine {
                 return Err(error);
             }
         };
+        let timing_started = std::time::Instant::now();
 
         let result = async {
             if resolved_model != ctx.active.model {
@@ -760,6 +762,7 @@ impl AgentEngine {
                 images,
                 files: Vec::new(),
             };
+            self.storage.record_agent_run_event(&agent_run_id, "pre_provider_overhead", timing_started.elapsed().as_millis() as u64, &serde_json::json!({}))?;
             let started = AgentEvent::GenerationStarted;
             if let Some(tx) = &progress { let _ = tx.send(started.clone()); }
             let mut continuation=None;
@@ -801,6 +804,7 @@ impl AgentEngine {
                     ));
                 }
                 turns += 1;
+                self.storage.record_agent_run_event(&agent_run_id, "provider_request_start", timing_started.elapsed().as_millis() as u64, &serde_json::json!({"turn":turns}))?;
                 let remaining = std::time::Duration::from_secs(self.config.max_runtime_seconds)
                     .saturating_sub(run_started.elapsed());
                 let turn = tokio::select! {
@@ -815,6 +819,7 @@ impl AgentEngine {
                         ),
                     ) => response.map_err(|_| anyhow!("agent runtime limit reached during provider turn"))??,
                 };
+                self.storage.record_agent_run_event(&agent_run_id, "provider_completion", timing_started.elapsed().as_millis() as u64, &serde_json::json!({"turn":turns}))?;
                 provider_events.extend(turn.events);
                 match turn.step {
                     ProviderStep::Final(answer)=>{
@@ -1178,6 +1183,7 @@ impl AgentEngine {
                     return Err(error);
                 }
             };
+            self.storage.record_agent_run_event(&agent_run_id, "final_answer_ready", timing_started.elapsed().as_millis() as u64, &serde_json::json!({}))?;
             if token.is_cancelled() {
                 let _ = self.storage.set_agent_run_status(
                     principal,
