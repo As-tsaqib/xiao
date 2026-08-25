@@ -1445,6 +1445,11 @@ async fn manager_agent_action(
     config.validate().map_err(bad)?;
     config.save_atomic(&state.config_path).map_err(bad)?;
     *state.app.config.write().await = config.clone();
+    state
+        .app
+        .commands
+        .update_agent_config(config.agent.clone())
+        .await;
     Ok(Json(json!({"applied":true,"settings":config.agent})))
 }
 

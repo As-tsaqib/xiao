@@ -220,6 +220,9 @@ pub struct CommandCore {
 }
 
 impl CommandCore {
+    pub async fn update_agent_config(&self, config: crate::config::AgentConfig) {
+        self.agent.update_config(config).await;
+    }
     pub fn new(
         config: Arc<RwLock<AppConfig>>,
         storage: Arc<Storage>,
