@@ -34,7 +34,8 @@ use crate::{
     tools::{
         builtin::{
             AndroidXiaoRestartTool, AndroidXiaoStatusTool, ContextStatsTool, MemoryDeleteTool,
-            MemorySearchTool, MemorySetTool, SkillSearchTool, SkillViewTool, TermuxJobTool, TermuxTerminalTool,
+            MemorySearchTool, MemorySetTool, SkillSearchTool, SkillViewTool, TermuxJobTool,
+            TermuxTerminalTool,
         },
         ToolContext, ToolPolicy, ToolRegistry, ToolResult,
     },
@@ -192,7 +193,10 @@ impl AgentEngine {
             skill_dependency_resolver = Some(resolver.clone());
             let terminal = TermuxTerminalTool::new(executor, resolver, termux_home);
             tools
-                .register(TermuxJobTool::new(terminal.clone(), config.max_execution_plan_steps))
+                .register(TermuxJobTool::new(
+                    terminal.clone(),
+                    config.max_execution_plan_steps,
+                ))
                 .expect("register termux_job tool");
             tools
                 .register(terminal)
@@ -1956,7 +1960,7 @@ mod tests {
                     name: name.into(),
                     arguments: serde_json::json!({}),
                 }]),
-                continuation: Some(serde_json::json!({"turn":turn})),
+                continuation: Some(serde_json::json!({ "turn": turn })),
                 events: Vec::new(),
             };
             Ok(match turn {
@@ -2043,7 +2047,7 @@ mod tests {
                 step: ProviderStep::ToolCalls(vec![ToolCall {
                     call_id: id.into(),
                     name: "adaptive_action".into(),
-                    arguments: serde_json::json!({"strategy":strategy}),
+                    arguments: serde_json::json!({ "strategy": strategy }),
                 }]),
                 continuation: None,
                 events: Vec::new(),

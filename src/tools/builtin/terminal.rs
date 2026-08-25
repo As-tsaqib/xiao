@@ -18,7 +18,11 @@ pub struct TermuxTerminalTool {
 
 impl Clone for TermuxTerminalTool {
     fn clone(&self) -> Self {
-        Self { executor: self.executor.clone(), dependencies: self.dependencies.clone(), default_cwd: self.default_cwd.clone() }
+        Self {
+            executor: self.executor.clone(),
+            dependencies: self.dependencies.clone(),
+            default_cwd: self.default_cwd.clone(),
+        }
     }
 }
 
@@ -157,7 +161,10 @@ pub struct TermuxJobTool {
 
 impl TermuxJobTool {
     pub fn new(terminal: TermuxTerminalTool, max_steps: usize) -> Self {
-        Self { terminal, max_steps: max_steps.clamp(1, 64) }
+        Self {
+            terminal,
+            max_steps: max_steps.clamp(1, 64),
+        }
     }
 }
 
@@ -215,7 +222,10 @@ impl Tool for TermuxJobTool {
         if job.steps.is_empty() || job.steps.len() > self.max_steps || job.steps.len() > 64 {
             return Err(anyhow!("termux_job requires 1..={} steps", self.max_steps));
         }
-        if !matches!(job.mode.as_deref(), None | Some("auto") | Some("sequential")) {
+        if !matches!(
+            job.mode.as_deref(),
+            None | Some("auto") | Some("sequential")
+        ) {
             return Err(anyhow!("termux_job mode must be auto or sequential"));
         }
         let mut results = Vec::with_capacity(job.steps.len());
@@ -223,17 +233,25 @@ impl Tool for TermuxJobTool {
             let call = json!({"program":step.program,"args":step.args,"cwd":step.cwd});
             match crate::tools::policy::termux_call_policy(&call) {
                 crate::tools::PolicyDecision::Allow => {}
-                crate::tools::PolicyDecision::Deny(reason) | crate::tools::PolicyDecision::RequireApproval(reason) => {
-                    results.push(json!({"index":index,"id":step.id,"status":"denied","error":reason}));
-                    if !step.continue_on_error { break; }
+                crate::tools::PolicyDecision::Deny(reason)
+                | crate::tools::PolicyDecision::RequireApproval(reason) => {
+                    results
+                        .push(json!({"index":index,"id":step.id,"status":"denied","error":reason}));
+                    if !step.continue_on_error {
+                        break;
+                    }
                     continue;
                 }
             }
             match self.terminal.execute(context, call).await {
-                Ok(output) => results.push(json!({"index":index,"id":step.id,"status":"succeeded","summary":output})),
+                Ok(output) => results.push(
+                    json!({"index":index,"id":step.id,"status":"succeeded","summary":output}),
+                ),
                 Err(error) => {
                     results.push(json!({"index":index,"id":step.id,"status":"failed","error":error.to_string()}));
-                    if !step.continue_on_error { break; }
+                    if !step.continue_on_error {
+                        break;
+                    }
                 }
             }
         }

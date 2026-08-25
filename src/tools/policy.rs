@@ -19,10 +19,15 @@ pub struct ToolPolicy {
 impl Default for ToolPolicy {
     fn default() -> Self {
         Self {
-            safe_side_effects: ["memory_set", "memory_delete", "termux_terminal", "termux_job"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            safe_side_effects: [
+                "memory_set",
+                "memory_delete",
+                "termux_terminal",
+                "termux_job",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         }
     }
 }

@@ -1826,7 +1826,15 @@ impl ProgressAggregator {
             AgentEvent::TextDelta(delta) => {
                 self.visible_text.push_str(&delta);
                 if self.visible_text.chars().count() > 3_000 {
-                    self.visible_text = self.visible_text.chars().rev().take(3_000).collect::<String>().chars().rev().collect();
+                    self.visible_text = self
+                        .visible_text
+                        .chars()
+                        .rev()
+                        .take(3_000)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
                 }
                 self.stream_chunk();
             }
@@ -2129,7 +2137,9 @@ impl ProgressAggregator {
         }
         let mut blocks = vec![Block::Progress { items }];
         if !self.visible_text.is_empty() {
-            blocks.push(Block::Paragraph { text: self.visible_text.clone() });
+            blocks.push(Block::Paragraph {
+                text: self.visible_text.clone(),
+            });
         }
         View {
             title: None,

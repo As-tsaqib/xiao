@@ -1591,14 +1591,19 @@ impl Provider for CustomProvider {
                 progress.clone(),
                 body["messages"].as_array().cloned().unwrap_or_default(),
                 capabilities.tool_protocol != ToolProtocol::StructuredJsonFallback,
-            ).await?;
-            let (step, continuation) = if capabilities.tool_protocol == ToolProtocol::StructuredJsonFallback {
+            )
+            .await?;
+            let (step, continuation) = if capabilities.tool_protocol
+                == ToolProtocol::StructuredJsonFallback
+            {
                 let step = parse_structured_agent_output(&streamed.text, &req.tools)?;
                 let continuation = match &step {
                     ProviderStep::ToolCalls(calls) => {
                         let mut transcript = structured_transcript.take().unwrap_or_default();
                         transcript.push(serde_json::json!({"role":"assistant","kind":"tool_calls","calls":calls}));
-                        Some(serde_json::json!({"kind":"xiao_structured_continuation_v1","transcript":bound_structured_transcript(transcript)?}))
+                        Some(
+                            serde_json::json!({"kind":"xiao_structured_continuation_v1","transcript":bound_structured_transcript(transcript)?}),
+                        )
                     }
                     ProviderStep::Final(_) => None,
                 };
@@ -1606,7 +1611,10 @@ impl Provider for CustomProvider {
             } else if streamed.tool_calls.is_empty() {
                 (ProviderStep::Final(streamed.text), None)
             } else {
-                (ProviderStep::ToolCalls(streamed.tool_calls), streamed.continuation)
+                (
+                    ProviderStep::ToolCalls(streamed.tool_calls),
+                    streamed.continuation,
+                )
             };
             return Ok(ProviderTurn {
                 step,
@@ -1619,14 +1627,21 @@ impl Provider for CustomProvider {
             "custom",
             progress.clone(),
             capabilities.tool_protocol != ToolProtocol::StructuredJsonFallback,
-        ).await?;
-        let (step, continuation) = if capabilities.tool_protocol == ToolProtocol::StructuredJsonFallback {
+        )
+        .await?;
+        let (step, continuation) = if capabilities.tool_protocol
+            == ToolProtocol::StructuredJsonFallback
+        {
             let step = parse_structured_agent_output(&streamed.text, &req.tools)?;
             let continuation = match &step {
                 ProviderStep::ToolCalls(calls) => {
                     let mut transcript = structured_transcript.take().unwrap_or_default();
-                    transcript.push(serde_json::json!({"role":"assistant","kind":"tool_calls","calls":calls}));
-                    Some(serde_json::json!({"kind":"xiao_structured_continuation_v1","transcript":bound_structured_transcript(transcript)?}))
+                    transcript.push(
+                        serde_json::json!({"role":"assistant","kind":"tool_calls","calls":calls}),
+                    );
+                    Some(
+                        serde_json::json!({"kind":"xiao_structured_continuation_v1","transcript":bound_structured_transcript(transcript)?}),
+                    )
                 }
                 ProviderStep::Final(_) => None,
             };
@@ -1636,7 +1651,10 @@ impl Provider for CustomProvider {
         } else {
             let mut input = body["input"].as_array().cloned().unwrap_or_default();
             input.extend(streamed.function_items);
-            (ProviderStep::ToolCalls(streamed.tool_calls), Some(serde_json::json!({"input":input})))
+            (
+                ProviderStep::ToolCalls(streamed.tool_calls),
+                Some(serde_json::json!({ "input": input })),
+            )
         };
         Ok(ProviderTurn {
             step,
@@ -2591,25 +2609,55 @@ async fn consume_custom_chat_sse(
     let mut calls: HashMap<usize, (String, String, String)> = HashMap::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        emit(&progress, AgentEvent::StreamChunk { provider: "custom".into(), bytes: chunk.len() });
+        emit(
+            &progress,
+            AgentEvent::StreamChunk {
+                provider: "custom".into(),
+                bytes: chunk.len(),
+            },
+        );
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].trim_end_matches('\r').to_owned();
             buffer.drain(..=pos);
             let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
-            if data == "[DONE]" { continue; }
+            if data == "[DONE]" {
+                continue;
+            }
             let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else { continue };
             let Some(delta) = value.pointer("/choices/0/delta") else { continue };
             if let Some(part) = delta.get("content").and_then(serde_json::Value::as_str) {
                 text.push_str(part);
-                if visible_text { emit(&progress, AgentEvent::TextDelta(part.to_owned())); }
+                if visible_text {
+                    emit(&progress, AgentEvent::TextDelta(part.to_owned()));
+                }
             }
-            for call in delta.get("tool_calls").and_then(serde_json::Value::as_array).into_iter().flatten() {
-                let index = call.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+            for call in delta
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let index = call
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
                 let entry = calls.entry(index).or_default();
-                if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) { entry.0.push_str(id); }
-                if let Some(name) = call.pointer("/function/name").and_then(serde_json::Value::as_str) { entry.1.push_str(name); }
-                if let Some(args) = call.pointer("/function/arguments").and_then(serde_json::Value::as_str) { entry.2.push_str(args); }
+                if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) {
+                    entry.0.push_str(id);
+                }
+                if let Some(name) = call
+                    .pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    entry.1.push_str(name);
+                }
+                if let Some(args) = call
+                    .pointer("/function/arguments")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    entry.2.push_str(args);
+                }
             }
         }
     }
@@ -2621,16 +2669,28 @@ async fn consume_custom_chat_sse(
         let arguments = serde_json::from_str(&raw)
             .map_err(|_| anyhow!("custom chat tool call arguments are malformed JSON"))?;
         wire_calls.push(serde_json::json!({"id":call_id,"type":"function","function":{"name":name,"arguments":raw}}));
-        tool_calls.push(ToolCall { call_id, name, arguments });
+        tool_calls.push(ToolCall {
+            call_id,
+            name,
+            arguments,
+        });
     }
-    let continuation = if tool_calls.is_empty() { None } else {
+    let continuation = if tool_calls.is_empty() {
+        None
+    } else {
         messages.push(serde_json::json!({"role":"assistant","tool_calls":wire_calls}));
-        Some(serde_json::json!({"messages":messages}))
+        Some(serde_json::json!({ "messages": messages }))
     };
     if text.is_empty() && tool_calls.is_empty() {
-        return Err(anyhow!("custom chat stream contained no assistant text or tool call"));
+        return Err(anyhow!(
+            "custom chat stream contained no assistant text or tool call"
+        ));
     }
-    Ok(StreamedChat { text, tool_calls, continuation })
+    Ok(StreamedChat {
+        text,
+        tool_calls,
+        continuation,
+    })
 }
 
 fn responses_tool_progress_event(value: &serde_json::Value) -> Option<AgentEvent> {
@@ -3729,14 +3789,25 @@ mod tests {
     #[test]
     fn unknown_optional_inputs_are_optimistically_routable() {
         let record = crate::storage::ProviderProfileModelRecord {
-            profile_id: "profile-a".into(), model_id: "model-a".into(),
-            text_capable: true, vision_capable: false, file_input_capable: false,
-            native_tools: true, structured_output: true, continuation: true,
-            native_tools_state: "supported".into(), structured_output_state: "supported".into(),
-            continuation_state: "supported".into(), vision_state: "unknown".into(),
-            file_input_state: "unknown".into(), model_discovery: true,
-            tool_protocol: "native".into(), evidence: "probe inconclusive".into(),
-            probe_status: "completed".into(), probe_version: 1, probed_at: "now".into(),
+            profile_id: "profile-a".into(),
+            model_id: "model-a".into(),
+            text_capable: true,
+            vision_capable: false,
+            file_input_capable: false,
+            native_tools: true,
+            structured_output: true,
+            continuation: true,
+            native_tools_state: "supported".into(),
+            structured_output_state: "supported".into(),
+            continuation_state: "supported".into(),
+            vision_state: "unknown".into(),
+            file_input_state: "unknown".into(),
+            model_discovery: true,
+            tool_protocol: "native".into(),
+            evidence: "probe inconclusive".into(),
+            probe_status: "completed".into(),
+            probe_version: 1,
+            probed_at: "now".into(),
         };
         let capabilities = profile_capabilities_from_record(record);
         assert!(capabilities.vision);
@@ -3746,14 +3817,25 @@ mod tests {
     #[test]
     fn explicit_unsupported_optional_inputs_are_not_routable() {
         let mut record = crate::storage::ProviderProfileModelRecord {
-            profile_id: "profile-a".into(), model_id: "model-a".into(),
-            text_capable: true, vision_capable: false, file_input_capable: false,
-            native_tools: true, structured_output: true, continuation: true,
-            native_tools_state: "supported".into(), structured_output_state: "supported".into(),
-            continuation_state: "supported".into(), vision_state: "unsupported".into(),
-            file_input_state: "unsupported".into(), model_discovery: true,
-            tool_protocol: "native".into(), evidence: "explicit provider rejection".into(),
-            probe_status: "completed".into(), probe_version: 1, probed_at: "now".into(),
+            profile_id: "profile-a".into(),
+            model_id: "model-a".into(),
+            text_capable: true,
+            vision_capable: false,
+            file_input_capable: false,
+            native_tools: true,
+            structured_output: true,
+            continuation: true,
+            native_tools_state: "supported".into(),
+            structured_output_state: "supported".into(),
+            continuation_state: "supported".into(),
+            vision_state: "unsupported".into(),
+            file_input_state: "unsupported".into(),
+            model_discovery: true,
+            tool_protocol: "native".into(),
+            evidence: "explicit provider rejection".into(),
+            probe_status: "completed".into(),
+            probe_version: 1,
+            probed_at: "now".into(),
         };
         let capabilities = profile_capabilities_from_record(record.clone());
         assert!(!capabilities.vision);
