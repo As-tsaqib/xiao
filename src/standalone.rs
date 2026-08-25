@@ -765,10 +765,6 @@ fn nonempty_env(name: &str) -> Option<OsString> {
     env::var_os(name).filter(|value| !value.is_empty())
 }
 
-fn default_principal() -> String {
-    "termux:default".into()
-}
-
 fn absolute_from(base: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
