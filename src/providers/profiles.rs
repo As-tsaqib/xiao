@@ -77,6 +77,34 @@ impl ProviderProfileStore {
         })
     }
 
+    pub fn record_runtime_capability(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        protocol: &str,
+        capability: &str,
+        state: &str,
+        source: &str,
+    ) -> Result<()> {
+        if !matches!(
+            (capability, state),
+            (
+                "vision" | "file_input" | "streaming",
+                "supported" | "unsupported"
+            )
+        ) {
+            return Err(anyhow!("invalid runtime capability evidence"));
+        }
+        let now = Utc::now().to_rfc3339();
+        self.storage.with_conn(|connection| {
+            let transaction=connection.transaction()?;
+            transaction.execute("INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) VALUES(?,?,?,?,?,'auto',?,?) ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET state=excluded.state,source=excluded.source,observed_at=excluded.observed_at", params![profile_id,model_id,protocol,capability,state,source,now])?;
+            if capability=="vision" { transaction.execute("UPDATE provider_profile_models SET vision_state=?,vision_capable=? WHERE profile_id=? AND model_id=?",params![state,(state=="supported") as i32,profile_id,model_id])?; }
+            if capability=="file_input" { transaction.execute("UPDATE provider_profile_models SET file_input_state=?,file_input_capable=? WHERE profile_id=? AND model_id=?",params![state,(state=="supported") as i32,profile_id,model_id])?; }
+            transaction.commit()?; Ok(())
+        })
+    }
+
     pub fn create(&self, mut input: ProviderProfileInput) -> Result<ProviderProfileRecord> {
         input.alias = canonical_alias(&input.alias)?;
         input.endpoint = validate_endpoint(&input.endpoint)?;

@@ -1488,6 +1488,8 @@ impl Provider for CustomProvider {
         if req.account_id.is_none() && !self.cfg.enabled {
             return Err(anyhow!("custom provider is disabled"));
         }
+        let profile_id = req.account_id.clone();
+        let had_images = !req.images.is_empty();
         let target = self.target(req.account_id.as_deref())?;
         let endpoint = if target.protocol == "openai_chat_completions" {
             endpoint_with_suffix(&target.base_url, "/chat/completions")
@@ -1602,7 +1604,24 @@ impl Provider for CustomProvider {
             .json(&body)
             .send()
             .await?;
-        let response = ensure_success(response, "Custom provider").await?;
+        let response = match ensure_success(response, "Custom provider").await {
+            Ok(response) => response,
+            Err(error) => {
+                if had_images && explicit_image_unsupported(&error.to_string()) {
+                    if let Some(profile_id) = profile_id.as_deref() {
+                        let _ = self.profiles.record_runtime_capability(
+                            profile_id,
+                            &req.model,
+                            &target.protocol,
+                            "vision",
+                            "unsupported",
+                            "provider_explicit_unsupported",
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
         if !response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -1652,6 +1671,18 @@ impl Provider for CustomProvider {
                     (ProviderStep::Final(answer), None)
                 }
             };
+            if had_images {
+                if let Some(profile_id) = profile_id.as_deref() {
+                    let _ = self.profiles.record_runtime_capability(
+                        profile_id,
+                        &req.model,
+                        &target.protocol,
+                        "vision",
+                        "supported",
+                        "runtime_success",
+                    );
+                }
+            }
             return Ok(ProviderTurn {
                 step,
                 continuation,
@@ -1689,6 +1720,18 @@ impl Provider for CustomProvider {
                     streamed.continuation,
                 )
             };
+            if had_images {
+                if let Some(profile_id) = profile_id.as_deref() {
+                    let _ = self.profiles.record_runtime_capability(
+                        profile_id,
+                        &req.model,
+                        &target.protocol,
+                        "vision",
+                        "supported",
+                        "runtime_success",
+                    );
+                }
+            }
             return Ok(ProviderTurn {
                 step,
                 continuation,
@@ -1729,6 +1772,18 @@ impl Provider for CustomProvider {
                 Some(serde_json::json!({ "input": input })),
             )
         };
+        if had_images {
+            if let Some(profile_id) = profile_id.as_deref() {
+                let _ = self.profiles.record_runtime_capability(
+                    profile_id,
+                    &req.model,
+                    &target.protocol,
+                    "vision",
+                    "supported",
+                    "runtime_success",
+                );
+            }
+        }
         Ok(ProviderTurn {
             step,
             continuation,
@@ -2644,6 +2699,19 @@ fn upstream_error_summary(body: &[u8], truncated: bool) -> String {
     safe
 }
 
+fn explicit_image_unsupported(error: &str) -> bool {
+    let value = error.to_ascii_lowercase();
+    value.contains("http 400")
+        && [
+            "image input is not supported",
+            "image_url is not supported",
+            "unsupported content type: image",
+            "does not support images",
+        ]
+        .iter()
+        .any(|needle| value.contains(needle))
+}
+
 fn extract_chat_content(value: &serde_json::Value) -> Option<String> {
     let content = value.pointer("/choices/0/message/content")?;
     if let Some(text) = content.as_str() {
@@ -2823,6 +2891,7 @@ async fn consume_responses_sse(
     let mut text = String::new();
     let mut calls = Vec::new();
     let mut items = Vec::new();
+    let mut argument_deltas = HashMap::<String, String>::new();
     let mut stream_error = None;
 
     while let Some(chunk) = stream.next().await {
@@ -2875,9 +2944,20 @@ async fn consume_responses_sse(
                     ) else {
                         continue;
                     };
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(|value| value.as_str())
+                    let key = item
+                        .get("item_id")
+                        .or_else(|| item.get("id"))
+                        .or_else(|| item.get("call_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(call_id);
+                    let arguments = argument_deltas
+                        .remove(key)
+                        .or_else(|| {
+                            item.get("arguments")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_owned)
+                        })
+                        .as_deref()
                         .and_then(|value| serde_json::from_str(value).ok())
                         .unwrap_or_else(|| serde_json::json!({}));
                     calls.push(ToolCall {
@@ -2886,6 +2966,20 @@ async fn consume_responses_sse(
                         arguments,
                     });
                     items.push(item.clone());
+                }
+                Some("response.function_call_arguments.delta") => {
+                    if let (Some(key), Some(delta)) = (
+                        value
+                            .get("item_id")
+                            .or_else(|| value.get("call_id"))
+                            .and_then(serde_json::Value::as_str),
+                        value.get("delta").and_then(serde_json::Value::as_str),
+                    ) {
+                        argument_deltas
+                            .entry(key.into())
+                            .or_default()
+                            .push_str(delta);
+                    }
                 }
                 Some("response.completed") if text.is_empty() => {
                     if let Some(response) = value.get("response") {
