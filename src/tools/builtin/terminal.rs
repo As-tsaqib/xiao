@@ -92,13 +92,30 @@ impl Tool for TermuxTerminalTool {
                 context.progress.as_ref(),
             )
             .await?;
+        let session_workspace = if context.session_id.is_empty() {
+            self.default_cwd.clone()
+        } else {
+            let dir = self.default_cwd.join(".xiao/workspaces").join(&context.session_id);
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        };
+        let effective_cwd = match arguments.cwd {
+            Some(custom) => {
+                if custom.is_absolute() {
+                    custom
+                } else {
+                    session_workspace.join(custom)
+                }
+            }
+            None => session_workspace.clone(),
+        };
         let outcome = self
             .executor
             .execute(
                 TermuxCommand {
                     program: arguments.program,
                     args: arguments.args,
-                    cwd: arguments.cwd.unwrap_or_else(|| self.default_cwd.clone()),
+                    cwd: effective_cwd,
                     environment: arguments.environment,
                     timeout_ms: arguments.timeout_ms.unwrap_or(120_000),
                     max_output_chars: 16_384,
