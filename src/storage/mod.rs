@@ -2525,10 +2525,12 @@ impl Storage {
             // behind after the main session disappears.
             let session_ids = {
                 let mut statement = transaction.prepare(
-                    "WITH RECURSIVE descendants(id) AS (\
-                        SELECT ?1\
-                        UNION\
-                        SELECT s.id FROM sessions s JOIN descendants d ON s.parent_id=d.id WHERE s.owner_principal=?2\
+                    "WITH RECURSIVE descendants(id) AS (
+                        SELECT ?1
+                        UNION
+                        SELECT s.id FROM sessions s
+                        JOIN descendants d ON s.parent_id=d.id
+                        WHERE s.owner_principal=?2
                     ) SELECT id FROM descendants",
                 )?;
                 let rows = statement
@@ -2537,15 +2539,17 @@ impl Storage {
                 rows
             };
             let running: bool = transaction.query_row(
-                "WITH RECURSIVE descendants(id) AS (\
-                    SELECT ?1\
-                    UNION\
-                    SELECT s.id FROM sessions s JOIN descendants d ON s.parent_id=d.id WHERE s.owner_principal=?2\
-                ) SELECT EXISTS(\
-                    SELECT 1 FROM agent_runs\
-                     WHERE owner_principal=?2\
-                       AND session_id IN (SELECT id FROM descendants)\
-                       AND status IN ('received','context_build','running','awaiting_approval','verifying')\
+                "WITH RECURSIVE descendants(id) AS (
+                    SELECT ?1
+                    UNION
+                    SELECT s.id FROM sessions s
+                    JOIN descendants d ON s.parent_id=d.id
+                    WHERE s.owner_principal=?2
+                ) SELECT EXISTS(
+                    SELECT 1 FROM agent_runs
+                    WHERE owner_principal=?2
+                      AND session_id IN (SELECT id FROM descendants)
+                      AND status IN ('received','context_build','running','awaiting_approval','verifying')
                 )",
                 params![id, owner],
                 |row| row.get(0),

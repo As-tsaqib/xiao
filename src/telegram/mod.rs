@@ -3203,14 +3203,9 @@ mod tests {
             .handle_update(topic_message(1, 100, 10, 10, "/login"))
             .await
             .unwrap();
-        let custom = last_callbacks(&telegram_probe)[2].clone();
-        adapter
-            .handle_update(callback(2, 100, 10, 10, custom))
-            .await
-            .unwrap();
         adapter
             .handle_update(topic_message(
-                3,
+                2,
                 100,
                 10,
                 10,
@@ -3222,21 +3217,21 @@ mod tests {
         let skip = last_callbacks(&telegram_probe)[0].clone();
         // A non-owner cannot mutate this menu or its custom-login state.
         adapter
-            .handle_update(callback(4, 100, 10, 11, skip.clone()))
+            .handle_update(callback(3, 100, 10, 11, skip.clone()))
             .await
             .unwrap();
         // Same owner/chat but wrong topic cannot mutate the wizard/menu.
         adapter
-            .handle_update(callback(5, 100, 20, 10, skip.clone()))
+            .handle_update(callback(4, 100, 20, 10, skip.clone()))
             .await
             .unwrap();
         adapter
-            .handle_update(callback(6, 100, 10, 10, skip))
+            .handle_update(callback(5, 100, 10, 10, skip))
             .await
             .unwrap();
         let default_alias = last_callbacks(&telegram_probe)[0].clone();
         adapter
-            .handle_update(callback(7, 100, 10, 10, default_alias))
+            .handle_update(callback(6, 100, 10, 10, default_alias))
             .await
             .unwrap();
 
@@ -3244,17 +3239,17 @@ mod tests {
         assert_eq!(model_page_one.len(), 10);
         let next = model_page_one[7].clone();
         adapter
-            .handle_update(callback(8, 100, 10, 10, next))
+            .handle_update(callback(7, 100, 10, 10, next))
             .await
             .unwrap();
         let select_page_two_first = last_callbacks(&telegram_probe)[0].clone();
         adapter
-            .handle_update(callback(9, 100, 10, 10, select_page_two_first))
+            .handle_update(callback(8, 100, 10, 10, select_page_two_first))
             .await
             .unwrap();
         let confirm = last_callbacks(&telegram_probe)[0].clone();
         adapter
-            .handle_update(callback(10, 100, 10, 10, confirm))
+            .handle_update(callback(9, 100, 10, 10, confirm))
             .await
             .unwrap();
 
