@@ -139,8 +139,7 @@ impl ClientConfig {
             control_socket,
             token,
         })?;
-        let _ = write_new_private(path, content.as_bytes())?;
-        Ok(())
+        write_atomic_private(path, content.as_bytes())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -794,6 +793,28 @@ fn ensure_private_dir(path: &Path, tighten_existing: bool) -> Result<()> {
     if !existed || tighten_existing {
         set_private_dir(path)?;
     }
+    Ok(())
+}
+
+fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4().simple()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp)
+        .with_context(|| format!("create {}", temp.display()))?;
+    set_private_file(&temp)?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(error).with_context(|| format!("write {}", temp.display()));
+    }
+    drop(file);
+    fs::rename(&temp, path)
+        .with_context(|| format!("rename {} to {}", temp.display(), path.display()))?;
+    set_private_file(path)?;
     Ok(())
 }
 
