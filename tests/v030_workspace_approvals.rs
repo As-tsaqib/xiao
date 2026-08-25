@@ -1,16 +1,14 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use xiao::{
     runtime::{
-        CapabilityRegistry, CommandOutcome, DependencyResolver, ExecutionBackend, ExecutionPurpose,
-        PackageBackend, PackageCandidate, ProcessExecutor, RuntimeEnvironment, SelinuxState,
-        TermuxCommand, TermuxEnvironment, TermuxPackageBackend, TermuxRepositoryBackend,
+        CapabilityRegistry, CommandOutcome, DependencyResolver, ExecutionBackend, PackageBackend,
+        PackageCandidate, ProcessExecutor, RuntimeEnvironment, SelinuxState, TermuxCommand,
         TrustedPackageRepository,
     },
-    storage::Storage,
     tools::{
-        builtin::terminal::TermuxTerminalTool, policy::ToolPolicy, Tool, ToolContext, ToolRegistry,
-        ToolRisk,
+        builtin::TermuxTerminalTool, Tool, ToolCall, ToolContext, ToolPolicy, ToolRegistry,
+        ToolRunStatus,
     },
 };
 
@@ -31,12 +29,13 @@ impl ProcessExecutor for DummyExecutor {
             program: command.program,
             args: command.args,
             cwd: command.cwd,
-            exit_code: 0,
+            exit_code: Some(0),
             stdout: "ok\n".into(),
             stderr: String::new(),
             duration_ms: 10,
             truncated: false,
-            purpose: command.purpose,
+            timed_out: false,
+            cancelled: false,
         })
     }
 }
@@ -44,19 +43,25 @@ impl ProcessExecutor for DummyExecutor {
 struct DummyPackageRepo;
 #[async_trait::async_trait]
 impl TrustedPackageRepository for DummyPackageRepo {
-    async fn resolve_candidate(
+    async fn search(
         &self,
-        _binary: &str,
+        _query: &str,
         _cancellation: tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<Option<PackageCandidate>> {
-        Ok(None)
+    ) -> anyhow::Result<Vec<PackageCandidate>> {
+        Ok(vec![])
     }
 }
 
 struct DummyBackend;
 #[async_trait::async_trait]
 impl PackageBackend for DummyBackend {
-    async fn install_package(
+    fn package_manager_name(&self) -> &str {
+        "dummy"
+    }
+    async fn binary_available(&self, _binary: &str) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+    async fn install(
         &self,
         _pkg: &str,
         _cancellation: tokio_util::sync::CancellationToken,
@@ -65,27 +70,36 @@ impl PackageBackend for DummyBackend {
     }
 }
 
+fn test_capabilities() -> Arc<CapabilityRegistry> {
+    Arc::new(CapabilityRegistry::from_environment(&RuntimeEnvironment {
+        platform: "android".into(),
+        os_version: None,
+        android_version: Some("14".into()),
+        device_model: None,
+        architecture: "aarch64".into(),
+        xiao_version: "0.3.0".into(),
+        effective_uid: 1000,
+        root_available: false,
+        selinux: SelinuxState::Enforcing,
+        termux: None,
+        installed_binaries: BTreeMap::new(),
+        execution_backend: ExecutionBackend::Termux,
+        created_at: "now".into(),
+    }))
+}
+
 #[tokio::test]
 async fn termux_terminal_defaults_to_isolated_session_workspace() {
     let dir = tempfile::tempdir().unwrap();
     let termux_home = dir.path().join("home");
     std::fs::create_dir_all(&termux_home).unwrap();
 
-    let env = TermuxEnvironment {
-        prefix: dir.path().to_path_buf(),
-        home: termux_home.clone(),
-        path: "/bin".into(),
-        shell: "/bin/sh".into(),
-        package_manager: None,
-        uid: Some(1000),
-        gid: Some(1000),
-    };
     let last_cwd = Arc::new(std::sync::Mutex::new(None));
     let executor: Arc<dyn ProcessExecutor> = Arc::new(DummyExecutor {
         last_cwd: last_cwd.clone(),
     });
     let resolver = Arc::new(DependencyResolver::with_trusted_repository(
-        Arc::new(CapabilityRegistry::default()),
+        test_capabilities(),
         Arc::new(DummyBackend),
         None,
         Arc::new(DummyPackageRepo),
@@ -113,20 +127,14 @@ async fn termux_terminal_defaults_to_isolated_session_workspace() {
 
     assert!(result.is_ok());
     let recorded_cwd = last_cwd.lock().unwrap().clone().unwrap();
-    assert!(
-        recorded_cwd.ends_with(".xiao/workspaces/session-abc-123")
-            || recorded_cwd == termux_home
-            || recorded_cwd.starts_with(&termux_home)
-    );
+    assert!(recorded_cwd.ends_with(".xiao/workspaces/session-abc-123"));
 }
 
 #[tokio::test]
 async fn yolo_mode_converts_ask_to_allow_but_never_bypasses_hard_deny() {
     let policy = ToolPolicy::default();
-    let storage = Arc::new(Storage::open_memory().unwrap());
-    let registry = ToolRegistry::with_runtime(policy, 4096, storage);
+    let registry = ToolRegistry::new(policy, 4096);
 
-    // Hard deny must fail closed regardless of yolo_mode
     let context_yolo = ToolContext {
         principal: "owner:test".into(),
         session_id: "s1".into(),
@@ -137,9 +145,12 @@ async fn yolo_mode_converts_ask_to_allow_but_never_bypasses_hard_deny() {
         progress: None,
     };
 
-    // Unknown/denied tool fails closed
-    assert!(registry
-        .execute(&context_yolo, "unregistered_tool", serde_json::json!({}))
-        .await
-        .is_err());
+    let call = ToolCall {
+        id: "call-1".into(),
+        name: "unregistered_tool".into(),
+        arguments: serde_json::json!({}),
+    };
+
+    let execution = registry.execute(&call, &context_yolo).await;
+    assert_eq!(execution.result.status, ToolRunStatus::Failed);
 }
