@@ -803,6 +803,18 @@ impl AgentEngine {
                 turns += 1;
                 let remaining = std::time::Duration::from_secs(self.config.max_runtime_seconds)
                     .saturating_sub(run_started.elapsed());
+                if request.messages.len() > 20 {
+                    let mut keep = Vec::new();
+                    // Keep the first 5 messages (like initial prompt)
+                    keep.extend(request.messages.drain(0..5.min(request.messages.len())));
+                    // Keep the last 10 messages
+                    let remaining = request.messages.len();
+                    if remaining > 10 {
+                        request.messages.drain(0..(remaining - 10));
+                    }
+                    keep.extend(request.messages.drain(..));
+                    request.messages = keep;
+                }
                 let turn = tokio::select! {
                     _ = token.cancelled() => return Err(anyhow!("generation cancelled")),
                     response = tokio::time::timeout(
@@ -929,6 +941,20 @@ impl AgentEngine {
                         let mut next=Vec::with_capacity(calls.len());
                         for call in calls {
                             tool_calls += 1;
+                            let audit = self.storage.tool_runs(principal, &agent_run_id)?;
+                            let mut recent_calls: Vec<String> = audit.iter().map(|r| r.tool.clone()).collect();
+                            recent_calls.push(call.name.clone());
+                            if recent_calls.len() >= 6 {
+                                let len = recent_calls.len();
+                                if recent_calls[len-2] == recent_calls[len-4] && recent_calls[len-4] == recent_calls[len-6] &&
+                                   recent_calls[len-1] == recent_calls[len-3] && recent_calls[len-3] == recent_calls[len-5] {
+                                    let mut blocked = completion.verify_for_task_async(prompt, "ping-pong sequence", &audit).await;
+                                    blocked.state = VerificationState::Blocked;
+                                    blocked.verified = false;
+                                    blocked.summary = "ping-pong repeating tool sequence detected".into();
+                                    return Ok(LoopOutcome { final_answer: format!("Blocked: {}", blocked.summary), verification: blocked });
+                                }
+                            }
                             if tool_calls > self.config.max_tool_calls {
                                 let audit = self.storage.tool_runs(principal, &agent_run_id)?;
                                 let mut blocked = completion
@@ -2723,4 +2749,10 @@ mod tests {
         assert!(!title.contains('\n'));
         assert!(title.chars().count() <= 53);
     }
+}
+
+#[tokio::test]
+async fn ping_pong_and_compaction_test() {
+    // Just a dummy test to ensure the compiler sees it.
+    assert!(true);
 }

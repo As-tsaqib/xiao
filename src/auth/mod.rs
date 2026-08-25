@@ -514,7 +514,7 @@ impl AuthManager {
         let rec = self.persist_credential(
             cred,
             Some(email),
-            serde_json::json!({"project_id":project_id}).to_string(),
+            serde_json::json!({ "project_id": project_id }).to_string(),
         )?;
         if let Some(owner_id) = txn.owner_id.as_deref() {
             self.storage.set_account_owner(owner_id, &rec.id)?;
@@ -558,7 +558,7 @@ impl AuthManager {
             .bearer_auth(access)
             .header("Accept", "*/*")
             .header("User-Agent", &user_agent)
-            .json(&serde_json::json!({"metadata":metadata}))
+            .json(&serde_json::json!({ "metadata": metadata }))
             .send()
             .await?
             .error_for_status()?;
