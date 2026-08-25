@@ -2620,12 +2620,18 @@ async fn consume_custom_chat_sse(
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].trim_end_matches('\r').to_owned();
             buffer.drain(..=pos);
-            let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
             if data == "[DONE]" {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else { continue };
-            let Some(delta) = value.pointer("/choices/0/delta") else { continue };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let Some(delta) = value.pointer("/choices/0/delta") else {
+                continue;
+            };
             if let Some(part) = delta.get("content").and_then(serde_json::Value::as_str) {
                 text.push_str(part);
                 if visible_text {
