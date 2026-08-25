@@ -1765,6 +1765,7 @@ struct ProgressAggregator {
     next_id: u64,
     detail: String,
     stream_chunks: usize,
+    visible_text: String,
 }
 
 struct ToolProgress {
@@ -1784,6 +1785,7 @@ impl ProgressAggregator {
             next_id: 1,
             detail,
             stream_chunks: 0,
+            visible_text: String::new(),
         }
     }
 
@@ -1821,6 +1823,13 @@ impl ProgressAggregator {
                 ..
             } => self.await_approval(&tool, &call_id, &summary),
             AgentEvent::StreamChunk { .. } => self.stream_chunk(),
+            AgentEvent::TextDelta(delta) => {
+                self.visible_text.push_str(&delta);
+                if self.visible_text.chars().count() > 3_000 {
+                    self.visible_text = self.visible_text.chars().rev().take(3_000).collect::<String>().chars().rev().collect();
+                }
+                self.stream_chunk();
+            }
             AgentEvent::GenerationCompleted => {
                 self.set_active("Finishing response".into(), ProgressActivity::Writing)
             }
@@ -2118,9 +2127,13 @@ impl ProgressAggregator {
                 active.label = safe_progress(&active.label);
             }
         }
+        let mut blocks = vec![Block::Progress { items }];
+        if !self.visible_text.is_empty() {
+            blocks.push(Block::Paragraph { text: self.visible_text.clone() });
+        }
         View {
             title: None,
-            blocks: vec![Block::Progress { items }],
+            blocks,
             actions: vec![],
             side_mode: false,
         }

@@ -1416,7 +1416,7 @@ impl CommandCore {
             Err(error) => check("FAIL", "DB transaction", safe_diagnostic(&error)),
         }
         match self.storage.schema_version() {
-            Ok(26) => check("PASS", "Migrations/schema", "schema version 26".into()),
+            Ok(27) => check("PASS", "Migrations/schema", "schema version 27".into()),
             Ok(version) => check(
                 "FAIL",
                 "Migrations/schema",

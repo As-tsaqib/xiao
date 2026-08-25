@@ -5,6 +5,7 @@ const SECTIONS = [
   ['dashboard', 'Overview', 'Live control-plane summary'],
   ['setup', 'Telegram', 'Owner binding and bot transport'],
   ['providers', 'Custom AI', 'Profiles, probes, and write-only credentials'],
+  ['agent', 'Agent', 'Loop, streaming, execution and latency controls'],
   ['sessions', 'Sessions', 'Conversation state and exact AI selection'],
   ['attachments', 'Attachments', 'Quota, ingestion, and processing records'],
   ['tasks', 'Runs', 'Observable work and cancellation'],
@@ -28,6 +29,7 @@ const ICONS = {
   dashboard: 'M3 3h7v7H3V3Zm11 0h7v7h-7V3ZM3 14h7v7H3v-7Zm11 0h7v7h-7v-7Z',
   setup: 'M12 3a3 3 0 0 0-2.83 4H4v3h5.17a3 3 0 0 0 0 4H4v3h5.17A3 3 0 1 0 12 14a3 3 0 0 0 0-4h8V7h-8a3 3 0 0 0 0-4Zm0 3a1 1 0 1 1 0 2 1 1 0 0 1 0-2Zm0 8a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z',
   providers: 'M12 2 3 7v10l9 5 9-5V7l-9-5Zm0 3.1L17 8l-5 2.9L7 8l5-2.9Zm-6 5.5 5 2.9v5.5l-5-2.8v-5.6Zm7 8.4v-5.5l5-2.9v5.6l-5 2.8Z',
+  agent: 'M12 2a4 4 0 0 0-4 4v1H6a3 3 0 0 0-3 3v7a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3v-7a3 3 0 0 0-3-3h-2V6a4 4 0 0 0-4-4Zm-2 5V6a2 2 0 1 1 4 0v1h-4Z',
   sessions: 'M4 4h16v12H7l-3 3V4Zm3 4h10v2H7V8Zm0 4h7v2H7v-2Z',
   attachments: 'M8 3h8l4 4v14H4V3h4Zm7 1.5V8h3.5L15 4.5ZM8 12h8v2H8v-2Zm0 4h8v2H8v-2Z',
   tasks: 'M13 2 4 14h7l-1 8 10-13h-7l0-7Z',
@@ -240,6 +242,7 @@ function App() {
       case 'dashboard': return <DashboardView {...props} />;
       case 'setup': return <SetupView {...props} />;
       case 'providers': return <ProvidersView {...props} />;
+      case 'agent': return <AgentView {...props} />;
       case 'sessions': return <SessionsView {...props} />;
       case 'attachments': return <AttachmentsView {...props} />;
       case 'tasks': return <TasksView {...props} />;
@@ -341,6 +344,19 @@ function SetupView({ data, action, busy, setNotice }) {
   };
   const ownerChanged = telegram.owner_user_id !== undefined && telegram.owner_user_id !== null && Number(telegram.owner_user_id) !== Number(draft.owner);
   return <div className="grid two"><Panel title="Telegram control plane" eyebrow="SQLITE AUTHORITATIVE"><form className="form-grid" onSubmit={event => { event.preventDefault(); save('save'); }}><Field label="Bot token" hint="Write-only. Leave blank to retain the active immutable secret reference."><input type="password" autoComplete="new-password" value={draft.token} onChange={event => setDraft({ ...draft, token: event.target.value })} placeholder="••••••••••••••••" /></Field><Field label="Owner Telegram user ID"><input type="number" required value={draft.owner} onChange={event => setDraft({ ...draft, owner: event.target.value })} placeholder="123456789" /></Field><Field label="Allowed chat IDs" hint="Optional, comma-separated scope restriction" wide><input value={draft.chats} onChange={event => setDraft({ ...draft, chats: event.target.value })} placeholder="-1001234567890, -1009876543210" /></Field>{ownerChanged && <label className="retention wide"><b>Owner binding replacement</b><p>This changes only the Telegram authentication binding; the durable installation owner and owner data remain unchanged.</p><span className="toggle"><input type="checkbox" checked={draft.confirmOwnerChange} onChange={event => setDraft({ ...draft, confirmOwnerChange: event.target.checked })} /> I confirm this owner replacement</span></label>}<label className="toggle wide"><input type="checkbox" checked={draft.enabled} onChange={event => setDraft({ ...draft, enabled: event.target.checked })} /> Enable Telegram adapter</label><div className="form-actions wide"><Button tone="secondary" disabled={busy} onClick={() => save('save')}>Save control state</Button><Button tone="primary" disabled={busy} onClick={() => save('save_and_test')}>Save & test</Button><Button disabled={busy} onClick={() => action('telegram', { action: 'test', ...(draft.token.trim() ? { token: draft.token.trim() } : {}) }, 'Telegram getMe completed; no configuration was changed.', 'setup')}>Test token</Button></div></form></Panel><Panel title="Current transport state" eyebrow="NO FILE/DB SPLIT"><Rows rows={[["Bot token", telegram.token_configured ? 'configured (write-only)' : 'not configured', telegram.token_configured ? 'ready' : 'warn'], ["Bot identity", telegram.bot?.username ? `@${telegram.bot.username} · ${telegram.bot.id}` : (telegram.bot?.id || 'not tested')], ["Owner state", telegram.owner_state, telegram.owner_state === 'configured' ? 'ready' : 'warn'], ["Allowed chats", (telegram.allowed_chat_ids || []).length || 'all owner chats'], ["Legacy candidates", telegram.legacy_candidate_count || 0]]} /><p className="helper">The database is authoritative. Compatibility TOML is a one-way projection and cannot roll back committed Telegram state.</p></Panel></div>;
+}
+
+function AgentView({ data, action, busy }) {
+  const settings = data?.settings || {};
+  const [draft, setDraft] = useState(settings);
+  useEffect(() => setDraft(settings), [data]);
+  if (!data) return <Loading />;
+  const number = (key, min, max) => <Field label={titleCase(key)} hint={`${min}–${max}`}><input type="number" min={min} max={max} value={draft[key] ?? ''} onChange={event => setDraft({ ...draft, [key]: Number(event.target.value) })} /></Field>;
+  const toggle = key => <label className="toggle"><input type="checkbox" checked={Boolean(draft[key])} onChange={event => setDraft({ ...draft, [key]: event.target.checked })} /> {titleCase(key)}</label>;
+  return <form onSubmit={event => { event.preventDefault(); action('agent', { action: 'update', ...draft }, 'Agent settings saved atomically. New runs use the updated snapshot.', 'agent'); }}>
+    <div className="grid two"><Panel title="Loop limits" eyebrow="BOUNDED"><div className="form-grid">{number('max_turns', 2, 500)}{number('max_tool_calls', 1, 512)}{number('max_runtime_seconds', 10, 3600)}{number('max_no_progress_repeats', 1, 10)}</div></Panel><Panel title="Performance" eyebrow="NEW RUN SNAPSHOT"><div className="form-grid">{number('max_parallel_readonly_tools', 1, 16)}{number('max_execution_plan_steps', 1, 64)}{toggle('provider_streaming')}{toggle('parallel_readonly_tools')}{toggle('execution_plan_enabled')}{toggle('plan_cache_enabled')}{toggle('background_learning')}</div></Panel></div>
+    <Panel title="Effective daemon state" eyebrow="DIAGNOSTICS"><Rows rows={[["Config generation", data.generation], ["Loaded", data.loaded ? 'yes' : 'no', data.loaded ? 'ready' : 'warn'], ["Active runs", data.active_runs || 0]]} /><div className="panel-actions"><Button tone="primary" type="submit" disabled={busy}>Save Agent settings</Button></div></Panel>
+  </form>;
 }
 
 function ProvidersView({ data, action, setConfirm, setProfileEditor }) {

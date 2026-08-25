@@ -34,7 +34,7 @@ use crate::{
     tools::{
         builtin::{
             AndroidXiaoRestartTool, AndroidXiaoStatusTool, ContextStatsTool, MemoryDeleteTool,
-            MemorySearchTool, MemorySetTool, SkillSearchTool, SkillViewTool, TermuxTerminalTool,
+            MemorySearchTool, MemorySetTool, SkillSearchTool, SkillViewTool, TermuxJobTool, TermuxTerminalTool,
         },
         ToolContext, ToolPolicy, ToolRegistry, ToolResult,
     },
@@ -190,8 +190,12 @@ impl AgentEngine {
                 repository,
             ));
             skill_dependency_resolver = Some(resolver.clone());
+            let terminal = TermuxTerminalTool::new(executor, resolver, termux_home);
             tools
-                .register(TermuxTerminalTool::new(executor, resolver, termux_home))
+                .register(TermuxJobTool::new(terminal.clone(), config.max_execution_plan_steps))
+                .expect("register termux_job tool");
+            tools
+                .register(terminal)
                 .expect("register Termux terminal tool");
             tools
                 .register_alias("terminal", "termux_terminal")
@@ -608,33 +612,6 @@ impl AgentEngine {
                 return Err(error);
             }
         };
-
-        if append_user {
-            let memory_result = tokio::select! {
-                _ = token.cancelled() => Err(anyhow!("generation cancelled during memory evaluation")),
-                result = memory_evaluator.apply_explicit_async(
-                    principal,
-                    &ctx.active.id,
-                    prompt,
-                    token.clone(),
-                ) => result,
-            };
-            if let Err(error) = memory_result {
-                let safe_error = bound_text(redact_text(&error.to_string()), 4_096);
-                let _ = self.storage.set_agent_run_status(
-                    principal,
-                    &agent_run_id,
-                    if token.is_cancelled() {
-                        "cancelled"
-                    } else {
-                        "failed"
-                    },
-                    Some(&safe_error),
-                );
-                self.active.lock().unwrap().remove(&active_key);
-                return Err(error);
-            }
-        }
 
         let result = async {
             if resolved_model != ctx.active.model {
@@ -1282,7 +1259,22 @@ impl AgentEngine {
                 };
                 // Learning is post-completion and best-effort; failure cannot
                 // rewrite a successfully delivered task into a failed one.
-                let _ = learning.evaluate_async(principal, &trace).await;
+                if self.config.background_learning {
+                    let learning = learning.clone();
+                    let memory_evaluator = memory_evaluator.clone();
+                    let principal = principal.to_owned();
+                    let session_id = ctx.active.id.clone();
+                    let prompt = prompt.to_owned();
+                    let token = CancellationToken::new();
+                    tokio::spawn(async move {
+                        if append_user {
+                            let _ = memory_evaluator
+                                .apply_explicit_async(&principal, &session_id, &prompt, token)
+                                .await;
+                        }
+                        let _ = learning.evaluate_async(&principal, &trace).await;
+                    });
+                }
             } else {
                 let status = match verification.state {
                     VerificationState::Blocked => "blocked",

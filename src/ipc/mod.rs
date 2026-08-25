@@ -269,6 +269,7 @@ pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
         .route("/v1/admin/client-config", get(client_config))
         .route("/v1/admin/dashboard", get(manager_dashboard))
         .route("/v1/admin/providers", get(manager_providers))
+        .route("/v1/admin/agent", get(manager_agent).post(manager_agent_action))
         .route(
             "/v1/admin/providers/custom",
             post(manager_custom_profile_action),
@@ -1344,6 +1345,46 @@ async fn manager_runtime(
             "secrets": "configured (private)",
         },
     })))
+}
+
+async fn manager_agent(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !authorized_admin(&headers, &state) { return Err(deny()); }
+    let agent = state.app.config.read().await.agent.clone();
+    Ok(Json(json!({
+        "settings": agent,
+        "effective": agent,
+        "generation": state.app.storage.schema_version().map_err(bad)?,
+        "loaded": true,
+        "active_runs": state.app.storage.manager_counts(&state.app.storage.management_owner_id().map_err(bad)?).map_err(bad)?.running_runs
+    })))
+}
+
+async fn manager_agent_action(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !authorized_admin(&headers, &state) { return Err(deny()); }
+    if body.get("action").and_then(serde_json::Value::as_str) != Some("update") {
+        return Err(bad(anyhow!("agent action must be update")));
+    }
+    let mut config = state.app.config.read().await.clone();
+    let mut value = serde_json::to_value(&config.agent).map_err(bad)?;
+    let object = value.as_object_mut().ok_or_else(|| bad(anyhow!("invalid agent settings")))?;
+    for (key, next) in body.as_object().into_iter().flatten() {
+        if key != "action" {
+            if !object.contains_key(key) { return Err(bad(anyhow!("unknown agent setting {key}"))); }
+            object.insert(key.clone(), next.clone());
+        }
+    }
+    config.agent = serde_json::from_value(value).map_err(bad)?;
+    config.validate().map_err(bad)?;
+    config.save_atomic(&state.config_path).map_err(bad)?;
+    *state.app.config.write().await = config.clone();
+    Ok(Json(json!({"applied":true,"settings":config.agent})))
 }
 
 async fn manager_context(

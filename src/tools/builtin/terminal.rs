@@ -16,6 +16,12 @@ pub struct TermuxTerminalTool {
     default_cwd: PathBuf,
 }
 
+impl Clone for TermuxTerminalTool {
+    fn clone(&self) -> Self {
+        Self { executor: self.executor.clone(), dependencies: self.dependencies.clone(), default_cwd: self.default_cwd.clone() }
+    }
+}
+
 impl TermuxTerminalTool {
     pub fn new(
         executor: Arc<dyn ProcessExecutor>,
@@ -140,6 +146,101 @@ impl Tool for TermuxTerminalTool {
             "dependency": dependency,
             "verification_evidence": purpose == ExecutionPurpose::Verification,
             "artifacts": artifacts,
+        }))?)
+    }
+}
+
+pub struct TermuxJobTool {
+    terminal: TermuxTerminalTool,
+    max_steps: usize,
+}
+
+impl TermuxJobTool {
+    pub fn new(terminal: TermuxTerminalTool, max_steps: usize) -> Self {
+        Self { terminal, max_steps: max_steps.clamp(1, 64) }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobArguments {
+    steps: Vec<JobStep>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobStep {
+    id: String,
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    continue_on_error: bool,
+}
+
+#[async_trait]
+impl Tool for TermuxJobTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "termux_job".into(),
+            description: "Run a bounded ordered workflow of structured argv commands under the unprivileged Termux UID. Every step is policy checked; opaque shell strings and root escalation are forbidden.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "steps":{"type":"array","minItems":1,"maxItems":64,"items":{
+                        "type":"object","properties":{
+                            "id":{"type":"string","minLength":1,"maxLength":64},
+                            "program":{"type":"string","minLength":1,"maxLength":128},
+                            "args":{"type":"array","maxItems":128,"items":{"type":"string","maxLength":8192}},
+                            "cwd":{"type":"string"},
+                            "continue_on_error":{"type":"boolean"}
+                        },"required":["id","program"],"additionalProperties":false
+                    }},
+                    "mode":{"type":"string","enum":["auto","sequential"]}
+                },"required":["steps"],"additionalProperties":false
+            }),
+            risk: ToolRisk::SideEffect,
+            origin: ToolOrigin::Termux,
+            effect: ToolEffect::NonIdempotent,
+            required_capabilities: vec!["execution.termux".into()],
+            timeout_ms: 600_000,
+        }
+    }
+
+    async fn execute(&self, context: &ToolContext, arguments: Value) -> Result<String> {
+        let job: JobArguments = serde_json::from_value(arguments)?;
+        if job.steps.is_empty() || job.steps.len() > self.max_steps || job.steps.len() > 64 {
+            return Err(anyhow!("termux_job requires 1..={} steps", self.max_steps));
+        }
+        if !matches!(job.mode.as_deref(), None | Some("auto") | Some("sequential")) {
+            return Err(anyhow!("termux_job mode must be auto or sequential"));
+        }
+        let mut results = Vec::with_capacity(job.steps.len());
+        for (index, step) in job.steps.into_iter().enumerate() {
+            let call = json!({"program":step.program,"args":step.args,"cwd":step.cwd});
+            match crate::tools::policy::termux_call_policy(&call) {
+                crate::tools::PolicyDecision::Allow => {}
+                crate::tools::PolicyDecision::Deny(reason) | crate::tools::PolicyDecision::RequireApproval(reason) => {
+                    results.push(json!({"index":index,"id":step.id,"status":"denied","error":reason}));
+                    if !step.continue_on_error { break; }
+                    continue;
+                }
+            }
+            match self.terminal.execute(context, call).await {
+                Ok(output) => results.push(json!({"index":index,"id":step.id,"status":"succeeded","summary":output})),
+                Err(error) => {
+                    results.push(json!({"index":index,"id":step.id,"status":"failed","error":error.to_string()}));
+                    if !step.continue_on_error { break; }
+                }
+            }
+        }
+        Ok(serde_json::to_string(&json!({
+            "job_status": if results.iter().all(|item| item["status"] == "succeeded") { "succeeded" } else { "failed" },
+            "steps": results,
+            "verification_evidence": true
         }))?)
     }
 }

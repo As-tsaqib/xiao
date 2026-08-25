@@ -1356,6 +1356,60 @@ impl Storage {
                 )?;
                 transaction.commit()?;
             }
+            {
+                let transaction = conn.transaction()?;
+                transaction.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS provider_capability_evidence(
+                      profile_id TEXT NOT NULL,
+                      model_id TEXT NOT NULL,
+                      protocol TEXT NOT NULL,
+                      capability TEXT NOT NULL,
+                      state TEXT NOT NULL CHECK(state IN ('supported','unsupported','unknown')),
+                      owner_override TEXT NOT NULL DEFAULT 'auto' CHECK(owner_override IN ('auto','force_supported','force_unsupported')),
+                      source TEXT NOT NULL,
+                      observed_at TEXT NOT NULL,
+                      PRIMARY KEY(profile_id,model_id,protocol,capability)
+                    );
+                    CREATE TABLE IF NOT EXISTS learning_jobs(
+                      id TEXT PRIMARY KEY,
+                      owner_id TEXT NOT NULL,
+                      run_id TEXT NOT NULL UNIQUE,
+                      status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed')),
+                      attempts INTEGER NOT NULL DEFAULT 0,
+                      not_before TEXT NOT NULL,
+                      last_error_redacted TEXT,
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS tool_run_steps(
+                      id TEXT PRIMARY KEY,
+                      parent_tool_run_id TEXT NOT NULL REFERENCES tool_runs(id) ON DELETE CASCADE,
+                      step_index INTEGER NOT NULL,
+                      step_id TEXT NOT NULL,
+                      program TEXT NOT NULL,
+                      arguments_json TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      output TEXT,
+                      error TEXT,
+                      created_at TEXT NOT NULL,
+                      completed_at TEXT,
+                      UNIQUE(parent_tool_run_id,step_index)
+                    );
+                    CREATE TABLE IF NOT EXISTS agent_run_events(
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+                      event_kind TEXT NOT NULL,
+                      elapsed_ms INTEGER NOT NULL,
+                      metadata_json TEXT NOT NULL DEFAULT '{}',
+                      created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_agent_run_events_run ON agent_run_events(agent_run_id,id);
+                    INSERT OR IGNORE INTO schema_migrations(version) VALUES(27);
+                    "#,
+                )?;
+                transaction.commit()?;
+            }
             // A database can be opened once before a legacy owner row is
             // materialized by an older frontend (for example a v0.2.5
             // session written after the first v0.2.7 boot). Re-scan on every
@@ -4918,7 +4972,7 @@ mod tests {
                 connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                     row.get(0)
                 })?;
-            assert_eq!(latest, 26);
+            assert_eq!(latest, 27);
             for table in [
                 "agent_runs",
                 "tool_runs",
