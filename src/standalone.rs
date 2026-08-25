@@ -690,7 +690,6 @@ fn resolve_cli_paths(
     }
 }
 
-
 fn nonempty_env(name: &str) -> Option<OsString> {
     env::var_os(name).filter(|value| !value.is_empty())
 }
@@ -928,6 +927,4 @@ mod tests {
         assert_eq!(valid_managed_pid(&paths, &init.runtime).unwrap(), None);
         assert!(!init.runtime.managed_state.exists());
     }
-
-
 }
