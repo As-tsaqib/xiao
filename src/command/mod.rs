@@ -1416,11 +1416,11 @@ impl CommandCore {
             Err(error) => check("FAIL", "DB transaction", safe_diagnostic(&error)),
         }
         match self.storage.schema_version() {
-            Ok(25) => check("PASS", "Migrations/schema", "schema version 25".into()),
+            Ok(26) => check("PASS", "Migrations/schema", "schema version 26".into()),
             Ok(version) => check(
                 "FAIL",
                 "Migrations/schema",
-                format!("expected 25, found {version}"),
+                format!("expected 26, found {version}"),
             ),
             Err(error) => check("FAIL", "Migrations/schema", safe_diagnostic(&error)),
         }

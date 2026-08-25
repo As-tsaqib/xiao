@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use xiao::{
     auth::AuthManager,
-    config::CustomProviderConfig,
     providers::profiles::ProviderProfileStore,
     security::secrets::SecretStore,
     storage::{ProviderProfileInput, Storage},
@@ -76,11 +75,7 @@ fn legacy_custom_credentials_migrate_to_direct_api_key_refs_idempotently() {
     let dir = tempfile::tempdir().unwrap();
     let secrets = Arc::new(SecretStore::new(dir.path().to_path_buf()));
     let storage = Arc::new(Storage::open_memory().unwrap());
-    let auth = Arc::new(AuthManager::new(
-        storage.clone(),
-        secrets.clone(),
-        CustomProviderConfig::default(),
-    ));
+    let auth = Arc::new(AuthManager::new(storage.clone(), dir.path().to_path_buf()));
     let store = ProviderProfileStore::new(storage.clone());
 
     // Legacy credential in provider_accounts

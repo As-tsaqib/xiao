@@ -1,5 +1,5 @@
 mod payload;
-mod profiles;
+pub mod profiles;
 
 pub use profiles::{
     secret_headers_ref_for, CustomProfileEdit, CustomProfileService, ProviderProfileStore,

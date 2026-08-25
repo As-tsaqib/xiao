@@ -220,6 +220,7 @@ pub struct ProviderProfileRecord {
     pub endpoint: String,
     pub protocol: String,
     pub credential_ref: Option<String>,
+    pub api_key_ref: Option<String>,
     pub safe_headers_json: String,
     pub secret_headers_ref: Option<String>,
     pub enabled: bool,
@@ -262,7 +263,9 @@ pub struct ProviderProfileInput {
     pub endpoint: String,
     pub protocol: String,
     pub credential_ref: Option<String>,
+    pub api_key_ref: Option<String>,
     pub safe_headers_json: String,
+    pub secret_headers_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -833,6 +836,7 @@ impl Storage {
                   endpoint TEXT NOT NULL,
                   protocol TEXT NOT NULL,
                   credential_ref TEXT,
+                  api_key_ref TEXT,
                   safe_headers_json TEXT NOT NULL DEFAULT '{}',
                   secret_headers_ref TEXT,
                   enabled INTEGER NOT NULL DEFAULT 1,
@@ -1343,6 +1347,15 @@ impl Storage {
                 )?;
                 transaction.commit()?;
             }
+            {
+                let transaction = conn.transaction()?;
+                ensure_column(&transaction, "provider_profiles", "api_key_ref", "TEXT")?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version) VALUES(26)",
+                    [],
+                )?;
+                transaction.commit()?;
+            }
             // A database can be opened once before a legacy owner row is
             // materialized by an older frontend (for example a v0.2.5
             // session written after the first v0.2.7 boot). Re-scan on every
@@ -1775,7 +1788,7 @@ impl Storage {
         })
     }
 
-    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+    pub fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         let run = || {
             let mut conn = self
                 .conn
