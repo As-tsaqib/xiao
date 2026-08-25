@@ -480,6 +480,7 @@ impl AgentEngine {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         principal: &str,
@@ -492,7 +493,7 @@ impl AgentEngine {
     ) -> Result<AgentAnswer> {
         let token = parent_cancellation
             .map(|parent| parent.child_token())
-            .unwrap_or_else(CancellationToken::new);
+            .unwrap_or_default();
         let active_key = run_key(principal, scope, explicit_session);
         {
             let mut active = self.active.lock().unwrap();

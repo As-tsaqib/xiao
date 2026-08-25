@@ -607,6 +607,7 @@ impl TelegramAdapter {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_with_live_events(
         &self,
         principal: &str,
@@ -2317,8 +2318,7 @@ fn parse_internal_approval_command(command: &str) -> Option<(bool, &str)> {
 }
 
 fn is_stop_command(text: &str) -> bool {
-    text.trim_start()
-        .split_whitespace()
+    text.split_whitespace()
         .next()
         .is_some_and(|command| matches!(command.split('@').next(), Some("/stop")))
 }
