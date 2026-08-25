@@ -349,7 +349,7 @@ impl AgentEngine {
         prompt: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        self.run(principal, None, None, prompt, true, progress)
+        self.run(principal, None, None, prompt, true, progress, None)
             .await
     }
 
@@ -360,8 +360,31 @@ impl AgentEngine {
         prompt: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        self.run(principal, Some(scope), None, prompt, true, progress)
+        self.run(principal, Some(scope), None, prompt, true, progress, None)
             .await
+    }
+
+    /// Run a Telegram request under the caller's cancellation lineage.  The
+    /// adapter uses one parent token for download, ingestion, provider work
+    /// and tools so `/stop` can interrupt the whole message work item.
+    pub async fn submit_with_progress_in_scope_with_cancellation(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        prompt: &str,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        cancellation: CancellationToken,
+    ) -> Result<AgentAnswer> {
+        self.run(
+            principal,
+            Some(scope),
+            None,
+            prompt,
+            true,
+            progress,
+            Some(cancellation),
+        )
+        .await
     }
 
     pub async fn submit_to_session_with_progress(
@@ -371,8 +394,16 @@ impl AgentEngine {
         prompt: &str,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentAnswer> {
-        self.run(principal, None, Some(session_id), prompt, true, progress)
-            .await
+        self.run(
+            principal,
+            None,
+            Some(session_id),
+            prompt,
+            true,
+            progress,
+            None,
+        )
+        .await
     }
 
     pub async fn retry_to_session_with_progress(
@@ -386,8 +417,16 @@ impl AgentEngine {
             .storage
             .latest_user_message(principal, &ctx.active.id)?
             .ok_or_else(|| anyhow!("no user request available to retry"))?;
-        self.run(principal, None, Some(session_id), &prompt, false, progress)
-            .await
+        self.run(
+            principal,
+            None,
+            Some(session_id),
+            &prompt,
+            false,
+            progress,
+            None,
+        )
+        .await
     }
 
     pub async fn retry_with_progress(
@@ -413,8 +452,32 @@ impl AgentEngine {
             .storage
             .latest_user_message(principal, &ctx.active.id)?
             .ok_or_else(|| anyhow!("no user request available to retry"))?;
-        self.run(principal, scope, None, &prompt, false, progress)
+        self.run(principal, scope, None, &prompt, false, progress, None)
             .await
+    }
+
+    pub async fn retry_with_progress_in_scope_with_cancellation(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        cancellation: CancellationToken,
+    ) -> Result<AgentAnswer> {
+        let ctx = self.sessions.context_for_telegram(principal, scope)?;
+        let prompt = self
+            .storage
+            .latest_user_message(principal, &ctx.active.id)?
+            .ok_or_else(|| anyhow!("no user request available to retry"))?;
+        self.run(
+            principal,
+            Some(scope),
+            None,
+            &prompt,
+            false,
+            progress,
+            Some(cancellation),
+        )
+        .await
     }
 
     async fn run(
@@ -425,8 +488,11 @@ impl AgentEngine {
         prompt: &str,
         append_user: bool,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        parent_cancellation: Option<CancellationToken>,
     ) -> Result<AgentAnswer> {
-        let token = CancellationToken::new();
+        let token = parent_cancellation
+            .map(|parent| parent.child_token())
+            .unwrap_or_else(CancellationToken::new);
         let active_key = run_key(principal, scope, explicit_session);
         {
             let mut active = self.active.lock().unwrap();
@@ -434,22 +500,6 @@ impl AgentEngine {
                 return Err(anyhow!("a generation is already active for this frontend"));
             }
             active.insert(active_key.clone(), token.clone());
-        }
-
-        if append_user {
-            let appended = if let Some(session_id) = explicit_session {
-                self.sessions
-                    .append_user_to_session(principal, session_id, prompt)
-            } else {
-                match scope {
-                    Some(scope) => self.sessions.append_user_telegram(principal, scope, prompt),
-                    None => self.sessions.append_user(principal, prompt),
-                }
-            };
-            if let Err(error) = appended {
-                self.active.lock().unwrap().remove(&active_key);
-                return Err(error);
-            }
         }
 
         let ctx = if let Some(session_id) = explicit_session {
@@ -468,6 +518,24 @@ impl AgentEngine {
             }
         };
 
+        let active_provider = match self.storage.active_provider_kind() {
+            Ok(provider) if provider == "custom" => provider,
+            Ok(_) => {
+                self.active.lock().unwrap().remove(&active_key);
+                return Err(anyhow!("provider runtime policy is invalid"));
+            }
+            Err(error) => {
+                self.active.lock().unwrap().remove(&active_key);
+                return Err(anyhow!("provider runtime policy is unavailable: {error}"));
+            }
+        };
+        if ctx.active.provider != active_provider {
+            self.active.lock().unwrap().remove(&active_key);
+            return Err(anyhow!(
+                "provider_configuration_required: session uses legacy provider '{}'; select a supported Custom profile and exact model before generating",
+                ctx.active.provider
+            ));
+        }
         let provider = match self.providers.get(&ctx.active.provider) {
             Ok(provider) => provider,
             Err(error) => {
@@ -486,6 +554,20 @@ impl AgentEngine {
                 return Err(error);
             }
         };
+        // Resolve and validate the captured session before recording a new
+        // request. A legacy Codex/Antigravity history stays readable, but a
+        // rejected generation must not mutate it with an unserviceable user
+        // message. Writing to the captured id also prevents a concurrent UI
+        // session switch from redirecting this request.
+        if append_user {
+            if let Err(error) = self
+                .sessions
+                .append_user_to_session(principal, &ctx.active.id, prompt)
+            {
+                self.active.lock().unwrap().remove(&active_key);
+                return Err(error);
+            }
+        }
         let semantic = Arc::new(
             if provider
                 .supports_semantic_evaluation_for(&resolved_model, ctx.active.account_id.as_deref())
@@ -1006,11 +1088,25 @@ impl AgentEngine {
                                     "awaiting_approval",
                                     None,
                                 )?;
+                                if let Some(approval_id) = execution.approval_id.clone() {
+                                    let requested = AgentEvent::ApprovalRequested {
+                                        approval_id,
+                                        tool: call.name.clone(),
+                                        call_id: call.call_id.clone(),
+                                        summary: bound_text(
+                                            redact_text(&execution.result.output),
+                                            1_024,
+                                        ),
+                                    };
+                                    if let Some(tx) = &progress {
+                                        let _ = tx.send(requested.clone());
+                                    }
+                                    provider_events.push(requested);
+                                }
                                 let approval_status = AgentEvent::Status(format!(
                                     "Owner approval required before continuing: {}",
                                     execution.result.output
                                 ));
-                                if let Some(tx) = &progress { let _ = tx.send(approval_status.clone()); }
                                 provider_events.push(approval_status);
                                 let wait_for = tool_remaining.min(std::time::Duration::from_secs(15 * 60));
                                 match self.tools.wait_for_exact_approval(
@@ -2219,6 +2315,24 @@ mod tests {
         assert!(error.contains("cancelled"));
         assert_eq!(db.messages("u", &session).unwrap().len(), 1);
         assert_eq!(db.agent_runs("u", 10).unwrap()[0].status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn legacy_provider_history_is_read_only_until_custom_is_selected() {
+        let (engine, db, session, _tmp) = engine("codex", Arc::new(EchoProvider));
+        db.append_message("u", &session, "assistant", "legacy answer")
+            .unwrap();
+
+        let error = engine
+            .submit_with_progress("u", "new request", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider_configuration_required"));
+        let messages = db.messages("u", &session).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "legacy answer");
+        assert!(db.agent_runs("u", 10).unwrap().is_empty());
     }
 
     #[tokio::test]

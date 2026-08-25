@@ -28,7 +28,6 @@ use crate::{
     agent::AgentAnswer,
     app::AppState,
     attachments::{AttachmentIngest, AttachmentKind},
-    auth::{AuthChallenge, AuthEvent},
     command::CommandResult,
     presentation::{
         Action, ActionTarget, Block, ProgressActivity, ProgressIcon, ProgressItem, ProgressState,
@@ -55,6 +54,10 @@ pub struct TelegramAdapter {
     /// two callbacks/commands cannot race a multi-step UI/state transition. Long
     /// generation deliberately does not hold this lane; `/stop` remains a fast path.
     principal_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    /// One parent cancellation token per in-flight Telegram message work item.
+    /// It spans bot download, attachment processing and the resulting agent
+    /// run; the keyed list tolerates an already-accepted concurrent update.
+    active_work: Arc<Mutex<HashMap<String, Vec<CancellationToken>>>>,
 }
 
 struct CustomInputContext<'a> {
@@ -96,6 +99,7 @@ impl TelegramAdapter {
                 cfg.telegram.ui.menu_ttl_seconds,
             ))),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -227,6 +231,49 @@ impl TelegramAdapter {
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
     }
+
+    fn work_key(principal: &str, scope: TelegramScope) -> String {
+        format!("{principal}:{}:{}", scope.chat_id, scope.thread_key())
+    }
+
+    fn begin_work(&self, principal: &str, scope: TelegramScope) -> CancellationToken {
+        let token = CancellationToken::new();
+        if let Ok(mut active) = self.active_work.lock() {
+            active
+                .entry(Self::work_key(principal, scope))
+                .or_default()
+                .push(token.clone());
+        }
+        token
+    }
+
+    fn finish_work(&self, principal: &str, scope: TelegramScope, token: &CancellationToken) {
+        if let Ok(mut active) = self.active_work.lock() {
+            let key = Self::work_key(principal, scope);
+            if let Some(tokens) = active.get_mut(&key) {
+                if let Some(index) = tokens.iter().position(|registered| registered == token) {
+                    tokens.remove(index);
+                }
+                if tokens.is_empty() {
+                    active.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn cancel_work(&self, principal: &str, scope: TelegramScope) -> bool {
+        self.active_work
+            .lock()
+            .ok()
+            .and_then(|active| active.get(&Self::work_key(principal, scope)).cloned())
+            .map(|tokens| {
+                for token in tokens {
+                    token.cancel();
+                }
+                true
+            })
+            .unwrap_or(false)
+    }
     async fn execute_serialized(
         &self,
         principal: &str,
@@ -238,6 +285,20 @@ impl TelegramAdapter {
         self.app
             .commands
             .execute_text_in_telegram_scope(principal, scope, input, None)
+            .await
+    }
+
+    async fn execute_internal_serialized(
+        &self,
+        principal: &str,
+        scope: TelegramScope,
+        input: &str,
+    ) -> Result<CommandResult> {
+        let lane = self.principal_lock(principal);
+        let _guard = lane.lock().await;
+        self.app
+            .commands
+            .execute_callback_in_telegram_scope(principal, scope, input, None)
             .await
     }
 
@@ -270,6 +331,32 @@ impl TelegramAdapter {
         }
         let scope = message.scope();
         let principal = self.app.resolve_telegram_owner(user.id)?.owner_id;
+
+        // `/stop` is deliberately evaluated before pending rename/login input
+        // and before the principal UI lane.  A running task must remain
+        // cancellable even while a scoped menu is waiting for text.
+        if message.text.as_deref().is_some_and(is_stop_command) {
+            self.cancel_work(&principal, scope);
+            return match self
+                .app
+                .commands
+                .execute_text_in_telegram_scope(&principal, scope, message.text.as_deref().unwrap_or_default(), None)
+                .await
+            {
+                Ok(result) => self.send_result(scope, user.id, result).await,
+                Err(error) => self
+                    .send_view(
+                        scope,
+                        &View::info(
+                            "ERROR",
+                            crate::security::redact::redact_text(&error.to_string()),
+                        ),
+                        None,
+                    )
+                    .await
+                    .map(|_| ()),
+            };
+        }
 
         // UI capture is checked after ACL but before slash parsing or agent dispatch.
         if let Some(menu) = self.menus.pending_for_scope(scope, user.id) {
@@ -308,7 +395,10 @@ impl TelegramAdapter {
                         return Ok(());
                     }
                     let command = format!("{} {}", prefix, text.trim());
-                    match self.execute_serialized(&principal, scope, &command).await {
+                    match self
+                        .execute_internal_serialized(&principal, scope, &command)
+                        .await
+                    {
                         Ok(result) => {
                             let next = result_view(result)?;
                             guard.current_view = next;
@@ -335,62 +425,62 @@ impl TelegramAdapter {
             }
         }
 
-        let attachment_prompt = match self
-            .ingest_telegram_attachment(&principal, scope, &message)
-            .await
-        {
-            Ok(prompt) => prompt,
-            Err(error) => {
-                self.send_view(
-                    scope,
-                    &View::info(
-                        "ATTACHMENT ERROR",
-                        crate::security::redact::redact_text(&error.to_string()),
-                    ),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-        let text = match attachment_prompt.as_deref().or(message.text.as_deref()) {
-            Some(text) => text,
-            None => return Ok(()),
-        };
+        let work = self.begin_work(&principal, scope);
+        let result = async {
+            let attachment_prompt = match self
+                .ingest_telegram_attachment(&principal, scope, &message, &work)
+                .await
+            {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    self.send_view(
+                        scope,
+                        &View::info(
+                            "ATTACHMENT ERROR",
+                            crate::security::redact::redact_text(&error.to_string()),
+                        ),
+                        None,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let text = match attachment_prompt.as_deref().or(message.text.as_deref()) {
+                Some(text) => text,
+                None => return Ok(()),
+            };
 
-        let is_agent_request =
-            !text.trim_start().starts_with('/') || text.trim_start().starts_with("/retry");
-        let result = if is_agent_request {
-            if message.chat.kind == "private" {
-                self.execute_with_draft(&principal, scope, update_id, text)
-                    .await
+            let is_agent_request =
+                !text.trim_start().starts_with('/') || text.trim_start().starts_with("/retry");
+            let result = if is_agent_request {
+                // Every Telegram generation receives observable live events so an
+                // exact ASK decision can surface as a scoped inline card. Private
+                // chats retain the existing draft transport; topics intentionally
+                // receive no draft updates but do receive the same approval card.
+                self.execute_with_live_events(
+                    &principal,
+                    scope,
+                    update_id,
+                    user.id,
+                    text,
+                    (message.chat.kind == "private").then_some(update_id),
+                    work.child_token(),
+                )
+                .await
             } else {
-                // Generation is cancellable and owns a captured immutable session id;
-                // never hold the principal mutation lane across provider latency.
-                self.app
-                    .commands
-                    .execute_text_in_telegram_scope(&principal, scope, text, None)
+                self.execute_serialized(&principal, scope, text).await
+            };
+            match result {
+                Ok(value) => self.send_result(scope, user.id, value).await,
+                Err(error) => self
+                    .send_view(scope, &View::info("ERROR", error.to_string()), None)
                     .await
+                    .map(|_| ()),
             }
-        } else if text
-            .split_whitespace()
-            .next()
-            .is_some_and(|x| matches!(x.split('@').next(), Some("/stop") | Some("/cancel")))
-        {
-            self.app
-                .commands
-                .execute_text_in_telegram_scope(&principal, scope, text, None)
-                .await
-        } else {
-            self.execute_serialized(&principal, scope, text).await
-        };
-        match result {
-            Ok(value) => self.send_result(scope, user.id, value).await,
-            Err(error) => self
-                .send_view(scope, &View::info("ERROR", error.to_string()), None)
-                .await
-                .map(|_| ()),
         }
+        .await;
+        self.finish_work(&principal, scope, &work);
+        result
     }
 
     async fn ingest_telegram_attachment(
@@ -398,6 +488,7 @@ impl TelegramAdapter {
         principal: &str,
         scope: TelegramScope,
         message: &Message,
+        cancellation: &CancellationToken,
     ) -> Result<Option<String>> {
         let selected = if let Some(photo) = message
             .photo
@@ -439,7 +530,10 @@ impl TelegramAdapter {
                 max_bytes
             ));
         }
-        let file = self.client.get_file(file_id).await?;
+        let file = self
+            .client
+            .get_file_with_cancellation(file_id, cancellation)
+            .await?;
         if file.file_size.is_some_and(|size| size > max_bytes) {
             return Err(anyhow!(
                 "Telegram attachment exceeds the configured {} byte limit",
@@ -448,7 +542,7 @@ impl TelegramAdapter {
         }
         let bytes = self
             .client
-            .download_file_bounded(&file.file_path, max_bytes)
+            .download_file_bounded_with_cancellation(&file.file_path, max_bytes, cancellation)
             .await?;
         let context = self.app.sessions.context_for_telegram(principal, scope)?;
         let manager = self.app.attachments.clone();
@@ -457,8 +551,7 @@ impl TelegramAdapter {
         let session_id = context.active.id;
         let telegram_file_id = file_id.to_owned();
         let telegram_unique_id = unique_id.to_owned();
-        let cancellation = CancellationToken::new();
-        let processing_token = cancellation.clone();
+        let processing_token = cancellation.child_token();
         let mut processing = tokio::task::spawn_blocking(move || {
             manager.ingest_with_cancellation(
                 AttachmentIngest {
@@ -509,12 +602,15 @@ impl TelegramAdapter {
         )))
     }
 
-    async fn execute_with_draft(
+    async fn execute_with_live_events(
         &self,
         principal: &str,
         scope: TelegramScope,
-        draft_id: i64,
+        update_id: i64,
+        user_id: i64,
         text: &str,
+        draft_id: Option<i64>,
+        cancellation: CancellationToken,
     ) -> Result<CommandResult> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let is_retry = text.trim_start().starts_with("/retry");
@@ -522,12 +618,23 @@ impl TelegramAdapter {
             if is_retry {
                 self.app
                     .commands
-                    .retry_with_progress_in_telegram_scope(principal, scope, Some(tx))
+                    .retry_with_progress_in_telegram_scope_with_cancellation(
+                        principal,
+                        scope,
+                        Some(tx),
+                        cancellation.child_token(),
+                    )
                     .await
             } else {
                 self.app
                     .commands
-                    .execute_text_in_telegram_scope(principal, scope, text, Some(tx))
+                    .execute_text_in_telegram_scope_with_cancellation(
+                        principal,
+                        scope,
+                        text,
+                        Some(tx),
+                        cancellation.child_token(),
+                    )
                     .await
             }
         };
@@ -555,17 +662,34 @@ impl TelegramAdapter {
         loop {
             tokio::select! {
                 result = &mut future => {
-                    if dirty {
+                    if dirty && let Some(draft_id) = draft_id {
                         let view = aggregator.view();
                         let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
                     }
                     return result;
                 }
                 event = rx.recv() => {
-                    if let Some(event) = event { aggregator.push(event); dirty = true; }
+                    if let Some(event) = event {
+                        if let AgentEvent::ApprovalRequested {
+                            approval_id,
+                            tool,
+                            summary,
+                            ..
+                        } = &event
+                        {
+                            if let Err(error) = self
+                                .send_approval_card(scope, user_id, approval_id, tool, summary)
+                                .await
+                            {
+                                tracing::warn!(%error, update_id, "failed to send Telegram approval card");
+                            }
+                        }
+                        aggregator.push(event);
+                        dirty = true;
+                    }
                 }
                 _ = ticker.tick() => {
-                    if dirty || last_sent.elapsed() >= HEARTBEAT {
+                    if (dirty || last_sent.elapsed() >= HEARTBEAT) && let Some(draft_id) = draft_id {
                         let view = aggregator.view();
                         let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
                         dirty = false;
@@ -574,6 +698,36 @@ impl TelegramAdapter {
                 }
             }
         }
+    }
+
+    /// Emit a one-shot approval card through the normal scoped menu system.
+    /// The opaque approval id remains in memory behind callback indirection;
+    /// it is never made a public Telegram command or exposed in message text.
+    async fn send_approval_card(
+        &self,
+        scope: TelegramScope,
+        user_id: i64,
+        approval_id: &str,
+        tool: &str,
+        summary: &str,
+    ) -> Result<()> {
+        let safe_tool = safe_progress(tool);
+        let safe_summary = safe_progress(summary);
+        let view = View {
+            title: Some("APPROVAL REQUIRED".into()),
+            blocks: vec![Block::Paragraph {
+                text: format!(
+                    "{safe_tool} is waiting for your one-time decision.\n{safe_summary}\n\nThis approval is bound to this owner, chat/topic, run, tool call, arguments and expiry."
+                ),
+            }],
+            actions: vec![vec![
+                Action::command("Approve once", format!("/_approval:approve:{approval_id}")),
+                Action::command("Deny", format!("/_approval:deny:{approval_id}")),
+            ]],
+            side_mode: false,
+        };
+        self.send_menu(scope, user_id, view).await?;
+        Ok(())
     }
 
     async fn send_view(
@@ -616,12 +770,6 @@ impl TelegramAdapter {
                             .await?;
                     }
                 }
-                Ok(())
-            }
-            CommandResult::StartedAuth(challenge) => {
-                let view = auth_view(&challenge);
-                let menu = self.send_menu(scope, user_id, view).await?;
-                self.watch_auth(challenge, menu);
                 Ok(())
             }
             CommandResult::StartCustomLogin => {
@@ -1062,44 +1210,24 @@ impl TelegramAdapter {
             .app
             .sessions
             .context_for_telegram(principal, wizard.scope)?;
-        let previous_selection = (
-            context.active.provider.clone(),
-            context.active.account_id.clone(),
-            context.active.model.clone(),
-        );
         let profile_service = crate::providers::CustomProfileService::new(
             self.app.storage.clone(),
             self.app.auth.secrets().clone(),
         );
-        let profile_result = profile_service.create_profile_with_credential_ref(
-            principal,
-            &wizard.alias,
-            wizard
-                .endpoint
-                .as_deref()
-                .ok_or_else(|| anyhow!("custom endpoint is missing"))?,
-            &wizard.protocol,
-            std::collections::BTreeMap::new(),
-            std::collections::BTreeMap::new(),
-            wizard.credential_ref.as_deref(),
-            None,
-        )?;
-        let profile = profile_result.profile;
-        let profile_store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
         let profile_models = wizard
             .models
             .iter()
             .map(|candidate| {
                 if candidate == &model {
                     crate::providers::profile_model_from_probe(
-                        &profile.profile_id,
+                        "pending-custom-profile",
                         candidate,
                         probe,
                         &probed_at,
                     )
                 } else {
                     crate::storage::ProviderProfileModelRecord {
-                        profile_id: profile.profile_id.clone(),
+                        profile_id: "pending-custom-profile".into(),
                         model_id: candidate.clone(),
                         text_capable: true,
                         vision_capable: false,
@@ -1122,44 +1250,20 @@ impl TelegramAdapter {
                 }
             })
             .collect::<Vec<_>>();
-        let commit = (|| -> Result<()> {
-            profile_store.replace_models(principal, &profile.profile_id, &profile_models)?;
-            self.app.storage.set_session_provider(
-                principal,
-                &context.active.id,
-                "custom",
-                Some(&profile.profile_id),
-                &model,
-            )?;
-            self.app.storage.audit(
-                principal,
-                "custom_provider_configured",
-                &format!(
-                    "session_id={};profile_id={};model={model}",
-                    context.active.id, profile.profile_id
-                ),
-            )?;
-            Ok(())
-        })();
-        if let Err(error) = commit {
-            // Compensate the cross-table wizard commit. The transient
-            // credential remains owned by the wizard so Retry can safely
-            // resume instead of silently losing the owner's key.
-            let restore = self.app.storage.set_session_provider(
-                principal,
-                &context.active.id,
-                &previous_selection.0,
-                previous_selection.1.as_deref(),
-                &previous_selection.2,
-            );
-            let remove = profile_store.delete(principal, &profile.profile_id);
-            if let Err(rollback) = restore.and(remove.map(|_| ())) {
-                return Err(anyhow!(
-                    "Custom profile commit failed ({error}); rollback also failed ({rollback})"
-                ));
-            }
-            return Err(anyhow!("commit Custom profile selection: {error}"));
-        }
+        profile_service.create_profile_with_models_and_activate_session_with_credential_ref(
+            principal,
+            &wizard.alias,
+            wizard
+                .endpoint
+                .as_deref()
+                .ok_or_else(|| anyhow!("custom endpoint is missing"))?,
+            &wizard.protocol,
+            std::collections::BTreeMap::new(),
+            wizard.credential_ref.as_deref(),
+            &profile_models,
+            &context.active.id,
+            &model,
+        )?;
         Ok(())
     }
 
@@ -1323,6 +1427,38 @@ impl TelegramAdapter {
                     .app
                     .resolve_telegram_owner(guard.owner_user_id)?
                     .owner_id;
+                if let Some((approve, approval_id)) = parse_internal_approval_command(&command) {
+                    let decided =
+                        self.app
+                            .storage
+                            .decide_approval(&principal, approval_id, approve)?;
+                    if decided {
+                        self.app.storage.audit(
+                            &principal,
+                            "telegram_contextual_approval_decided",
+                            &format!(
+                                "approval_id={approval_id};decision={}",
+                                if approve { "approved" } else { "denied" }
+                            ),
+                        )?;
+                    }
+                    guard.current_view = View::info(
+                        "APPROVAL",
+                        if decided {
+                            if approve {
+                                "Approved once. The active run may now continue."
+                            } else {
+                                "Denied. The active run will receive the denial."
+                            }
+                        } else {
+                            "This approval is no longer pending or has expired."
+                        },
+                    );
+                    guard.pending_input = None;
+                    guard.revision += 1;
+                    self.edit_first(&mut guard).await?;
+                    return Ok(());
+                }
                 if command.starts_with("/_custom:") {
                     if let Err(error) = self
                         .handle_custom_action(&mut guard, &principal, &command)
@@ -1383,29 +1519,38 @@ impl TelegramAdapter {
                     self.advance_menu_prompt(&mut guard).await?;
                     return Ok(());
                 }
-                let fast = command.split_whitespace().next().is_some_and(|x| {
-                    matches!(
-                        x.split('@').next(),
-                        Some("/stop") | Some("/cancel") | Some("/retry")
-                    )
-                });
+                let fast = command
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|x| matches!(x.split('@').next(), Some("/stop") | Some("/retry")));
                 let result = if fast {
                     self.app
                         .commands
-                        .execute_text_in_telegram_scope(&principal, callback_scope, &command, None)
+                        .execute_callback_in_telegram_scope(
+                            &principal,
+                            callback_scope,
+                            &command,
+                            None,
+                        )
                         .await?
                 } else {
-                    self.execute_serialized(&principal, callback_scope, &command)
+                    let lane = self.principal_lock(&principal);
+                    let _guard = lane.lock().await;
+                    self.app
+                        .commands
+                        .execute_callback_in_telegram_scope(
+                            &principal,
+                            callback_scope,
+                            &command,
+                            None,
+                        )
                         .await?
                 };
-                let (next, auth, pending) = match result {
-                    CommandResult::StartedAuth(challenge) => {
-                        (auth_view(&challenge), Some(challenge), None)
-                    }
+                let (next, pending) = match result {
                     CommandResult::InputRequest {
                         view,
                         command_prefix,
-                    } => (view, None, Some(command_prefix)),
+                    } => (view, Some(command_prefix)),
                     CommandResult::StartCustomLogin => {
                         let wizard = self.custom_logins.begin(
                             callback_scope,
@@ -1415,22 +1560,17 @@ impl TelegramAdapter {
                         let id = wizard.lock().await.id.clone();
                         (
                             login::endpoint_view(&id),
-                            None,
                             Some(format!("custom:{id}:endpoint")),
                         )
                     }
-                    CommandResult::Agent(answer) => (agent_final_view(answer), None, None),
-                    other => (result_view(other)?, None, None),
+                    CommandResult::Agent(answer) => (agent_final_view(answer), None),
+                    other => (result_view(other)?, None),
                 };
                 let previous = std::mem::replace(&mut guard.current_view, next);
                 guard.history.push(previous);
                 guard.pending_input = pending;
                 guard.revision += 1;
                 self.edit_first(&mut guard).await?;
-                drop(guard);
-                if let Some(challenge) = auth {
-                    self.watch_auth(challenge, menu.clone());
-                }
             }
         }
         Ok(())
@@ -1462,60 +1602,6 @@ impl TelegramAdapter {
             .send_view(scope, &guard.current_view, Some(markup))
             .await?;
         Ok(())
-    }
-
-    fn watch_auth(&self, challenge: AuthChallenge, menu: Arc<tokio::sync::Mutex<MenuSession>>) {
-        let transaction_id = match &challenge {
-            AuthChallenge::BrowserUrl { transaction_id, .. } => Some(transaction_id.clone()),
-            AuthChallenge::ApiKey { .. } => None,
-        };
-        let Some(transaction_id) = transaction_id else {
-            return;
-        };
-        let mut events = self.app.auth.subscribe();
-        let client = self.client.clone();
-        let watched = transaction_id.clone();
-        let watched_menu = menu.clone();
-        tokio::spawn(async move {
-            let deadline = sleep(Duration::from_secs(900));
-            tokio::pin!(deadline);
-            loop {
-                tokio::select! {
-                    _ = &mut deadline => break,
-                    event = events.recv() => match event {
-                        Ok(AuthEvent::Completed { transaction_id, account }) if transaction_id == watched => {
-                            let mut guard = watched_menu.lock().await;
-                            if guard.expires_at <= std::time::Instant::now() { break; }
-                            guard.current_view = View {
-                                title: Some(account.provider.to_ascii_uppercase()),
-                                blocks: vec![Block::Paragraph { text: format!("CONNECTED\n{}", account.email.clone().unwrap_or_else(|| account.label.clone())) }],
-                                actions: vec![vec![Action::command("Use Account", format!("/account use {}", account.id)), Action::command("Accounts", "/account")], vec![Action::close()]],
-                                side_mode: false,
-                            };
-                            guard.revision += 1;
-                            let markup = keyboard(&guard.current_view, &guard.id, guard.revision);
-                            let rendered = rich::render(&guard.current_view, false);
-                            let plain = rich::plain(&guard.current_view);
-                            let _ = menu::edit_first(&client, &mut guard, rendered, plain, markup).await;
-                            break;
-                        }
-                        Ok(AuthEvent::Failed { transaction_id, error, .. }) if transaction_id == watched => {
-                            let mut guard = watched_menu.lock().await;
-                            if guard.expires_at <= std::time::Instant::now() { break; }
-                            guard.current_view = View { title: Some("LOGIN FAILED".into()), blocks: vec![Block::Paragraph { text: error }], actions: vec![vec![Action::command("Login", "/login"), Action::back()]], side_mode: false };
-                            guard.revision += 1;
-                            let markup = keyboard(&guard.current_view, &guard.id, guard.revision);
-                            let rendered = rich::render(&guard.current_view, false);
-                            let plain = rich::plain(&guard.current_view);
-                            let _ = menu::edit_first(&client, &mut guard, rendered, plain, markup).await;
-                            break;
-                        }
-                        Ok(_) => continue,
-                        Err(_) => break,
-                    }
-                }
-            }
-        });
     }
 }
 
@@ -1718,6 +1804,12 @@ impl ProgressAggregator {
             } => {
                 self.complete_tool(&tool, Some(call_id), &summary);
             }
+            AgentEvent::ApprovalRequested {
+                tool,
+                call_id,
+                summary,
+                ..
+            } => self.await_approval(&tool, &call_id, &summary),
             AgentEvent::StreamChunk { .. } => self.stream_chunk(),
             AgentEvent::GenerationCompleted => {
                 self.set_active("Finishing response".into(), ProgressActivity::Writing)
@@ -1880,6 +1972,25 @@ impl ProgressAggregator {
             item.summary = Some(safe_summary.clone());
         }
         self.trim();
+    }
+
+    fn await_approval(&mut self, tool: &str, call_id: &str, summary: &str) {
+        let progress = tool_progress(tool);
+        let detail = safe_progress(summary);
+        let label = if detail.is_empty() {
+            format!("Awaiting approval · {}", progress.active)
+        } else {
+            safe_progress(&format!(
+                "Awaiting approval · {} · {detail}",
+                progress.active
+            ))
+        };
+        self.set_active_for_tool(
+            label,
+            progress.activity,
+            tool.to_owned(),
+            Some(call_id.to_owned()),
+        );
     }
 
     fn stream_chunk(&mut self) {
@@ -2177,6 +2288,32 @@ fn normalize_tool_name(tool: &str) -> String {
     tool.trim().to_ascii_lowercase().replace('-', "_")
 }
 
+fn parse_internal_approval_command(command: &str) -> Option<(bool, &str)> {
+    let parts = command.trim().split(':').collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0] != "/_approval" {
+        return None;
+    }
+    let approve = match parts[1] {
+        "approve" => true,
+        "deny" => false,
+        _ => return None,
+    };
+    let id = parts[2];
+    let valid = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-');
+    valid.then_some((approve, id))
+}
+
+fn is_stop_command(text: &str) -> bool {
+    text.trim_start()
+        .split_whitespace()
+        .next()
+        .is_some_and(|command| matches!(command.split('@').next(), Some("/stop")))
+}
+
 fn safe_progress(value: &str) -> String {
     let mut s = crate::security::redact::redact_text(value).replace('\n', " ");
     if s.chars().count() > 140 {
@@ -2197,29 +2334,6 @@ fn result_view(result: CommandResult) -> Result<View> {
         CommandResult::InputRequest { view, .. } => Ok(view),
         CommandResult::NoContent => Ok(View::default()),
         _ => Err(anyhow!("result requires specialized renderer")),
-    }
-}
-
-fn auth_view(challenge: &AuthChallenge) -> View {
-    match challenge {
-        AuthChallenge::BrowserUrl { provider, url, transaction_id } => View {
-            title: Some(format!("{} LOGIN", if provider == "codex" { "CODEX" } else { "AGY" })),
-            blocks: vec![Block::Paragraph {
-                text: concat!(
-                    "Open the login page on this Android device. The localhost OAuth callback ",
-                    "returns to xiao and this same menu updates automatically."
-                )
-                .into(),
-            }],
-            actions: vec![vec![Action::url("Open Login Page", url)], vec![Action::command("Cancel", format!("/login cancel {transaction_id}")), Action::back()]],
-            side_mode: false,
-        },
-        AuthChallenge::ApiKey { .. } => View {
-            title: Some("CUSTOM PROVIDER".into()),
-            blocks: vec![Block::Paragraph { text: "Configure the Custom API key in KernelSU WebUI/local admin API. It is never requested through Telegram.".into() }],
-            actions: vec![vec![Action::back(), Action::close()]],
-            side_mode: false,
-        },
     }
 }
 
@@ -2414,6 +2528,66 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.unwrap_or_else(|_|panic!("Telegram update {id} was not processed promptly"));
+    }
+
+    #[tokio::test]
+    async fn stop_preempts_pending_rename_and_custom_login_input() {
+        let telegram_base = serve(Router::new().fallback(post(telegram_stub))).await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.storage.database = temp.path().join("xiao.db");
+        cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.logs_dir = temp.path().join("logs");
+        cfg.paths.secrets_dir = temp.path().join("secrets");
+        cfg.telegram.enabled = true;
+        cfg.telegram.access.allowed_chat_ids = vec![100];
+        cfg.telegram.access.owner_user_id = Some(10);
+        let app = AppState::build(cfg).await.unwrap();
+        let scope = TelegramScope::new(100, None);
+        let menus = Arc::new(MenuStore::new(Duration::from_secs(60)));
+        let menu = menus.prepare_scoped(scope, 10, View::info("RENAME", "pending"));
+        let menu_id = menu.lock().await.id.clone();
+        menus.insert(menu.clone(), menu_id.clone());
+        let custom_logins = Arc::new(CustomLoginStore::new(Duration::from_secs(60)));
+        let adapter = TelegramAdapter {
+            app,
+            client: TelegramClient::with_base("test-token".into(), telegram_base).unwrap(),
+            menus,
+            custom_logins: custom_logins.clone(),
+            principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        menu.lock().await.pending_input = Some("/sessions rename session-a".into());
+        adapter
+            .handle_update(message(1, 100, 10, "/stop"))
+            .await
+            .unwrap();
+        assert_eq!(
+            menu.lock().await.pending_input.as_deref(),
+            Some("/sessions rename session-a")
+        );
+
+        let wizard = custom_logins.begin(scope, 10, menu_id);
+        let wizard_id = wizard.lock().await.id.clone();
+        menu.lock().await.pending_input = Some(format!("custom:{wizard_id}:endpoint"));
+        adapter
+            .handle_update(message(2, 100, 10, "/stop@xiao_test_bot"))
+            .await
+            .unwrap();
+        assert_eq!(
+            menu.lock().await.pending_input.as_deref(),
+            Some(format!("custom:{wizard_id}:endpoint").as_str())
+        );
+        assert!(custom_logins.get(&wizard_id).is_some());
+    }
+
+    #[test]
+    fn stop_detection_accepts_only_the_canonical_command_head() {
+        assert!(is_stop_command("/stop"));
+        assert!(is_stop_command("  /stop@xiao_test_bot extra"));
+        assert!(!is_stop_command("/s"));
+        assert!(!is_stop_command("/stop-now"));
     }
 
     #[test]
@@ -2788,6 +2962,7 @@ mod tests {
             menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
             custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let first = message(1, 100, 10, "run a long request");
@@ -2904,6 +3079,7 @@ mod tests {
             menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
             custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
         adapter
             .handle_update(topic_message(1, 100, 10, 10, "/status"))
@@ -3011,6 +3187,7 @@ mod tests {
             menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
             custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
 
         adapter
@@ -3148,6 +3325,7 @@ mod tests {
             menus,
             custom_logins,
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
         let principal = app.resolve_telegram_owner(10).unwrap().owner_id;
 
@@ -3329,6 +3507,7 @@ mod tests {
             menus,
             custom_logins: custom_logins.clone(),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
         {
             let mut guard = menu.lock().await;
@@ -3442,6 +3621,7 @@ mod tests {
             menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
             custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
             principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let mut document = topic_message(70, 100, 7, 10, "");

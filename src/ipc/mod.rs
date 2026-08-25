@@ -102,6 +102,9 @@ pub struct ApplyRequest {
     pub log_level: Option<String>,
     pub progress_detail: Option<String>,
     pub menu_close_behavior: Option<String>,
+    /// Deprecated v0.2.8 compatibility fields. Legacy credentials remain
+    /// stored for history isolation, but this endpoint never enables or
+    /// mutates an inactive provider.
     pub antigravity_enabled: Option<bool>,
     pub antigravity_oauth_client_id: Option<String>,
     pub antigravity_oauth_client_secret: Option<String>,
@@ -176,15 +179,6 @@ struct CustomProfileActionRequest {
     secret_headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     clear_secret_headers: bool,
-    session_id: Option<String>,
-    model: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AccountActionRequest {
-    action: String,
-    account_id: Option<String>,
-    provider: Option<String>,
     session_id: Option<String>,
     model: Option<String>,
 }
@@ -273,7 +267,6 @@ pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
             "/v1/admin/providers/custom",
             post(manager_custom_profile_action),
         )
-        .route("/v1/admin/providers/accounts", post(manager_account_action))
         .route("/v1/admin/runtime", get(manager_runtime))
         .route("/v1/admin/context", get(manager_context))
         .route(
@@ -559,6 +552,15 @@ async fn admin_apply(
             "telegram owner/token must be mutated via POST /v1/admin/telegram (TelegramSetupService); legacy /v1/admin/apply no longer mutates telegram identity",
         ));
     }
+    if req.antigravity_enabled.is_some()
+        || req.antigravity_oauth_client_id.is_some()
+        || req.antigravity_oauth_client_secret.is_some()
+        || req.antigravity_default_model.is_some()
+    {
+        return Err(bad(
+            "provider_configuration_required: Codex and Antigravity are legacy-only in v0.2.8; configure a Custom profile instead",
+        ));
+    }
     let old = state.app.config.read().await.clone();
     let mut next = old.clone();
     if let Some(v) = req.gateway_enabled {
@@ -590,23 +592,6 @@ async fn admin_apply(
     }
     if let Some(v) = req.menu_close_behavior {
         next.telegram.ui.menu_close_behavior = v;
-    }
-    if let Some(v) = req.antigravity_enabled {
-        next.providers.antigravity.enabled = v;
-    }
-    if let Some(v) = req.antigravity_oauth_client_id {
-        next.providers.antigravity.oauth_client_id = if v.trim().is_empty() {
-            None
-        } else {
-            Some(v.trim().to_owned())
-        };
-    }
-    if let Some(v) = req.antigravity_default_model {
-        next.providers.antigravity.default_model = if v.trim().is_empty() {
-            None
-        } else {
-            Some(v.trim().to_owned())
-        };
     }
     if let Some(v) = req.custom_enabled {
         next.providers.custom.enabled = v;
@@ -655,35 +640,7 @@ async fn admin_apply(
             )
             .map_err(bad)?;
     }
-    if let Some(secret) = req
-        .antigravity_oauth_client_secret
-        .as_deref()
-        .map(str::trim)
-        .filter(|x| !x.is_empty())
-    {
-        state
-            .app
-            .auth
-            .set_antigravity_client_secret(Some(secret))
-            .map_err(bad)?;
-    }
     state.app.providers.reload_config(&next);
-    if old.providers.antigravity.default_model != next.providers.antigravity.default_model {
-        let models = state.app.providers.models("antigravity").map_err(bad)?;
-        let preferred = models
-            .first()
-            .ok_or_else(|| bad("provider antigravity has no usable models"))?;
-        state
-            .app
-            .storage
-            .reconcile_provider_models(
-                "antigravity",
-                old.providers.antigravity.default_model.as_deref(),
-                preferred,
-                &models,
-            )
-            .map_err(bad)?;
-    }
     if old.providers.custom.default_model != next.providers.custom.default_model
         || old.providers.custom.models != next.providers.custom.models
     {
@@ -713,7 +670,7 @@ async fn admin_apply(
         "ok": true,
         "applied": true,
         "restart_required": restart_required,
-        "hot_reloaded": ["telegram.access.owner_user_id","telegram.access.allowed_chat_ids","telegram.ui","providers.antigravity","providers.custom","gateway.auto_restart"]
+        "hot_reloaded": ["telegram.access.owner_user_id","telegram.access.allowed_chat_ids","telegram.ui","providers.custom","gateway.auto_restart"]
     })))
 }
 
@@ -934,31 +891,6 @@ async fn manager_providers(
         return Err(deny());
     }
     let owner = management_owner(&state).await.map_err(bad)?;
-    let accounts = state
-        .app
-        .storage
-        .accounts_for_owner(&owner, None)
-        .map_err(bad)?
-        .into_iter()
-        .filter(|account| account.provider != "custom")
-        .map(|account| {
-            let models = state
-                .app
-                .providers
-                .models(&account.provider)
-                .unwrap_or_default();
-            json!({
-                "id": account.id,
-                "provider": account.provider,
-                "label": account.label,
-                "email": account.email,
-                "status": account.status,
-                "access_expires_at": account.access_expires_at,
-                "credential_configured": state.app.auth.credential(&account.id).ok().flatten().is_some(),
-                "models": models,
-            })
-        })
-        .collect::<Vec<_>>();
     let profiles_store = ProviderProfileStore::new(state.app.storage.clone());
     let cfg = state.app.config.read().await.clone();
     let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
@@ -999,7 +931,11 @@ async fn manager_providers(
         .collect::<Vec<_>>();
     Ok(Json(json!({
         "provider_states": state.app.providers.states(),
-        "accounts": accounts,
+        // Keep the field empty for a bounded wire-compatible transition, but
+        // never expose legacy account metadata or credentials to normal
+        // product surfaces. Custom profile secrets are distinct write-only
+        // references and cannot be inherited by a legacy session.
+        "accounts": [],
         "custom_profiles": profiles,
     })))
 }
@@ -1369,150 +1305,6 @@ async fn manager_custom_profile_action(
     }
 }
 
-async fn manager_account_action(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(req): Json<AccountActionRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if !authorized_admin(&headers, &state) {
-        return Err(deny());
-    }
-    let owner = management_owner(&state).await.map_err(bad)?;
-    match req.action.as_str() {
-        "login" => {
-            let provider = canonical_managed_provider(
-                req.provider
-                    .as_deref()
-                    .ok_or_else(|| bad("provider is required"))?,
-            )
-            .map_err(bad)?;
-            let challenge = state
-                .app
-                .auth
-                .begin_login_for_owner(provider, &owner)
-                .await
-                .map_err(bad)?;
-            Ok(Json(json!({"ok":true,"challenge":challenge})))
-        }
-        "reconnect" => {
-            let account_id = req
-                .account_id
-                .as_deref()
-                .ok_or_else(|| bad("account_id is required"))?;
-            let account = managed_account(&state, &owner, account_id)?;
-            let challenge = state
-                .app
-                .auth
-                .begin_reconnect_for_owner(&account.provider, &owner, &account.id)
-                .await
-                .map_err(bad)?;
-            Ok(Json(json!({"ok":true,"challenge":challenge})))
-        }
-        "test" => {
-            let account = managed_account(
-                &state,
-                &owner,
-                req.account_id
-                    .as_deref()
-                    .ok_or_else(|| bad("account_id is required"))?,
-            )?;
-            let credential = state
-                .app
-                .auth
-                .credential_for_use(&account.id)
-                .await
-                .map_err(bad)?;
-            if credential.is_none() {
-                return Err(bad("account credential is unavailable"));
-            }
-            Ok(Json(json!({"ok":true,"status":"credential_ready"})))
-        }
-        "use" => {
-            let account = managed_account(
-                &state,
-                &owner,
-                req.account_id
-                    .as_deref()
-                    .ok_or_else(|| bad("account_id is required"))?,
-            )?;
-            let session_id = req
-                .session_id
-                .as_deref()
-                .ok_or_else(|| bad("session_id is required"))?;
-            let model = req
-                .model
-                .as_deref()
-                .ok_or_else(|| bad("model is required"))?;
-            state
-                .app
-                .commands
-                .management_set_session_ai(
-                    &owner,
-                    session_id,
-                    &account.provider,
-                    Some(account.id.clone()),
-                    model,
-                )
-                .map_err(bad)?;
-            Ok(Json(json!({"ok":true})))
-        }
-        "disconnect" => {
-            let account = managed_account(
-                &state,
-                &owner,
-                req.account_id
-                    .as_deref()
-                    .ok_or_else(|| bad("account_id is required"))?,
-            )?;
-            let detached = state
-                .app
-                .storage
-                .detach_account_from_sessions(&account.id)
-                .map_err(bad)?;
-            state.app.auth.logout(&account.id).map_err(bad)?;
-            state
-                .app
-                .storage
-                .audit(
-                    &owner,
-                    "provider_account_disconnected",
-                    &format!("account_id={};sessions_detached={detached}", account.id),
-                )
-                .map_err(bad)?;
-            Ok(Json(json!({"ok":true,"sessions_detached":detached})))
-        }
-        _ => Err(bad("unsupported account action")),
-    }
-}
-
-fn canonical_managed_provider(provider: &str) -> Result<&'static str> {
-    match provider.trim().to_ascii_lowercase().as_str() {
-        "codex" => Ok("codex"),
-        "agy" | "antigravity" => Ok("antigravity"),
-        _ => Err(anyhow!(
-            "managed account provider must be Codex or Antigravity"
-        )),
-    }
-}
-
-fn managed_account(
-    state: &ApiState,
-    owner: &str,
-    account_id: &str,
-) -> Result<crate::storage::AccountRecord, (StatusCode, Json<Value>)> {
-    let account = state
-        .app
-        .storage
-        .account_for_owner(owner, account_id)
-        .map_err(bad)?
-        .ok_or_else(|| bad("account not found"))?;
-    if account.provider == "custom" {
-        return Err(bad("Custom credentials are managed through their profile"));
-    }
-    canonical_managed_provider(&account.provider).map_err(bad)?;
-    Ok(account)
-}
-
 async fn manager_runtime(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1689,7 +1481,7 @@ async fn manager_session_action(
                 "active_session_id":context.active.id,
             })));
         }
-        "cancel" => {
+        "stop" => {
             let session_id = required_session()?;
             let cancelled = state
                 .app
@@ -1724,30 +1516,55 @@ async fn manager_session_action(
                 .rename_session(&owner, session_id, value)
                 .map_err(bad)?;
         }
-        "archive" => {
+        "delete" => {
             let session_id = required_session()?;
             let scope = state
                 .app
                 .storage
                 .telegram_scope_for_session(&owner, session_id)
                 .map_err(bad)?;
-            if let Some((chat_id, message_thread_id)) = scope {
+            let (active, deleted) = if let Some((chat_id, message_thread_id)) = scope {
                 state
                     .app
                     .sessions
-                    .archive_and_recover_telegram(
+                    .delete_and_recover_telegram(
                         &owner,
                         crate::telegram::TelegramScope::new(chat_id, message_thread_id),
                         session_id,
                     )
-                    .map_err(bad)?;
+                    .map_err(bad)?
             } else {
                 state
                     .app
                     .sessions
-                    .archive_and_recover(&owner, session_id)
-                    .map_err(bad)?;
-            }
+                    .delete_and_recover(&owner, session_id)
+                    .map_err(bad)?
+            };
+            let cleanup_warning = state
+                .app
+                .attachments
+                .cleanup_deleted_session_paths(&deleted.attachment_paths)
+                .err()
+                .map(|error| redact_text(&error.to_string()));
+            state
+                .app
+                .storage
+                .audit(
+                    &owner,
+                    "session_deleted",
+                    &format!(
+                        "session_id={session_id};replacement_session_id={};attachment_cleanup_warning={}",
+                        active.id,
+                        cleanup_warning.as_deref().unwrap_or("none")
+                    ),
+                )
+                .map_err(bad)?;
+            return Ok(Json(json!({
+                "ok": true,
+                "deleted": true,
+                "active_session": active,
+                "cleanup_warning": cleanup_warning,
+            })));
         }
         "yolo" => {
             let session_id = required_session()?;
@@ -2238,19 +2055,18 @@ async fn manager_security(
         .into_iter()
         .filter(|session| session.yolo_mode)
         .collect::<Vec<_>>();
-    let credentials = state
-        .app
-        .storage
-        .accounts_for_owner(&owner, None)
-        .map_err(bad)?
+    let profiles = ProviderProfileStore::new(state.app.storage.clone())
+        .list(&owner)
+        .map_err(bad)?;
+    let credentials = profiles
         .into_iter()
-        .map(|account| {
+        .map(|profile| {
             json!({
-                "id": account.id,
-                "provider": account.provider,
-                "label": account.label,
-                "configured": state.app.auth.credential(&account.id).ok().flatten().is_some(),
-                "status": account.status,
+                "id": profile.profile_id,
+                "provider": "custom",
+                "label": profile.alias,
+                "configured": profile.credential_ref.is_some() || profile.secret_headers_ref.is_some(),
+                "status": if profile.enabled { "enabled" } else { "disabled" },
             })
         })
         .collect::<Vec<_>>();
@@ -2628,7 +2444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_account_test_use_and_disconnect_are_owner_and_session_bound() {
+    async fn legacy_provider_accounts_are_hidden_and_cannot_be_selected() {
         let (state, _directory) = test_state().await;
         let headers = admin_headers("admin-test-token");
         let owner = management_owner(&state).await.unwrap();
@@ -2645,7 +2461,20 @@ mod tests {
         let session = state
             .app
             .storage
-            .create_session(&owner, "manager", "custom", None, "default", false, None)
+            .create_session(
+                &owner,
+                "legacy history",
+                "codex",
+                Some(&account.id),
+                "gpt-legacy",
+                false,
+                None,
+            )
+            .unwrap();
+        state
+            .app
+            .storage
+            .append_message(&owner, &session.id, "assistant", "historical legacy answer")
             .unwrap();
 
         let providers = manager_providers(State(state.clone()), headers.clone())
@@ -2653,71 +2482,20 @@ mod tests {
             .unwrap()
             .0;
         let serialized = serde_json::to_string(&providers).unwrap();
-        assert!(serialized.contains("managed-codex"));
+        assert!(!serialized.contains("managed-codex"));
         assert!(!serialized.contains("ACCOUNT_SECRET_SENTINEL"));
-        assert_eq!(providers["accounts"][0]["credential_configured"], true);
-
-        let tested = manager_account_action(
-            State(state.clone()),
-            headers.clone(),
-            Json(AccountActionRequest {
-                action: "test".into(),
-                account_id: Some(account.id.clone()),
-                provider: None,
-                session_id: None,
-                model: None,
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(tested["status"], "credential_ready");
-
-        let _ = manager_account_action(
-            State(state.clone()),
-            headers.clone(),
-            Json(AccountActionRequest {
-                action: "use".into(),
-                account_id: Some(account.id.clone()),
-                provider: None,
-                session_id: Some(session.id.clone()),
-                model: Some("gpt-5.6-sol".into()),
-            }),
-        )
-        .await
-        .unwrap();
-        let selected = state
+        assert_eq!(providers["accounts"], json!([]));
+        assert_eq!(
+            state.app.storage.messages(&owner, &session.id).unwrap()[0].content,
+            "historical legacy answer"
+        );
+        let error = state
             .app
-            .storage
-            .session(&owner, &session.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(selected.provider, "codex");
-        assert_eq!(selected.account_id.as_deref(), Some(account.id.as_str()));
-        assert_eq!(selected.model, "gpt-5.6-sol");
-
-        let _ = manager_account_action(
-            State(state.clone()),
-            headers,
-            Json(AccountActionRequest {
-                action: "disconnect".into(),
-                account_id: Some(account.id.clone()),
-                provider: None,
-                session_id: None,
-                model: None,
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(state.app.auth.credential(&account.id).unwrap().is_none());
-        assert!(state
-            .app
-            .storage
-            .session(&owner, &session.id)
-            .unwrap()
-            .unwrap()
-            .account_id
-            .is_none());
+            .commands
+            .management_set_session_ai(&owner, &session.id, "codex", Some(account.id), "gpt-legacy")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider_configuration_required"));
     }
 
     #[tokio::test]
@@ -2867,58 +2645,94 @@ mod tests {
 
     #[test]
     fn webui_uses_only_typed_xiaod_manager_actions() {
+        // Keep the source contract explicit and let CI prove that the checked-in
+        // Vite bundle is regenerated from it. The browser may transport only
+        // typed manager resources; all authority remains in xiaod.
         let javascript = include_str!("../../module/webroot/assets/app.js");
         let html = include_str!("../../module/webroot/index.html");
+        let app = include_str!("../../webui/src/App.jsx");
+        let bridge = include_str!("../../webui/src/bridge.js");
+        assert!(html.contains("id=\"root\""));
         assert!(javascript.contains("manager-get-base64"));
         assert!(javascript.contains("manager-post-base64"));
+        assert!(bridge.contains("const GET_RESOURCES"));
+        assert!(bridge.contains("const POST_RESOURCES"));
         for forbidden in [
             "sqlite3",
             "xiao.db",
             "writeFile",
+            "ksuExec",
             "raw-root",
             "/system/bin/su",
         ] {
             assert!(!javascript.contains(forbidden));
+            assert!(!bridge.contains(forbidden));
+        }
+        for resource in [
+            "dashboard",
+            "telegram",
+            "providers",
+            "provider-custom",
+            "runtime",
+            "context",
+            "sessions",
+            "runs",
+            "attachments",
+            "memory",
+            "skills",
+            "tools",
+            "security",
+            "diagnostics",
+            "logs",
+        ] {
+            assert!(
+                bridge.contains(resource),
+                "WebUI bridge is missing typed manager resource {resource}"
+            );
         }
         for section in [
-            "Dashboard",
-            "Providers",
-            "Runtime",
+            "Overview",
+            "Telegram",
+            "Custom AI",
             "Sessions",
-            "Tasks",
+            "Attachments",
+            "Runs",
             "Memory",
             "Skills",
             "Tools",
             "Security",
+            "Runtime",
             "Diagnostics",
             "Logs",
         ] {
-            assert!(html.contains(section), "missing WebUI section {section}");
+            assert!(app.contains(section), "missing WebUI manager section {section}");
         }
-        for control in [
-            "addCodex",
-            "addAgy",
-            "sessionAiProvider",
-            "sessionAiBinding",
-            "sessionAiModel",
-        ] {
-            assert!(html.contains(control), "missing WebUI control {control}");
-        }
-        for behavior in [
-            "beginProviderLogin(account.provider, account)",
-            "action: 'reconnect'",
-            "action: 'test'",
-            "managerPost('provider-accounts'",
+        for required in [
+            "write-only",
+            "provider: 'custom'",
             "managerPost('provider-custom'",
             "managerPost('sessions'",
-            "Change AI Configuration",
-            "recent_denied_actions",
-            "counts.blocked_runs",
-            "run.verification",
+            "ProfileEditor",
+            "SessionAiDialog",
+            "secret headers",
+            "Custom profile",
         ] {
             assert!(
-                javascript.contains(behavior),
-                "missing WebUI management behavior {behavior}"
+                app.contains(required),
+                "missing Custom-only WebUI behavior {required}"
+            );
+        }
+        for removed in [
+            "provider-accounts",
+            "addCodex",
+            "addAgy",
+            "beginProviderLogin",
+            "action: 'reconnect'",
+            "action: 'oauth'",
+        ] {
+            assert!(
+                !app.contains(removed) && !bridge.contains(removed),
+                "removed provider-manager surface remains: {removed}"
             );
         }
     }

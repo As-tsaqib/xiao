@@ -126,6 +126,11 @@ impl ToolRunStatus {
 pub struct ToolExecution {
     pub result: ToolResult,
     pub status: ToolRunStatus,
+    /// Present only when this exact call created or re-used a pending,
+    /// owner-bound approval request.  The identifier is deliberately kept out
+    /// of the human-facing tool output: transports use it only to construct a
+    /// scoped one-shot approval control.
+    pub approval_id: Option<String>,
     pub approval_mode: Option<String>,
     pub policy_original: Option<String>,
 }

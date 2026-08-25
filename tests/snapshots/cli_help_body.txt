@@ -19,16 +19,15 @@ Telegram:
   xiao telegram test
 
 Providers / models:
-  xiao login codex|antigravity|custom
+  xiao login [custom]
   xiao model show|list|use MODEL
-  xiao model accounts list|show|use|reconnect|disconnect ...
   xiao model custom list|add|show|edit|test|probe|models|use|delete ...
 
 Sessions:
-  xiao sessions list|new|show|use|rename|archive ...
+  xiao sessions list|new|show|use|rename|delete ...
   xiao btw
   xiao yolo status|on|off
-  xiao cancel
+  xiao stop
   xiao retry
 
 Owner data / execution:

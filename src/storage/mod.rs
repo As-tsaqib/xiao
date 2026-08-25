@@ -31,6 +31,12 @@ pub struct SessionRecord {
     pub last_active_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionDeletionResult {
+    pub active_session_id: String,
+    pub attachment_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRecord {
     pub role: String,
@@ -1287,8 +1293,6 @@ impl Storage {
             // The compatibility TOML is imported at most once. A populated
             // control row from an earlier v0.2.7 boot is already authoritative
             // and must not be overwritten by a stale file on the next start.
-            // This is the final migration in the hardening sequence so schema
-            // numbers remain monotonic and easy to audit.
             {
                 let transaction = conn.transaction()?;
                 ensure_column(
@@ -1304,6 +1308,38 @@ impl Storage {
                 transaction.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version) VALUES(24)",
                     [],
+                )?;
+                transaction.commit()?;
+            }
+            // v0.2.8 makes Custom the only active runtime provider.  This
+            // policy row deliberately does not erase legacy provider accounts,
+            // sessions, credentials, messages, or audit history: historical
+            // conversations remain readable, while a new generation fails
+            // closed with provider_configuration_required until the owner
+            // selects an exact Custom profile/model.  The data update is
+            // conditional so repeated startup migrations are idempotent.
+            {
+                let transaction = conn.transaction()?;
+                transaction.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS provider_runtime_policy(
+                      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                      active_provider_kind TEXT NOT NULL CHECK(active_provider_kind='custom'),
+                      legacy_generation_behavior TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    INSERT OR IGNORE INTO provider_runtime_policy(
+                      singleton,active_provider_kind,legacy_generation_behavior,updated_at
+                    ) VALUES(1,'custom','provider_configuration_required',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+                    UPDATE provider_runtime_policy
+                       SET active_provider_kind='custom',
+                           legacy_generation_behavior='provider_configuration_required',
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE singleton=1
+                       AND (active_provider_kind<>'custom'
+                         OR legacy_generation_behavior<>'provider_configuration_required');
+                    INSERT OR IGNORE INTO schema_migrations(version) VALUES(25);
+                    "#,
                 )?;
                 transaction.commit()?;
             }
@@ -1346,6 +1382,21 @@ impl Storage {
 
     pub fn installation_owner(&self) -> Result<OwnerIdentity> {
         Ok(OwnerIdentity::from_owner_id(self.management_owner_id()?))
+    }
+
+    /// The migration-backed runtime provider policy is the durable source of
+    /// truth for whether an old conversation may start another generation.
+    /// It deliberately leaves legacy session rows and credentials readable.
+    pub fn active_provider_kind(&self) -> Result<String> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT active_provider_kind FROM provider_runtime_policy WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        })
     }
 
     pub fn owner_resolution_candidates(&self) -> Result<Vec<String>> {
@@ -2437,6 +2488,252 @@ impl Storage {
             let n=conn.execute("UPDATE sessions SET archived=1,last_active_at=? WHERE id=? AND owner_principal=? AND is_side=0", params![Utc::now().to_rfc3339(),id,owner])?;
             if n != 1 { return Err(anyhow::anyhow!("session not found for principal")); }
             Ok(())
+        })
+    }
+
+    /// Delete a main session and all of its conversation-owned descendants in
+    /// one transaction. Owner-global memories, skills, provider profiles and
+    /// audit history are deliberately outside this transaction's delete set.
+    /// `scope` selects the Telegram frontend pointer when the operation comes
+    /// from Telegram; `None` uses the local/CLI frontend pointer.
+    pub fn delete_session_and_recover(
+        &self,
+        owner: &str,
+        id: &str,
+        scope: Option<TelegramScope>,
+    ) -> Result<SessionDeletionResult> {
+        self.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            let target: Option<(i64, i64, Option<String>)> = transaction
+                .query_row(
+                    "SELECT is_side,archived,parent_id FROM sessions WHERE id=? AND owner_principal=?",
+                    params![id, owner],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((is_side, _archived, _parent)) = target else {
+                return Err(anyhow::anyhow!("session not found for principal"));
+            };
+            if is_side != 0 {
+                return Err(anyhow::anyhow!(
+                    "side sessions cannot be deleted from the main session manager"
+                ));
+            }
+            // A side conversation is a child of its main conversation. Use a
+            // recursive set rather than assuming a single level so an old or
+            // repaired database cannot leave a descendant run/attachment
+            // behind after the main session disappears.
+            let session_ids = {
+                let mut statement = transaction.prepare(
+                    "WITH RECURSIVE descendants(id) AS (\
+                        SELECT ?1\
+                        UNION\
+                        SELECT s.id FROM sessions s JOIN descendants d ON s.parent_id=d.id WHERE s.owner_principal=?2\
+                    ) SELECT id FROM descendants",
+                )?;
+                let rows = statement
+                    .query_map(params![id, owner], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            let running: bool = transaction.query_row(
+                "WITH RECURSIVE descendants(id) AS (\
+                    SELECT ?1\
+                    UNION\
+                    SELECT s.id FROM sessions s JOIN descendants d ON s.parent_id=d.id WHERE s.owner_principal=?2\
+                ) SELECT EXISTS(\
+                    SELECT 1 FROM agent_runs\
+                     WHERE owner_principal=?2\
+                       AND session_id IN (SELECT id FROM descendants)\
+                       AND status IN ('received','context_build','running','awaiting_approval','verifying')\
+                )",
+                params![id, owner],
+                |row| row.get(0),
+            )?;
+            if running {
+                return Err(anyhow::anyhow!(
+                    "cannot delete a session with an active generation"
+                ));
+            }
+
+            let mut attachment_paths = Vec::new();
+            for session_id in &session_ids {
+                let mut statement = transaction.prepare(
+                    "SELECT local_path FROM attachments WHERE owner_id=? AND session_id=?",
+                )?;
+                let paths = statement
+                        .query_map(params![owner, session_id], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                attachment_paths.extend(paths);
+            }
+
+            let replacement_for_scope = |transaction: &rusqlite::Transaction<'_>,
+                                          scope: Option<TelegramScope>|
+             -> Result<Option<String>> {
+                let candidates = if let Some(scope) = scope {
+                    let mut statement = transaction.prepare(
+                        "SELECT s.id FROM sessions s JOIN telegram_session_scopes ts ON ts.session_id=s.id WHERE s.owner_principal=? AND ts.owner_principal=? AND ts.chat_id=? AND ts.thread_id_key=? AND s.is_side=0 AND s.archived=0 ORDER BY s.last_active_at DESC",
+                    )?;
+                    let rows = statement
+                        .query_map(
+                            params![owner, owner, scope.chat_id, scope.thread_key()],
+                            |row| row.get::<_, String>(0),
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    rows
+                } else {
+                    let mut statement = transaction.prepare(
+                        "SELECT id FROM sessions WHERE owner_principal=? AND is_side=0 AND archived=0 ORDER BY last_active_at DESC",
+                    )?;
+                    let rows = statement
+                        .query_map(params![owner], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    rows
+                };
+                Ok(candidates.into_iter().find(|candidate| {
+                    !session_ids.iter().any(|deleted| deleted == candidate)
+                }))
+            };
+
+            let new_replacement = |transaction: &rusqlite::Transaction<'_>,
+                                   scope: Option<TelegramScope>|
+             -> Result<String> {
+                let replacement = Uuid::new_v4().to_string();
+                let now = Utc::now().to_rfc3339();
+                transaction.execute(
+                    "INSERT INTO sessions(id,name,provider,account_id,model,archived,is_side,parent_id,yolo_mode,created_at,last_active_at,owner_principal) VALUES(?,?, 'custom',NULL,'default',0,0,NULL,0,?,?,?)",
+                    params![
+                        replacement,
+                        format!("Session {}", Utc::now().format("%d %b %H:%M")),
+                        now,
+                        now,
+                        owner
+                    ],
+                )?;
+                if let Some(scope) = scope {
+                    transaction.execute(
+                        "INSERT INTO telegram_session_scopes(session_id,owner_principal,chat_id,thread_id_key,is_side,created_at) VALUES(?,?,?,?,0,?)",
+                        params![replacement, owner, scope.chat_id, scope.thread_key(), now],
+                    )?;
+                }
+                Ok(replacement)
+            };
+
+            let state_references_deleted = |state: &(String, Option<String>, String)| {
+                session_ids.iter().any(|deleted| {
+                    deleted == &state.0 || state.1.as_deref() == Some(deleted.as_str())
+                })
+            };
+            let active_id = if let Some(scope) = scope {
+                let state: Option<(String, Option<String>, String)> = transaction
+                    .query_row(
+                        "SELECT active_main_session_id,side_session_id,mode FROM telegram_active_sessions WHERE owner_principal=? AND chat_id=? AND thread_id_key=?",
+                        params![owner, scope.chat_id, scope.thread_key()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                if state
+                    .as_ref()
+                    .map(state_references_deleted)
+                    .unwrap_or(true)
+                {
+                    let replacement = replacement_for_scope(&transaction, Some(scope))?
+                        .unwrap_or(new_replacement(&transaction, Some(scope))?);
+                    transaction.execute(
+                        "INSERT INTO telegram_active_sessions(owner_principal,chat_id,thread_id_key,active_main_session_id,side_session_id,mode,updated_at) VALUES(?,?,?,?,NULL,'main',?) ON CONFLICT(owner_principal,chat_id,thread_id_key) DO UPDATE SET active_main_session_id=excluded.active_main_session_id,side_session_id=NULL,mode='main',updated_at=excluded.updated_at",
+                        params![owner, scope.chat_id, scope.thread_key(), replacement, Utc::now().to_rfc3339()],
+                    )?;
+                    replacement
+                } else {
+                    state.expect("checked above").0
+                }
+            } else {
+                let state: Option<(String, Option<String>, String)> = transaction
+                    .query_row(
+                        "SELECT active_main_session_id,side_session_id,mode FROM frontend_state WHERE principal=?",
+                        params![owner],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                if state
+                    .as_ref()
+                    .map(state_references_deleted)
+                    .unwrap_or(true)
+                {
+                    let replacement = replacement_for_scope(&transaction, None)?
+                        .unwrap_or(new_replacement(&transaction, None)?);
+                    transaction.execute(
+                        "INSERT INTO frontend_state(principal,active_main_session_id,side_session_id,mode) VALUES(?,?,NULL,'main') ON CONFLICT(principal) DO UPDATE SET active_main_session_id=excluded.active_main_session_id,side_session_id=NULL,mode='main'",
+                        params![owner, replacement],
+                    )?;
+                    replacement
+                } else {
+                    state.expect("checked above").0
+                }
+            };
+
+            // Pending grants are exact one-shot records, not session content.
+            // Preserve their audit trail but make every unconsumed grant
+            // terminal before its corresponding run is removed.
+            for session_id in &session_ids {
+                transaction.execute(
+                    "UPDATE approvals SET status='denied',approval_mode='session_deleted',decided_at=? WHERE owner_principal=? AND session_id=? AND status IN ('pending','approved')",
+                    params![Utc::now().to_rfc3339(), owner, session_id],
+                )?;
+            }
+            // A malformed/legacy pointer must never prevent a committed
+            // deletion. The requested scope has already been atomically
+            // repointed above; any stale pointer is rebuilt lazily by its
+            // normal frontend context initializer.
+            for session_id in &session_ids {
+                transaction.execute(
+                    "DELETE FROM telegram_active_sessions WHERE owner_principal=? AND (active_main_session_id=? OR side_session_id=?)",
+                    params![owner, session_id, session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM frontend_state WHERE principal=? AND (active_main_session_id=? OR side_session_id=?)",
+                    params![owner, session_id, session_id],
+                )?;
+            }
+            for session_id in &session_ids {
+                transaction.execute(
+                    "DELETE FROM tool_runs WHERE agent_run_id IN (SELECT id FROM agent_runs WHERE owner_principal=? AND session_id=?)",
+                    params![owner, session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM agent_runs WHERE owner_principal=? AND session_id=?",
+                    params![owner, session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM attachments WHERE owner_id=? AND session_id=?",
+                    params![owner, session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM messages WHERE session_id=?",
+                    params![session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM provider_native_sessions WHERE session_id=?",
+                    params![session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM session_summaries WHERE session_id=?",
+                    params![session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM telegram_session_scopes WHERE session_id=?",
+                    params![session_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM sessions WHERE id=? AND owner_principal=?",
+                    params![session_id, owner],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(SessionDeletionResult {
+                active_session_id: active_id,
+                attachment_paths,
+            })
         })
     }
     pub fn set_session_provider(
@@ -4604,7 +4901,7 @@ mod tests {
                 connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                     row.get(0)
                 })?;
-            assert_eq!(latest, 24);
+            assert_eq!(latest, 25);
             for table in [
                 "agent_runs",
                 "tool_runs",
@@ -4636,6 +4933,7 @@ mod tests {
                 "owner_migration_candidates",
                 "attachment_reservations",
                 "telegram_progress_emoji",
+                "provider_runtime_policy",
             ] {
                 let exists: bool = connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?)",

@@ -37,7 +37,7 @@ const TOP_LEVEL: &[&str] = &[
     "sessions",
     "btw",
     "yolo",
-    "cancel",
+    "stop",
     "retry",
     "memory",
     "skills",
@@ -468,15 +468,15 @@ async fn public_daemon_command(
             )
         }
         "yolo" => yolo_command(&client, options, &args[1..], presenter).await,
-        "cancel" => {
-            exact_arity(args, 1, "usage: xiao cancel")?;
+        "stop" => {
+            exact_arity(args, 1, "usage: xiao stop")?;
             let session = client.target_session(options).await?;
             presenter.success(
-                "cancel",
+                "stop",
                 client
                     .post_admin(
                         "/v1/admin/sessions",
-                        &json!({"action":"cancel","session_id":session}),
+                        &json!({"action":"stop","session_id":session}),
                     )
                     .await?,
             )
@@ -781,25 +781,16 @@ async fn login_command(
     args: &[String],
     presenter: &CliPresenter,
 ) -> CliResult<()> {
-    if args.len() != 1 {
-        return Err(CliFailure::usage(
-            "usage: xiao login <codex|antigravity|custom>",
-        ));
+    if args.is_empty() || matches!(args, [value] if value == "custom") {
+        return custom_add_interactive(client, presenter).await;
     }
-    match args[0].as_str() {
-        "codex" | "antigravity" => presenter.success(
-            &format!("login {}", args[0]),
-            client
-                .post_admin(
-                    "/v1/admin/providers/accounts",
-                    &json!({"action":"login","provider":args[0]}),
-                )
-                .await?,
-        ),
-        "custom" => custom_add_interactive(client, presenter).await,
-        _ => Err(CliFailure::usage(
-            "provider must be codex, antigravity, or custom",
-        )),
+    match args {
+        [value] if matches!(value.as_str(), "codex" | "antigravity" | "agy") => {
+            Err(CliFailure::usage(
+                "provider_configuration_required: Codex and Antigravity are no longer supported; use `xiao login` for a Custom endpoint",
+            ))
+        }
+        _ => Err(CliFailure::usage("usage: xiao login [custom]")),
     }
 }
 
@@ -811,7 +802,7 @@ async fn model_command(
 ) -> CliResult<()> {
     let Some(sub) = args.first().map(String::as_str) else {
         return Err(CliFailure::usage(
-            "usage: xiao model <show|list|use|accounts|custom>",
+            "usage: xiao model <show|list|use|custom>",
         ));
     };
     match sub {
@@ -856,89 +847,9 @@ async fn model_command(
                 .await?;
             presenter.success("model use", value)
         }
-        "accounts" => accounts_command(client, options, &args[1..], presenter).await,
         "custom" => custom_command(client, options, &args[1..], presenter).await,
         _ => Err(CliFailure::usage(
-            "usage: xiao model <show|list|use> | xiao model accounts ... | xiao model custom ...",
-        )),
-    }
-}
-
-async fn accounts_command(
-    client: &DaemonClient,
-    options: &GlobalOptions,
-    args: &[String],
-    presenter: &CliPresenter,
-) -> CliResult<()> {
-    match args.first().map(String::as_str) {
-        Some("list") if args.len() == 1 => {
-            let providers = client.get_admin("/v1/admin/providers").await?;
-            presenter.success("model accounts list", dto_model_accounts(providers))
-        }
-        Some("show") if args.len() == 2 => {
-            let account = account_by_id(client, &args[1]).await?;
-            presenter.success(
-                "model accounts show",
-                xiao::cli_contract::project_account(account),
-            )
-        }
-        Some("use") if args.len() == 2 || args.len() == 3 => {
-            let account = account_by_id(client, &args[1]).await?;
-            let provider = account
-                .get("provider")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let model = if let Some(model) = args.get(2) {
-                model.clone()
-            } else {
-                account
-                    .get("models")
-                    .and_then(Value::as_array)
-                    .and_then(|models| models.first())
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .ok_or_else(|| CliFailure {
-                        code: EXIT_REJECTED,
-                        message: "account has no available model".into(),
-                    })?
-            };
-            let session = client.target_session(options).await?;
-            presenter.success(
-                "model accounts use",
-                client
-                    .post_admin(
-                        "/v1/admin/sessions",
-                        &json!({
-                            "action":"ai_config",
-                            "session_id":session,
-                            "provider":provider,
-                            "account_or_profile_id":args[1],
-                            "model":model,
-                        }),
-                    )
-                    .await?,
-            )
-        }
-        Some("reconnect") if args.len() == 2 => presenter.success(
-            "model accounts reconnect",
-            client
-                .post_admin(
-                    "/v1/admin/providers/accounts",
-                    &json!({"action":"reconnect","account_id":args[1]}),
-                )
-                .await?,
-        ),
-        Some("disconnect") if args.len() == 2 => presenter.success(
-            "model accounts disconnect",
-            client
-                .post_admin(
-                    "/v1/admin/providers/accounts",
-                    &json!({"action":"disconnect","account_id":args[1]}),
-                )
-                .await?,
-        ),
-        _ => Err(CliFailure::usage(
-            "usage: xiao model accounts <list|show ID|use ID [MODEL]|reconnect ID|disconnect ID>",
+            "usage: xiao model <show|list|use> | xiao model custom ...",
         )),
     }
 }
@@ -1310,17 +1221,17 @@ async fn sessions_command(
                 )
                 .await?,
         ),
-        Some("archive") if args.len() == 2 => presenter.success(
-            "sessions archive",
+        Some("delete") if args.len() == 2 => presenter.success(
+            "sessions delete",
             client
                 .post_admin(
                     "/v1/admin/sessions",
-                    &json!({"action":"archive","session_id":args[1]}),
+                    &json!({"action":"delete","session_id":args[1]}),
                 )
                 .await?,
         ),
         _ => Err(CliFailure::usage(
-            "usage: xiao sessions <list|new|show ID|use ID|rename ID NAME|archive ID>",
+            "usage: xiao sessions <list|new|show ID|use ID|rename ID NAME|delete ID>",
         )),
     }
 }
@@ -1593,18 +1504,10 @@ async fn setup(
             }),
         )
         .await?;
-    presenter.line("4/6 AI provider (optional)");
-    let provider = prompt_line("Provider [skip/codex/antigravity/custom]: ")?;
+    presenter.line("4/6 Custom AI endpoint (optional)");
+    let provider = prompt_line("Configure Custom endpoint now? [skip/custom]: ")?;
     let provider_result = match provider.trim().to_ascii_lowercase().as_str() {
         "" | "skip" => Value::Null,
-        "codex" | "antigravity" => {
-            client
-                .post_admin(
-                    "/v1/admin/providers/accounts",
-                    &json!({"action":"login","provider":provider.trim().to_ascii_lowercase()}),
-                )
-                .await?
-        }
         "custom" => {
             custom_add_interactive(
                 &client,
@@ -1616,11 +1519,7 @@ async fn setup(
             .await?;
             json!({"started":true,"provider":"custom"})
         }
-        _ => {
-            return Err(CliFailure::usage(
-                "setup provider must be skip, codex, antigravity, or custom",
-            ))
-        }
+        _ => return Err(CliFailure::usage("setup provider must be skip or custom")),
     };
     presenter.line("5/6 Running bounded diagnostics...");
     let diagnostics = client.get_admin("/v1/admin/diagnostics").await?;
@@ -1929,7 +1828,6 @@ fn manager_resource_path(resource: &str) -> CliResult<&'static str> {
         "dashboard" => Ok("/v1/admin/dashboard"),
         "providers" => Ok("/v1/admin/providers"),
         "provider-custom" => Ok("/v1/admin/providers/custom"),
-        "provider-accounts" => Ok("/v1/admin/providers/accounts"),
         "runtime" => Ok("/v1/admin/runtime"),
         "context" => Ok("/v1/admin/context"),
         "sessions" => Ok("/v1/admin/sessions"),
@@ -1951,22 +1849,6 @@ async fn session_by_id(client: &DaemonClient, id: &str) -> CliResult<Value> {
         .get_admin(&format!("/v1/admin/sessions?id={}", url_encode(id)))
         .await?;
     find_item(&data, id, &["id"])
-}
-
-async fn account_by_id(client: &DaemonClient, id: &str) -> CliResult<Value> {
-    let data = client.get_admin("/v1/admin/providers").await?;
-    data.get("accounts")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
-        })
-        .cloned()
-        .ok_or_else(|| CliFailure {
-            code: EXIT_NOT_FOUND,
-            message: format!("account `{id}` not found"),
-        })
 }
 
 async fn custom_by_id(client: &DaemonClient, id: &str) -> CliResult<Value> {
@@ -2004,17 +1886,7 @@ fn models_for_session(session: &Value, providers: &Value) -> Value {
             .cloned()
             .unwrap_or_else(|| json!([]))
     } else {
-        providers
-            .get("accounts")
-            .and_then(Value::as_array)
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|item| item.get("id").and_then(Value::as_str) == binding)
-            })
-            .and_then(|item| item.get("models"))
-            .cloned()
-            .unwrap_or_else(|| json!([]))
+        json!([])
     };
     json!({
         "session_id":session.get("id"),
@@ -2147,9 +2019,6 @@ fn dto_doctor(value: Value) -> Value {
 }
 fn dto_tools(value: Value) -> Value {
     xiao::cli_contract::project_tools(value)
-}
-fn dto_model_accounts(value: Value) -> Value {
-    xiao::cli_contract::project_accounts(value)
 }
 fn dto_model_custom(value: Value) -> Value {
     xiao::cli_contract::project_custom_profiles(value)
@@ -2536,10 +2405,9 @@ fn print_subcommand_help(path: &[String]) {
         ["chat"] | ["ask"] => r#"Usage: xiao chat [--file PATH] [--image PATH] [--session ID] [--json] [--quiet] "PROMPT""#,
         ["telegram"] => "Usage: xiao telegram <status|configure|set-owner|set-token-file|test>",
         ["telegram", "configure"] => "Usage: xiao telegram configure [--owner ID] [--allowed-chat ID] [--token-file PATH] [--enable|--disable] [--test]",
-        ["model"] => "Usage: xiao model <show|list|use|accounts|custom> ...",
-        ["model", "accounts"] => "Usage: xiao model accounts <list|show|use|reconnect|disconnect> ...",
+        ["model"] => "Usage: xiao model <show|list|use|custom> ...",
         ["model", "custom"] => "Usage: xiao model custom <list|add|show|edit|test|probe|models|use|delete> ...",
-        ["sessions"] => "Usage: xiao sessions <list|new|show|use|rename|archive> ...",
+        ["sessions"] => "Usage: xiao sessions <list|new|show|use|rename|delete> ...",
         ["yolo"] => "Usage: xiao yolo <status|on|off> [--session ID]",
         ["memory"] => "Usage: xiao memory <list|search|get|set|forget> ...",
         ["skills"] => "Usage: xiao skills <list|search|show|enable|disable|delete> ...",
@@ -2548,14 +2416,14 @@ fn print_subcommand_help(path: &[String]) {
         ["runs"] => "Usage: xiao runs <list|show|cancel> ...",
         ["daemon"] => "Usage: xiao daemon <start|foreground|stop|restart|status|logs> ...",
         ["config"] => "Usage: xiao config <path|check|show>",
-        ["login"] => "Usage: xiao login <codex|antigravity|custom>",
+        ["login"] => "Usage: xiao login [custom]",
         ["setup"] => "Usage: xiao setup\nInteractive secure setup. Secrets are read from hidden TTY input; they are never required as argv values.",
         ["status"] => "Usage: xiao status [--json] [--quiet]",
         ["context"] => "Usage: xiao context [--session ID] [--json]",
         ["doctor"] => "Usage: xiao doctor [--json]",
         ["tools"] => "Usage: xiao tools [--json]",
         ["btw"] => "Usage: xiao btw",
-        ["cancel"] => "Usage: xiao cancel [--session ID]",
+        ["stop"] => "Usage: xiao stop [--session ID]",
         ["retry"] => "Usage: xiao retry [--session ID]",
         ["logs"] => "Usage: xiao logs [LINES]",
         _ => {
@@ -2590,16 +2458,15 @@ Telegram:
   xiao telegram test
 
 Providers / models:
-  xiao login codex|antigravity|custom
+  xiao login [custom]
   xiao model show|list|use MODEL
-  xiao model accounts list|show|use|reconnect|disconnect ...
   xiao model custom list|add|show|edit|test|probe|models|use|delete ...
 
 Sessions:
-  xiao sessions list|new|show|use|rename|archive ...
+  xiao sessions list|new|show|use|rename|delete ...
   xiao btw
   xiao yolo status|on|off
-  xiao cancel
+  xiao stop
   xiao retry
 
 Owner data / execution:
@@ -2698,12 +2565,11 @@ mod cli_tests {
             "xiao telegram test",
             "xiao login",
             "xiao model show|list|use",
-            "xiao model accounts",
             "xiao model custom",
             "xiao sessions",
             "xiao btw",
             "xiao yolo",
-            "xiao cancel",
+            "xiao stop",
             "xiao retry",
             "xiao memory",
             "xiao skills",
@@ -2720,6 +2586,8 @@ mod cli_tests {
         assert!(help.contains("Unknown commands are never treated as chat"));
         assert!(!help.contains("xiao about"));
         assert!(!help.contains("xiao logout"));
+        assert!(!help.contains("xiao model accounts"));
+        assert!(!help.contains("xiao login codex"));
     }
 
     #[test]

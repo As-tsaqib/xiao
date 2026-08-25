@@ -25,7 +25,7 @@ use crate::{
         NormalizedFile, NormalizedImage, PdfFallbackCapabilities, PdfFallbackProvider,
         PdfFallbackRequest,
     },
-    auth::{antigravity_user_agent, AuthManager},
+    auth::AuthManager,
     config::{AppConfig, CustomProviderConfig},
     security::redact::redact_text,
     storage::MessageRecord,
@@ -196,6 +196,14 @@ pub enum AgentEvent {
         call_id: String,
     },
     ToolCompletedWithId {
+        tool: String,
+        call_id: String,
+        summary: String,
+    },
+    /// Observable state for a typed ASK decision.  This never includes tool
+    /// arguments, credentials, model reasoning, or a reusable grant.
+    ApprovalRequested {
+        approval_id: String,
         tool: String,
         call_id: String,
         summary: String,
@@ -610,34 +618,11 @@ fn build_providers(
     config: &AppConfig,
     auth: Arc<AuthManager>,
 ) -> HashMap<String, Arc<dyn Provider>> {
+    // v0.2.8 deliberately exposes exactly one active provider family. The
+    // legacy adapters remain in this module only so old serialized sessions
+    // and archived history can still be decoded during migration; they are
+    // not registered, reachable, or advertised by normal runtime surfaces.
     let mut p: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-    p.insert(
-        "codex".into(),
-        Arc::new(CodexProvider::new(
-            config.providers.codex.enabled,
-            config.providers.codex.base_url.clone(),
-            config.providers.codex.default_model.clone(),
-            auth.clone(),
-        )),
-    );
-    let antigravity = &config.providers.antigravity;
-    let antigravity_base = antigravity.base_url.clone().unwrap_or_else(|| {
-        format!(
-            "{}/v1internal:streamGenerateContent?alt=sse",
-            antigravity.daily_base.trim_end_matches('/')
-        )
-    });
-    p.insert(
-        "antigravity".into(),
-        Arc::new(AntigravityProvider::new(
-            antigravity.enabled,
-            antigravity_base,
-            antigravity.default_model.clone(),
-            antigravity_user_agent(antigravity).to_owned(),
-            antigravity.x_goog_api_client.clone(),
-            auth.clone(),
-        )),
-    );
     p.insert(
         "custom".into(),
         Arc::new(CustomProvider::new(config.providers.custom.clone(), auth)),

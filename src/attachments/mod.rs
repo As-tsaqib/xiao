@@ -1352,6 +1352,41 @@ impl AttachmentManager {
         Ok(removed)
     }
 
+    /// Remove raw files whose owning session was already deleted by the
+    /// transactional SessionService. The database row is deleted first; this
+    /// post-commit cleanup therefore cannot roll back a committed session
+    /// deletion and only accepts paths inside the private attachment store.
+    pub fn cleanup_deleted_session_paths(&self, paths: &[String]) -> Result<usize> {
+        let root = self
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| self.root().to_path_buf());
+        let mut removed = 0usize;
+        for raw in paths {
+            let path = Path::new(raw);
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow!("deleted attachment path has no parent"))?
+                .canonicalize()
+                .map_err(|_| anyhow!("deleted attachment parent is unavailable"))?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| anyhow!("deleted attachment path has no file name"))?;
+            // Check canonical parent rather than a lexical prefix. A stored
+            // `root/../outside` path or a parent symlink must never reach
+            // post-commit file cleanup outside Xiao's private store.
+            if !parent.starts_with(&root) {
+                return Err(anyhow!("deleted attachment path escaped the private store"));
+            }
+            match fs::remove_file(parent.join(name)) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn recent_for_prompt(
         &self,
         owner: &str,
@@ -2293,6 +2328,19 @@ mod tests {
         assert_eq!(manager.cleanup_orphans().unwrap(), 1);
         assert!(!orphan.exists());
         assert!(keep.exists());
+    }
+
+    #[test]
+    fn deleted_session_cleanup_rejects_lexically_prefixed_escape_paths() {
+        let (manager, directory, _storage, _session) = manager();
+        let outside = directory.path().join("outside.bin");
+        fs::write(&outside, b"must survive").unwrap();
+        let escape = manager.root().join("..").join("outside.bin");
+
+        assert!(manager
+            .cleanup_deleted_session_paths(&[escape.display().to_string()])
+            .is_err());
+        assert!(outside.exists());
     }
 
     #[test]

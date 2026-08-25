@@ -6,6 +6,7 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 use super::commands::BotCommand;
 use super::types::{ApiEnvelope, BotIdentity, SentMessage, TelegramFile, Update};
@@ -97,7 +98,44 @@ impl TelegramClient {
         self.call("getFile", json!({ "file_id": file_id })).await
     }
 
+    /// Cancellable equivalent used only by an active Telegram work item.
+    /// Dropping the request future on cancellation aborts the HTTP transfer;
+    /// no parallel networking path or raw transport is introduced.
+    pub async fn get_file_with_cancellation(
+        &self,
+        file_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<TelegramFile> {
+        if file_id.trim().is_empty() || file_id.chars().count() > 1_024 {
+            return Err(anyhow!("invalid Telegram file id"));
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(anyhow!("Telegram attachment download cancelled")),
+            result = self.call("getFile", json!({ "file_id": file_id })) => result,
+        }
+    }
+
     pub async fn download_file_bounded(&self, file_path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        self.download_file_bounded_inner(file_path, max_bytes, None)
+            .await
+    }
+
+    pub async fn download_file_bounded_with_cancellation(
+        &self,
+        file_path: &str,
+        max_bytes: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>> {
+        self.download_file_bounded_inner(file_path, max_bytes, Some(cancellation))
+            .await
+    }
+
+    async fn download_file_bounded_inner(
+        &self,
+        file_path: &str,
+        max_bytes: u64,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Vec<u8>> {
         if max_bytes == 0 || max_bytes > 200 * 1024 * 1024 {
             return Err(anyhow!("invalid Telegram download limit"));
         }
@@ -118,11 +156,14 @@ impl TelegramClient {
             self.token,
             file_path.trim_start_matches('/')
         );
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
+        let send = self.client.get(url).send();
+        let response = match cancellation {
+            Some(cancellation) => tokio::select! {
+                _ = cancellation.cancelled() => return Err(anyhow!("Telegram attachment download cancelled")),
+                result = send => result,
+            },
+            None => send.await,
+        }
             .map_err(|error| self.safe_error("file download transport", error))?
             .error_for_status()
             .map_err(|error| self.safe_error("file download status", error))?;
@@ -134,7 +175,17 @@ impl TelegramClient {
         }
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next = match cancellation {
+                Some(cancellation) => tokio::select! {
+                    _ = cancellation.cancelled() => return Err(anyhow!("Telegram attachment download cancelled")),
+                    chunk = stream.next() => chunk,
+                },
+                None => stream.next().await,
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             let chunk = chunk.map_err(|error| self.safe_error("file download", error))?;
             if (bytes.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
                 return Err(anyhow!(
@@ -423,7 +474,7 @@ mod tests {
         body::Bytes,
         extract::State,
         http::{HeaderMap, Uri},
-        routing::post,
+        routing::{get, post},
         Json, Router,
     };
     use std::sync::{Arc, Mutex};
@@ -601,6 +652,43 @@ mod tests {
         assert_eq!(requests[0].0, "setMyCommands");
         let body: Value = serde_json::from_slice(&requests[0].2).unwrap();
         assert_eq!(body["commands"], serde_json::to_value(expected).unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellable_attachment_download_aborts_before_the_server_responds() {
+        async fn slow_download() -> Vec<u8> {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            b"too late".to_vec()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/file/bottest-token/files/slow.bin", get(slow_download)),
+            )
+            .await
+            .unwrap();
+        });
+        let client =
+            TelegramClient::with_base("test-token".into(), format!("http://{address}")).unwrap();
+        let cancellation = CancellationToken::new();
+        let future = client.download_file_bounded_with_cancellation(
+            "files/slow.bin",
+            1024,
+            &cancellation,
+        );
+        tokio::pin!(future);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), &mut future)
+            .await
+            .expect("cancellation did not interrupt the download")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cancelled"));
         server.abort();
     }
 }

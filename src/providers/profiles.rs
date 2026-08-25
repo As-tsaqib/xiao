@@ -52,6 +52,114 @@ impl ProviderProfileStore {
             .ok_or_else(|| anyhow!("created Custom profile is missing"))
     }
 
+    /// Commit a newly discovered Custom profile, its exact model catalog and
+    /// one session selection as a single SQLite transaction.  Telegram's
+    /// setup wizard prepares its immutable credential before this call; no
+    /// profile or active-session split can survive a failed catalog/audit
+    /// write.
+    pub(crate) fn create_with_models_and_activate_session(
+        &self,
+        mut input: ProviderProfileInput,
+        models: &[ProviderProfileModelRecord],
+        session_id: &str,
+        selected_model: &str,
+    ) -> Result<ProviderProfileRecord> {
+        input.alias = canonical_alias(&input.alias)?;
+        input.endpoint = validate_endpoint(&input.endpoint)?;
+        validate_protocol(&input.protocol)?;
+        let headers = parse_safe_headers(&input.safe_headers_json)?;
+        input.safe_headers_json = serde_json::to_string(&headers)?;
+        if models.len() > 2_000 {
+            return Err(anyhow!("Custom profile model catalog is too large"));
+        }
+        let selected_model = selected_model.trim();
+        if selected_model.is_empty() || selected_model.chars().count() > 512 {
+            return Err(anyhow!("selected Custom model is empty or too long"));
+        }
+        if !models.iter().any(|model| model.model_id == selected_model) {
+            return Err(anyhow!("selected Custom model is absent from the discovered catalog"));
+        }
+        for model in models {
+            validate_tool_protocol(&model.tool_protocol)?;
+            if model.model_id.trim().is_empty() || model.model_id.chars().count() > 512 {
+                return Err(anyhow!("Custom model id is empty or too long"));
+            }
+        }
+        let profile_id = input
+            .profile_id
+            .take()
+            .unwrap_or_else(|| format!("custom:{}", Uuid::new_v4().simple()));
+        let models = models
+            .iter()
+            .cloned()
+            .map(|mut model| {
+                model.profile_id = profile_id.clone();
+                model
+            })
+            .collect::<Vec<_>>();
+        let now = Utc::now().to_rfc3339();
+        self.storage.with_conn(|connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO owners(owner_id,telegram_user_id,created_at,updated_at) VALUES(?,NULL,?,?)",
+                params![input.owner_id, now, now],
+            )?;
+            if let Some(credential_ref) = input.credential_ref.as_deref() {
+                let credential = transaction
+                    .query_row(
+                        "SELECT owner_id,provider FROM provider_accounts WHERE id=?",
+                        params![credential_ref],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, String>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                    .ok_or_else(|| anyhow!("prepared Custom profile credential is missing"))?;
+                if credential.0.as_deref() != Some(input.owner_id.as_str()) {
+                    return Err(anyhow!(
+                        "prepared Custom profile credential belongs to another owner"
+                    ));
+                }
+                if credential.1 != "custom" {
+                    return Err(anyhow!(
+                        "prepared Custom profile credential is not a Custom credential"
+                    ));
+                }
+            }
+            transaction.execute(
+                "INSERT INTO provider_profiles(profile_id,owner_id,provider_kind,alias,endpoint,protocol,credential_ref,safe_headers_json,enabled,reachability,created_at,updated_at) VALUES(?,?,'custom',?,?,?,?,?,1,'unknown',?,?)",
+                params![profile_id, input.owner_id, input.alias, input.endpoint, input.protocol, input.credential_ref, input.safe_headers_json, now, now],
+            )?;
+            for model in &models {
+                transaction.execute(
+                    "INSERT INTO provider_profile_models(profile_id,model_id,text_capable,vision_capable,file_input_capable,native_tools,structured_output,continuation,native_tools_state,structured_output_state,continuation_state,vision_state,file_input_state,model_discovery,tool_protocol,evidence,probe_status,probe_version,probed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![profile_id, model.model_id, model.text_capable as i32, model.vision_capable as i32, model.file_input_capable as i32, model.native_tools as i32, model.structured_output as i32, model.continuation as i32, model.native_tools_state, model.structured_output_state, model.continuation_state, model.vision_state, model.file_input_state, model.model_discovery as i32, model.tool_protocol, model.evidence, model.probe_status, model.probe_version, model.probed_at],
+                )?;
+            }
+            transaction.execute(
+                "UPDATE provider_profiles SET reachability='reachable',last_probe_at=?,updated_at=? WHERE profile_id=?",
+                params![now, now, profile_id],
+            )?;
+            if transaction.execute(
+                "UPDATE sessions SET provider='custom',account_id=?,model=?,last_active_at=? WHERE id=? AND owner_principal=? AND archived=0",
+                params![profile_id, selected_model, now, session_id, input.owner_id],
+            )? != 1 {
+                return Err(anyhow!("session not found for owner or is archived"));
+            }
+            transaction.execute(
+                "INSERT INTO audit_events(principal,action,detail,created_at) VALUES(?,?,?,?)",
+                params![input.owner_id, "custom_provider_configured", format!("session_id={session_id};profile_id={profile_id};model={selected_model}"), now],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })?;
+        self.get(&input.owner_id, &profile_id)?
+            .ok_or_else(|| anyhow!("created Custom profile is missing"))
+    }
+
     pub fn list(&self, owner_id: &str) -> Result<Vec<ProviderProfileRecord>> {
         self.storage.with_conn(|connection| {
             let mut statement = connection.prepare(
@@ -715,6 +823,44 @@ impl CustomProfileService {
                     .map_err(Into::into)
             })?
             .ok_or_else(|| anyhow!("created Custom profile is missing"))?;
+        Ok(CustomProfileEditResult {
+            profile,
+            cleanup_warnings: Vec::new(),
+        })
+    }
+
+    /// Atomically publish a Custom login wizard's prepared credential,
+    /// discovered catalog and selected session model.  The credential itself
+    /// is immutable and was stored before this call; SQLite is the sole
+    /// authority for the profile/catalog/session/audit switch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_profile_with_models_and_activate_session_with_credential_ref(
+        &self,
+        owner_id: &str,
+        alias: &str,
+        endpoint: &str,
+        protocol: &str,
+        safe_headers: BTreeMap<String, String>,
+        existing_credential_ref: Option<&str>,
+        models: &[ProviderProfileModelRecord],
+        session_id: &str,
+        selected_model: &str,
+    ) -> Result<CustomProfileEditResult> {
+        let profile = ProviderProfileStore::new(self.storage.clone())
+            .create_with_models_and_activate_session(
+                ProviderProfileInput {
+                    profile_id: None,
+                    owner_id: owner_id.into(),
+                    alias: alias.into(),
+                    endpoint: endpoint.into(),
+                    protocol: protocol.into(),
+                    credential_ref: existing_credential_ref.map(str::to_owned),
+                    safe_headers_json: serde_json::to_string(&safe_headers)?,
+                },
+                models,
+                session_id,
+                selected_model,
+            )?;
         Ok(CustomProfileEditResult {
             profile,
             cleanup_warnings: Vec::new(),

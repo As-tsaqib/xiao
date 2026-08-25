@@ -430,9 +430,12 @@ impl SessionAiService {
             ));
         }
         let provider = match input.provider.trim().to_ascii_lowercase().as_str() {
-            "codex" => "codex",
-            "antigravity" | "agy" => "antigravity",
             "custom" => "custom",
+            "codex" | "antigravity" | "agy" => {
+                return Err(anyhow!(
+                    "provider_configuration_required: legacy provider is no longer supported; select a Custom profile and model"
+                ))
+            }
             _ => return Err(anyhow!("unknown provider")),
         };
         let model = input.model.trim();
@@ -480,25 +483,6 @@ impl SessionAiService {
                     ));
                 }
             }
-        } else {
-            let account = self
-                .storage
-                .account_for_owner(owner, binding)?
-                .ok_or_else(|| anyhow!("provider account not found for owner"))?;
-            if account.provider != provider {
-                return Err(anyhow!("account does not belong to selected provider"));
-            }
-            let models = self.providers.models(provider)?;
-            if !models.iter().any(|candidate| candidate == model) {
-                return Err(anyhow!("model is not available for selected provider"));
-            }
-            self.storage.activate_account(
-                owner,
-                &input.session_id,
-                &account.id,
-                provider,
-                model,
-            )?;
         }
         self.storage
             .session(owner, &input.session_id)?
