@@ -208,7 +208,6 @@ impl DaemonClient {
         Ok(Self {
             http,
             endpoint,
-            principal: client.principal,
             client_token: client.token,
             admin_token,
         })

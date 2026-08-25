@@ -139,7 +139,8 @@ impl ClientConfig {
             control_socket,
             token,
         })?;
-        write_new_private(path, content.as_bytes())
+        write_new_private(path, content.as_bytes())?;
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
