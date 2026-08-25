@@ -942,7 +942,7 @@ impl AgentEngine {
                         for call in calls {
                             tool_calls += 1;
                             let audit = self.storage.tool_runs(principal, &agent_run_id)?;
-                            let mut recent_calls: Vec<String> = audit.iter().map(|r| r.tool.clone()).collect();
+                            let mut recent_calls: Vec<String> = audit.iter().map(|r| r.tool_name.clone()).collect();
                             recent_calls.push(call.name.clone());
                             if recent_calls.len() >= 6 {
                                 let len = recent_calls.len();

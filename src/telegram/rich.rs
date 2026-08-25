@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::presentation::{Block, ProgressIcon, ProgressItem, ProgressState, RichText, View};
+use crate::presentation::{Block, ProgressIcon, ProgressItem, ProgressState, ProgressActivity, RichText, View};
 use serde_json::{json, Value};
 
 const AI_ACTION_THINKING: &str = "5535034915403333642";
