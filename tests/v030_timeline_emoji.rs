@@ -8,7 +8,7 @@ fn custom_emoji_registry_gracefully_falls_back_when_unvalidated_or_non_numeric()
     let mut registry = TelegramEmojiRegistry::default();
 
     // Non-digit emoji ID rejected
-    registry.set(ProgressIcon::Tool, Some("invalid-emoji-id"), true);
+    registry.set_verified_custom_emoji(ProgressIcon::Tool, Some("invalid-emoji-id"), true);
     let view = View {
         title: None,
         side_mode: false,
@@ -31,7 +31,7 @@ fn custom_emoji_registry_gracefully_falls_back_when_unvalidated_or_non_numeric()
     assert!(!json_str.contains("invalid-emoji-id"));
 
     // Valid numeric emoji ID accepted when validated
-    registry.set(ProgressIcon::Tool, Some("5368324170671204113"), true);
+    registry.set_verified_custom_emoji(ProgressIcon::Tool, Some("5368324170671204113"), true);
     let rendered_valid = render_with_registry(&view, true, &registry);
     let valid_str = rendered_valid.to_string();
     assert!(valid_str.contains("5368324170671204113"));
