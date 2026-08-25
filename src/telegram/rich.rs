@@ -439,15 +439,7 @@ mod tests {
         );
         let rendered = render_with_registry(&view, true, &registry);
         assert_eq!(rendered["blocks"][0]["text"][0], "🔎");
-    }],
-        }],
-        actions: vec![],
-        side_mode: false,
-    };
-    let rendered = render(&view, true);
-    assert_eq!(rendered["blocks"][0]["type"], "thinking");
-    assert_eq!(rendered["blocks"][0]["text"][0], "💭");
-}
+    }
 
     #[test]
     fn thinking_emoji_defaults_to_unicode_fallback() {
