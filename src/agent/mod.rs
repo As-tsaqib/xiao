@@ -910,7 +910,7 @@ impl AgentEngine {
                         .iter()
                         .rev()
                         .find(|m| m.role == "system" || m.role == "tool")
-                        .map(|m| format!("; last observable state: {}", &m.content))
+                        .map(|m| format!("; last observable state: {}", m.content))
                         .unwrap_or_default();
                     return Err(anyhow!(
                         "agent turn limit ({}) reached before a final answer{}",
