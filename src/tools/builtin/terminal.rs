@@ -676,7 +676,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_rejects_absolute_outside_symlink_cwd_and_sensitive_env_and_never_calls_executor() {
+    async fn terminal_rejects_absolute_outside_symlink_cwd_and_sensitive_env_and_never_calls_executor(
+    ) {
         let temp = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let packages = Arc::new(FakePackages {

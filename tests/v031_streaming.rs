@@ -222,7 +222,12 @@ async fn cached_unsupported_streaming_disables_streaming_on_future_requests() {
 
     // 1. Initially state is unknown -> optimistic streaming enabled
     let state = store
-        .capability_state(&profile.profile_id, "model-1", "openai_chat_completions", "streaming")
+        .capability_state(
+            &profile.profile_id,
+            "model-1",
+            "openai_chat_completions",
+            "streaming",
+        )
         .unwrap();
     assert_eq!(state, "unknown");
 
@@ -239,7 +244,12 @@ async fn cached_unsupported_streaming_disables_streaming_on_future_requests() {
         .unwrap();
 
     let updated_state = store
-        .capability_state(&profile.profile_id, "model-1", "openai_chat_completions", "streaming")
+        .capability_state(
+            &profile.profile_id,
+            "model-1",
+            "openai_chat_completions",
+            "streaming",
+        )
         .unwrap();
     assert_eq!(updated_state, "unsupported");
 
@@ -255,7 +265,12 @@ async fn cached_unsupported_streaming_disables_streaming_on_future_requests() {
         .unwrap();
 
     let effective_override = store
-        .capability_override(&profile.profile_id, "model-1", "openai_chat_completions", "streaming")
+        .capability_override(
+            &profile.profile_id,
+            "model-1",
+            "openai_chat_completions",
+            "streaming",
+        )
         .unwrap();
     assert_eq!(effective_override, "force_supported");
 }

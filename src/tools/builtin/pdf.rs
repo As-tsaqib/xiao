@@ -223,10 +223,7 @@ pub fn generate_valid_pdf(text: &str) -> Vec<u8> {
 
         let lines_for_page = &page_chunks[i];
         let mut stream_ops = Vec::new();
-        stream_ops.push("BT
-/F1 12 Tf
-72 750 Td
-16 TL".to_owned());
+        stream_ops.push("BT\n/F1 12 Tf\n72 750 Td\n16 TL".to_owned());
         for (line_idx, line) in lines_for_page.iter().enumerate() {
             let sanitized: String = line
                 .chars()
@@ -251,8 +248,7 @@ pub fn generate_valid_pdf(text: &str) -> Vec<u8> {
             }
         }
         stream_ops.push("ET".to_owned());
-        let stream_content = stream_ops.join("
-");
+        let stream_content = stream_ops.join("\n");
 
         let page_obj_content = format!(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 {font_obj_id} 0 R >> >> /Contents {content_obj_id} 0 R >>"
@@ -287,38 +283,24 @@ endstream",
     all_objects.extend(objects);
     all_objects.sort_by_key(|(id, _)| *id);
 
-    let mut pdf = b"%PDF-1.4
-%\xE2\xE3\xCF\xD3
-".to_vec();
+    let mut pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
     let mut offsets = Vec::new();
     for (id, content) in &all_objects {
         offsets.push((*id, pdf.len()));
-        pdf.extend_from_slice(format!("{id} 0 obj
-{content}
-endobj
-").as_bytes());
+        pdf.extend_from_slice(format!("{id} 0 obj\n{content}\nendobj\n").as_bytes());
     }
     offsets.sort_by_key(|(id, _)| *id);
 
     let xref = pdf.len();
     let total_objs = all_objects.len() + 1;
-    pdf.extend_from_slice(format!("xref
-0 {total_objs}
-").as_bytes());
-    pdf.extend_from_slice(b"0000000000 65535 f 
-");
+    pdf.extend_from_slice(format!("xref\n0 {total_objs}\n").as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
     for (_, offset) in offsets {
-        pdf.extend_from_slice(format!("{offset:010} 00000 n 
-").as_bytes());
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
     }
     pdf.extend_from_slice(
         format!(
-            "trailer
-<< /Size {total_objs} /Root 1 0 R >>
-startxref
-{xref}
-%%EOF
-"
+            "trailer\n<< /Size {total_objs} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
         )
         .as_bytes(),
     );

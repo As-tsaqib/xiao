@@ -14,7 +14,12 @@ fn probe_content_mismatch_yields_unknown_not_unsupported() {
         file_input: CapabilityState::Unknown,
     };
     assert_eq!(probe.vision, CapabilityState::Unknown);
-    let record = xiao::providers::profile_model_from_probe("prof-1", "model-1", &probe, "2026-08-26T00:00:00Z");
+    let record = xiao::providers::profile_model_from_probe(
+        "prof-1",
+        "model-1",
+        &probe,
+        "2026-08-26T00:00:00Z",
+    );
     assert!(!record.vision_capable);
     assert_eq!(record.vision_state, "unknown");
     assert!(!record.file_input_capable);
