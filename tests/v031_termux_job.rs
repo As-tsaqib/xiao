@@ -13,8 +13,7 @@ use xiao::{
     storage::Storage,
     tools::{
         builtin::{PdfCreateTool, TermuxJobTool, TermuxTerminalTool},
-        policy::ToolPolicy,
-        Tool, ToolContext,
+        PolicyDecision, Tool, ToolContext, ToolPolicy,
     },
 };
 
@@ -194,7 +193,7 @@ async fn termux_job_rejects_approval_requiring_substeps_with_distinct_status_and
     let db_path = temp.path().join("test.db");
     let storage = Arc::new(Storage::open(&db_path).unwrap());
     let run_id = storage
-        .create_agent_run("owner-1", "sess-1", "custom", "test-model", "test goal")
+        .create_agent_run("owner-1", "sess-1", "custom", "test-model", Some("test goal"))
         .unwrap();
 
     let tool_run_id = storage
@@ -275,7 +274,7 @@ async fn pdf_create_tool_policy_and_symlink_containment() {
         progress: None,
     };
     let decision = policy.evaluate(&tool.spec(), &ctx);
-    assert_eq!(decision, xiao::tools::PolicyDecision::Allow);
+    assert_eq!(decision, PolicyDecision::Allow);
 
     // 2. Symlink escape is rejected
     let workspace = temp.path().join(".xiao/workspaces/sess-pdf");
@@ -311,7 +310,7 @@ async fn pdf_create_tool_policy_and_symlink_containment() {
         .await
         .unwrap();
 
-    assert!(output.contains(""status":"succeeded""));
+    assert!(output.contains(r#""status":"succeeded""#));
     let pdf_path = workspace.join("docs/valid.pdf");
     assert!(pdf_path.exists());
     let pdf_bytes = std::fs::read(&pdf_path).unwrap();
