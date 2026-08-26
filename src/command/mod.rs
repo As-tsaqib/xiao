@@ -309,6 +309,11 @@ impl CommandCore {
         }
     }
 
+    pub fn reload_config(&self, config: &AppConfig) {
+        self.agent.reload_config(config.agent.clone());
+        self.providers.reload_config(config);
+    }
+
     pub async fn execute_text(&self, principal: &str, input: &str) -> Result<CommandResult> {
         self.execute_text_with_progress(principal, input, None)
             .await
@@ -828,12 +833,9 @@ impl CommandCore {
                     let profile_id = context.active.account_id.as_deref().ok_or_else(|| {
                         anyhow!("select a Custom profile before selecting a Custom model")
                     })?;
-                    let model_record = ProviderProfileStore::new(self.storage.clone())
+                    let _model_record = ProviderProfileStore::new(self.storage.clone())
                         .model(profile_id, &model)?
                         .ok_or_else(|| anyhow!("model is not in the provider catalog"))?;
-                    if SessionAiService::is_unprobed(&model_record) {
-                        self.probe_custom_model(principal, scope, &model).await?;
-                    }
                 }
                 self.set_model(principal, scope, &model)?;
                 self.events.publish(AppEvent::ModelChanged {
@@ -1106,82 +1108,13 @@ impl CommandCore {
         {
             return Err(anyhow!("model is not in the provider catalog"));
         }
-        if let Some(binding) = c.active.account_id.clone() {
-            self.management_set_session_ai(
-                principal,
-                &c.active.id,
-                &c.active.provider,
-                Some(binding),
-                model,
-            )?;
-            Ok(())
-        } else {
-            // Compatibility for an inert pre-profile Custom default session.
-            self.storage.set_session_provider(
-                principal,
-                &c.active.id,
-                &c.active.provider,
-                None,
-                model,
-            )
-        }
-    }
-
-    async fn probe_custom_model(
-        &self,
-        principal: &str,
-        scope: Option<TelegramScope>,
-        model: &str,
-    ) -> Result<()> {
-        let context = self.session_context(principal, scope)?;
-        let Some(profile_id) = context.active.account_id.as_deref() else {
-            // Fresh/local compatibility sessions predate owner-scoped Custom
-            // profiles and use the inert `default` catalog entry. Selecting
-            // that placeholder must remain possible, but it is never probed
-            // or treated as agent-capable and carries no credential/header.
-            // Any configured Custom endpoint must instead be represented by
-            // an explicit owner-owned profile before it can be selected.
-            let custom = &self.config.read().await.providers.custom;
-            if custom.base_url.is_none() && model == "default" {
-                return Ok(());
-            }
-            return Err(anyhow!(
-                "select a Custom profile before selecting a Custom model"
-            ));
-        };
-        let profiles = ProviderProfileStore::new(self.storage.clone());
-        let profile = profiles
-            .get(principal, profile_id)?
-            .ok_or_else(|| anyhow!("selected Custom profile does not belong to the owner"))?;
-        let mut models = profiles.models(profile_id)?;
-        let Some(selected) = models
-            .iter_mut()
-            .find(|candidate| candidate.model_id == model)
-        else {
-            return Err(anyhow!("model is not in the provider catalog"));
-        };
-        // Resolve only the selected profile's credential. An empty
-        // credential_ref intentionally means no Authorization header; never
-        // fall back to another Custom account or the legacy singleton.
-        let selected_api_key = profile
-            .credential_ref
-            .as_deref()
-            .and_then(|reference| self.auth.credential(reference).ok().flatten())
-            .and_then(|credential| credential.api_key);
-        let headers = profile.merged_headers(self.auth.secrets())?;
-        let probe = crate::providers::probe_custom_capabilities(
-            &profile.endpoint,
-            &headers,
-            selected_api_key.as_deref(),
-            &profile.protocol,
+        self.storage.set_session_provider(
+            principal,
+            &c.active.id,
+            &c.active.provider,
+            c.active.account_id.as_deref(),
             model,
         )
-        .await;
-        let probed_at = chrono::Utc::now().to_rfc3339();
-        *selected =
-            crate::providers::profile_model_from_probe(profile_id, model, &probe, &probed_at);
-        profiles.replace_models(principal, profile_id, &models)?;
-        Ok(())
     }
 
     fn session_context(

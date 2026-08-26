@@ -49,8 +49,35 @@ impl SessionManager {
 
     pub fn new_main(&self, principal: &str) -> Result<SessionRecord> {
         let name = format!("Session {}", Local::now().format("%d %b %H:%M"));
-        self.storage
-            .create_session(principal, &name, "custom", None, "default", false, None)
+        let mut provider = "custom".to_string();
+        let mut account_id = None;
+        let mut model = "default".to_string();
+
+        let current_main = if let Ok(Some((main_id, _, _))) = self.storage.frontend_state(principal)
+        {
+            self.storage.session(principal, &main_id).ok().flatten()
+        } else {
+            self.storage
+                .list_main_sessions(principal, 1, 0, false)
+                .ok()
+                .and_then(|list| list.into_iter().next())
+        };
+
+        if let Some(s) = current_main {
+            provider = s.provider;
+            account_id = s.account_id;
+            model = s.model;
+        }
+
+        self.storage.create_session(
+            principal,
+            &name,
+            &provider,
+            account_id.as_deref(),
+            &model,
+            false,
+            None,
+        )
     }
 
     pub fn context_for(&self, principal: &str) -> Result<SessionContext> {
@@ -276,9 +303,36 @@ impl SessionManager {
         scope: TelegramScope,
     ) -> Result<SessionRecord> {
         let name = format!("Session {}", Local::now().format("%d %b %H:%M"));
-        let session = self
-            .storage
-            .create_session(principal, &name, "custom", None, "default", false, None)?;
+        let mut provider = "custom".to_string();
+        let mut account_id = None;
+        let mut model = "default".to_string();
+
+        let current_main = if let Ok(Some((main_id, _, _))) =
+            self.storage.telegram_frontend_state(principal, scope)
+        {
+            self.storage.session(principal, &main_id).ok().flatten()
+        } else {
+            self.storage
+                .list_main_sessions_in_telegram_scope(principal, scope, 1, 0, false)
+                .ok()
+                .and_then(|list| list.into_iter().next())
+        };
+
+        if let Some(s) = current_main {
+            provider = s.provider;
+            account_id = s.account_id;
+            model = s.model;
+        }
+
+        let session = self.storage.create_session(
+            principal,
+            &name,
+            &provider,
+            account_id.as_deref(),
+            &model,
+            false,
+            None,
+        )?;
         self.storage
             .bind_session_to_telegram_scope(principal, &session.id, scope)?;
         Ok(session)
@@ -742,5 +796,88 @@ mod tests {
             storage.telegram_scope_for_session(owner, &side.id).unwrap(),
             Some((100, Some(10)))
         );
+    }
+
+    #[test]
+    fn new_session_inherits_from_active_main_within_same_scope() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let manager = SessionManager::new(storage.clone());
+
+        let owner_a = "user:alice";
+        let owner_b = "user:bob";
+        let scope_1 = TelegramScope::new(100, Some(1));
+        let scope_2 = TelegramScope::new(100, Some(2));
+
+        // 1. First session gets defaults: custom / None / default
+        let first_a1 = manager.ensure_telegram_session(owner_a, scope_1).unwrap();
+        assert_eq!(first_a1.provider, "custom");
+        assert_eq!(first_a1.account_id, None);
+        assert_eq!(first_a1.model, "default");
+
+        // First session for owner_a in generic scope also gets defaults
+        let first_gen = manager.ensure_default_session(owner_a).unwrap();
+        assert_eq!(first_gen.provider, "custom");
+        assert_eq!(first_gen.account_id, None);
+        assert_eq!(first_gen.model, "default");
+
+        // Add a message to first_a1 to verify history is NOT inherited
+        storage
+            .append_message(owner_a, &first_a1.id, "user", "hello in first")
+            .unwrap();
+        assert_eq!(storage.messages(owner_a, &first_a1.id).unwrap().len(), 1);
+
+        // Update active session in scope_1 to custom provider profile and new model
+        storage
+            .set_session_provider(
+                owner_a,
+                &first_a1.id,
+                "custom",
+                Some("profile_123"),
+                "gpt-5-turbo",
+            )
+            .unwrap();
+
+        // 2. /new (create_and_switch_telegram) inherits provider/account/model from active main in same scope
+        let second_a1 = manager
+            .create_and_switch_telegram(owner_a, scope_1)
+            .unwrap();
+        assert_eq!(second_a1.provider, "custom");
+        assert_eq!(second_a1.account_id.as_deref(), Some("profile_123"));
+        assert_eq!(second_a1.model, "gpt-5-turbo");
+
+        // Verify NO history inheritance into the new session
+        let msgs = storage.messages(owner_a, &second_a1.id).unwrap();
+        assert!(msgs.is_empty());
+
+        // 3. No cross-topic inheritance: scope_2 on owner_a should get default
+        let first_a2 = manager.ensure_telegram_session(owner_a, scope_2).unwrap();
+        assert_eq!(first_a2.provider, "custom");
+        assert_eq!(first_a2.account_id, None);
+        assert_eq!(first_a2.model, "default");
+
+        // 4. No cross-owner inheritance: owner_b on scope_1 should get default
+        let first_b1 = manager.ensure_telegram_session(owner_b, scope_1).unwrap();
+        assert_eq!(first_b1.provider, "custom");
+        assert_eq!(first_b1.account_id, None);
+        assert_eq!(first_b1.model, "default");
+
+        // 5. Test generic (non-telegram) create_and_switch inheritance
+        storage
+            .set_session_provider(
+                owner_a,
+                &first_gen.id,
+                "custom",
+                Some("profile_gen"),
+                "claude-sonnet",
+            )
+            .unwrap();
+        let second_gen = manager.create_and_switch(owner_a).unwrap();
+        assert_eq!(second_gen.provider, "custom");
+        assert_eq!(second_gen.account_id.as_deref(), Some("profile_gen"));
+        assert_eq!(second_gen.model, "claude-sonnet");
+        assert!(storage
+            .messages(owner_a, &second_gen.id)
+            .unwrap()
+            .is_empty());
     }
 }

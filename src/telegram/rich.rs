@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use crate::presentation::{Block, ProgressIcon, ProgressItem, ProgressState, RichText, View};
 use serde_json::{json, Value};
 
-const AI_ACTION_THINKING: &str = "5535034915403333642";
 const AI_ACTION_ANALYZING: &str = "5535457114983497745";
 const AI_ACTION_SEARCHING: &str = "5537511986251694100";
 const AI_ACTION_FETCHING: &str = "5535365052359507996";
@@ -27,27 +26,27 @@ impl Default for TelegramEmojiRegistry {
     fn default() -> Self {
         let mut entries = HashMap::new();
         for (icon, id, fallback) in [
-            (ProgressIcon::Thinking, AI_ACTION_THINKING, "💭"),
-            (ProgressIcon::Analyzing, AI_ACTION_ANALYZING, "🧠"),
-            (ProgressIcon::WebSearch, AI_ACTION_SEARCHING, "🔎"),
-            (ProgressIcon::FileSearch, AI_ACTION_SEARCHING, "📁"),
-            (ProgressIcon::Fetching, AI_ACTION_FETCHING, "🌐"),
-            (ProgressIcon::DocumentRead, AI_ACTION_ANALYZING, "📄"),
-            (ProgressIcon::ImageInspect, AI_ACTION_MEDIA, "🖼️"),
-            (ProgressIcon::Terminal, AI_ACTION_TOOL, "⌘"),
-            (ProgressIcon::Coding, AI_ACTION_CODING, "💻"),
-            (ProgressIcon::Editing, AI_ACTION_CODING, "✎"),
-            (ProgressIcon::Installing, AI_ACTION_TOOL, "📦"),
-            (ProgressIcon::Testing, AI_ACTION_TOOL, "🧪"),
-            (ProgressIcon::Tool, AI_ACTION_TOOL, "⚙️"),
-            (ProgressIcon::Writing, AI_ACTION_WRITING, "✨"),
-            (ProgressIcon::Audio, AI_ACTION_MEDIA, "🔊"),
-            (ProgressIcon::Video, AI_ACTION_MEDIA, "🎬"),
+            (ProgressIcon::Thinking, None, "💭"),
+            (ProgressIcon::Analyzing, Some(AI_ACTION_ANALYZING), "🧠"),
+            (ProgressIcon::WebSearch, Some(AI_ACTION_SEARCHING), "🔎"),
+            (ProgressIcon::FileSearch, Some(AI_ACTION_SEARCHING), "📁"),
+            (ProgressIcon::Fetching, Some(AI_ACTION_FETCHING), "🌐"),
+            (ProgressIcon::DocumentRead, Some(AI_ACTION_ANALYZING), "📄"),
+            (ProgressIcon::ImageInspect, Some(AI_ACTION_MEDIA), "🖼️"),
+            (ProgressIcon::Terminal, Some(AI_ACTION_TOOL), "⌘"),
+            (ProgressIcon::Coding, Some(AI_ACTION_CODING), "💻"),
+            (ProgressIcon::Editing, Some(AI_ACTION_CODING), "✎"),
+            (ProgressIcon::Installing, Some(AI_ACTION_TOOL), "📦"),
+            (ProgressIcon::Testing, Some(AI_ACTION_TOOL), "🧪"),
+            (ProgressIcon::Tool, Some(AI_ACTION_TOOL), "⚙️"),
+            (ProgressIcon::Writing, Some(AI_ACTION_WRITING), "✨"),
+            (ProgressIcon::Audio, Some(AI_ACTION_MEDIA), "🔊"),
+            (ProgressIcon::Video, Some(AI_ACTION_MEDIA), "🎬"),
         ] {
             entries.insert(
                 icon,
                 TelegramEmoji {
-                    custom_emoji_id: Some(id.to_owned()),
+                    custom_emoji_id: id.map(str::to_owned),
                     fallback,
                 },
             );
@@ -89,7 +88,7 @@ impl TelegramEmojiRegistry {
         );
     }
 
-    fn get(&self, icon: ProgressIcon) -> TelegramEmoji {
+    pub fn get(&self, icon: ProgressIcon) -> TelegramEmoji {
         self.entries.get(&icon).cloned().unwrap_or(TelegramEmoji {
             custom_emoji_id: None,
             fallback: "•",
@@ -220,26 +219,15 @@ fn progress_text(items: &[ProgressItem], registry: &TelegramEmojiRegistry) -> Va
             text.push(json!("\n"));
         }
         if item.state == ProgressState::Active {
-            text.push(activity_icon(item.icon, registry));
+            // Telegram Android clips custom emoji inside RichBlockThinking.
+            // Use the registry fallback for consistent draft rendering.
+            text.push(json!(registry.get(item.icon).fallback));
             text.push(json!(format!(" {}", item.label)));
         } else {
             text.push(json!(format!("{} {}", icon(&item.state), item.label)));
         }
     }
     Value::Array(text)
-}
-
-fn activity_icon(icon: ProgressIcon, registry: &TelegramEmojiRegistry) -> Value {
-    let emoji = registry.get(icon);
-    if let Some(custom_emoji_id) = emoji.custom_emoji_id {
-        json!({
-            "type": "custom_emoji",
-            "custom_emoji_id": custom_emoji_id,
-            "alternative_text": emoji.fallback,
-        })
-    } else {
-        json!(emoji.fallback)
-    }
 }
 
 fn icon(s: &ProgressState) -> &'static str {
@@ -357,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn active_progress_uses_the_official_ai_actions_emoji() {
+    fn active_draft_progress_uses_unicode_fallback() {
         let view = View {
             title: None,
             blocks: vec![Block::Progress {
@@ -377,12 +365,9 @@ mod tests {
         };
         let rendered = render(&view, true);
         assert_eq!(rendered["blocks"][0]["type"], "thinking");
-        assert_eq!(
-            rendered["blocks"][0]["text"][0]["custom_emoji_id"],
-            AI_ACTION_SEARCHING
-        );
-        assert_eq!(rendered["blocks"][0]["text"][0]["alternative_text"], "🔎");
+        assert_eq!(rendered["blocks"][0]["text"][0], "🔎");
         assert_eq!(rendered["blocks"][0]["text"][1], " Searching the web");
+        assert!(!rendered.to_string().contains("custom_emoji"));
     }
 
     #[test]
@@ -440,5 +425,34 @@ mod tests {
         );
         let rendered = render_with_registry(&view, true, &registry);
         assert_eq!(rendered["blocks"][0]["text"][0], "🔎");
+    }
+
+    #[test]
+    fn thinking_emoji_defaults_to_unicode_fallback() {
+        let registry = TelegramEmojiRegistry::default();
+        let emoji = registry.get(ProgressIcon::Thinking);
+        assert_eq!(emoji.custom_emoji_id, None);
+        assert_eq!(emoji.fallback, "💭");
+
+        let view = View {
+            title: None,
+            blocks: vec![Block::Progress {
+                items: vec![ProgressItem {
+                    id: 1,
+                    state: ProgressState::Active,
+                    activity: ProgressActivity::Thinking,
+                    icon: ProgressIcon::Thinking,
+                    action_key: None,
+                    correlation_id: None,
+                    summary: None,
+                    label: "Thinking".into(),
+                }],
+            }],
+            actions: vec![],
+            side_mode: false,
+        };
+        let rendered = render(&view, true);
+        assert_eq!(rendered["blocks"][0]["type"], "thinking");
+        assert_eq!(rendered["blocks"][0]["text"][0], "💭");
     }
 }

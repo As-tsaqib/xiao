@@ -263,6 +263,56 @@ pub struct ProviderProfileModelRecord {
     pub probed_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCapabilityEvidenceRecord {
+    pub profile_id: String,
+    pub model_id: String,
+    pub protocol: String,
+    pub capability: String,
+    pub state: String,
+    pub owner_override: String,
+    pub source: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LearningJobRecord {
+    pub id: String,
+    pub owner_id: String,
+    pub run_id: String,
+    pub status: String,
+    pub attempts: u32,
+    pub not_before: String,
+    pub last_error_redacted: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolRunStepRecord {
+    pub id: String,
+    pub parent_tool_run_id: String,
+    pub step_index: usize,
+    pub step_id: String,
+    pub program: String,
+    pub arguments_json: String,
+    pub status: String,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunEventRecord {
+    pub id: i64,
+    pub agent_run_id: String,
+    pub event_kind: String,
+    pub elapsed_ms: u64,
+    pub metadata_json: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ProviderProfileInput {
     pub profile_id: Option<String>,
@@ -1426,6 +1476,10 @@ impl Storage {
             // startup so the migration is restart-safe and idempotent. A
             // single candidate is deterministic; multiple candidates remain
             // explicitly unresolved and are never guessed together.
+                        let _ = conn.execute(
+                "UPDATE learning_jobs SET status='pending',updated_at=? WHERE status='running'",
+                params![Utc::now().to_rfc3339()],
+            );
             refresh_owner_migration_candidates(conn)?;
             Ok(())
         })
@@ -4326,6 +4380,314 @@ impl Storage {
             )
             .optional()
             .map_err(Into::into)
+        })
+    }
+
+    pub fn get_capability_evidence(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        protocol: &str,
+        capability: &str,
+    ) -> Result<Option<ProviderCapabilityEvidenceRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT profile_id,model_id,protocol,capability,state,owner_override,source,observed_at FROM provider_capability_evidence WHERE profile_id=? AND model_id=? AND protocol=? AND capability=?",
+                params![profile_id, model_id, protocol, capability],
+                |row| {
+                    Ok(ProviderCapabilityEvidenceRecord {
+                        profile_id: row.get(0)?,
+                        model_id: row.get(1)?,
+                        protocol: row.get(2)?,
+                        capability: row.get(3)?,
+                        state: row.get(4)?,
+                        owner_override: row.get(5)?,
+                        source: row.get(6)?,
+                        observed_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_capability_evidence(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        protocol: &str,
+        capability: &str,
+        state: &str,
+        source: &str,
+        owner_override: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            if let Some(ovr) = owner_override {
+                conn.execute(
+                    "INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET state=excluded.state,owner_override=excluded.owner_override,source=excluded.source,observed_at=excluded.observed_at",
+                    params![profile_id, model_id, protocol, capability, state, ovr, source, now],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) VALUES(?,?,?,?,?,'auto',?,?) ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET state=excluded.state,source=excluded.source,observed_at=excluded.observed_at",
+                    params![profile_id, model_id, protocol, capability, state, source, now],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn set_capability_override(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        protocol: &str,
+        capability: &str,
+        owner_override: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) VALUES(?,?,?,?,'unknown',?,'owner_override',?) ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET owner_override=excluded.owner_override,observed_at=excluded.observed_at",
+                params![profile_id, model_id, protocol, capability, owner_override, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_capability_evidence(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+    ) -> Result<Vec<ProviderCapabilityEvidenceRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT profile_id,model_id,protocol,capability,state,owner_override,source,observed_at FROM provider_capability_evidence WHERE profile_id=? AND model_id=? ORDER BY capability",
+            )?;
+            let rows = stmt
+                .query_map(params![profile_id, model_id], |row| {
+                    Ok(ProviderCapabilityEvidenceRecord {
+                        profile_id: row.get(0)?,
+                        model_id: row.get(1)?,
+                        protocol: row.get(2)?,
+                        capability: row.get(3)?,
+                        state: row.get(4)?,
+                        owner_override: row.get(5)?,
+                        source: row.get(6)?,
+                        observed_at: row.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn invalidate_automatic_capability_evidence(&self, profile_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE provider_capability_evidence SET state='unknown',source='invalidated_on_endpoint_change',observed_at=? WHERE profile_id=? AND source != 'owner_override'",
+                params![now, profile_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn enqueue_learning_job(
+        &self,
+        owner_id: &str,
+        run_id: &str,
+        not_before: Option<&str>,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let nb = not_before.unwrap_or(&now);
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO learning_jobs(id,owner_id,run_id,status,attempts,not_before,created_at,updated_at) VALUES(?,?,?,'pending',0,?,?,?) ON CONFLICT(run_id) DO UPDATE SET status='pending',updated_at=excluded.updated_at",
+                params![id, owner_id, run_id, nb, now, now],
+            )?;
+            Ok(())
+        })?;
+        Ok(id)
+    }
+
+    pub fn claim_pending_learning_job(
+        &self,
+        max_attempts: u32,
+    ) -> Result<Option<LearningJobRecord>> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let candidate: Option<(String, u32)> = conn
+                .query_row(
+                    "SELECT id,attempts FROM learning_jobs WHERE status='pending' AND not_before <= ? AND attempts < ? ORDER BY created_at ASC LIMIT 1",
+                    params![now, max_attempts as i64],
+                    |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u32)),
+                )
+                .optional()?;
+            let Some((id, attempts)) = candidate else {
+                return Ok(None);
+            };
+            let next_attempts = attempts + 1;
+            conn.execute(
+                "UPDATE learning_jobs SET status='running',attempts=?,updated_at=? WHERE id=? AND status='pending'",
+                params![next_attempts as i64, now, id],
+            )?;
+            let record = conn.query_row(
+                "SELECT id,owner_id,run_id,status,attempts,not_before,last_error_redacted,created_at,updated_at FROM learning_jobs WHERE id=?",
+                params![id],
+                |row| {
+                    Ok(LearningJobRecord {
+                        id: row.get(0)?,
+                        owner_id: row.get(1)?,
+                        run_id: row.get(2)?,
+                        status: row.get(3)?,
+                        attempts: row.get::<_, i64>(4)? as u32,
+                        not_before: row.get(5)?,
+                        last_error_redacted: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                },
+            )?;
+            Ok(Some(record))
+        })
+    }
+
+    pub fn finish_learning_job(&self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE learning_jobs SET status=?,last_error_redacted=?,updated_at=? WHERE id=?",
+                params![status, error, now, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn recover_stale_learning_jobs(&self) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            let count = conn.execute(
+                "UPDATE learning_jobs SET status='pending',updated_at=? WHERE status='running'",
+                params![now],
+            )?;
+            Ok(count)
+        })
+    }
+
+    pub fn learning_job(&self, id_or_run_id: &str) -> Result<Option<LearningJobRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id,owner_id,run_id,status,attempts,not_before,last_error_redacted,created_at,updated_at FROM learning_jobs WHERE id=? OR run_id=?",
+                params![id_or_run_id, id_or_run_id],
+                |row| {
+                    Ok(LearningJobRecord {
+                        id: row.get(0)?,
+                        owner_id: row.get(1)?,
+                        run_id: row.get(2)?,
+                        status: row.get(3)?,
+                        attempts: row.get::<_, i64>(4)? as u32,
+                        not_before: row.get(5)?,
+                        last_error_redacted: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_tool_run_step(
+        &self,
+        parent_tool_run_id: &str,
+        step_index: usize,
+        step_id: &str,
+        program: &str,
+        args_json: &str,
+        status: &str,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tool_run_steps(id,parent_tool_run_id,step_index,step_id,program,arguments_json,status,output,error,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(parent_tool_run_id,step_index) DO UPDATE SET status=excluded.status,output=excluded.output,error=excluded.error,completed_at=excluded.completed_at",
+                params![id, parent_tool_run_id, step_index as i64, step_id, program, args_json, status, output, error, now, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn tool_run_steps(&self, parent_tool_run_id: &str) -> Result<Vec<ToolRunStepRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id,parent_tool_run_id,step_index,step_id,program,arguments_json,status,output,error,created_at,completed_at FROM tool_run_steps WHERE parent_tool_run_id=? ORDER BY step_index ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![parent_tool_run_id], |row| {
+                    Ok(ToolRunStepRecord {
+                        id: row.get(0)?,
+                        parent_tool_run_id: row.get(1)?,
+                        step_index: row.get::<_, i64>(2)? as usize,
+                        step_id: row.get(3)?,
+                        program: row.get(4)?,
+                        arguments_json: row.get(5)?,
+                        status: row.get(6)?,
+                        output: row.get(7)?,
+                        error: row.get(8)?,
+                        created_at: row.get(9)?,
+                        completed_at: row.get(10)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn record_run_event(
+        &self,
+        agent_run_id: &str,
+        event_kind: &str,
+        elapsed_ms: u64,
+        metadata_json: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let meta = metadata_json.unwrap_or("{}");
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agent_run_events(agent_run_id,event_kind,elapsed_ms,metadata_json,created_at) VALUES(?,?,?,?,?)",
+                params![agent_run_id, event_kind, elapsed_ms as i64, meta, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn agent_run_events(&self, agent_run_id: &str) -> Result<Vec<AgentRunEventRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id,agent_run_id,event_kind,elapsed_ms,metadata_json,created_at FROM agent_run_events WHERE agent_run_id=? ORDER BY id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![agent_run_id], |row| {
+                    Ok(AgentRunEventRecord {
+                        id: row.get(0)?,
+                        agent_run_id: row.get(1)?,
+                        event_kind: row.get(2)?,
+                        elapsed_ms: row.get::<_, i64>(3)? as u64,
+                        metadata_json: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
         })
     }
 }

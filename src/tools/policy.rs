@@ -92,6 +92,12 @@ pub(crate) fn termux_call_policy(arguments: &Value) -> PolicyDecision {
         .and_then(|name| name.to_str())
         .unwrap_or(program)
         .to_ascii_lowercase();
+
+    if matches!(program.as_str(), "su" | "tsu" | "sudo" | "doas") {
+        return PolicyDecision::Deny(format!(
+            "root escalation via {program} is forbidden in Termux unprivileged executor; root operations require typed AndroidBroker tools"
+        ));
+    }
     let args = object
         .get("args")
         .and_then(Value::as_array)

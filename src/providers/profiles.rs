@@ -1229,6 +1229,10 @@ impl CustomProfileService {
                     "DELETE FROM provider_profile_models WHERE profile_id=?",
                     params![profile_id],
                 )?;
+                transaction.execute(
+                    "UPDATE provider_capability_evidence SET state='unknown',source='invalidated_on_endpoint_change',observed_at=? WHERE profile_id=? AND source != 'owner_override'",
+                    params![Utc::now().to_rfc3339(), profile_id],
+                )?;
             }
             transaction.commit()?;
             Ok(())

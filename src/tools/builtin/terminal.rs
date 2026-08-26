@@ -276,6 +276,10 @@ impl Tool for TermuxJobTool {
                     continue;
                 }
             }
+            if context.cancellation.is_cancelled() {
+                results.push(serde_json::json!({"index":index,"id":step.id,"status":"cancelled","error":"job cancelled"}));
+                break;
+            }
             match self.terminal.execute(context, call).await {
                 Ok(output) => {
                     if let (Some(storage), Some(id)) = (&self.storage, audit_id.as_deref()) {
