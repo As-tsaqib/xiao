@@ -15,7 +15,7 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
         conn.execute_batch(
             r#"
             CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
-            INSERT INTO schema_migrations(version) VALUES(1),(26);
+            INSERT INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14),(15),(16),(17),(18),(19),(20),(21),(22),(23),(24),(25),(26);
 
             CREATE TABLE installation_owner(
               id TEXT PRIMARY KEY,
