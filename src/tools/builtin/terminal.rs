@@ -115,11 +115,9 @@ impl Tool for TermuxTerminalTool {
         let session_workspace = if context.session_id.is_empty() {
             self.default_cwd.clone()
         } else {
-            let dir = self
-                .default_cwd
+            self.default_cwd
                 .join(".xiao/workspaces")
-                .join(&context.session_id);
-            dir
+                .join(&context.session_id)
         };
         std::fs::create_dir_all(&session_workspace)?;
         let canonical_workspace = session_workspace.canonicalize()?;
@@ -523,12 +521,9 @@ fn verified_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        runtime::{
-            CapabilityRegistry, CommandOutcome, ExecutionBackend, PackageBackend, PackageCandidate,
-            RuntimeEnvironment, SelinuxState, TermuxEnvironment, TrustedPackageRepository,
-        },
-        storage::{MessageRecord, Storage},
+    use crate::runtime::{
+        CapabilityRegistry, CommandOutcome, ExecutionBackend, PackageBackend, PackageCandidate,
+        RuntimeEnvironment, SelinuxState, TermuxEnvironment, TrustedPackageRepository,
     };
     use std::{
         collections::{BTreeMap, BTreeSet},

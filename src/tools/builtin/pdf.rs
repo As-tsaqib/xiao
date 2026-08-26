@@ -208,18 +208,18 @@ pub fn generate_valid_pdf(text: &str) -> Vec<u8> {
         .chunks(LINES_PER_PAGE)
         .map(|chunk| chunk.to_vec())
         .collect();
-    let num_pages = page_chunks.len().max(1);
+    if page_chunks.is_empty() {
+        page_chunks.push(Vec::new());
+    }
 
     let font_obj_id = 3;
     let mut objects: Vec<(usize, String)> = Vec::new();
     let mut kids_refs = Vec::new();
 
-    for i in 0..num_pages {
+    for (i, lines_for_page) in page_chunks.iter().enumerate() {
         let page_obj_id = 4 + 2 * i;
         let content_obj_id = page_obj_id + 1;
         kids_refs.push(format!("{page_obj_id} 0 R"));
-
-        let lines_for_page = &page_chunks[i];
         let mut stream_ops = Vec::new();
         stream_ops.push("BT\n/F1 12 Tf\n72 750 Td\n16 TL".to_owned());
         for (line_idx, line) in lines_for_page.iter().enumerate() {

@@ -1379,14 +1379,12 @@ impl CustomProvider {
             Ok("force_unsupported") => return false,
             _ => {}
         }
-        match self
-            .profiles
-            .capability_state(profile_id, model, protocol, "streaming")
-            .as_deref()
-        {
-            Ok("unsupported") => false,
-            _ => true,
-        }
+        !matches!(
+            self.profiles
+                .capability_state(profile_id, model, protocol, "streaming")
+                .as_deref(),
+            Ok("unsupported")
+        )
     }
     fn new(cfg: CustomProviderConfig, auth: Arc<AuthManager>) -> Self {
         let storage = auth.storage();

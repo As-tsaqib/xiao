@@ -103,7 +103,7 @@ pub(crate) fn is_sensitive_path_or_value(value: &str) -> bool {
     {
         return true;
     }
-    for part in lower.split(|c| matches!(c, '/' | '\\')) {
+    for part in lower.split(['/', '\\']) {
         if matches!(
             part,
             ".ssh" | ".gnupg" | ".aws" | ".azure" | ".env" | "secrets" | ".netrc"
