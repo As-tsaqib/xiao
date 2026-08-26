@@ -4301,7 +4301,7 @@ impl Storage {
                 )?;
             } else {
                 conn.execute(
-                    "INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) VALUES(?,?,?,?,'unknown','auto',?,?) ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET state=excluded.state,source=excluded.source,observed_at=excluded.observed_at",
+                    "INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) VALUES(?,?,?,?,?,'auto',?,?) ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET state=excluded.state,source=excluded.source,observed_at=excluded.observed_at",
                     params![profile_id, model_id, protocol, capability, state, source, now],
                 )?;
             }
