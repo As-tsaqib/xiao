@@ -86,6 +86,12 @@ impl Tool for TermuxTerminalTool {
 
     async fn execute(&self, context: &ToolContext, arguments: Value) -> Result<String> {
         let arguments: Arguments = serde_json::from_value(arguments)?;
+        preflight_validate_command(
+            &arguments.program,
+            &arguments.args,
+            arguments.cwd.as_ref(),
+            &arguments.artifacts,
+        )?;
         let declared_artifacts = arguments.artifacts.clone();
         let purpose = arguments.purpose.unwrap_or(ExecutionPurpose::UserCommand);
         if purpose == ExecutionPurpose::PackageInstall {
@@ -315,6 +321,65 @@ impl Tool for TermuxJobTool {
             "verification_evidence": true
         }))?)
     }
+}
+
+fn preflight_validate_command(
+    program: &str,
+    args: &[String],
+    cwd: Option<&PathBuf>,
+    artifacts: &[PathBuf],
+) -> Result<()> {
+    let trimmed_prog = program.trim();
+    if trimmed_prog.is_empty() {
+        return Err(anyhow!("program must not be empty"));
+    }
+    if trimmed_prog.contains(' ')
+        || trimmed_prog.contains('\t')
+        || trimmed_prog.contains('\n')
+        || trimmed_prog.contains('|')
+        || trimmed_prog.contains(';')
+        || trimmed_prog.contains('&')
+    {
+        return Err(anyhow!(
+            "model-supplied shell command strings are forbidden; provide structured binary and argv in 'program' and 'args' (e.g. program: 'python', args: ['script.py'])"
+        ));
+    }
+    if ["su", "tsu", "sudo", "doas"].contains(&trimmed_prog) {
+        return Err(anyhow!(
+            "root escalation via {trimmed_prog} is forbidden in Termux unprivileged executor; root operations require typed AndroidBroker tools"
+        ));
+    }
+    if ["sh", "bash", "zsh", "fish", "dash", "ksh"].contains(&trimmed_prog)
+        && args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-c" | "--command" | "-ic" | "-c;"))
+    {
+        return Err(anyhow!(
+            "model-supplied shell command strings are forbidden; use structured argv"
+        ));
+    }
+    if let Some(cwd) = cwd {
+        if cwd
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(anyhow!(
+                "cwd must be within workspace; parent directory traversal ('..') is forbidden"
+            ));
+        }
+    }
+    for artifact in artifacts {
+        if artifact.is_absolute()
+            || artifact
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(anyhow!(
+                "artifact paths must be relative paths within the workspace; parent traversal ('..') and absolute escapes are forbidden"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verified_artifacts(
@@ -585,6 +650,53 @@ mod tests {
             verified_artifacts(&task, workspace.path(), &[outside.path().to_path_buf()]).is_err()
         );
         assert!(verified_artifacts(&task, workspace.path(), &[PathBuf::from("missing")]).is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_preflight_rejects_shell_strings_and_artifact_escapes() {
+        let packages = Arc::new(FakePackages {
+            available: Mutex::new(BTreeSet::new()),
+            installs: Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(FakeExecutor {
+            commands: Mutex::new(Vec::new()),
+        });
+        let resolver = Arc::new(DependencyResolver::new(
+            capabilities(),
+            packages.clone(),
+            None,
+        ));
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let context = ToolContext {
+            principal: "owner".into(),
+            session_id: "session".into(),
+            agent_run_id: "run".into(),
+            yolo_mode: false,
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+            progress: None,
+        };
+
+        // Rejects compound shell string
+        let err = terminal
+            .execute(&context, json!({"program": "python3 -c 'print(1)'"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("shell command strings are forbidden"));
+
+        // Rejects bash -c
+        let err2 = terminal
+            .execute(&context, json!({"program": "bash", "args": ["-c", "id"]}))
+            .await
+            .unwrap_err();
+        assert!(err2.to_string().contains("shell command strings are forbidden"));
+
+        // Rejects artifact escape
+        let err3 = terminal
+            .execute(&context, json!({"program": "ls", "artifacts": ["../../etc/passwd"]}))
+            .await
+            .unwrap_err();
+        assert!(err3.to_string().contains("relative paths within the workspace"));
     }
 
     #[tokio::test]

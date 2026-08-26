@@ -84,13 +84,28 @@ pub(crate) fn termux_call_policy(arguments: &Value) -> PolicyDecision {
     let Some(object) = arguments.as_object() else {
         return PolicyDecision::Deny("termux_terminal arguments must be an object".into());
     };
-    let Some(program) = object.get("program").and_then(Value::as_str) else {
+    let Some(raw_program) = object.get("program").and_then(Value::as_str) else {
         return PolicyDecision::Deny("termux_terminal requires a structured program".into());
     };
-    let program = std::path::Path::new(program)
+    let trimmed_raw = raw_program.trim();
+    if trimmed_raw.is_empty() {
+        return PolicyDecision::Deny("termux_terminal requires a non-empty program".into());
+    }
+    if trimmed_raw.contains(' ')
+        || trimmed_raw.contains('\t')
+        || trimmed_raw.contains('\n')
+        || trimmed_raw.contains('|')
+        || trimmed_raw.contains(';')
+        || trimmed_raw.contains('&')
+    {
+        return PolicyDecision::Deny(
+            "model-supplied shell command strings are forbidden; provide structured binary and argv in 'program' and 'args' (e.g. program: 'python', args: ['script.py'])".into(),
+        );
+    }
+    let program = std::path::Path::new(trimmed_raw)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(program)
+        .unwrap_or(trimmed_raw)
         .to_ascii_lowercase();
 
     if matches!(program.as_str(), "su" | "tsu" | "sudo" | "doas") {

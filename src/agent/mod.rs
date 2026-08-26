@@ -124,6 +124,12 @@ impl AgentEngine {
         tools
             .register(SkillViewTool::new(skills))
             .expect("register skill_view tool");
+        tools
+            .register(crate::tools::builtin::PdfCreateTool::new("/workspace"))
+            .expect("register pdf_create tool");
+        tools
+            .register_alias("create_pdf", "pdf_create")
+            .expect("register create_pdf alias");
         Self::with_registry(sessions, storage, providers, config, tools)
     }
 
@@ -225,6 +231,17 @@ impl AgentEngine {
         tools
             .register(SkillViewTool::new(skills))
             .expect("register skill_view tool");
+        let default_pdf_cwd = if let Some(termux) = environment.termux.as_ref() {
+            termux.home.clone()
+        } else {
+            runtime.workspace().root().to_path_buf()
+        };
+        tools
+            .register(crate::tools::builtin::PdfCreateTool::new(default_pdf_cwd))
+            .expect("register pdf_create tool");
+        tools
+            .register_alias("create_pdf", "pdf_create")
+            .expect("register create_pdf alias");
         if environment.effective_uid == 0 {
             let broker = Arc::new(SystemAndroidBroker::default());
             tools
@@ -813,7 +830,21 @@ impl AgentEngine {
                 ));
             }
             let available_tools = if provider_capabilities.is_agent_capable() {
-                self.tools.available_specs(&tool_context)
+                let all_specs = self.tools.available_specs(&tool_context);
+                if task_kind == TaskKind::Informational {
+                    all_specs
+                        .into_iter()
+                        .filter(|spec| {
+                            spec.risk == crate::tools::ToolRisk::ReadOnly
+                                || matches!(
+                                    spec.name.as_str(),
+                                    "session_search" | "memory" | "recall" | "context_stats" | "skills"
+                                )
+                        })
+                        .collect()
+                } else {
+                    all_specs
+                }
             } else {
                 Vec::new()
             };
@@ -3203,5 +3234,23 @@ mod tests {
         loop_signatures.push_back("termux_terminal:true:invalid_xref".into());
 
         assert!(result_aware_ping_pong(&loop_signatures, 2));
+    }
+
+    #[tokio::test]
+    async fn informational_prompts_do_not_expose_execution_tools() {
+        let provider = Arc::new(EchoProvider);
+        let (engine, db, session, _tmp) = engine("info-tool-filter", provider);
+        let run = engine
+            .submit_with_progress(
+                "u",
+                "How do I implement quicksort in Rust? Give me an example",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!run.final_answer.is_empty());
+        let tools = db.tool_runs("u", &run.run_id).unwrap();
+        // Informational question runs without exposed execution tools
+        assert!(tools.iter().all(|t| t.risk == "read_only"));
     }
 }
