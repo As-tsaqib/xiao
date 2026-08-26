@@ -193,7 +193,13 @@ async fn termux_job_rejects_approval_requiring_substeps_with_distinct_status_and
     let db_path = temp.path().join("test.db");
     let storage = Arc::new(Storage::open(&db_path).unwrap());
     let run_id = storage
-        .create_agent_run("owner-1", "sess-1", "custom", "test-model", Some("test goal"))
+        .create_agent_run(
+            "owner-1",
+            "sess-1",
+            "custom",
+            "test-model",
+            Some("test goal"),
+        )
         .unwrap();
 
     let tool_run_id = storage
