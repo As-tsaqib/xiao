@@ -2432,15 +2432,17 @@ mod tests {
 
         // Emulate SetModel callback
         let start = std::time::Instant::now();
-        let cmd = crate::command::Command::SetModel { model: "slow_model".into() };
-        let _ = app
-            .execute(owner, Some(scope), cmd)
-            .await
-            .unwrap();
+        let cmd = crate::command::Command::SetModel {
+            model: "slow_model".into(),
+        };
+        let _ = app.execute(owner, Some(scope), cmd).await.unwrap();
         let elapsed = start.elapsed();
 
         // Ensure it doesn't wait (should be very fast, well under 100ms)
-        assert!(elapsed.as_millis() < 500, "SetModel should not wait for slow probe");
+        assert!(
+            elapsed.as_millis() < 500,
+            "SetModel should not wait for slow probe"
+        );
 
         // Ensure the model was persisted
         let active = app
