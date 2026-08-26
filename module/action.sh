@@ -26,8 +26,8 @@ stop_watchdog() {
   touch "$XIAO_STOP"
   rm -f "$XIAO_RESTART"
   stop_owned_pid_file "$XIAO_WATCHDOG_PID" "$XIAO_WATCHDOG"
-  stop_owned_pid_file "$XIAO_DAEMON_PID" "$XIAOD_BINARY"
-  xiao_log 'Watchdog dan xiaod dihentikan.'
+  stop_owned_pid_file "$XIAO_DAEMON_PID" "$XIAO_BINARY"
+  xiao_log 'Watchdog dan xiao daemon dihentikan.'
 }
 
 wait_daemon_replaced() {
@@ -35,14 +35,14 @@ wait_daemon_replaced() {
   remaining=${2:-20}
   while [ "$remaining" -gt 0 ]; do
     current_pid=$(pid_from_file "$XIAO_DAEMON_PID" 2>/dev/null || true)
-    if [ "$current_pid" != "$previous_pid" ] && pid_matches "$current_pid" "$XIAOD_BINARY"; then
-      xiao_log "xiaod siap (PID $current_pid)."
+    if [ "$current_pid" != "$previous_pid" ] && pid_matches "$current_pid" "$XIAO_BINARY"; then
+      xiao_log "xiao daemon siap (PID $current_pid)."
       return 0
     fi
     sleep 1
     remaining=$((remaining - 1))
   done
-  xiao_log 'xiaod belum siap setelah 20 detik; periksa watchdog.log dan daemon.log.' >&2
+  xiao_log 'xiao daemon belum siap setelah 20 detik; periksa watchdog.log dan daemon.log.' >&2
   return 1
 }
 
@@ -57,14 +57,14 @@ restart_daemon() {
   fi
 
   touch "$XIAO_RESTART" || return 1
-  if pid_matches "$previous_pid" "$XIAOD_BINARY"; then
+  if pid_matches "$previous_pid" "$XIAO_BINARY"; then
     kill -TERM "$previous_pid" 2>/dev/null || {
       rm -f "$XIAO_RESTART"
       return 1
     }
-    xiao_log "Restart xiaod diminta melalui watchdog (PID $previous_pid)."
+    xiao_log "Restart xiao daemon diminta melalui watchdog (PID $previous_pid)."
   else
-    xiao_log 'xiaod tidak aktif; watchdog diminta memulihkannya sekarang.'
+    xiao_log 'xiao daemon tidak aktif; watchdog diminta memulihkannya sekarang.'
   fi
   wait_daemon_replaced "$previous_pid" 20
 }
@@ -79,9 +79,9 @@ show_status() {
   echo "Date: $(date '+%Y-%m-%d %H:%M:%S')"
   echo
   if daemon_is_running; then
-    echo "✓ xiaod     : RUNNING (PID $(pid_from_file "$XIAO_DAEMON_PID"))"
+    echo "✓ Daemon    : RUNNING (PID $(pid_from_file "$XIAO_DAEMON_PID"))"
   else
-    echo '✗ xiaod     : STOPPED'
+    echo '✗ Daemon    : STOPPED'
   fi
   if watchdog_is_running; then
     echo "✓ Watchdog  : ACTIVE (PID $(pid_from_file "$XIAO_WATCHDOG_PID"))"

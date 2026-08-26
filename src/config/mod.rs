@@ -92,15 +92,15 @@ impl AppConfig {
         if self.telegram.ui.menu_ttl_seconds == 0 {
             return Err(anyhow!("telegram.ui.menu_ttl_seconds must be > 0"));
         }
-        if !(2..=32).contains(&self.agent.max_turns) {
-            return Err(anyhow!("agent.max_turns must be between 2 and 32"));
+        if !(2..=500).contains(&self.agent.max_turns) {
+            return Err(anyhow!("agent.max_turns must be between 2 and 500"));
         }
-        if !(1..=256).contains(&self.agent.max_tool_calls) {
-            return Err(anyhow!("agent.max_tool_calls must be between 1 and 256"));
+        if !(1..=512).contains(&self.agent.max_tool_calls) {
+            return Err(anyhow!("agent.max_tool_calls must be between 1 and 512"));
         }
-        if !(1..=8).contains(&self.agent.max_no_progress_repeats) {
+        if !(1..=10).contains(&self.agent.max_no_progress_repeats) {
             return Err(anyhow!(
-                "agent.max_no_progress_repeats must be between 1 and 8"
+                "agent.max_no_progress_repeats must be between 1 and 10"
             ));
         }
         if !(10..=3_600).contains(&self.agent.max_runtime_seconds) {
@@ -144,6 +144,16 @@ impl AppConfig {
         if !(1_024..=65_536).contains(&self.agent.tool_output_max_chars) {
             return Err(anyhow!(
                 "agent.tool_output_max_chars must be between 1024 and 65536"
+            ));
+        }
+        if !(1..=16).contains(&self.agent.max_parallel_readonly_tools) {
+            return Err(anyhow!(
+                "agent.max_parallel_readonly_tools must be between 1 and 16"
+            ));
+        }
+        if !(1..=64).contains(&self.agent.max_execution_plan_steps) {
+            return Err(anyhow!(
+                "agent.max_execution_plan_steps must be between 1 and 64"
             ));
         }
         if !matches!(
@@ -327,6 +337,20 @@ pub struct AgentConfig {
     pub summary_threshold_chars: usize,
     #[serde(default = "default_tool_output_max_chars")]
     pub tool_output_max_chars: usize,
+    #[serde(default = "default_max_parallel_readonly_tools")]
+    pub max_parallel_readonly_tools: usize,
+    #[serde(default = "default_max_execution_plan_steps")]
+    pub max_execution_plan_steps: usize,
+    #[serde(default = "yes")]
+    pub provider_streaming: bool,
+    #[serde(default = "yes")]
+    pub parallel_readonly_tools: bool,
+    #[serde(default = "yes")]
+    pub execution_plan_enabled: bool,
+    #[serde(default = "yes")]
+    pub plan_cache_enabled: bool,
+    #[serde(default = "yes")]
+    pub background_learning: bool,
 }
 
 impl Default for AgentConfig {
@@ -339,6 +363,13 @@ impl Default for AgentConfig {
             context_max_chars: default_context_max_chars(),
             summary_threshold_chars: default_summary_threshold_chars(),
             tool_output_max_chars: default_tool_output_max_chars(),
+            max_parallel_readonly_tools: default_max_parallel_readonly_tools(),
+            max_execution_plan_steps: default_max_execution_plan_steps(),
+            provider_streaming: true,
+            parallel_readonly_tools: true,
+            execution_plan_enabled: true,
+            plan_cache_enabled: true,
+            background_learning: true,
         }
     }
 }
@@ -676,16 +707,16 @@ fn default_custom_tool_protocol() -> String {
     "auto".into()
 }
 fn default_agent_max_turns() -> usize {
-    8
+    150
 }
 fn default_agent_max_tool_calls() -> usize {
-    32
+    256
 }
 fn default_agent_no_progress_repeats() -> usize {
-    2
+    3
 }
 fn default_agent_runtime_seconds() -> u64 {
-    600
+    1_800
 }
 fn default_context_max_chars() -> usize {
     32_000
@@ -695,6 +726,12 @@ fn default_summary_threshold_chars() -> usize {
 }
 fn default_tool_output_max_chars() -> usize {
     4_096
+}
+fn default_max_parallel_readonly_tools() -> usize {
+    8
+}
+fn default_max_execution_plan_steps() -> usize {
+    32
 }
 fn default_attachment_image_bytes() -> u64 {
     20 * 1024 * 1024
@@ -886,5 +923,35 @@ mod tests {
         config.agent = AgentConfig::default();
         config.agent.summary_threshold_chars = config.agent.context_max_chars + 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn v031_agent_defaults_match_runtime_contract() {
+        let agent = AgentConfig::default();
+        assert_eq!(agent.max_turns, 150);
+        assert_eq!(agent.max_tool_calls, 256);
+        assert_eq!(agent.max_no_progress_repeats, 3);
+        assert_eq!(agent.max_runtime_seconds, 1_800);
+        assert_eq!(agent.max_parallel_readonly_tools, 8);
+        assert_eq!(agent.max_execution_plan_steps, 32);
+        assert!(agent.provider_streaming);
+        assert!(agent.parallel_readonly_tools);
+        assert!(agent.execution_plan_enabled);
+        assert!(agent.plan_cache_enabled);
+        assert!(agent.background_learning);
+    }
+
+    #[test]
+    fn v031_agent_limits_enforce_hard_ceilings() {
+        let mut config = AppConfig::default();
+        config.validate().unwrap();
+        config.agent.max_turns = 501;
+        assert!(config.validate().unwrap_err().to_string().contains("500"));
+        config.agent.max_turns = 150;
+        config.agent.max_parallel_readonly_tools = 17;
+        assert!(config.validate().unwrap_err().to_string().contains("16"));
+        config.agent.max_parallel_readonly_tools = 8;
+        config.agent.max_execution_plan_steps = 65;
+        assert!(config.validate().unwrap_err().to_string().contains("64"));
     }
 }

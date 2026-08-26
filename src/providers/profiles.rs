@@ -24,6 +24,87 @@ impl ProviderProfileStore {
         Self { storage }
     }
 
+    pub fn set_capability_override(
+        &self,
+        owner_id: &str,
+        profile_id: &str,
+        model_id: &str,
+        capability: &str,
+        owner_override: &str,
+    ) -> Result<()> {
+        if !matches!(capability, "vision" | "file_input") {
+            return Err(anyhow!("capability must be vision or file_input"));
+        }
+        if !matches!(
+            owner_override,
+            "auto" | "force_supported" | "force_unsupported"
+        ) {
+            return Err(anyhow!("invalid capability override"));
+        }
+        let profile = self
+            .get(owner_id, profile_id)?
+            .ok_or_else(|| anyhow!("Custom profile not found"))?;
+        let model = self
+            .model(profile_id, model_id)?
+            .ok_or_else(|| anyhow!("Custom model not found"))?;
+        let state = if capability == "vision" {
+            &model.vision_state
+        } else {
+            &model.file_input_state
+        };
+        let now = Utc::now().to_rfc3339();
+        self.storage.with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET owner_override=excluded.owner_override,source=excluded.source,observed_at=excluded.observed_at",
+                params![profile_id, model_id, profile.protocol, capability, state, owner_override, "owner_override", now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn capability_override(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        protocol: &str,
+        capability: &str,
+    ) -> Result<String> {
+        self.storage.with_conn(|connection| {
+            Ok(connection.query_row(
+                "SELECT owner_override FROM provider_capability_evidence WHERE profile_id=? AND model_id=? AND protocol=? AND capability=?",
+                params![profile_id, model_id, protocol, capability], |row| row.get(0),
+            ).optional()?.unwrap_or_else(|| "auto".into()))
+        })
+    }
+
+    pub fn record_runtime_capability(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        protocol: &str,
+        capability: &str,
+        state: &str,
+        source: &str,
+    ) -> Result<()> {
+        if !matches!(
+            (capability, state),
+            (
+                "vision" | "file_input" | "streaming",
+                "supported" | "unsupported"
+            )
+        ) {
+            return Err(anyhow!("invalid runtime capability evidence"));
+        }
+        let now = Utc::now().to_rfc3339();
+        self.storage.with_conn(|connection| {
+            let transaction=connection.transaction()?;
+            transaction.execute("INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) VALUES(?,?,?,?,?,'auto',?,?) ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET state=excluded.state,source=excluded.source,observed_at=excluded.observed_at", params![profile_id,model_id,protocol,capability,state,source,now])?;
+            if capability=="vision" { transaction.execute("UPDATE provider_profile_models SET vision_state=?,vision_capable=? WHERE profile_id=? AND model_id=?",params![state,(state=="supported") as i32,profile_id,model_id])?; }
+            if capability=="file_input" { transaction.execute("UPDATE provider_profile_models SET file_input_state=?,file_input_capable=? WHERE profile_id=? AND model_id=?",params![state,(state=="supported") as i32,profile_id,model_id])?; }
+            transaction.commit()?; Ok(())
+        })
+    }
+
     pub fn create(&self, mut input: ProviderProfileInput) -> Result<ProviderProfileRecord> {
         input.alias = canonical_alias(&input.alias)?;
         input.endpoint = validate_endpoint(&input.endpoint)?;
@@ -42,8 +123,8 @@ impl ProviderProfileStore {
                 params![input.owner_id, now, now],
             )?;
             transaction.execute(
-                "INSERT INTO provider_profiles(profile_id,owner_id,provider_kind,alias,endpoint,protocol,credential_ref,safe_headers_json,enabled,reachability,created_at,updated_at) VALUES(?,?,'custom',?,?,?,?,?,1,'unknown',?,?)",
-                params![profile_id, input.owner_id, input.alias, input.endpoint, input.protocol, input.credential_ref, input.safe_headers_json, now, now],
+                "INSERT INTO provider_profiles(profile_id,owner_id,provider_kind,alias,endpoint,protocol,credential_ref,api_key_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at) VALUES(?,?,'custom',?,?,?,?,?,?,?,1,'unknown',?,?)",
+                params![profile_id, input.owner_id, input.alias, input.endpoint, input.protocol, input.credential_ref, input.api_key_ref, input.safe_headers_json, input.secret_headers_ref, now, now],
             )?;
             transaction.commit()?;
             Ok(())
@@ -132,8 +213,8 @@ impl ProviderProfileStore {
                 }
             }
             transaction.execute(
-                "INSERT INTO provider_profiles(profile_id,owner_id,provider_kind,alias,endpoint,protocol,credential_ref,safe_headers_json,enabled,reachability,created_at,updated_at) VALUES(?,?,'custom',?,?,?,?,?,1,'unknown',?,?)",
-                params![profile_id, input.owner_id, input.alias, input.endpoint, input.protocol, input.credential_ref, input.safe_headers_json, now, now],
+                "INSERT INTO provider_profiles(profile_id,owner_id,provider_kind,alias,endpoint,protocol,credential_ref,api_key_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at) VALUES(?,?,'custom',?,?,?,?,?,?,?,1,'unknown',?,?)",
+                params![profile_id, input.owner_id, input.alias, input.endpoint, input.protocol, input.credential_ref, input.api_key_ref, input.safe_headers_json, input.secret_headers_ref, now, now],
             )?;
             for model in &models {
                 transaction.execute(
@@ -165,7 +246,7 @@ impl ProviderProfileStore {
     pub fn list(&self, owner_id: &str) -> Result<Vec<ProviderProfileRecord>> {
         self.storage.with_conn(|connection| {
             let mut statement = connection.prepare(
-                "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? ORDER BY updated_at DESC,alias",
+                "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,api_key_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? ORDER BY updated_at DESC,alias",
             )?;
             let rows = statement.query_map(params![owner_id], row_profile)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -176,7 +257,7 @@ impl ProviderProfileStore {
         self.storage.with_conn(|connection| {
             connection
                 .query_row(
-                    "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
+                    "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,api_key_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
                     params![owner_id, profile_id],
                     row_profile,
                 )
@@ -189,7 +270,7 @@ impl ProviderProfileStore {
         self.storage.with_conn(|connection| {
             connection
                 .query_row(
-                    "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE profile_id=?",
+                    "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,api_key_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE profile_id=?",
                     params![profile_id],
                     row_profile,
                 )
@@ -207,7 +288,7 @@ impl ProviderProfileStore {
         self.storage.with_conn(|connection| {
             connection
                 .query_row(
-                    "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND alias=?",
+                    "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,api_key_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND alias=?",
                     params![owner_id, alias],
                     row_profile,
                 )
@@ -253,6 +334,86 @@ impl ProviderProfileStore {
         )
     }
 
+    pub fn set_direct_api_key(
+        &self,
+        secrets: &SecretStore,
+        owner_id: &str,
+        profile_id: &str,
+        api_key: &str,
+    ) -> Result<String> {
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            return Err(anyhow!("API key cannot be empty"));
+        }
+        let profile = self
+            .get(owner_id, profile_id)?
+            .ok_or_else(|| anyhow!("Custom profile not found for owner"))?;
+        let ref_id = format!(
+            "custom-api-key:{}:{}",
+            profile.profile_id.replace(':', "_"),
+            Uuid::new_v4().simple()
+        );
+        secrets.put(&ref_id, api_key)?;
+        self.update_exact(
+            owner_id,
+            profile_id,
+            "UPDATE provider_profiles SET api_key_ref=?,updated_at=? WHERE owner_id=? AND profile_id=?",
+            params![Some(&ref_id), Utc::now().to_rfc3339(), owner_id, profile_id],
+        )?;
+        Ok(ref_id)
+    }
+
+    pub fn resolve_api_key(
+        &self,
+        secrets: &SecretStore,
+        profile: &ProviderProfileRecord,
+    ) -> Result<Option<String>> {
+        if let Some(key_ref) = &profile.api_key_ref {
+            if let Some(key) = secrets.get(key_ref)? {
+                return Ok(Some(key));
+            }
+        }
+        if let Some(cred_ref) = &profile.credential_ref {
+            if let Some(cred_str) = secrets.get(&format!("account-{cred_ref}"))? {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cred_str) {
+                    if let Some(key) = val.get("api_key").and_then(|k| k.as_str()) {
+                        return Ok(Some(key.to_string()));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn migrate_legacy_credentials(
+        &self,
+        secrets: &SecretStore,
+        auth: &AuthManager,
+    ) -> Result<usize> {
+        let unmigrated: Vec<(String, String, String)> = self.storage.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT owner_id, profile_id, credential_ref FROM provider_profiles WHERE api_key_ref IS NULL AND credential_ref IS NOT NULL",
+            )?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?;
+
+        let mut count = 0;
+        for (owner_id, profile_id, cred_ref) in unmigrated {
+            if let Ok(Some(cred)) = auth.credential(&cred_ref) {
+                if let Some(key) = cred.api_key {
+                    if !key.trim().is_empty() {
+                        let _ = self.set_direct_api_key(secrets, &owner_id, &profile_id, &key)?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
     pub fn edit_metadata(
         &self,
         owner_id: &str,
@@ -287,6 +448,7 @@ impl ProviderProfileStore {
                 params![next_alias, next_protocol, next_headers, Utc::now().to_rfc3339(), owner_id, profile_id],
             )?;
             if protocol.is_some_and(|value| value != current.1) {
+                transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
                 transaction.execute(
                     "DELETE FROM provider_profile_models WHERE profile_id=?",
                     params![profile_id],
@@ -305,7 +467,7 @@ impl ProviderProfileStore {
         self.storage.with_conn(|connection| {
             let transaction = connection.transaction()?;
             let changed = transaction.execute(
-                "UPDATE provider_profiles SET endpoint=?,credential_ref=NULL,safe_headers_json='{}',secret_headers_ref=NULL,reachability='unknown',last_probe_at=NULL,updated_at=? WHERE owner_id=? AND profile_id=?",
+                "UPDATE provider_profiles SET endpoint=?,credential_ref=NULL,api_key_ref=NULL,safe_headers_json='{}',secret_headers_ref=NULL,reachability='unknown',last_probe_at=NULL,updated_at=? WHERE owner_id=? AND profile_id=?",
                 params![endpoint, Utc::now().to_rfc3339(), owner_id, profile_id],
             )?;
             if changed != 1 {
@@ -315,6 +477,7 @@ impl ProviderProfileStore {
                 "DELETE FROM provider_profile_models WHERE profile_id=?",
                 params![profile_id],
             )?;
+            transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
             transaction.commit()?;
             Ok(())
         })
@@ -344,7 +507,7 @@ impl ProviderProfileStore {
         self.storage.with_conn(|connection| {
             let transaction = connection.transaction()?;
             let changed = transaction.execute(
-                "UPDATE provider_profiles SET endpoint=?,credential_ref=NULL,safe_headers_json='{}',secret_headers_ref=NULL,reachability='unknown',last_probe_at=NULL,updated_at=? WHERE owner_id=? AND profile_id=?",
+                "UPDATE provider_profiles SET endpoint=?,credential_ref=NULL,api_key_ref=NULL,safe_headers_json='{}',secret_headers_ref=NULL,reachability='unknown',last_probe_at=NULL,updated_at=? WHERE owner_id=? AND profile_id=?",
                 params![endpoint, Utc::now().to_rfc3339(), owner_id, profile_id],
             )?;
             if changed != 1 {
@@ -354,6 +517,7 @@ impl ProviderProfileStore {
                 "DELETE FROM provider_profile_models WHERE profile_id=?",
                 params![profile_id],
             )?;
+            transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
             transaction.commit()?;
             Ok(())
         })?;
@@ -482,10 +646,16 @@ impl ProviderProfileStore {
         profile_id: &str,
         secrets: &SecretStore,
     ) -> Result<Option<String>> {
+        let profile = self.get(owner_id, profile_id)?;
         let credential = self.delete(owner_id, profile_id)?;
         let secret_ref = secret_headers_ref_for(profile_id);
         let _ = secrets.remove(&secret_ref);
         let _ = secrets.rollback_staged(&secret_ref);
+        if let Some(p) = profile {
+            if let Some(key_ref) = p.api_key_ref {
+                let _ = secrets.remove(&key_ref);
+            }
+        }
         Ok(credential)
     }
 
@@ -514,7 +684,9 @@ impl ProviderProfileStore {
             endpoint: endpoint.into(),
             protocol: config.protocol.clone(),
             credential_ref,
+            api_key_ref: None,
             safe_headers_json: serde_json::to_string(&config.headers)?,
+            secret_headers_ref: None,
         })?;
         let capabilities = config
             .models
@@ -797,7 +969,7 @@ impl CustomProfileService {
                 }
             }
             transaction.execute(
-                "INSERT INTO provider_profiles(profile_id,owner_id,provider_kind,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at) VALUES(?,?,'custom',?,?,?,?,?, ?,1,'unknown',?,?)",
+                "INSERT INTO provider_profiles(profile_id,owner_id,provider_kind,alias,endpoint,protocol,credential_ref,api_key_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at) VALUES(?,?,'custom',?,?,?,?,NULL,?,?,1,'unknown',?,?)",
                 params![profile_id, owner_id, alias, endpoint, protocol, credential_ref, safe_headers_json, new_secret_ref, now, now],
             )?;
             transaction.commit()?;
@@ -817,7 +989,7 @@ impl CustomProfileService {
             .with_conn(|connection| {
                 connection
                     .query_row(
-                        "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
+                        "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,api_key_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
                         params![owner_id, profile_id],
                         row_profile,
                     )
@@ -857,7 +1029,9 @@ impl CustomProfileService {
                     endpoint: endpoint.into(),
                     protocol: protocol.into(),
                     credential_ref: existing_credential_ref.map(str::to_owned),
+                    api_key_ref: None,
                     safe_headers_json: serde_json::to_string(&safe_headers)?,
+                    secret_headers_ref: None,
                 },
                 models,
                 session_id,
@@ -932,7 +1106,7 @@ impl CustomProfileService {
             .with_conn(|connection| {
                 connection
                     .query_row(
-                        "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
+                        "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,api_key_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
                         params![owner_id, profile_id],
                         row_profile,
                     )
@@ -1050,6 +1224,7 @@ impl CustomProfileService {
                 params![next_alias, next_endpoint, next_protocol, next_safe_headers, next_secret_ref, next_credential_ref, Utc::now().to_rfc3339(), owner_id, profile_id],
             )?;
             if endpoint_changed || protocol_changed {
+                transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
                 transaction.execute(
                     "DELETE FROM provider_profile_models WHERE profile_id=?",
                     params![profile_id],
@@ -1149,7 +1324,7 @@ impl CustomProfileService {
             .with_conn(|connection| {
                 connection
                     .query_row(
-                        "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
+                        "SELECT profile_id,owner_id,alias,endpoint,protocol,credential_ref,api_key_ref,safe_headers_json,secret_headers_ref,enabled,reachability,created_at,updated_at,last_probe_at FROM provider_profiles WHERE owner_id=? AND profile_id=?",
                         params![owner_id, profile_id],
                         row_profile,
                     )
@@ -1228,13 +1403,14 @@ fn row_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderProfileRecor
         endpoint: row.get(3)?,
         protocol: row.get(4)?,
         credential_ref: row.get(5)?,
-        safe_headers_json: row.get(6)?,
-        secret_headers_ref: row.get(7)?,
-        enabled: row.get::<_, i64>(8)? != 0,
-        reachability: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
-        last_probe_at: row.get(12)?,
+        api_key_ref: row.get(6)?,
+        safe_headers_json: row.get(7)?,
+        secret_headers_ref: row.get(8)?,
+        enabled: row.get::<_, i64>(9)? != 0,
+        reachability: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        last_probe_at: row.get(13)?,
     })
 }
 
@@ -1442,7 +1618,9 @@ mod tests {
                 endpoint: "https://a.example/v1".into(),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: Some("credential-a".into()),
+                api_key_ref: None,
                 safe_headers_json: r#"{"X-Workspace":"A"}"#.into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         store

@@ -181,6 +181,8 @@ struct CustomProfileActionRequest {
     clear_secret_headers: bool,
     session_id: Option<String>,
     model: Option<String>,
+    capability: Option<String>,
+    owner_override: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,10 +233,16 @@ struct LogsQuery {
 
 pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
     let cfg = app.config.read().await.clone();
-    let addr = cfg.ipc.socket_addr()?;
-    if !addr.ip().is_loopback() {
-        return Err(anyhow!("refusing non-loopback IPC bind"));
-    }
+    let paths = crate::standalone::CliPaths {
+        config: config_path.as_ref().to_owned(),
+        client_config: config_path.as_ref().with_file_name("client.toml"),
+        default_data_dir: cfg.paths.data_dir.clone(),
+    };
+    let runtime = crate::standalone::RuntimeLayout::from_config(&paths, &cfg);
+    crate::standalone::ensure_parent(&runtime.control_socket)?;
+    crate::standalone::set_private_dir(&runtime.run_dir)?;
+    let _ = std::fs::remove_file(&runtime.control_socket);
+
     let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
     let client_token = load_or_create_token(&secrets, "ipc-client-token")?;
     let admin_token = load_or_create_token(&secrets, "ipc-admin-token")?;
@@ -264,6 +272,10 @@ pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
         .route("/v1/admin/dashboard", get(manager_dashboard))
         .route("/v1/admin/providers", get(manager_providers))
         .route(
+            "/v1/admin/agent",
+            get(manager_agent).post(manager_agent_action),
+        )
+        .route(
             "/v1/admin/providers/custom",
             post(manager_custom_profile_action),
         )
@@ -292,10 +304,25 @@ pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
             get(manager_security).post(manager_approval_action),
         )
         .route("/v1/admin/diagnostics", get(manager_diagnostics))
+        .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "local authenticated IPC listening");
-    axum::serve(listener, router).await?;
+    #[cfg(unix)]
+    {
+        let listener = tokio::net::UnixListener::bind(&runtime.control_socket)?;
+        crate::standalone::set_private_file(&runtime.control_socket)?;
+        tracing::info!(
+            socket = %runtime.control_socket.display(),
+            "local Unix control socket listening"
+        );
+        let res = axum::serve(listener, router).await;
+        let _ = std::fs::remove_file(&runtime.control_socket);
+        res?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = router;
+        anyhow::bail!("xiao control socket requires a unix-like platform");
+    }
     Ok(())
 }
 
@@ -901,7 +928,31 @@ async fn manager_providers(
         .map(|profile| {
             let models = profiles_store
                 .models(&profile.profile_id)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .map(|model| {
+                    let vision_override = profiles_store
+                        .capability_override(
+                            &profile.profile_id,
+                            &model.model_id,
+                            &profile.protocol,
+                            "vision",
+                        )
+                        .unwrap_or_else(|_| "auto".into());
+                    let file_input_override = profiles_store
+                        .capability_override(
+                            &profile.profile_id,
+                            &model.model_id,
+                            &profile.protocol,
+                            "file_input",
+                        )
+                        .unwrap_or_else(|_| "auto".into());
+                    let mut value = serde_json::to_value(model).unwrap_or_default();
+                    value["vision_override"] = json!(vision_override);
+                    value["file_input_override"] = json!(file_input_override);
+                    value
+                })
+                .collect::<Vec<_>>();
             // Header values are write-only just like API keys. The manager may expose
             // names for inspection, but never returns stored values to a frontend.
             // P1-4: safe_headers -> DB, secret_headers -> SecretStore, only names in JSON.
@@ -1199,6 +1250,30 @@ async fn manager_custom_profile_action(
                 .map_err(bad)?;
             Ok(Json(json!({"ok":true,"models":models})))
         }
+        "capability_override" => {
+            let profile_id = req
+                .profile_id
+                .as_deref()
+                .ok_or_else(|| bad("profile_id is required"))?;
+            let model = req
+                .model
+                .as_deref()
+                .ok_or_else(|| bad("model is required"))?;
+            let capability = req
+                .capability
+                .as_deref()
+                .ok_or_else(|| bad("capability is required"))?;
+            let owner_override = req
+                .owner_override
+                .as_deref()
+                .ok_or_else(|| bad("owner_override is required"))?;
+            profiles
+                .set_capability_override(&owner, profile_id, model, capability, owner_override)
+                .map_err(bad)?;
+            Ok(Json(
+                json!({"ok":true,"profile_id":profile_id,"model":model,"capability":capability,"owner_override":owner_override}),
+            ))
+        }
         "probe" => {
             // P0-4 WebUI exact-model probe: bounded single-model probe -> persist, no catalog discovery.
             let profile_id = req
@@ -1323,6 +1398,59 @@ async fn manager_runtime(
             "secrets": "configured (private)",
         },
     })))
+}
+
+async fn manager_agent(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !authorized_admin(&headers, &state) {
+        return Err(deny());
+    }
+    let agent = state.app.config.read().await.agent.clone();
+    Ok(Json(json!({
+        "settings": agent,
+        "effective": agent,
+        "generation": state.app.storage.schema_version().map_err(bad)?,
+        "loaded": true,
+        "active_runs": state.app.storage.manager_counts(&state.app.storage.management_owner_id().map_err(bad)?).map_err(bad)?.running_runs
+    })))
+}
+
+async fn manager_agent_action(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !authorized_admin(&headers, &state) {
+        return Err(deny());
+    }
+    if body.get("action").and_then(serde_json::Value::as_str) != Some("update") {
+        return Err(bad(anyhow!("agent action must be update")));
+    }
+    let mut config = state.app.config.read().await.clone();
+    let mut value = serde_json::to_value(&config.agent).map_err(bad)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| bad(anyhow!("invalid agent settings")))?;
+    for (key, next) in body.as_object().into_iter().flatten() {
+        if key != "action" {
+            if !object.contains_key(key) {
+                return Err(bad(anyhow!("unknown agent setting {key}")));
+            }
+            object.insert(key.clone(), next.clone());
+        }
+    }
+    config.agent = serde_json::from_value(value).map_err(bad)?;
+    config.validate().map_err(bad)?;
+    config.save_atomic(&state.config_path).map_err(bad)?;
+    *state.app.config.write().await = config.clone();
+    state
+        .app
+        .commands
+        .update_agent_config(config.agent.clone())
+        .await;
+    Ok(Json(json!({"applied":true,"settings":config.agent})))
 }
 
 async fn manager_context(
@@ -1680,6 +1808,11 @@ async fn manager_runs(
                 .storage
                 .dependency_installs(&run.id)
                 .unwrap_or_default();
+            let timings = state
+                .app
+                .storage
+                .agent_run_events(&run.id)
+                .unwrap_or_default();
             let result = state
                 .app
                 .storage
@@ -1710,6 +1843,7 @@ async fn manager_runs(
                 },
                 "tools": tools,
                 "dependency_installs": dependencies,
+                "timings": timings,
             })
         })
         .collect::<Vec<_>>();
@@ -2391,6 +2525,8 @@ mod tests {
                 clear_secret_headers: false,
                 session_id: None,
                 model: None,
+                capability: None,
+                owner_override: None,
             }),
         )
         .await
@@ -2426,6 +2562,8 @@ mod tests {
                 clear_secret_headers: false,
                 session_id: None,
                 model: None,
+                capability: None,
+                owner_override: None,
             }),
         )
         .await;
@@ -2644,10 +2782,10 @@ mod tests {
     }
 
     #[test]
-    fn webui_uses_only_typed_xiaod_manager_actions() {
+    fn webui_uses_only_typed_xiao_daemon_manager_actions() {
         // Keep the source contract explicit and let CI prove that the checked-in
         // Vite bundle is regenerated from it. The browser may transport only
-        // typed manager resources; all authority remains in xiaod.
+        // typed manager resources; all authority remains in xiao daemon.
         let javascript = include_str!("../../module/webroot/assets/app.js");
         let html = include_str!("../../module/webroot/index.html");
         let app = include_str!("../../webui/src/App.jsx");

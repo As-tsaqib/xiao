@@ -61,6 +61,10 @@ impl TelegramEmojiRegistry {
         Self::default()
     }
 
+    pub fn set(&mut self, icon: ProgressIcon, custom_emoji_id: Option<&str>, validated: bool) {
+        self.set_verified_custom_emoji(icon, custom_emoji_id, validated);
+    }
+
     pub fn set_verified_custom_emoji(
         &mut self,
         icon: ProgressIcon,

@@ -4,11 +4,11 @@ const MANAGER_POST = 'manager-post-base64';
 const GET_RESOURCES = new Set([
   'dashboard', 'telegram', 'providers', 'runtime', 'context', 'sessions',
   'runs', 'attachments', 'memory', 'skills', 'tools', 'security',
-  'diagnostics', 'logs'
+  'diagnostics', 'logs', 'agent'
 ]);
 const POST_RESOURCES = new Set([
   'telegram', 'provider-custom', 'sessions', 'runs', 'attachments', 'memory',
-  'skills', 'security'
+  'skills', 'security', 'agent'
 ]);
 let sequence = 0;
 

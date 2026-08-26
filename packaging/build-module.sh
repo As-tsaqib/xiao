@@ -20,16 +20,11 @@ else
   BUILD="$ROOT/target/$RUST_TARGET/$PROFILE"
 fi
 
-for binary in xiao xiaod; do
-  [ -x "$BUILD/$binary" ] || {
-    echo "Missing executable: $BUILD/$binary" >&2
-    exit 1
-  }
-  file "$BUILD/$binary" | grep -q 'ELF 64-bit.*ARM aarch64' || {
-    echo "Not an Android arm64 ELF binary: $BUILD/$binary" >&2
-    exit 1
-  }
-done
+[ -x "$BUILD/xiao" ] || { echo "Missing executable: $BUILD/xiao" >&2; exit 1; }
+file "$BUILD/xiao" | grep -q 'ELF 64-bit.*ARM aarch64' || {
+  echo "Not an Android arm64 ELF binary: $BUILD/xiao" >&2
+  exit 1
+}
 
 mkdir -p "$OUT"
 STAGE=$(mktemp -d "${TMPDIR:-$OUT}/xiao-kernelsu-arm64.XXXXXX")
@@ -43,13 +38,12 @@ sed -i \
   -e "s/@MODULE_VERSION@/$MODULE_VERSION/g" \
   -e "s/@VERSION_CODE@/$VERSION_CODE/g" \
   "$STAGE/module.prop"
-install -m 0755 "$BUILD/xiaod" "$STAGE/bin/xiaod"
 install -m 0755 "$BUILD/xiao" "$STAGE/bin/xiao"
 
 find "$STAGE" -type d -exec chmod 0755 {} +
 find "$STAGE" -type f -exec chmod 0644 {} +
 find "$STAGE" -type f -name '*.sh' -exec chmod 0755 {} +
-chmod 0755 "$STAGE/bin/xiao" "$STAGE/bin/xiaod"
+chmod 0755 "$STAGE/bin/xiao"
 chmod 0755 "$STAGE/termux/xiao-wrapper"
 
 required=(
@@ -65,7 +59,6 @@ required=(
   skip_mount
   config.example.toml
   bin/xiao
-  bin/xiaod
   webroot/index.html
   webroot/assets/app.js
   webroot/assets/app.css
@@ -78,6 +71,10 @@ for entry in "${required[@]}"; do
     exit 1
   }
 done
+[ "$(find "$STAGE/bin" -maxdepth 1 -type f | wc -l)" -eq 1 ] || {
+  echo 'Module must ship exactly one regular native executable.' >&2
+  exit 1
+}
 
 for script in "$STAGE"/*.sh; do
   sh -n "$script"
@@ -113,16 +110,14 @@ if find "$STAGE" -type f \( -name '*.db' -o -name '*.db-*' -o -name '*.secret' \
 fi
 
 if command -v readelf >/dev/null 2>&1; then
-  for binary in "$STAGE/bin/xiao" "$STAGE/bin/xiaod"; do
-    readelf -l "$binary" | grep '/system/bin/linker64' >/dev/null || {
-      echo "Unexpected Android interpreter: $binary" >&2
-      exit 1
-    }
-    ! readelf -d "$binary" | grep -E 'libssl|libcrypto|libstdc\+\+|libgcc_s' >/dev/null || {
-      echo "Unexpected non-system runtime dependency: $binary" >&2
-      exit 1
-    }
-  done
+  readelf -l "$STAGE/bin/xiao" | grep '/system/bin/linker64' >/dev/null || {
+    echo 'Unexpected Android interpreter: xiao' >&2
+    exit 1
+  }
+  ! readelf -d "$STAGE/bin/xiao" | grep -E 'libssl|libcrypto|libstdc\+\+|libgcc_s' >/dev/null || {
+    echo 'Unexpected non-system runtime dependency: xiao' >&2
+    exit 1
+  }
 fi
 
 find "$STAGE" -exec touch -t 202601010000 {} +

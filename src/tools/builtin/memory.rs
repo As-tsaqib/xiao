@@ -181,6 +181,6 @@ impl Tool for MemoryDeleteTool {
             &arguments.key,
             Some(&context.session_id),
         )?;
-        Ok(serde_json::to_string(&json!({"deleted":deleted}))?)
+        Ok(serde_json::to_string(&json!({ "deleted": deleted }))?)
     }
 }

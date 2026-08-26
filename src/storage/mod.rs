@@ -97,6 +97,14 @@ pub struct AgentRunRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunEventRecord {
+    pub event_kind: String,
+    pub elapsed_ms: u64,
+    pub metadata: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolRunRecord {
     pub id: String,
     pub agent_run_id: String,
@@ -220,6 +228,7 @@ pub struct ProviderProfileRecord {
     pub endpoint: String,
     pub protocol: String,
     pub credential_ref: Option<String>,
+    pub api_key_ref: Option<String>,
     pub safe_headers_json: String,
     pub secret_headers_ref: Option<String>,
     pub enabled: bool,
@@ -254,7 +263,7 @@ pub struct ProviderProfileModelRecord {
     pub probed_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProviderProfileInput {
     pub profile_id: Option<String>,
     pub owner_id: String,
@@ -262,7 +271,9 @@ pub struct ProviderProfileInput {
     pub endpoint: String,
     pub protocol: String,
     pub credential_ref: Option<String>,
+    pub api_key_ref: Option<String>,
     pub safe_headers_json: String,
+    pub secret_headers_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -833,6 +844,7 @@ impl Storage {
                   endpoint TEXT NOT NULL,
                   protocol TEXT NOT NULL,
                   credential_ref TEXT,
+                  api_key_ref TEXT,
                   safe_headers_json TEXT NOT NULL DEFAULT '{}',
                   secret_headers_ref TEXT,
                   enabled INTEGER NOT NULL DEFAULT 1,
@@ -1343,6 +1355,71 @@ impl Storage {
                 )?;
                 transaction.commit()?;
             }
+            {
+                let transaction = conn.transaction()?;
+                ensure_column(&transaction, "provider_profiles", "api_key_ref", "TEXT")?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version) VALUES(26)",
+                    [],
+                )?;
+                transaction.commit()?;
+            }
+            {
+                let transaction = conn.transaction()?;
+                transaction.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS provider_capability_evidence(
+                      profile_id TEXT NOT NULL,
+                      model_id TEXT NOT NULL,
+                      protocol TEXT NOT NULL,
+                      capability TEXT NOT NULL,
+                      state TEXT NOT NULL CHECK(state IN ('supported','unsupported','unknown')),
+                      owner_override TEXT NOT NULL DEFAULT 'auto' CHECK(owner_override IN ('auto','force_supported','force_unsupported')),
+                      source TEXT NOT NULL,
+                      observed_at TEXT NOT NULL,
+                      PRIMARY KEY(profile_id,model_id,protocol,capability)
+                    );
+                    CREATE TABLE IF NOT EXISTS learning_jobs(
+                      id TEXT PRIMARY KEY,
+                      owner_id TEXT NOT NULL,
+                      run_id TEXT NOT NULL UNIQUE,
+                      status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed')),
+                      attempts INTEGER NOT NULL DEFAULT 0,
+                      not_before TEXT NOT NULL,
+                      last_error_redacted TEXT,
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS tool_run_steps(
+                      id TEXT PRIMARY KEY,
+                      parent_tool_run_id TEXT NOT NULL REFERENCES tool_runs(id) ON DELETE CASCADE,
+                      step_index INTEGER NOT NULL,
+                      step_id TEXT NOT NULL,
+                      program TEXT NOT NULL,
+                      arguments_json TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      output TEXT,
+                      error TEXT,
+                      created_at TEXT NOT NULL,
+                      completed_at TEXT,
+                      UNIQUE(parent_tool_run_id,step_index)
+                    );
+                    CREATE TABLE IF NOT EXISTS agent_run_events(
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+                      event_kind TEXT NOT NULL,
+                      elapsed_ms INTEGER NOT NULL,
+                      metadata_json TEXT NOT NULL DEFAULT '{}',
+                      created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_agent_run_events_run ON agent_run_events(agent_run_id,id);
+                    INSERT OR IGNORE INTO schema_migrations(version) VALUES(27);
+                    "#,
+                )?;
+                ensure_column(&transaction, "learning_jobs", "payload_json", "TEXT NOT NULL DEFAULT '{}'")?;
+                ensure_column(&transaction, "learning_jobs", "delivered_at", "TEXT")?;
+                transaction.commit()?;
+            }
             // A database can be opened once before a legacy owner row is
             // materialized by an older frontend (for example a v0.2.5
             // session written after the first v0.2.7 boot). Re-scan on every
@@ -1775,7 +1852,7 @@ impl Storage {
         })
     }
 
-    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+    pub fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         let run = || {
             let mut conn = self
                 .conn
@@ -1815,6 +1892,49 @@ impl Storage {
                     |row| row.get(0),
                 )
                 .map_err(Into::into)
+        })
+    }
+
+    pub fn enqueue_learning_job(
+        &self,
+        owner_id: &str,
+        run_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let id = Uuid::new_v4().to_string();
+        let payload = serde_json::to_string(&crate::security::redact::redact_json(payload))?;
+        self.with_conn(|connection| { connection.execute("INSERT INTO learning_jobs(id,owner_id,run_id,status,attempts,not_before,created_at,updated_at,payload_json) VALUES(?,?,?,'pending',0,'9999-12-31T23:59:59Z',?,?,?) ON CONFLICT(run_id) DO NOTHING",params![id,owner_id,run_id,now,now,payload])?; Ok(()) })
+    }
+
+    pub fn release_learning_job_after_delivery(&self, run_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(|connection| { connection.execute("UPDATE learning_jobs SET not_before=?,delivered_at=?,updated_at=? WHERE run_id=? AND status='pending'",params![now,now,now,run_id])?; Ok(()) })
+    }
+
+    pub fn claim_learning_job(
+        &self,
+    ) -> Result<Option<(String, String, String, serde_json::Value)>> {
+        self.with_conn(|connection| {
+            let transaction=connection.transaction()?; let now=Utc::now(); let stale=(now-chrono::Duration::minutes(15)).to_rfc3339();
+            transaction.execute("UPDATE learning_jobs SET status='pending',updated_at=? WHERE status='running' AND updated_at<? AND attempts<3",params![now.to_rfc3339(),stale])?;
+            let job=transaction.query_row("SELECT id,owner_id,run_id,payload_json FROM learning_jobs WHERE status='pending' AND delivered_at IS NOT NULL AND not_before<=? AND attempts<3 ORDER BY created_at LIMIT 1",params![now.to_rfc3339()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))).optional()?;
+            if let Some((id,owner,run,payload))=job { transaction.execute("UPDATE learning_jobs SET status='running',attempts=attempts+1,updated_at=? WHERE id=?",params![now.to_rfc3339(),id])?; transaction.commit()?; return Ok(Some((id,owner,run,serde_json::from_str(&payload)?))); }
+            transaction.commit()?; Ok(None)
+        })
+    }
+
+    pub fn finish_learning_job(&self, id: &str, result: Result<(), &str>) -> Result<()> {
+        let (status, error) = match result {
+            Ok(()) => ("succeeded", None),
+            Err(error) => ("failed", Some(crate::security::redact::redact_text(error))),
+        };
+        self.with_conn(|connection| {
+            connection.execute(
+                "UPDATE learning_jobs SET status=?,last_error_redacted=?,updated_at=? WHERE id=?",
+                params![status, error, Utc::now().to_rfc3339(), id],
+            )?;
+            Ok(())
         })
     }
 
@@ -2273,6 +2393,44 @@ impl Storage {
         })
     }
 
+    pub fn record_agent_run_event(
+        &self,
+        run_id: &str,
+        event_kind: &str,
+        elapsed_ms: u64,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        if !matches!(
+            event_kind,
+            "pre_provider_overhead"
+                | "provider_request_start"
+                | "first_byte"
+                | "first_visible_text_delta"
+                | "provider_completion"
+                | "tool_group"
+                | "verification"
+                | "final_answer_ready"
+                | "final_frontend_delivery"
+                | "background_learning"
+        ) {
+            return Err(anyhow::anyhow!("invalid agent timing event"));
+        }
+        let metadata = serde_json::to_string(&crate::security::redact::redact_json(metadata))?;
+        self.with_conn(|connection| {
+            connection.execute("INSERT INTO agent_run_events(agent_run_id,event_kind,elapsed_ms,metadata_json,created_at) VALUES(?,?,?,?,?)", params![run_id,event_kind,elapsed_ms.min(86_400_000) as i64,metadata,Utc::now().to_rfc3339()])?;
+            connection.execute("DELETE FROM agent_run_events WHERE agent_run_id=? AND id NOT IN (SELECT id FROM agent_run_events WHERE agent_run_id=? ORDER BY id DESC LIMIT 128)", params![run_id,run_id])?;
+            Ok(())
+        })
+    }
+
+    pub fn agent_run_events(&self, run_id: &str) -> Result<Vec<AgentRunEventRecord>> {
+        self.with_conn(|connection| {
+            let mut statement=connection.prepare("SELECT event_kind,elapsed_ms,metadata_json,created_at FROM agent_run_events WHERE agent_run_id=? ORDER BY id")?;
+            let rows=statement.query_map(params![run_id], |row| Ok(AgentRunEventRecord { event_kind:row.get(0)?, elapsed_ms:row.get::<_,i64>(1)?.max(0) as u64, metadata:serde_json::from_str(&row.get::<_,String>(2)?).unwrap_or_default(), created_at:row.get(3)? }))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
     /// Return an assistant result persisted within this run's observable time
     /// window, so a later answer in the same session is never misattributed.
     pub fn agent_run_result(&self, owner: &str, run: &AgentRunRecord) -> Result<Option<String>> {
@@ -2313,6 +2471,45 @@ impl Storage {
             Ok(())
         })?;
         Ok(id)
+    }
+
+    pub fn create_tool_run_step(
+        &self,
+        agent_run_id: &str,
+        step_index: usize,
+        step_id: &str,
+        program: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let arguments = serde_json::to_string(&crate::security::redact::redact_json(arguments))?;
+        self.with_conn(|connection| {
+            let parent:String=connection.query_row("SELECT id FROM tool_runs WHERE agent_run_id=? AND tool_name='termux_job' AND status='running' ORDER BY started_at DESC LIMIT 1", params![agent_run_id], |row| row.get(0))?;
+            connection.execute("INSERT INTO tool_run_steps(id,parent_tool_run_id,step_index,step_id,program,arguments_json,status,created_at) VALUES(?,?,?,?,?,?,'running',?)", params![id,parent,step_index as i64,step_id,program,arguments,Utc::now().to_rfc3339()])?;
+            Ok(id.clone())
+        })
+    }
+
+    pub fn finish_tool_run_step(
+        &self,
+        id: &str,
+        status: &str,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn(|connection| {
+            connection.execute(
+                "UPDATE tool_run_steps SET status=?,output=?,error=?,completed_at=? WHERE id=?",
+                params![
+                    status,
+                    output.map(crate::security::redact::redact_text),
+                    error.map(crate::security::redact::redact_text),
+                    Utc::now().to_rfc3339(),
+                    id
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn set_tool_run_status(
@@ -4905,7 +5102,7 @@ mod tests {
                 connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                     row.get(0)
                 })?;
-            assert_eq!(latest, 25);
+            assert_eq!(latest, 27);
             for table in [
                 "agent_runs",
                 "tool_runs",

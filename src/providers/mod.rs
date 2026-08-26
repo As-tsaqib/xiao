@@ -1,5 +1,5 @@
 mod payload;
-mod profiles;
+pub mod profiles;
 
 pub use profiles::{
     secret_headers_ref_for, CustomProfileEdit, CustomProfileService, ProviderProfileStore,
@@ -212,6 +212,7 @@ pub enum AgentEvent {
         provider: String,
         bytes: usize,
     },
+    TextDelta(String),
     GenerationCompleted,
     GenerationFailed(String),
 }
@@ -760,8 +761,10 @@ fn profile_capabilities_from_record(
     };
     ProviderCapabilities {
         text: record.text_capable,
-        vision: record.vision_state == "supported" && record.vision_capable,
-        file_input: record.file_input_state == "supported" && record.file_input_capable,
+        // Unknown is an optimistic real-request state. Only explicit
+        // Unsupported evidence closes the route.
+        vision: record.vision_state != "unsupported",
+        file_input: record.file_input_state != "unsupported",
         native_tools: protocol == ToolProtocol::Native,
         tool_protocol: protocol,
         model_discovery: record.model_discovery,
@@ -909,7 +912,7 @@ impl Provider for CodexProvider {
             .send()
             .await?;
         let response = ensure_success(response, "Codex").await?;
-        let streamed = consume_responses_sse(response, "codex", progress.clone()).await?;
+        let streamed = consume_responses_sse(response, "codex", progress.clone(), true).await?;
         if !streamed.tool_calls.is_empty() {
             let mut next_input = input;
             next_input.extend(streamed.function_items);
@@ -1341,14 +1344,10 @@ impl CustomProvider {
             }
             // Critical isolation rule: resolve only the selected profile's
             // credential reference. Absence means no Authorization header.
-            let api_key = match profile.credential_ref.as_deref() {
-                Some(reference) => self
-                    .auth
-                    .credential(reference)?
-                    .and_then(|credential| credential.api_key)
-                    .filter(|key| !key.trim().is_empty()),
-                None => None,
-            };
+            let api_key = self
+                .profiles
+                .resolve_api_key(self.auth.secrets(), &profile)?
+                .filter(|key| !key.trim().is_empty());
             let headers = profile.merged_headers(self.auth.secrets())?;
             return Ok(CustomTarget {
                 base_url: profile.endpoint,
@@ -1443,7 +1442,8 @@ impl Provider for CustomProvider {
         let Some(profile_id) = profile_id else {
             return self.capabilities(model);
         };
-        self.profiles
+        let mut capabilities = self
+            .profiles
             .model(profile_id, model)
             .ok()
             .flatten()
@@ -1452,7 +1452,24 @@ impl Provider for CustomProvider {
                 ProviderCapabilities::chat_only(
                     "selected Custom profile/model has not passed capability probing",
                 )
-            })
+            });
+        if let Ok(Some(profile)) = self.profiles.get_by_id(profile_id) {
+            for (capability, target) in [
+                ("vision", &mut capabilities.vision),
+                ("file_input", &mut capabilities.file_input),
+            ] {
+                match self
+                    .profiles
+                    .capability_override(profile_id, model, &profile.protocol, capability)
+                    .as_deref()
+                {
+                    Ok("force_supported") => *target = true,
+                    Ok("force_unsupported") => *target = false,
+                    _ => {}
+                }
+            }
+        }
+        capabilities
     }
     fn supports_semantic_evaluation(&self, model: &str) -> bool {
         (self
@@ -1531,6 +1548,8 @@ impl Provider for CustomProvider {
         if req.account_id.is_none() && !self.cfg.enabled {
             return Err(anyhow!("custom provider is disabled"));
         }
+        let profile_id = req.account_id.clone();
+        let had_images = !req.images.is_empty();
         let target = self.target(req.account_id.as_deref())?;
         let capabilities = self.capabilities_for(&req.model, req.account_id.as_deref());
         if !req.images.is_empty() && !capabilities.vision {
@@ -1580,54 +1599,191 @@ impl Provider for CustomProvider {
                 capabilities.tool_protocol,
             )?
         };
-        let response = request.json(&body).send().await?;
-        let response = ensure_success(response, "Custom provider").await?;
-        let value: serde_json::Value = response.json().await?;
-        let (step, continuation) = match capabilities.tool_protocol {
-            ToolProtocol::Native if target.protocol == "openai_chat_completions" => {
-                parse_custom_chat_turn(&value, body["messages"].clone())?
-            }
-            ToolProtocol::Native => parse_custom_responses_turn(&value, body["input"].clone())?,
-            ToolProtocol::StructuredJsonFallback => {
-                let text = if target.protocol == "openai_chat_completions" {
-                    extract_chat_content(&value)
-                } else {
-                    extract_output_text(&value)
+        let response = request
+            .header("Accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await?;
+        let response = match ensure_success(response, "Custom provider").await {
+            Ok(response) => response,
+            Err(error) => {
+                if had_images && explicit_image_unsupported(&error.to_string()) {
+                    if let Some(profile_id) = profile_id.as_deref() {
+                        let _ = self.profiles.record_runtime_capability(
+                            profile_id,
+                            &req.model,
+                            &target.protocol,
+                            "vision",
+                            "unsupported",
+                            "provider_explicit_unsupported",
+                        );
+                    }
                 }
-                .ok_or_else(|| anyhow!("custom structured response contained no JSON text"))?;
-                let step = parse_structured_agent_output(&text, &req.tools)?;
+                return Err(error);
+            }
+        };
+        if !response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream"))
+        {
+            let value: serde_json::Value = response.json().await?;
+            let (step, continuation) = match capabilities.tool_protocol {
+                ToolProtocol::Native if target.protocol == "openai_chat_completions" => {
+                    parse_custom_chat_turn(&value, body["messages"].clone())?
+                }
+                ToolProtocol::Native => parse_custom_responses_turn(&value, body["input"].clone())?,
+                ToolProtocol::StructuredJsonFallback => {
+                    let text = if target.protocol == "openai_chat_completions" {
+                        extract_chat_content(&value)
+                    } else {
+                        extract_output_text(&value)
+                    }
+                    .ok_or_else(|| anyhow!("custom structured response contained no JSON text"))?;
+                    let step = parse_structured_agent_output(&text, &req.tools)?;
+                    let continuation = match &step {
+                        ProviderStep::ToolCalls(calls) => {
+                            let mut transcript = structured_transcript.take().unwrap_or_default();
+                            transcript.push(serde_json::json!({
+                                "role":"assistant", "kind":"tool_calls",
+                                "calls":calls.iter().map(|call| serde_json::json!({
+                                    "call_id":call.call_id,"name":call.name,"arguments":call.arguments,
+                                })).collect::<Vec<_>>()
+                            }));
+                            Some(serde_json::json!({
+                                "kind":"xiao_structured_continuation_v1",
+                                "transcript":bound_structured_transcript(transcript)?,
+                            }))
+                        }
+                        ProviderStep::Final(_) => None,
+                    };
+                    (step, continuation)
+                }
+                ToolProtocol::ChatOnly => {
+                    let answer = if target.protocol == "openai_chat_completions" {
+                        extract_chat_content(&value)
+                    } else {
+                        extract_output_text(&value)
+                    }
+                    .filter(|answer| !answer.trim().is_empty())
+                    .ok_or_else(|| anyhow!("custom response contained no assistant text"))?;
+                    (ProviderStep::Final(answer), None)
+                }
+            };
+            if had_images {
+                if let Some(profile_id) = profile_id.as_deref() {
+                    let _ = self.profiles.record_runtime_capability(
+                        profile_id,
+                        &req.model,
+                        &target.protocol,
+                        "vision",
+                        "supported",
+                        "runtime_success",
+                    );
+                }
+            }
+            return Ok(ProviderTurn {
+                step,
+                continuation,
+                events: vec![AgentEvent::Status("Custom provider completed".into())],
+            });
+        }
+        if target.protocol == "openai_chat_completions" {
+            let streamed = consume_custom_chat_sse(
+                response,
+                progress.clone(),
+                body["messages"].as_array().cloned().unwrap_or_default(),
+                capabilities.tool_protocol != ToolProtocol::StructuredJsonFallback,
+            )
+            .await?;
+            let (step, continuation) = if capabilities.tool_protocol
+                == ToolProtocol::StructuredJsonFallback
+            {
+                let step = parse_structured_agent_output(&streamed.text, &req.tools)?;
                 let continuation = match &step {
                     ProviderStep::ToolCalls(calls) => {
                         let mut transcript = structured_transcript.take().unwrap_or_default();
-                        transcript.push(serde_json::json!({
-                            "role":"assistant",
-                            "kind":"tool_calls",
-                            "calls":calls.iter().map(|call| serde_json::json!({
-                                "call_id":call.call_id,
-                                "name":call.name,
-                                "arguments":call.arguments,
-                            })).collect::<Vec<_>>()
-                        }));
-                        Some(serde_json::json!({
-                            "kind":"xiao_structured_continuation_v1",
-                            "transcript":bound_structured_transcript(transcript)?,
-                        }))
+                        transcript.push(serde_json::json!({"role":"assistant","kind":"tool_calls","calls":calls}));
+                        Some(
+                            serde_json::json!({"kind":"xiao_structured_continuation_v1","transcript":bound_structured_transcript(transcript)?}),
+                        )
                     }
                     ProviderStep::Final(_) => None,
                 };
                 (step, continuation)
-            }
-            ToolProtocol::ChatOnly => {
-                let answer = if target.protocol == "openai_chat_completions" {
-                    extract_chat_content(&value)
-                } else {
-                    extract_output_text(&value)
+            } else if streamed.tool_calls.is_empty() {
+                (ProviderStep::Final(streamed.text), None)
+            } else {
+                (
+                    ProviderStep::ToolCalls(streamed.tool_calls),
+                    streamed.continuation,
+                )
+            };
+            if had_images {
+                if let Some(profile_id) = profile_id.as_deref() {
+                    let _ = self.profiles.record_runtime_capability(
+                        profile_id,
+                        &req.model,
+                        &target.protocol,
+                        "vision",
+                        "supported",
+                        "runtime_success",
+                    );
                 }
-                .filter(|answer| !answer.trim().is_empty())
-                .ok_or_else(|| anyhow!("custom response contained no assistant text"))?;
-                (ProviderStep::Final(answer), None)
             }
+            return Ok(ProviderTurn {
+                step,
+                continuation,
+                events: vec![AgentEvent::Status("Custom provider completed".into())],
+            });
+        }
+        let streamed = consume_responses_sse(
+            response,
+            "custom",
+            progress.clone(),
+            capabilities.tool_protocol != ToolProtocol::StructuredJsonFallback,
+        )
+        .await?;
+        let (step, continuation) = if capabilities.tool_protocol
+            == ToolProtocol::StructuredJsonFallback
+        {
+            let step = parse_structured_agent_output(&streamed.text, &req.tools)?;
+            let continuation = match &step {
+                ProviderStep::ToolCalls(calls) => {
+                    let mut transcript = structured_transcript.take().unwrap_or_default();
+                    transcript.push(
+                        serde_json::json!({"role":"assistant","kind":"tool_calls","calls":calls}),
+                    );
+                    Some(
+                        serde_json::json!({"kind":"xiao_structured_continuation_v1","transcript":bound_structured_transcript(transcript)?}),
+                    )
+                }
+                ProviderStep::Final(_) => None,
+            };
+            (step, continuation)
+        } else if streamed.tool_calls.is_empty() {
+            (ProviderStep::Final(streamed.text), None)
+        } else {
+            let mut input = body["input"].as_array().cloned().unwrap_or_default();
+            input.extend(streamed.function_items);
+            (
+                ProviderStep::ToolCalls(streamed.tool_calls),
+                Some(serde_json::json!({ "input": input })),
+            )
         };
+        if had_images {
+            if let Some(profile_id) = profile_id.as_deref() {
+                let _ = self.profiles.record_runtime_capability(
+                    profile_id,
+                    &req.model,
+                    &target.protocol,
+                    "vision",
+                    "supported",
+                    "runtime_success",
+                );
+            }
+        }
         Ok(ProviderTurn {
             step,
             continuation,
@@ -1664,7 +1820,7 @@ fn custom_chat_body(
     let mut body = serde_json::json!({
         "model": req.model,
         "messages": messages,
-        "stream": false,
+        "stream": true,
     });
     if protocol == ToolProtocol::Native && !req.tools.is_empty() {
         body["tools"] = serde_json::Value::Array(
@@ -1718,7 +1874,7 @@ fn custom_responses_body(
     let mut body = serde_json::json!({
         "model": req.model,
         "input": input,
-        "stream": false,
+        "stream": true,
     });
     if let Some(instructions) = payload.instructions {
         body["instructions"] = serde_json::Value::String(instructions);
@@ -2543,6 +2699,19 @@ fn upstream_error_summary(body: &[u8], truncated: bool) -> String {
     safe
 }
 
+fn explicit_image_unsupported(error: &str) -> bool {
+    let value = error.to_ascii_lowercase();
+    value.contains("http 400")
+        && [
+            "image input is not supported",
+            "image_url is not supported",
+            "unsupported content type: image",
+            "does not support images",
+        ]
+        .iter()
+        .any(|needle| value.contains(needle))
+}
+
 fn extract_chat_content(value: &serde_json::Value) -> Option<String> {
     let content = value.pointer("/choices/0/message/content")?;
     if let Some(text) = content.as_str() {
@@ -2561,6 +2730,114 @@ struct StreamedResponses {
     text: String,
     tool_calls: Vec<ToolCall>,
     function_items: Vec<serde_json::Value>,
+}
+
+struct StreamedChat {
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    continuation: Option<serde_json::Value>,
+}
+
+async fn consume_custom_chat_sse(
+    response: reqwest::Response,
+    progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    mut messages: Vec<serde_json::Value>,
+    visible_text: bool,
+) -> Result<StreamedChat> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut text = String::new();
+    let mut calls: HashMap<usize, (String, String, String)> = HashMap::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        emit(
+            &progress,
+            AgentEvent::StreamChunk {
+                provider: "custom".into(),
+                bytes: chunk.len(),
+            },
+        );
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim_end_matches('\r').to_owned();
+            buffer.drain(..=pos);
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let Some(delta) = value.pointer("/choices/0/delta") else {
+                continue;
+            };
+            if let Some(part) = delta.get("content").and_then(serde_json::Value::as_str) {
+                text.push_str(part);
+                if visible_text {
+                    emit(&progress, AgentEvent::TextDelta(part.to_owned()));
+                }
+            }
+            for call in delta
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let index = call
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let entry = calls.entry(index).or_default();
+                if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) {
+                    entry.0.push_str(id);
+                }
+                if let Some(name) = call
+                    .pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    entry.1.push_str(name);
+                }
+                if let Some(args) = call
+                    .pointer("/function/arguments")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    entry.2.push_str(args);
+                }
+            }
+        }
+    }
+    let mut ordered = calls.into_iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|(index, _)| *index);
+    let mut tool_calls = Vec::with_capacity(ordered.len());
+    let mut wire_calls = Vec::with_capacity(ordered.len());
+    for (_, (call_id, name, raw)) in ordered {
+        let arguments = serde_json::from_str(&raw)
+            .map_err(|_| anyhow!("custom chat tool call arguments are malformed JSON"))?;
+        wire_calls.push(serde_json::json!({"id":call_id,"type":"function","function":{"name":name,"arguments":raw}}));
+        tool_calls.push(ToolCall {
+            call_id,
+            name,
+            arguments,
+        });
+    }
+    let continuation = if tool_calls.is_empty() {
+        None
+    } else {
+        messages.push(serde_json::json!({"role":"assistant","tool_calls":wire_calls}));
+        Some(serde_json::json!({ "messages": messages }))
+    };
+    if text.is_empty() && tool_calls.is_empty() {
+        return Err(anyhow!(
+            "custom chat stream contained no assistant text or tool call"
+        ));
+    }
+    Ok(StreamedChat {
+        text,
+        tool_calls,
+        continuation,
+    })
 }
 
 fn responses_tool_progress_event(value: &serde_json::Value) -> Option<AgentEvent> {
@@ -2607,12 +2884,14 @@ async fn consume_responses_sse(
     response: reqwest::Response,
     provider: &str,
     progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    visible_text: bool,
 ) -> Result<StreamedResponses> {
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut text = String::new();
     let mut calls = Vec::new();
     let mut items = Vec::new();
+    let mut argument_deltas = HashMap::<String, String>::new();
     let mut stream_error = None;
 
     while let Some(chunk) = stream.next().await {
@@ -2647,6 +2926,9 @@ async fn consume_responses_sse(
                 Some("response.output_text.delta") => {
                     if let Some(delta) = value.get("delta").and_then(|value| value.as_str()) {
                         text.push_str(delta);
+                        if visible_text {
+                            emit(&progress, AgentEvent::TextDelta(delta.to_owned()));
+                        }
                     }
                 }
                 Some("response.output_item.done") => {
@@ -2662,9 +2944,20 @@ async fn consume_responses_sse(
                     ) else {
                         continue;
                     };
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(|value| value.as_str())
+                    let key = item
+                        .get("item_id")
+                        .or_else(|| item.get("id"))
+                        .or_else(|| item.get("call_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(call_id);
+                    let arguments = argument_deltas
+                        .remove(key)
+                        .or_else(|| {
+                            item.get("arguments")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_owned)
+                        })
+                        .as_deref()
                         .and_then(|value| serde_json::from_str(value).ok())
                         .unwrap_or_else(|| serde_json::json!({}));
                     calls.push(ToolCall {
@@ -2673,6 +2966,20 @@ async fn consume_responses_sse(
                         arguments,
                     });
                     items.push(item.clone());
+                }
+                Some("response.function_call_arguments.delta") => {
+                    if let (Some(key), Some(delta)) = (
+                        value
+                            .get("item_id")
+                            .or_else(|| value.get("call_id"))
+                            .and_then(serde_json::Value::as_str),
+                        value.get("delta").and_then(serde_json::Value::as_str),
+                    ) {
+                        argument_deltas
+                            .entry(key.into())
+                            .or_default()
+                            .push_str(delta);
+                    }
                 }
                 Some("response.completed") if text.is_empty() => {
                     if let Some(response) = value.get("response") {
@@ -2985,7 +3292,9 @@ mod tests {
                 endpoint: "https://a.example/v1".into(),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: Some(credential.id),
+                api_key_ref: None,
                 safe_headers_json: r#"{"X-Profile-A":"HEADER_A"}"#.into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         profiles
@@ -3007,7 +3316,9 @@ mod tests {
                 endpoint: format!("http://{address}/v1"),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: None,
+                api_key_ref: None,
                 safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         profiles
@@ -3089,7 +3400,9 @@ mod tests {
                 endpoint: format!("http://{address}/v1"),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: None,
+                api_key_ref: None,
                 safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         profiles
@@ -3167,7 +3480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_custom_vision_serializes_normalized_image_and_rejects_nonvision_model() {
+    async fn production_custom_vision_serializes_supported_and_unknown_images() {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
         let app = Router::new().route(
             "/v1/chat/completions",
@@ -3195,7 +3508,9 @@ mod tests {
                 endpoint: format!("http://{address}/v1"),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: None,
+                api_key_ref: None,
                 safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         let mut vision = profile_model(&profile.profile_id, "vision-m", ToolProtocol::ChatOnly);
@@ -3241,8 +3556,14 @@ mod tests {
         assert!(serialized.contains("What is visible?"));
 
         req.model = "text-m".into();
-        let error = provider.run(req, None).await.unwrap_err().to_string();
-        assert!(error.contains("does not declare vision capability"));
+        assert_eq!(
+            provider.run(req, None).await.unwrap().final_answer,
+            "visible"
+        );
+        let optimistic = captured_rx.recv().await.unwrap();
+        assert!(serde_json::to_string(&optimistic)
+            .unwrap()
+            .contains("image_url"));
         server.abort();
     }
 
@@ -3642,5 +3963,63 @@ mod tests {
             })),
             Some(AgentEvent::ToolStarted("web_fetch".into()))
         );
+    }
+
+    #[test]
+    fn unknown_optional_inputs_are_optimistically_routable() {
+        let record = crate::storage::ProviderProfileModelRecord {
+            profile_id: "profile-a".into(),
+            model_id: "model-a".into(),
+            text_capable: true,
+            vision_capable: false,
+            file_input_capable: false,
+            native_tools: true,
+            structured_output: true,
+            continuation: true,
+            native_tools_state: "supported".into(),
+            structured_output_state: "supported".into(),
+            continuation_state: "supported".into(),
+            vision_state: "unknown".into(),
+            file_input_state: "unknown".into(),
+            model_discovery: true,
+            tool_protocol: "native".into(),
+            evidence: "probe inconclusive".into(),
+            probe_status: "completed".into(),
+            probe_version: 1,
+            probed_at: "now".into(),
+        };
+        let capabilities = profile_capabilities_from_record(record);
+        assert!(capabilities.vision);
+        assert!(capabilities.file_input);
+    }
+
+    #[test]
+    fn explicit_unsupported_optional_inputs_are_not_routable() {
+        let mut record = crate::storage::ProviderProfileModelRecord {
+            profile_id: "profile-a".into(),
+            model_id: "model-a".into(),
+            text_capable: true,
+            vision_capable: false,
+            file_input_capable: false,
+            native_tools: true,
+            structured_output: true,
+            continuation: true,
+            native_tools_state: "supported".into(),
+            structured_output_state: "supported".into(),
+            continuation_state: "supported".into(),
+            vision_state: "unsupported".into(),
+            file_input_state: "unsupported".into(),
+            model_discovery: true,
+            tool_protocol: "native".into(),
+            evidence: "explicit provider rejection".into(),
+            probe_status: "completed".into(),
+            probe_version: 1,
+            probed_at: "now".into(),
+        };
+        let capabilities = profile_capabilities_from_record(record.clone());
+        assert!(!capabilities.vision);
+        assert!(!capabilities.file_input);
+        record.vision_state = "supported".into();
+        assert!(profile_capabilities_from_record(record).vision);
     }
 }

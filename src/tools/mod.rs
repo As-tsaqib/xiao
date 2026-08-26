@@ -1,5 +1,7 @@
+pub mod cache;
 mod policy;
 mod registry;
+pub mod scheduler;
 mod types;
 
 pub mod builtin;

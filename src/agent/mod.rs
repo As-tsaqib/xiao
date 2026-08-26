@@ -15,7 +15,7 @@ use crate::{
     attachments::AttachmentManager,
     config::AgentConfig,
     context::{ContextEngine, SessionHistoryStore},
-    learning::{LearningEvaluator, LearningTrace, SafeToolObservation},
+    learning::{LearningTrace, SafeToolObservation},
     memory::{MemoryEvaluator, MemoryStore},
     providers::{
         AgentEvent, ProviderPdfFallback, ProviderRegistry, ProviderRequest, ProviderStep,
@@ -34,7 +34,8 @@ use crate::{
     tools::{
         builtin::{
             AndroidXiaoRestartTool, AndroidXiaoStatusTool, ContextStatsTool, MemoryDeleteTool,
-            MemorySearchTool, MemorySetTool, SkillSearchTool, SkillViewTool, TermuxTerminalTool,
+            MemorySearchTool, MemorySetTool, SkillSearchTool, SkillViewTool, TermuxJobTool,
+            TermuxTerminalTool,
         },
         ToolContext, ToolPolicy, ToolRegistry, ToolResult,
     },
@@ -42,6 +43,7 @@ use crate::{
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentAnswer {
+    pub run_id: String,
     /// Safe status events only. No private reasoning or provider hidden chain-of-thought is represented here.
     pub progress: Vec<AgentEvent>,
     /// Persistent user-facing final answer only.
@@ -69,9 +71,8 @@ pub struct AgentEngine {
     providers: Arc<ProviderRegistry>,
     active: Mutex<HashMap<String, CancellationToken>>,
     tools: Arc<ToolRegistry>,
-    config: AgentConfig,
+    config: Arc<tokio::sync::RwLock<AgentConfig>>,
     memory_store: Arc<MemoryStore>,
-    skill_registry: Arc<SkillRegistry>,
     context_engine: ContextEngine,
     attachments: Option<Arc<AttachmentManager>>,
 }
@@ -190,8 +191,16 @@ impl AgentEngine {
                 repository,
             ));
             skill_dependency_resolver = Some(resolver.clone());
+            let terminal = TermuxTerminalTool::new(executor, resolver, termux_home);
             tools
-                .register(TermuxTerminalTool::new(executor, resolver, termux_home))
+                .register(TermuxJobTool::with_storage(
+                    terminal.clone(),
+                    config.max_execution_plan_steps,
+                    storage.clone(),
+                ))
+                .expect("register termux_job tool");
+            tools
+                .register(terminal)
                 .expect("register Termux terminal tool");
             tools
                 .register_alias("terminal", "termux_terminal")
@@ -273,36 +282,102 @@ impl AgentEngine {
         } else {
             ContextEngine::new(storage.clone(), config.clone())
         };
-        let skill_store = Arc::new(SkillStore::new(storage.clone()));
-        let skill_registry = Arc::new(if let Some(runtime) = &runtime {
-            SkillRegistry::with_filesystem(
-                skill_store.clone(),
-                Arc::new(FilesystemSkills::with_runtime(
-                    runtime.workspace(),
-                    skill_store,
-                    runtime.capabilities(),
-                    None,
-                )),
-            )
-        } else {
-            SkillRegistry::new(skill_store)
-        });
         Self {
             sessions,
             storage,
             providers,
             active: Mutex::new(HashMap::new()),
             tools,
-            config,
+            config: Arc::new(tokio::sync::RwLock::new(config)),
             memory_store: memory,
-            skill_registry,
             context_engine,
             attachments,
         }
     }
 
+    async fn execute_readonly_group(
+        &self,
+        calls: Vec<crate::tools::ToolCall>,
+        context: &ToolContext,
+        run_id: &str,
+        limit: usize,
+        progress: Option<&mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<Vec<ToolResult>> {
+        let mut prepared = Vec::with_capacity(calls.len());
+        for call in calls {
+            let arguments = bounded_json(&redact_json(&call.arguments), 16_384);
+            let id = self.storage.create_tool_run(
+                run_id,
+                &bound_text(redact_text(&call.call_id), 256),
+                &bound_text(redact_text(&call.name), 128),
+                &arguments,
+                "read_only",
+            )?;
+            self.storage
+                .set_tool_run_status(&id, "running", None, None)?;
+            let event = AgentEvent::ToolStartedWithId {
+                tool: call.name.clone(),
+                call_id: call.call_id.clone(),
+            };
+            if let Some(progress) = progress {
+                let _ = progress.send(event);
+            }
+            prepared.push((call, id));
+        }
+        let ids = prepared
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>();
+        let calls = prepared.into_iter().map(|(call, _)| call).collect();
+        let executions = crate::tools::scheduler::schedule(
+            calls,
+            true,
+            limit,
+            |_| crate::tools::scheduler::ToolExecutionClass::ReadOnlyParallelSafe,
+            |call| async move { self.tools.execute(&call, context).await },
+        )
+        .await;
+        let mut results = Vec::with_capacity(executions.len());
+        for (id, execution) in ids.into_iter().zip(executions) {
+            let result = execution.result;
+            let interrupted = context.cancellation.is_cancelled();
+            self.storage.set_tool_run_status(
+                &id,
+                if interrupted {
+                    "interrupted"
+                } else {
+                    execution.status.as_str()
+                },
+                (!result.is_error).then_some(result.output.as_str()),
+                result.is_error.then_some(result.output.as_str()),
+            )?;
+            if let Some(progress) = progress {
+                let _ = progress.send(AgentEvent::ToolCompletedWithId {
+                    tool: result.name.clone(),
+                    call_id: result.call_id.clone(),
+                    summary: if interrupted {
+                        "cancelled".into()
+                    } else if result.is_error {
+                        format!("failed: {}", result.output)
+                    } else {
+                        "completed".into()
+                    },
+                });
+            }
+            results.push(result);
+        }
+        if context.cancellation.is_cancelled() {
+            return Err(anyhow!("generation cancelled during parallel tool group"));
+        }
+        Ok(results)
+    }
+
     pub fn cancel(&self, principal: &str) -> bool {
         self.cancel_in_scope(principal, None)
+    }
+
+    pub async fn update_config(&self, config: AgentConfig) {
+        *self.config.write().await = config;
     }
 
     pub fn cancel_in_scope(&self, principal: &str, scope: Option<TelegramScope>) -> bool {
@@ -491,6 +566,9 @@ impl AgentEngine {
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
         parent_cancellation: Option<CancellationToken>,
     ) -> Result<AgentAnswer> {
+        // One immutable settings snapshot governs this run; WebUI updates are
+        // visible only to later runs.
+        let config = self.config.read().await.clone();
         let token = parent_cancellation
             .map(|parent| parent.child_token())
             .unwrap_or_default();
@@ -588,11 +666,7 @@ impl AgentEngine {
             semantic.clone(),
         ));
         let completion = CompletionVerifier::with_semantic(semantic.clone());
-        let learning = LearningEvaluator::with_semantic(
-            self.skill_registry.clone(),
-            memory_evaluator.clone(),
-            semantic,
-        );
+        let _ = semantic;
 
         let goal = bound_text(redact_text(prompt), 4_096);
         let agent_run_id = match self.storage.create_agent_run(
@@ -608,33 +682,7 @@ impl AgentEngine {
                 return Err(error);
             }
         };
-
-        if append_user {
-            let memory_result = tokio::select! {
-                _ = token.cancelled() => Err(anyhow!("generation cancelled during memory evaluation")),
-                result = memory_evaluator.apply_explicit_async(
-                    principal,
-                    &ctx.active.id,
-                    prompt,
-                    token.clone(),
-                ) => result,
-            };
-            if let Err(error) = memory_result {
-                let safe_error = bound_text(redact_text(&error.to_string()), 4_096);
-                let _ = self.storage.set_agent_run_status(
-                    principal,
-                    &agent_run_id,
-                    if token.is_cancelled() {
-                        "cancelled"
-                    } else {
-                        "failed"
-                    },
-                    Some(&safe_error),
-                );
-                self.active.lock().unwrap().remove(&active_key);
-                return Err(error);
-            }
-        }
+        let timing_started = std::time::Instant::now();
 
         let result = async {
             if resolved_model != ctx.active.model {
@@ -779,6 +827,7 @@ impl AgentEngine {
                 images,
                 files: Vec::new(),
             };
+            self.storage.record_agent_run_event(&agent_run_id, "pre_provider_overhead", timing_started.elapsed().as_millis() as u64, &serde_json::json!({}))?;
             let started = AgentEvent::GenerationStarted;
             if let Some(tx) = &progress { let _ = tx.send(started.clone()); }
             let mut continuation=None;
@@ -793,15 +842,17 @@ impl AgentEngine {
             let mut last_unverified_signature = None::<String>;
             let mut last_unverified_evidence = None::<CompletionEvidence>;
             let mut no_progress_repeats = 0usize;
+            let mut observation_signatures = std::collections::VecDeque::<String>::new();
             let run_started = std::time::Instant::now();
             loop {
-                if run_started.elapsed().as_secs() >= self.config.max_runtime_seconds {
+                compact_provider_messages(&mut request.messages, config.context_max_chars, config.summary_threshold_chars);
+                if run_started.elapsed().as_secs() >= config.max_runtime_seconds {
                     return Err(anyhow!(
                         "agent runtime limit ({} seconds) reached",
-                        self.config.max_runtime_seconds
+                        config.max_runtime_seconds
                     ));
                 }
-                if turns >= self.config.max_turns {
+                if turns >= config.max_turns {
                     if let Some(mut blocked) = last_unverified_evidence {
                         blocked.state = VerificationState::Blocked;
                         blocked.verified = false;
@@ -816,11 +867,12 @@ impl AgentEngine {
                     }
                     return Err(anyhow!(
                         "agent turn limit ({}) reached before a final answer",
-                        self.config.max_turns
+                        config.max_turns
                     ));
                 }
                 turns += 1;
-                let remaining = std::time::Duration::from_secs(self.config.max_runtime_seconds)
+                self.storage.record_agent_run_event(&agent_run_id, "provider_request_start", timing_started.elapsed().as_millis() as u64, &serde_json::json!({"turn":turns}))?;
+                let remaining = std::time::Duration::from_secs(config.max_runtime_seconds)
                     .saturating_sub(run_started.elapsed());
                 let turn = tokio::select! {
                     _ = token.cancelled() => return Err(anyhow!("generation cancelled")),
@@ -834,6 +886,7 @@ impl AgentEngine {
                         ),
                     ) => response.map_err(|_| anyhow!("agent runtime limit reached during provider turn"))??,
                 };
+                self.storage.record_agent_run_event(&agent_run_id, "provider_completion", timing_started.elapsed().as_millis() as u64, &serde_json::json!({"turn":turns}))?;
                 provider_events.extend(turn.events);
                 match turn.step {
                     ProviderStep::Final(answer)=>{
@@ -889,7 +942,7 @@ impl AgentEngine {
                                     no_progress_repeats = 0;
                                     last_unverified_signature = Some(signature);
                                 }
-                                if no_progress_repeats >= self.config.max_no_progress_repeats {
+                                if no_progress_repeats >= config.max_no_progress_repeats {
                                     let mut blocked = verification;
                                     blocked.state = VerificationState::Blocked;
                                     blocked.verified = false;
@@ -919,8 +972,8 @@ impl AgentEngine {
                                     &installs,
                                     artifacts.values(),
                                     turns,
-                                    self.config.max_turns.saturating_sub(turns),
-                                    self.config.max_tool_calls.saturating_sub(tool_calls),
+                                    config.max_turns.saturating_sub(turns),
+                                    config.max_tool_calls.saturating_sub(tool_calls),
                                     remaining.as_secs(),
                                 );
                                 request.messages.push(crate::storage::MessageRecord {
@@ -945,10 +998,18 @@ impl AgentEngine {
                         }
                         if calls.is_empty(){return Err(anyhow!("provider returned an empty tool-call turn"));}
                         continuation=turn.continuation;
+                        if config.parallel_readonly_tools && calls.len()>1 && calls.iter().all(|call| crate::tools::scheduler::execution_class(self.tools.spec(&call.name).as_ref())==crate::tools::scheduler::ToolExecutionClass::ReadOnlyParallelSafe) {
+                            if tool_calls.saturating_add(calls.len())>config.max_tool_calls { return Err(anyhow!("agent tool-call limit ({}) reached",config.max_tool_calls)); }
+                            tool_calls+=calls.len();
+                            let group_started=timing_started.elapsed().as_millis() as u64;
+                            tool_results=self.execute_readonly_group(calls,&tool_context,&agent_run_id,config.max_parallel_readonly_tools,progress.as_ref()).await?;
+                            self.storage.record_agent_run_event(&agent_run_id,"tool_group",timing_started.elapsed().as_millis() as u64,&serde_json::json!({"started_ms":group_started,"class":"parallel_read_only","count":tool_results.len()}))?;
+                            continue;
+                        }
                         let mut next=Vec::with_capacity(calls.len());
                         for call in calls {
                             tool_calls += 1;
-                            if tool_calls > self.config.max_tool_calls {
+                            if tool_calls > config.max_tool_calls {
                                 let audit = self.storage.tool_runs(principal, &agent_run_id)?;
                                 let mut blocked = completion
                                     .verify_for_task_async(
@@ -961,7 +1022,7 @@ impl AgentEngine {
                                 blocked.verified = false;
                                 blocked.summary = format!(
                                     "agent tool-call limit ({}) reached without verified success",
-                                    self.config.max_tool_calls
+                                    config.max_tool_calls
                                 );
                                 return Ok(LoopOutcome {
                                     final_answer: format!("Blocked: {}", blocked.summary),
@@ -1001,7 +1062,7 @@ impl AgentEngine {
                                     next.push(ToolResult {
                                         call_id: call.call_id.clone(),
                                         name: call.name.clone(),
-                                        output: bound_text(redact_text(&format!("tool was not executed because its audit record could not be created: {error}")), self.config.tool_output_max_chars),
+                                        output: bound_text(redact_text(&format!("tool was not executed because its audit record could not be created: {error}")), config.tool_output_max_chars),
                                         is_error: true,
                                     });
                                     continue;
@@ -1036,7 +1097,7 @@ impl AgentEngine {
                                 provider_events.push(completed);
                                 next.push(result);
                                 if identical_failure_repeats
-                                    >= self.config.max_no_progress_repeats
+                                    >= config.max_no_progress_repeats
                                 {
                                     let audit = self.storage.tool_runs(principal, &agent_run_id)?;
                                     let mut blocked = completion
@@ -1053,7 +1114,7 @@ impl AgentEngine {
                                 continue;
                             }
                             self.storage.set_tool_run_status(&tool_run_id, "running", None, None)?;
-                            let tool_remaining = std::time::Duration::from_secs(self.config.max_runtime_seconds)
+                            let tool_remaining = std::time::Duration::from_secs(config.max_runtime_seconds)
                                 .saturating_sub(run_started.elapsed());
                             let mut execution=tokio::select!{
                                 _=token.cancelled()=>{
@@ -1171,6 +1232,16 @@ impl AgentEngine {
                             provider_events.push(completed);
                             next.push(result);
                         }
+                        let signature = next.iter().map(|result| format!("{}:{}:{}", result.name, result.is_error, short_hash(&result.output))).collect::<Vec<_>>().join("|");
+                        observation_signatures.push_back(signature);
+                        while observation_signatures.len() > 6 { observation_signatures.pop_front(); }
+                        if result_aware_ping_pong(&observation_signatures, config.max_no_progress_repeats) {
+                            let audit=self.storage.tool_runs(principal,&agent_run_id)?;
+                            let mut blocked=completion.verify_for_task_async(prompt,"repeated equivalent observations",&audit).await;
+                            blocked.state=VerificationState::Blocked; blocked.verified=false;
+                            blocked.summary="bounded no-progress limit reached after result-aware ping-pong".into();
+                            return Ok(LoopOutcome { final_answer:format!("Blocked: {}",blocked.summary), verification:blocked });
+                        }
                         tool_results=next;
                     }
                 }
@@ -1197,6 +1268,7 @@ impl AgentEngine {
                     return Err(error);
                 }
             };
+            self.storage.record_agent_run_event(&agent_run_id, "final_answer_ready", timing_started.elapsed().as_millis() as u64, &serde_json::json!({}))?;
             if token.is_cancelled() {
                 let _ = self.storage.set_agent_run_status(
                     principal,
@@ -1280,9 +1352,11 @@ impl AgentEngine {
                     verification_evidence: verification.summary.clone(),
                     skill_candidate: None,
                 };
-                // Learning is post-completion and best-effort; failure cannot
-                // rewrite a successfully delivered task into a failed one.
-                let _ = learning.evaluate_async(principal, &trace).await;
+                // Persist before returning, but keep the job unreleased until
+                // the frontend records final delivery acknowledgement.
+                if config.background_learning {
+                    self.storage.enqueue_learning_job(principal,&agent_run_id,&serde_json::json!({"trace":trace,"explicit_prompt":append_user.then_some(bound_text(redact_text(prompt),2_000))}))?;
+                }
             } else {
                 let status = match verification.state {
                     VerificationState::Blocked => "blocked",
@@ -1302,6 +1376,7 @@ impl AgentEngine {
             events.extend(provider_events);
             events.push(completed);
             Ok(AgentAnswer {
+                run_id: agent_run_id.clone(),
                 progress: events,
                 final_answer,
                 side_mode: ctx.mode == ChatMode::Side,
@@ -1368,6 +1443,51 @@ fn bounded_json(value: &serde_json::Value, max_chars: usize) -> String {
         "preview": serialized.chars().take(max_chars.saturating_sub(100)).collect::<String>()
     })
     .to_string()
+}
+
+fn short_hash(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(redact_text(value).as_bytes()))[..16].to_owned()
+}
+
+fn result_aware_ping_pong(signatures: &std::collections::VecDeque<String>, repeats: usize) -> bool {
+    let repeats = repeats.max(2);
+    if signatures.len() < repeats * 2 {
+        return false;
+    }
+    let values = signatures
+        .iter()
+        .rev()
+        .take(repeats * 2)
+        .collect::<Vec<_>>();
+    values.windows(3).all(|window| window[0] == window[2])
+}
+
+fn compact_provider_messages(
+    messages: &mut Vec<crate::storage::MessageRecord>,
+    max_chars: usize,
+    threshold: usize,
+) {
+    let total = messages
+        .iter()
+        .map(|message| message.content.chars().count())
+        .sum::<usize>();
+    if total <= threshold.min(max_chars) {
+        return;
+    }
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for message in messages.iter().rev() {
+        let size = message.content.chars().count();
+        if used + size > max_chars.saturating_sub(512) {
+            continue;
+        }
+        kept.push(message.clone());
+        used += size;
+    }
+    kept.reverse();
+    kept.insert(0, crate::storage::MessageRecord { role:"system".into(), content:"Earlier provider context was compacted. Durable messages and raw tool audit remain stored; rely only on the bounded observable context below.".into(), created_at:chrono::Utc::now().to_rfc3339() });
+    *messages = kept;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1964,7 +2084,7 @@ mod tests {
                     name: name.into(),
                     arguments: serde_json::json!({}),
                 }]),
-                continuation: Some(serde_json::json!({"turn":turn})),
+                continuation: Some(serde_json::json!({ "turn": turn })),
                 events: Vec::new(),
             };
             Ok(match turn {
@@ -2051,7 +2171,7 @@ mod tests {
                 step: ProviderStep::ToolCalls(vec![ToolCall {
                     call_id: id.into(),
                     name: "adaptive_action".into(),
-                    arguments: serde_json::json!({"strategy":strategy}),
+                    arguments: serde_json::json!({ "strategy": strategy }),
                 }]),
                 continuation: None,
                 events: Vec::new(),
@@ -2549,10 +2669,10 @@ mod tests {
         );
         assert_ne!(tools[0].arguments_json, tools[1].arguments_json);
         let learned = crate::skills::SkillStore::new(db).list("u", 10).unwrap();
-        assert_eq!(learned.len(), 1);
-        assert!(learned[0].procedure.contains("adaptive_action"));
-        assert!(learned[0].procedure.contains("verify"));
-        assert!(learned[0].pitfalls.contains("first strategy failed"));
+        assert!(
+            learned.is_empty(),
+            "post-delivery learning must not block AgentAnswer"
+        );
     }
 
     #[tokio::test]

@@ -115,7 +115,7 @@ impl AndroidBroker for SystemAndroidBroker {
         #[cfg(unix)]
         if unsafe { libc::geteuid() } != 0 {
             return Err(anyhow!(
-                "typed Android broker requires xiaod to run as UID 0"
+                "typed Android broker requires xiao daemon to run as UID 0"
             ));
         }
         match operation {

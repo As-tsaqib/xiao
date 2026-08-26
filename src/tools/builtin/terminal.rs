@@ -16,6 +16,16 @@ pub struct TermuxTerminalTool {
     default_cwd: PathBuf,
 }
 
+impl Clone for TermuxTerminalTool {
+    fn clone(&self) -> Self {
+        Self {
+            executor: self.executor.clone(),
+            dependencies: self.dependencies.clone(),
+            default_cwd: self.default_cwd.clone(),
+        }
+    }
+}
+
 impl TermuxTerminalTool {
     pub fn new(
         executor: Arc<dyn ProcessExecutor>,
@@ -92,13 +102,33 @@ impl Tool for TermuxTerminalTool {
                 context.progress.as_ref(),
             )
             .await?;
+        let session_workspace = if context.session_id.is_empty() {
+            self.default_cwd.clone()
+        } else {
+            let dir = self
+                .default_cwd
+                .join(".xiao/workspaces")
+                .join(&context.session_id);
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        };
+        let effective_cwd = match arguments.cwd {
+            Some(custom) => {
+                if custom.is_absolute() {
+                    custom
+                } else {
+                    session_workspace.join(custom)
+                }
+            }
+            None => session_workspace.clone(),
+        };
         let outcome = self
             .executor
             .execute(
                 TermuxCommand {
                     program: arguments.program,
                     args: arguments.args,
-                    cwd: arguments.cwd.unwrap_or_else(|| self.default_cwd.clone()),
+                    cwd: effective_cwd,
                     environment: arguments.environment,
                     timeout_ms: arguments.timeout_ms.unwrap_or(120_000),
                     max_output_chars: 16_384,
@@ -120,6 +150,165 @@ impl Tool for TermuxTerminalTool {
             "dependency": dependency,
             "verification_evidence": purpose == ExecutionPurpose::Verification,
             "artifacts": artifacts,
+        }))?)
+    }
+}
+
+pub struct TermuxJobTool {
+    terminal: TermuxTerminalTool,
+    max_steps: usize,
+    storage: Option<Arc<crate::storage::Storage>>,
+}
+
+impl TermuxJobTool {
+    pub fn new(terminal: TermuxTerminalTool, max_steps: usize) -> Self {
+        Self {
+            terminal,
+            max_steps: max_steps.clamp(1, 64),
+            storage: None,
+        }
+    }
+
+    pub fn with_storage(
+        terminal: TermuxTerminalTool,
+        max_steps: usize,
+        storage: Arc<crate::storage::Storage>,
+    ) -> Self {
+        Self {
+            terminal,
+            max_steps: max_steps.clamp(1, 64),
+            storage: Some(storage),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobArguments {
+    steps: Vec<JobStep>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobStep {
+    id: String,
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    continue_on_error: bool,
+}
+
+#[async_trait]
+impl Tool for TermuxJobTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "termux_job".into(),
+            description: "Run a bounded ordered workflow of structured argv commands under the unprivileged Termux UID. Every step is policy checked; opaque shell strings and root escalation are forbidden.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "steps":{"type":"array","minItems":1,"maxItems":64,"items":{
+                        "type":"object","properties":{
+                            "id":{"type":"string","minLength":1,"maxLength":64},
+                            "program":{"type":"string","minLength":1,"maxLength":128},
+                            "args":{"type":"array","maxItems":128,"items":{"type":"string","maxLength":8192}},
+                            "cwd":{"type":"string"},
+                            "continue_on_error":{"type":"boolean"}
+                        },"required":["id","program"],"additionalProperties":false
+                    }},
+                    "mode":{"type":"string","enum":["auto","sequential"]}
+                },"required":["steps"],"additionalProperties":false
+            }),
+            risk: ToolRisk::SideEffect,
+            origin: ToolOrigin::Termux,
+            effect: ToolEffect::NonIdempotent,
+            required_capabilities: vec!["execution.termux".into()],
+            timeout_ms: 600_000,
+        }
+    }
+
+    async fn execute(&self, context: &ToolContext, arguments: Value) -> Result<String> {
+        let job: JobArguments = serde_json::from_value(arguments)?;
+        if job.steps.is_empty() || job.steps.len() > self.max_steps || job.steps.len() > 64 {
+            return Err(anyhow!("termux_job requires 1..={} steps", self.max_steps));
+        }
+        if !matches!(
+            job.mode.as_deref(),
+            None | Some("auto") | Some("sequential")
+        ) {
+            return Err(anyhow!("termux_job mode must be auto or sequential"));
+        }
+        let mut results = Vec::with_capacity(job.steps.len());
+        for (index, step) in job.steps.into_iter().enumerate() {
+            if context.cancellation.is_cancelled() {
+                return Err(anyhow!("termux_job cancelled"));
+            }
+            let call = json!({"program":step.program,"args":step.args,"cwd":step.cwd});
+            let audit_id = self
+                .storage
+                .as_ref()
+                .map(|storage| {
+                    storage.create_tool_run_step(
+                        &context.agent_run_id,
+                        index,
+                        &step.id,
+                        &step.program,
+                        &call,
+                    )
+                })
+                .transpose()?;
+            match crate::tools::policy::termux_call_policy(&call) {
+                crate::tools::PolicyDecision::Allow => {}
+                crate::tools::PolicyDecision::Deny(reason)
+                | crate::tools::PolicyDecision::RequireApproval(reason) => {
+                    if let (Some(storage), Some(id)) = (&self.storage, audit_id.as_deref()) {
+                        storage.finish_tool_run_step(id, "denied", None, Some(&reason))?;
+                    }
+                    results
+                        .push(json!({"index":index,"id":step.id,"status":"denied","error":reason}));
+                    if !step.continue_on_error {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            match self.terminal.execute(context, call).await {
+                Ok(output) => {
+                    if let (Some(storage), Some(id)) = (&self.storage, audit_id.as_deref()) {
+                        storage.finish_tool_run_step(id, "succeeded", Some(&output), None)?;
+                    }
+                    results.push(
+                        json!({"index":index,"id":step.id,"status":"succeeded","summary":output}),
+                    );
+                }
+                Err(error) => {
+                    if let (Some(storage), Some(id)) = (&self.storage, audit_id.as_deref()) {
+                        storage.finish_tool_run_step(
+                            id,
+                            if context.cancellation.is_cancelled() {
+                                "interrupted"
+                            } else {
+                                "failed"
+                            },
+                            None,
+                            Some(&error.to_string()),
+                        )?;
+                    }
+                    results.push(json!({"index":index,"id":step.id,"status":"failed","error":error.to_string()}));
+                    if !step.continue_on_error {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(serde_json::to_string(&json!({
+            "job_status": if results.iter().all(|item| item["status"] == "succeeded") { "succeeded" } else { "failed" },
+            "steps": results,
+            "verification_evidence": true
         }))?)
     }
 }

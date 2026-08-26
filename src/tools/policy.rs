@@ -19,10 +19,15 @@ pub struct ToolPolicy {
 impl Default for ToolPolicy {
     fn default() -> Self {
         Self {
-            safe_side_effects: ["memory_set", "memory_delete", "termux_terminal"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            safe_side_effects: [
+                "memory_set",
+                "memory_delete",
+                "termux_terminal",
+                "termux_job",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         }
     }
 }
@@ -75,7 +80,7 @@ impl ToolPolicy {
     }
 }
 
-fn termux_call_policy(arguments: &Value) -> PolicyDecision {
+pub(crate) fn termux_call_policy(arguments: &Value) -> PolicyDecision {
     let Some(object) = arguments.as_object() else {
         return PolicyDecision::Deny("termux_terminal arguments must be an object".into());
     };

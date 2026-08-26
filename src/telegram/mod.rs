@@ -768,6 +768,7 @@ impl TelegramAdapter {
     ) -> Result<()> {
         match result {
             CommandResult::Agent(answer) => {
+                let run_id = answer.run_id.clone();
                 let artifacts = answer.artifacts.clone();
                 let view = agent_final_view(answer);
                 for page in paginate_final_view(&view, 3500) {
@@ -780,6 +781,15 @@ impl TelegramAdapter {
                             .await?;
                     }
                 }
+                self.app.storage.record_agent_run_event(
+                    &run_id,
+                    "final_frontend_delivery",
+                    0,
+                    &serde_json::json!({"frontend":"telegram"}),
+                )?;
+                self.app
+                    .storage
+                    .release_learning_job_after_delivery(&run_id)?;
                 Ok(())
             }
             CommandResult::StartCustomLogin => {
@@ -1765,6 +1775,7 @@ struct ProgressAggregator {
     next_id: u64,
     detail: String,
     stream_chunks: usize,
+    visible_text: String,
 }
 
 struct ToolProgress {
@@ -1784,6 +1795,7 @@ impl ProgressAggregator {
             next_id: 1,
             detail,
             stream_chunks: 0,
+            visible_text: String::new(),
         }
     }
 
@@ -1821,6 +1833,21 @@ impl ProgressAggregator {
                 ..
             } => self.await_approval(&tool, &call_id, &summary),
             AgentEvent::StreamChunk { .. } => self.stream_chunk(),
+            AgentEvent::TextDelta(delta) => {
+                self.visible_text.push_str(&delta);
+                if self.visible_text.chars().count() > 3_000 {
+                    self.visible_text = self
+                        .visible_text
+                        .chars()
+                        .rev()
+                        .take(3_000)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                }
+                self.stream_chunk();
+            }
             AgentEvent::GenerationCompleted => {
                 self.set_active("Finishing response".into(), ProgressActivity::Writing)
             }
@@ -2118,9 +2145,15 @@ impl ProgressAggregator {
                 active.label = safe_progress(&active.label);
             }
         }
+        let mut blocks = vec![Block::Progress { items }];
+        if !self.visible_text.is_empty() {
+            blocks.push(Block::Paragraph {
+                text: self.visible_text.clone(),
+            });
+        }
         View {
             title: None,
-            blocks: vec![Block::Progress { items }],
+            blocks,
             actions: vec![],
             side_mode: false,
         }
@@ -2602,6 +2635,7 @@ mod tests {
     #[test]
     fn final_surface_excludes_progress_and_keeps_side_marker() {
         let view = agent_final_view(AgentAnswer {
+            run_id: "test-run".into(),
             progress: vec![AgentEvent::ToolCompleted {
                 tool: "shell".into(),
                 summary: "SECRET HUGE TOOL OUTPUT".into(),

@@ -244,6 +244,7 @@ impl AppState {
             let _ =
                 profiles.migrate_singleton(&owner_id, &cfg.providers.custom, legacy_credential)?;
         }
+        let _ = profiles.migrate_legacy_credentials(auth.secrets(), &auth);
         let providers = Arc::new(ProviderRegistry::new(cfg.clone(), auth.clone()));
         for provider_id in providers.list() {
             // Custom capabilities are endpoint/model-specific and are stored
@@ -312,6 +313,7 @@ impl AppState {
             runtime.clone(),
             attachments.clone(),
         ));
+        spawn_learning_worker(storage.clone(), identity.clone());
         Ok(Self {
             config,
             config_path,
@@ -342,6 +344,49 @@ impl AppState {
         .reconcile(owner.as_str())?;
         Ok(owner)
     }
+}
+
+fn spawn_learning_worker(storage: Arc<Storage>, identity: Arc<IdentityWorkspace>) {
+    tokio::spawn(async move {
+        let memory = Arc::new(crate::memory::MemoryStore::with_workspace(
+            storage.clone(),
+            identity,
+        ));
+        let evaluator = crate::learning::LearningEvaluator::new(
+            Arc::new(crate::skills::SkillRegistry::new(Arc::new(
+                crate::skills::SkillStore::new(storage.clone()),
+            ))),
+            Arc::new(crate::memory::MemoryEvaluator::new(memory)),
+        );
+        loop {
+            match storage.claim_learning_job() {
+                Ok(Some((id, owner, run, payload))) => {
+                    let result = payload
+                        .get("trace")
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("learning trace missing"))
+                        .and_then(|value| serde_json::from_value(value).map_err(Into::into))
+                        .and_then(|trace| evaluator.evaluate(&owner, &trace).map(|_| ()));
+                    let _ = if let Err(error) = &result {
+                        storage.finish_learning_job(&id, Err(&error.to_string()))
+                    } else {
+                        storage.finish_learning_job(&id, Ok(()))
+                    };
+                    let _ = storage.record_agent_run_event(
+                        &run,
+                        "background_learning",
+                        0,
+                        &serde_json::json!({"status":if result.is_ok(){"succeeded"}else{"failed"}}),
+                    );
+                }
+                Ok(None) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                Err(error) => {
+                    tracing::warn!(%error,"learning worker poll failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -449,7 +494,9 @@ mod tests {
                 endpoint: "https://example.invalid/v1".into(),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: None,
+                api_key_ref: None,
                 safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         assert_eq!(profile.owner_id, owner.owner_id);
@@ -526,7 +573,9 @@ mod tests {
                 endpoint: "https://local-first.example/v1".into(),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: Some(credential.id.clone()),
+                api_key_ref: None,
                 safe_headers_json: r#"{"x-client":"local-first"}"#.into(),
+                secret_headers_ref: None,
             })
             .unwrap();
         let session = app

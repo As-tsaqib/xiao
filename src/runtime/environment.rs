@@ -69,7 +69,7 @@ pub struct TermuxEnvironment {
     pub path: String,
     pub shell: PathBuf,
     pub package_manager: Option<PathBuf>,
-    /// Owner of the Termux home. A root xiaod process drops to these IDs for
+    /// Owner of the Termux home. A root xiao daemon process drops to these IDs for
     /// every general-purpose Termux command.
     pub uid: Option<u32>,
     pub gid: Option<u32>,
@@ -393,7 +393,7 @@ fn detect_termux(host: &dyn HostProbe, _inherited_path: &str) -> Option<TermuxEn
         })
         .unwrap_or_else(|| prefix.join("home"));
     let prefix_bin = prefix.join("bin");
-    // xiaod commonly starts as root with a system/root PATH. Never carry that
+    // xiao daemon commonly starts as root with a system/root PATH. Never carry that
     // PATH into the unprivileged general executor: it could resolve `su` or
     // other Android administration binaries from a child process. Use the
     // canonical Termux bin directory as the complete child PATH.

@@ -47,12 +47,15 @@ impl CliPaths {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeLayout {
     pub data_dir: PathBuf,
+    pub run_dir: PathBuf,
     pub logs_dir: PathBuf,
     pub secrets_dir: PathBuf,
     pub database: PathBuf,
     pub daemon_log: PathBuf,
     pub managed_state: PathBuf,
-    lifecycle_lock: PathBuf,
+    pub control_socket: PathBuf,
+    pub runtime_lock: PathBuf,
+    pub lifecycle_lock: PathBuf,
 }
 
 impl RuntimeLayout {
@@ -63,13 +66,17 @@ impl RuntimeLayout {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let data_dir = resolve_from(&base, &config.paths.data_dir);
+        let run_dir = data_dir.join("run");
         let logs_dir = resolve_from(&base, &config.paths.logs_dir);
         let secrets_dir = resolve_from(&base, &config.paths.secrets_dir);
         let database = resolve_from(&base, &config.storage.database);
         Self {
             daemon_log: logs_dir.join("daemon.log"),
-            managed_state: data_dir.join("xiaod-managed.toml"),
-            lifecycle_lock: data_dir.join("xiaod-lifecycle.lock"),
+            managed_state: data_dir.join("xiao-daemon.toml"),
+            control_socket: run_dir.join("control.sock"),
+            runtime_lock: run_dir.join("runtime.lock"),
+            lifecycle_lock: run_dir.join("lifecycle.lock"),
+            run_dir,
             data_dir,
             logs_dir,
             secrets_dir,
@@ -78,19 +85,21 @@ impl RuntimeLayout {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientConfig {
-    pub endpoint: String,
+    pub control_socket: Option<PathBuf>,
     pub token: String,
-    pub principal: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct ClientConfigFile {
-    endpoint: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    control_socket: Option<PathBuf>,
     token: String,
-    #[serde(default = "default_principal")]
-    principal: String,
+    #[serde(default)]
+    principal: Option<String>,
 }
 
 impl ClientConfig {
@@ -100,38 +109,58 @@ impl ClientConfig {
             .with_context(|| format!("read {} (run `xiao quickstart` first)", path.display()))?;
         let file: ClientConfigFile =
             toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        if file.token.trim().is_empty() {
+            bail!("client token is empty");
+        }
         let config = Self {
-            endpoint: file.endpoint,
+            control_socket: file.control_socket,
             token: file.token,
-            principal: file.principal,
         };
-        config.validate()?;
+        if file.principal.is_some() || file.endpoint.is_some() {
+            let _ = Self::save_canonical(path, config.control_socket.as_deref(), &config.token);
+        }
         Ok(config)
     }
 
+    pub fn save_canonical(
+        path: impl AsRef<Path>,
+        control_socket: Option<&Path>,
+        token: &str,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        ensure_parent(path)?;
+        #[derive(Serialize)]
+        struct CanonicalClient<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            control_socket: Option<&'a Path>,
+            token: &'a str,
+        }
+        let content = toml::to_string_pretty(&CanonicalClient {
+            control_socket,
+            token,
+        })?;
+        write_atomic_private(path, content.as_bytes())
+    }
+
     pub fn validate(&self) -> Result<()> {
-        let url = url::Url::parse(&self.endpoint).context("invalid client endpoint")?;
-        if url.scheme() != "http" {
-            bail!("client endpoint must use http over loopback");
-        }
-        if !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
-            bail!("client refuses non-loopback endpoints");
-        }
         if self.token.trim().is_empty() {
             bail!("client token is empty");
-        }
-        if self.principal.trim().is_empty() {
-            bail!("client principal is empty");
         }
         Ok(())
     }
 
-    fn to_toml(&self) -> Result<String> {
+    #[allow(dead_code)]
+    pub fn to_toml(&self) -> Result<String> {
         self.validate()?;
-        Ok(toml::to_string_pretty(&ClientConfigFile {
-            endpoint: self.endpoint.clone(),
-            token: self.token.clone(),
-            principal: self.principal.clone(),
+        #[derive(Serialize)]
+        struct CanonicalClient<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            control_socket: Option<&'a Path>,
+            token: &'a str,
+        }
+        Ok(toml::to_string_pretty(&CanonicalClient {
+            control_socket: self.control_socket.as_deref(),
+            token: &self.token,
         })?)
     }
 }
@@ -223,7 +252,7 @@ pub fn load_existing(paths: &CliPaths) -> Result<InitResult> {
 
 pub fn provision_client_config(
     paths: &CliPaths,
-    config: &AppConfig,
+    _config: &AppConfig,
     runtime: &RuntimeLayout,
 ) -> Result<bool> {
     if paths.client_config.exists() {
@@ -235,17 +264,12 @@ pub fn provision_client_config(
         .get("ipc-client-token")?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("daemon has not provisioned the client credential yet"))?;
-    let client = ClientConfig {
-        endpoint: format!("http://{}", config.ipc.bind),
-        token,
-        principal: default_principal(),
-    };
-    ensure_parent(&paths.client_config)?;
-    write_new_private(&paths.client_config, client.to_toml()?.as_bytes())
+    ClientConfig::save_canonical(&paths.client_config, Some(&runtime.control_socket), &token)?;
+    Ok(true)
 }
 
 pub async fn start_daemon(paths: &CliPaths, init: &InitResult) -> Result<StartResult> {
-    let _lock = LifecycleLock::acquire(&init.runtime)?;
+    let _lifecycle = LifecycleLock::acquire(&init.runtime)?;
     if let Some(pid) = valid_managed_pid(paths, &init.runtime)? {
         if probe_daemon(&init.config, &init.runtime).await {
             let client_config_created =
@@ -256,7 +280,7 @@ pub async fn start_daemon(paths: &CliPaths, init: &InitResult) -> Result<StartRe
                 client_config_created,
             });
         }
-        bail!("managed xiaod PID {pid} exists but its IPC endpoint is not ready");
+        bail!("managed xiao daemon PID {pid} exists but its control endpoint is not ready");
     }
     if probe_daemon(&init.config, &init.runtime).await {
         let client_config_created = provision_client_config(paths, &init.config, &init.runtime)?;
@@ -282,6 +306,7 @@ pub async fn start_daemon(paths: &CliPaths, init: &InitResult) -> Result<StartRe
         .unwrap_or_else(|| init.runtime.data_dir.clone());
     let mut command = Command::new(&executable);
     command
+        .arg("daemon")
         .env("XIAO_CONFIG", &paths.config)
         .current_dir(working_dir)
         .stdin(Stdio::null())
@@ -316,7 +341,7 @@ pub async fn start_daemon(paths: &CliPaths, init: &InitResult) -> Result<StartRe
 }
 
 pub async fn stop_daemon(paths: &CliPaths, init: &InitResult) -> Result<StopResult> {
-    let _lock = LifecycleLock::acquire(&init.runtime)?;
+    let _lifecycle = LifecycleLock::acquire(&init.runtime)?;
     let Some(record) = read_managed_process(&init.runtime)? else {
         return if probe_daemon(&init.config, &init.runtime).await {
             Ok(StopResult::UnmanagedRunning)
@@ -340,7 +365,7 @@ pub async fn stop_daemon(paths: &CliPaths, init: &InitResult) -> Result<StopResu
     } else {
         terminate_record(&record, libc::SIGKILL)?;
         if !wait_for_exit(&record, Duration::from_secs(2)).await {
-            bail!("xiaod PID {} did not exit after SIGKILL", record.pid);
+            bail!("xiao daemon PID {} did not exit after SIGKILL", record.pid);
         }
         true
     };
@@ -357,17 +382,18 @@ pub async fn daemon_status(paths: &CliPaths, init: &InitResult) -> Result<Daemon
     Ok(DaemonStatus {
         managed_pid,
         reachable,
-        endpoint: format!("http://{}", init.config.ipc.bind),
+        endpoint: init.runtime.control_socket.display().to_string(),
     })
 }
 
 pub fn run_daemon_foreground(paths: &CliPaths, init: &InitResult) -> Result<ExitStatus> {
-    let _lock = LifecycleLock::acquire(&init.runtime)?;
+    let _lock = RuntimeLock::acquire(&init.runtime)?;
     if valid_managed_pid(paths, &init.runtime)?.is_some() {
-        bail!("xiaod is already running for this config");
+        bail!("xiao daemon is already running for this config");
     }
     let executable = find_daemon()?;
     let mut child = Command::new(&executable)
+        .arg("daemon")
         .env("XIAO_CONFIG", &paths.config)
         .current_dir(
             paths
@@ -409,15 +435,7 @@ pub fn tail_daemon_log(runtime: &RuntimeLayout, lines: usize) -> Result<Vec<Stri
 }
 
 pub fn find_daemon() -> Result<PathBuf> {
-    let current = env::current_exe().context("locate the xiao CLI executable")?;
-    discover_daemon(
-        nonempty_env("XIAOD_BIN").as_deref(),
-        &current,
-        env::var_os("PATH").as_deref(),
-    )
-    .ok_or_else(|| {
-        anyhow!("cannot find xiaod; install it next to xiao, put it on PATH, or set XIAOD_BIN")
-    })
+    env::current_exe().context("locate the xiao executable")
 }
 
 async fn wait_until_ready(
@@ -429,7 +447,7 @@ async fn wait_until_ready(
     loop {
         if let Some(status) = child.try_wait()? {
             bail!(
-                "xiaod exited during startup with {status}; inspect {}",
+                "xiao daemon exited during startup with {status}; inspect {}",
                 runtime.daemon_log.display()
             );
         }
@@ -438,7 +456,7 @@ async fn wait_until_ready(
         }
         if Instant::now() >= deadline {
             bail!(
-                "xiaod did not become ready within {} seconds; inspect {}",
+                "xiao daemon did not become ready within {} seconds; inspect {}",
                 DAEMON_START_TIMEOUT.as_secs(),
                 runtime.daemon_log.display()
             );
@@ -447,23 +465,35 @@ async fn wait_until_ready(
     }
 }
 
-async fn probe_daemon(config: &AppConfig, runtime: &RuntimeLayout) -> bool {
-    let Ok(Some(token)) = SecretStore::new(runtime.secrets_dir.clone()).get("ipc-client-token")
-    else {
-        return false;
-    };
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(Duration::from_millis(750))
-        .build()
-    else {
-        return false;
-    };
-    client
-        .get(format!("http://{}/v1/status", config.ipc.bind))
-        .bearer_auth(token)
-        .send()
-        .await
-        .is_ok_and(|response| response.status().is_success())
+async fn probe_daemon(_config: &AppConfig, runtime: &RuntimeLayout) -> bool {
+    #[cfg(unix)]
+    {
+        if !runtime.control_socket.exists() {
+            return false;
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(750))
+            .unix_socket(runtime.control_socket.clone())
+            .build();
+        let Ok(client) = client else {
+            return false;
+        };
+        let token = SecretStore::new(runtime.secrets_dir.clone())
+            .get("ipc-client-token")
+            .ok()
+            .flatten();
+        let mut req = client.get("http://localhost/v1/status");
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        req.send().await.is_ok_and(|response| {
+            response.status().is_success() || response.status() == reqwest::StatusCode::UNAUTHORIZED
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn valid_managed_pid(paths: &CliPaths, runtime: &RuntimeLayout) -> Result<Option<u32>> {
@@ -551,7 +581,7 @@ fn terminate_record(record: &ManagedProcess, signal: i32) -> Result<()> {
         if error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(());
         }
-        Err(error).with_context(|| format!("signal xiaod PID {}", record.pid))
+        Err(error).with_context(|| format!("signal xiao daemon PID {}", record.pid))
     }
     #[cfg(not(unix))]
     {
@@ -615,48 +645,82 @@ fn configure_detached(command: &mut Command) {
 #[cfg(not(unix))]
 fn configure_detached(_command: &mut Command) {}
 
-struct LifecycleLock {
-    path: PathBuf,
+pub struct RuntimeLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+    pub path: PathBuf,
+}
+
+impl RuntimeLock {
+    pub fn acquire(runtime: &RuntimeLayout) -> Result<Self> {
+        ensure_parent(&runtime.runtime_lock)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&runtime.runtime_lock)
+            .with_context(|| format!("open {}", runtime.runtime_lock.display()))?;
+        set_private_file(&runtime.runtime_lock)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                bail!("xiao runtime is locked by another daemon: {err}");
+            }
+        }
+        Ok(Self {
+            #[cfg(unix)]
+            _file: file,
+            path: runtime.runtime_lock.clone(),
+        })
+    }
+}
+
+impl Drop for RuntimeLock {
+    fn drop(&mut self) {}
+}
+
+pub struct LifecycleLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+    pub path: PathBuf,
 }
 
 impl LifecycleLock {
-    fn acquire(runtime: &RuntimeLayout) -> Result<Self> {
-        for _ in 0..2 {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&runtime.lifecycle_lock)
-            {
-                Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id())?;
-                    file.sync_all()?;
-                    set_private_file(&runtime.lifecycle_lock)?;
-                    return Ok(Self {
-                        path: runtime.lifecycle_lock.clone(),
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let owner = fs::read_to_string(&runtime.lifecycle_lock)
-                        .ok()
-                        .and_then(|raw| raw.trim().parse::<u32>().ok());
-                    if owner.is_some_and(process_alive) {
-                        bail!("another xiao daemon lifecycle command is still running");
-                    }
-                    fs::remove_file(&runtime.lifecycle_lock).with_context(|| {
-                        format!("remove stale {}", runtime.lifecycle_lock.display())
-                    })?;
-                }
-                Err(error) => return Err(error).context("create daemon lifecycle lock"),
+    pub fn acquire(runtime: &RuntimeLayout) -> Result<Self> {
+        ensure_parent(&runtime.lifecycle_lock)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&runtime.lifecycle_lock)
+            .with_context(|| format!("open {}", runtime.lifecycle_lock.display()))?;
+        set_private_file(&runtime.lifecycle_lock)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                bail!("failed to acquire lifecycle lock: {err}");
             }
         }
-        bail!("could not acquire daemon lifecycle lock")
+        Ok(Self {
+            #[cfg(unix)]
+            _file: file,
+            path: runtime.lifecycle_lock.clone(),
+        })
     }
 }
 
 impl Drop for LifecycleLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+    fn drop(&mut self) {}
 }
 
 fn resolve_cli_paths(
@@ -696,56 +760,8 @@ fn resolve_cli_paths(
     }
 }
 
-fn discover_daemon(
-    override_path: Option<&OsStr>,
-    current_exe: &Path,
-    path: Option<&OsStr>,
-) -> Option<PathBuf> {
-    if let Some(value) = override_path {
-        let candidate = PathBuf::from(value);
-        if is_executable(&candidate) {
-            return Some(normalized(&candidate));
-        }
-        return None;
-    }
-    if let Some(parent) = current_exe.parent() {
-        let sibling = parent.join("xiaod");
-        if is_executable(&sibling) {
-            return Some(normalized(&sibling));
-        }
-    }
-    path.and_then(|value| {
-        env::split_paths(value)
-            .map(|part| part.join("xiaod"))
-            .find(|candidate| is_executable(candidate))
-            .map(|candidate| normalized(&candidate))
-    })
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 fn nonempty_env(name: &str) -> Option<OsString> {
     env::var_os(name).filter(|value| !value.is_empty())
-}
-
-fn default_principal() -> String {
-    "termux:default".into()
 }
 
 fn absolute_from(base: &Path, path: &Path) -> PathBuf {
@@ -764,7 +780,7 @@ fn normalized(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn ensure_parent(path: &Path) -> Result<()> {
+pub fn ensure_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent, false)?;
     }
@@ -777,6 +793,28 @@ fn ensure_private_dir(path: &Path, tighten_existing: bool) -> Result<()> {
     if !existed || tighten_existing {
         set_private_dir(path)?;
     }
+    Ok(())
+}
+
+fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4().simple()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp)
+        .with_context(|| format!("create {}", temp.display()))?;
+    set_private_file(&temp)?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(error).with_context(|| format!("write {}", temp.display()));
+    }
+    drop(file);
+    fs::rename(&temp, path)
+        .with_context(|| format!("rename {} to {}", temp.display(), path.display()))?;
+    set_private_file(path)?;
     Ok(())
 }
 
@@ -796,7 +834,7 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn set_private_file(path: &Path) -> Result<()> {
+pub fn set_private_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
@@ -808,7 +846,7 @@ fn set_private_file(_path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn set_private_dir(path: &Path) -> Result<()> {
+pub fn set_private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
@@ -926,9 +964,8 @@ mod tests {
         };
         let init = initialize(&paths).unwrap();
         let existing = ClientConfig {
-            endpoint: "http://127.0.0.1:49999".into(),
+            control_socket: Some(temp.path().join("run/control.sock")),
             token: "existing-token".into(),
-            principal: "termux:kept".into(),
         }
         .to_toml()
         .unwrap();
@@ -941,22 +978,23 @@ mod tests {
     }
 
     #[test]
-    fn client_config_accepts_only_http_loopback_with_nonempty_identity() {
-        let valid = ClientConfig {
-            endpoint: "http://127.0.0.1:37921".into(),
-            token: "token".into(),
-            principal: "termux:test".into(),
-        };
-        assert!(valid.validate().is_ok());
+    fn client_config_validates_token_and_migrates_legacy_format() {
+        let temp = tempfile::tempdir().unwrap();
+        let client_path = temp.path().join("client.toml");
+        let legacy = "endpoint = \"http://127.0.0.1:37921\"\nprincipal = \"owner:legacy\"\ntoken = \"migrated-token\"\n";
+        fs::write(&client_path, legacy).unwrap();
+        let loaded = ClientConfig::load(&client_path).unwrap();
+        assert_eq!(loaded.token, "migrated-token");
+        assert!(loaded.validate().is_ok());
+        let migrated_raw = fs::read_to_string(&client_path).unwrap();
+        assert!(!migrated_raw.contains("principal"));
+        assert!(!migrated_raw.contains("endpoint"));
 
-        let mut invalid = valid.clone();
-        invalid.endpoint = "https://127.0.0.1:37921".into();
-        assert!(invalid.validate().is_err());
-        invalid.endpoint = "http://192.0.2.1:37921".into();
-        assert!(invalid.validate().is_err());
-        invalid.endpoint = "http://127.0.0.1:37921".into();
-        invalid.token.clear();
-        assert!(invalid.validate().is_err());
+        let empty = ClientConfig {
+            control_socket: None,
+            token: "".into(),
+        };
+        assert!(empty.validate().is_err());
     }
 
     #[test]
@@ -976,41 +1014,5 @@ mod tests {
         write_managed_process(&init.runtime, &record).unwrap();
         assert_eq!(valid_managed_pid(&paths, &init.runtime).unwrap(), None);
         assert!(!init.runtime.managed_state.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn daemon_discovery_prefers_explicit_then_sibling_then_path() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let explicit = temp.path().join("explicit-xiaod");
-        let sibling_dir = temp.path().join("sibling");
-        let path_dir = temp.path().join("path");
-        fs::create_dir_all(&sibling_dir).unwrap();
-        fs::create_dir_all(&path_dir).unwrap();
-        for candidate in [
-            explicit.clone(),
-            sibling_dir.join("xiaod"),
-            path_dir.join("xiaod"),
-        ] {
-            fs::write(&candidate, b"binary").unwrap();
-            fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let current = sibling_dir.join("xiao");
-        let path = env::join_paths([path_dir.clone()]).unwrap();
-        assert_eq!(
-            discover_daemon(Some(explicit.as_os_str()), &current, Some(&path)),
-            Some(normalized(&explicit))
-        );
-        assert_eq!(
-            discover_daemon(None, &current, Some(&path)),
-            Some(normalized(&sibling_dir.join("xiaod")))
-        );
-        fs::remove_file(sibling_dir.join("xiaod")).unwrap();
-        assert_eq!(
-            discover_daemon(None, &current, Some(&path)),
-            Some(normalized(&path_dir.join("xiaod")))
-        );
     }
 }

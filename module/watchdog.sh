@@ -12,9 +12,9 @@ backoff=0
 
 cleanup() {
   trap - INT TERM EXIT
-  if [ -n "$child" ] && pid_matches "$child" "$XIAOD_BINARY"; then
+  if [ -n "$child" ] && pid_matches "$child" "$XIAO_BINARY"; then
     kill -TERM "$child" 2>/dev/null || true
-    wait_owned_exit "$child" "$XIAOD_BINARY" 15 || kill -KILL "$child" 2>/dev/null || true
+    wait_owned_exit "$child" "$XIAO_BINARY" 15 || kill -KILL "$child" 2>/dev/null || true
   fi
   rm -f "$XIAO_DAEMON_PID" "$XIAO_WATCHDOG_PID"
   exit 0
@@ -42,14 +42,14 @@ while true; do
   HOME="$XIAO_DATA_DIR" XIAO_HOME="$XIAO_DATA_DIR" \
     XIAO_CONFIG="$XIAO_CONFIG" XIAO_CLIENT_CONFIG="$XIAO_CLIENT_CONFIG" \
     TMPDIR="$XIAO_TMP_DIR" XIAO_BOOT_START=1 \
-    "$XIAOD_BINARY" >> "$XIAO_DAEMON_LOG" 2>&1 &
+    "$XIAO_BINARY" daemon >> "$XIAO_DAEMON_LOG" 2>&1 &
   child=$!
   printf '%s\n' "$child" > "$XIAO_DAEMON_PID"
   chmod 0600 "$XIAO_DAEMON_PID" 2>/dev/null || true
-  xiao_log "xiaod dimulai (PID $child)."
+  xiao_log "xiao daemon dimulai (PID $child)."
 
   provision_wait=0
-  while [ "$provision_wait" -lt 30 ] && pid_matches "$child" "$XIAOD_BINARY"; do
+  while [ "$provision_wait" -lt 30 ] && pid_matches "$child" "$XIAO_BINARY"; do
     if ensure_client_config; then
       break
     fi
@@ -65,12 +65,12 @@ while true; do
   if [ -f "$XIAO_RESTART" ]; then
     rm -f "$XIAO_RESTART"
     backoff=0
-    xiao_log "xiaod keluar dengan kode $exit_code karena restart diminta; mulai ulang sekarang."
+    xiao_log "xiao daemon keluar dengan kode $exit_code karena restart diminta; mulai ulang sekarang."
     continue
   fi
 
   if ! auto_restart_enabled; then
-    xiao_log "xiaod keluar dengan kode $exit_code; auto_restart=false."
+    xiao_log "xiao daemon keluar dengan kode $exit_code; auto_restart=false."
     exit 0
   fi
 
@@ -88,7 +88,7 @@ while true; do
   fi
   delay=$backoff
   [ "$delay" -gt 0 ] || delay=$INTERVAL
-  xiao_log "xiaod keluar dengan kode $exit_code setelah ${runtime}s; mulai ulang dalam ${delay}s."
+  xiao_log "xiao daemon keluar dengan kode $exit_code setelah ${runtime}s; mulai ulang dalam ${delay}s."
   slept=0
   while [ "$slept" -lt "$delay" ] && [ ! -f "$XIAO_RESTART" ]; do
     [ -f "$MODDIR/disable" ] || [ -f "$XIAO_DISABLE" ] || [ -f "$XIAO_STOP" ] || {
