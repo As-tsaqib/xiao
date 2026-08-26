@@ -22,7 +22,12 @@ impl PdfCreateTool {
 
 #[derive(Debug, Deserialize)]
 struct Arguments {
-    #[serde(alias = "file_path", alias = "filename", alias = "output_path", alias = "target")]
+    #[serde(
+        alias = "file_path",
+        alias = "filename",
+        alias = "output_path",
+        alias = "target"
+    )]
     path: String,
     #[serde(alias = "text", alias = "body", alias = "data", alias = "markdown")]
     content: String,

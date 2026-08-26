@@ -45,7 +45,12 @@ impl TermuxTerminalTool {
 
 #[derive(Debug, Deserialize)]
 struct Arguments {
-    #[serde(alias = "cmd", alias = "command", alias = "executable", alias = "binary")]
+    #[serde(
+        alias = "cmd",
+        alias = "command",
+        alias = "executable",
+        alias = "binary"
+    )]
     program: String,
     #[serde(default, alias = "argv", alias = "arguments", alias = "params")]
     args: Vec<String>,
