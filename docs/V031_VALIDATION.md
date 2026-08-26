@@ -6,7 +6,7 @@ This record captures automated CI verification status and documents device limit
 
 - Branch: `main`
 - Schema migration: 26 → 27
-- Verified CI Run: in-progress (Commit `0dc0868a8677c7774c1ee2ef044f56f4d36ef55e`)
+- Verified CI Run: 33020411289 (Commit `8e33b09b5585eeeb1ef5347b4d13e3db856cfc2c`)
 - `rust` job: PASS (cargo check, cargo test with 312 unit/integration tests passing, strict clippy, release build, WebUI build, static acceptance).
 - `android-arm64` job: PASS (cargo-ndk build, WebUI embed, deterministic module ZIP build and sha256 checksum verification).
 - Local Rust, WebUI, and Android builds/tests: not run (repository policy; all validation via GitHub Actions CI).
@@ -40,6 +40,9 @@ This record captures automated CI verification status and documents device limit
    - Idempotent migration preserving sessions, memories, skills, and profiles; production learning payloads survive restart and stale lease recovery.
 10. **Observability**:
     - Real elapsed durations recorded using durable agent run start times for `final_frontend_delivery` and `background_learning`.
+11. **WebUI Redesign & Daemon IPC Alignment**:
+    - Functional `SessionAiDialog` and `ProfileEditor` with complete Custom profile lifecycle and write-only secret security.
+    - Fully typed daemon IPC action routing for session AI (`ai_config`), custom profile discovery/probe (`test`/`probe`), attachment removal (`remove`), memory forget/reconcile, and approval decisions.
 
 ## Device Limitations & Edge Behaviors
 
