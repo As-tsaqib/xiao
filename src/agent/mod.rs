@@ -380,6 +380,17 @@ impl AgentEngine {
         *self.config.write().await = config;
     }
 
+    pub fn reload_config(&self, config: AgentConfig) {
+        if let Ok(mut lock) = self.config.try_write() {
+            *lock = config;
+        } else {
+            let conf_lock = self.config.clone();
+            tokio::spawn(async move {
+                *conf_lock.write().await = config;
+            });
+        }
+    }
+
     pub fn cancel_in_scope(&self, principal: &str, scope: Option<TelegramScope>) -> bool {
         self.active
             .lock()
