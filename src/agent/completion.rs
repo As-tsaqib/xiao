@@ -402,6 +402,17 @@ impl CompletionVerifier {
                 );
             }
         }
+        let is_info_question = is_informational_or_code_example(strip_attachment_envelope(goal));
+        if unresolved > 0 && !is_info_question {
+            return evidence(
+                VerificationState::NotYetVerified,
+                task_kind,
+                format!("{unresolved} tool failure(s) remain unresolved"),
+                succeeded_tools,
+                unresolved,
+                Vec::new(),
+            );
+        }
         if !task_kind.is_action_like() {
             return evidence(
                 VerificationState::VerifiedSuccess,
