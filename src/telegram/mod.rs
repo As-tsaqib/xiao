@@ -2590,7 +2590,6 @@ mod tests {
 
     use super::*;
     use crate::tools::{ToolContext, ToolEffect, ToolOrigin, ToolPolicy, ToolRisk, ToolSpec};
-    use serde_json::Value;
     use axum::{
         body::Bytes,
         extract::State,
@@ -2598,6 +2597,7 @@ mod tests {
         routing::{get, post},
         Json, Router,
     };
+    use serde_json::Value;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
