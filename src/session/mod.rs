@@ -807,13 +807,7 @@ mod tests {
         storage
             .append_message(owner_a, &first_a1.id, "user", "hello in first")
             .unwrap();
-        assert_eq!(
-            storage
-                .messages(owner_a, &first_a1.id)
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(storage.messages(owner_a, &first_a1.id).unwrap().len(), 1);
 
         // Update active session in scope_1 to custom provider profile and new model
         storage
