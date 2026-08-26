@@ -1735,7 +1735,7 @@ mod tests {
             assert!(continuation.is_none());
             assert!(tool_results.is_empty());
             if let Some(tx) = progress {
-                let _ = tx.send(AgentEvent::Delta("Ini adalah gambar merah.".into()));
+                let _ = tx.send(AgentEvent::TextDelta("Ini adalah gambar merah.".into()));
             }
             Ok(ProviderTurn {
                 step: ProviderStep::Final("Ini adalah gambar merah.".into()),
