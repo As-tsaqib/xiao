@@ -921,7 +921,7 @@ fn binary_search<T: Ord>(slice: &[T], target: &T) -> Option<usize> { ... }
         let verifier = CompletionVerifier::default();
         let goal = "Build the binary";
         let build_failed = run("termux_terminal", "side_effect", "failed", Some("syntax error"));
-        let file_check = run("file_check", "read_only", "succeeded", Some("{"exists":false}"));
+        let file_check = run("file_check", "read_only", "succeeded", Some(r#"{"exists":false}"#));
         let evidence = verifier.verify_for_task(
             goal,
             "Done",
@@ -938,7 +938,7 @@ fn binary_search<T: Ord>(slice: &[T], target: &T) -> Option<usize> { ... }
             &[
                 run("termux_terminal", "side_effect", "failed", None),
                 build_fixed,
-                run("file_check", "read_only", "succeeded", Some("{"exists":true}")),
+                run("file_check", "read_only", "succeeded", Some(r#"{"exists":true}"#)),
             ],
         );
         assert_eq!(evidence_recovered.state, VerificationState::VerifiedSuccess);
