@@ -63,7 +63,7 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
             .create(xiao::storage::ProviderProfileInput {
                 profile_id: Some("prof-1".into()),
                 owner_id: "owner-1".into(),
-                alias: "Custom Provider".into(),
+                alias: "custom-provider".into(),
                 endpoint: "https://api.example.com/v1".into(),
                 protocol: "openai_chat_completions".into(),
                 safe_headers_json: "{}".into(),
@@ -124,7 +124,7 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
         .list("owner-1")
         .unwrap();
     assert_eq!(profiles.len(), 1);
-    assert_eq!(profiles[0].alias, "Custom Provider");
+    assert_eq!(profiles[0].alias, "custom-provider");
 }
 
 #[test]
