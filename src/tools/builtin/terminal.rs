@@ -624,7 +624,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.contains(""status":"denied""));
+        assert!(result.contains(r#""status":"denied"#));
     }
 
     #[tokio::test]
