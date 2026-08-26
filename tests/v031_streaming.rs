@@ -179,12 +179,7 @@ async fn raw_tool_json_never_appears_in_text_deltas() {
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let _ = engine
-        .submit_to_session_with_progress(
-            "owner-1",
-            &session.id,
-            "call tool",
-            Some(progress_tx),
-        )
+        .submit_to_session_with_progress("owner-1", &session.id, "call tool", Some(progress_tx))
         .await;
 
     while let Ok(event) = progress_rx.try_recv() {

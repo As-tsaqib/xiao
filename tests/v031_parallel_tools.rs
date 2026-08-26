@@ -117,7 +117,8 @@ impl Tool for SlowReadToolA {
         _args: serde_json::Value,
     ) -> anyhow::Result<String> {
         let current = self.active_concurrent.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_concurrent_seen.fetch_max(current, Ordering::SeqCst);
+        self.max_concurrent_seen
+            .fetch_max(current, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.active_concurrent.fetch_sub(1, Ordering::SeqCst);
         Ok(json!({ "result": "A", "verification_evidence": true }).to_string())
@@ -150,7 +151,8 @@ impl Tool for SlowReadToolB {
         _args: serde_json::Value,
     ) -> anyhow::Result<String> {
         let current = self.active_concurrent.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_concurrent_seen.fetch_max(current, Ordering::SeqCst);
+        self.max_concurrent_seen
+            .fetch_max(current, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.active_concurrent.fetch_sub(1, Ordering::SeqCst);
         Ok(json!({ "result": "B", "verification_evidence": true }).to_string())
@@ -212,12 +214,7 @@ async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
         .unwrap();
 
     let answer = engine
-        .submit_to_session_with_progress(
-            "owner-1",
-            &session.id,
-            "run two parallel reads",
-            None,
-        )
+        .submit_to_session_with_progress("owner-1", &session.id, "run two parallel reads", None)
         .await
         .unwrap();
 
