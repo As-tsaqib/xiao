@@ -25,8 +25,8 @@ fn v028_public_telegram_parser_matches_the_exact_registry() {
     assert_eq!(
         primary,
         [
-            "start", "help", "login", "provider", "model", "new", "sessions", "btw",
-            "status", "context", "retry", "yolo", "stop", "skills", "tools",
+            "start", "help", "login", "provider", "model", "new", "sessions", "btw", "status",
+            "context", "retry", "yolo", "stop", "skills", "tools",
         ]
     );
     assert_eq!(TelegramCommandRegistry::bot_commands().len(), 15);
@@ -52,7 +52,10 @@ fn v028_public_telegram_parser_matches_the_exact_registry() {
     ));
     assert!(matches!(parse("/stop").unwrap(), Some(Command::Stop)));
     assert!(matches!(parse("/login").unwrap(), Some(Command::Login)));
-    assert!(matches!(parse("/provider").unwrap(), Some(Command::Provider)));
+    assert!(matches!(
+        parse("/provider").unwrap(),
+        Some(Command::Provider)
+    ));
     assert!(matches!(parse("/model").unwrap(), Some(Command::Model)));
     assert!(parse("hello, agent").unwrap().is_none());
 
