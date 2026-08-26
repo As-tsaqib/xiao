@@ -72,7 +72,6 @@ pub struct AgentEngine {
     active: Mutex<HashMap<String, CancellationToken>>,
     tools: Arc<ToolRegistry>,
     config: Arc<tokio::sync::RwLock<AgentConfig>>,
-    memory_store: Arc<MemoryStore>,
     context_engine: ContextEngine,
     attachments: Option<Arc<AttachmentManager>>,
 }
@@ -265,11 +264,6 @@ impl AgentEngine {
         runtime: Option<Arc<RuntimeState>>,
         attachments: Option<Arc<AttachmentManager>>,
     ) -> Self {
-        let memory = Arc::new(if let Some(runtime) = &runtime {
-            MemoryStore::with_workspace(storage.clone(), runtime.workspace())
-        } else {
-            MemoryStore::new(storage.clone())
-        });
         let context_engine = if let Some(runtime) = &runtime {
             ContextEngine::with_runtime_and_attachments(
                 storage.clone(),
@@ -289,7 +283,6 @@ impl AgentEngine {
             active: Mutex::new(HashMap::new()),
             tools,
             config: Arc::new(tokio::sync::RwLock::new(config)),
-            memory_store: memory,
             context_engine,
             attachments,
         }
