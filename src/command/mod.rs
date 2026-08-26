@@ -31,6 +31,7 @@ pub enum Command {
     Start,
     Help { topic: Option<String> },
     Login,
+    Provider,
     Model,
     ModelPicker { page: usize },
     SetModel { model: String },
@@ -83,6 +84,7 @@ pub fn parse(input: &str) -> Result<Option<Command>> {
             "/login configures the Custom endpoint directly and accepts no provider argument"
         )),
         "start" if args.is_empty() => Ok(Some(Command::Start)),
+        "provider" if args.is_empty() => Ok(Some(Command::Provider)),
         "model" if args.is_empty() => Ok(Some(Command::Model)),
         "new" if args.is_empty() => Ok(Some(Command::NewSession)),
         "sessions" if args.is_empty() => Ok(Some(Command::Session { page: 1 })),
@@ -125,6 +127,7 @@ fn parse_internal_callback(input: &str) -> Result<Option<Command>> {
             topic: args.first().map(|value| (*value).to_owned()),
         })),
         "login" if args.is_empty() => Ok(Some(Command::Login)),
+        "provider" if args.is_empty() => Ok(Some(Command::Provider)),
         "new" if args.is_empty() => Ok(Some(Command::NewSession)),
         "btw" if args.is_empty() => Ok(Some(Command::ToggleSideChat)),
         "sessions" if args.is_empty() => Ok(Some(Command::Session { page: 1 })),
@@ -821,6 +824,9 @@ impl CommandCore {
                     self.session_view_with_notice(principal, scope, 1, notice)?,
                 ))
             }
+            Provider => Ok(CommandResult::ManagerView(
+                self.provider_view(principal, scope)?,
+            )),
             Model => Ok(CommandResult::ManagerView(
                 self.model_view(principal, scope)?,
             )),
@@ -997,6 +1003,75 @@ impl CommandCore {
         })
     }
 
+    fn provider_view(&self, principal: &str, scope: Option<TelegramScope>) -> Result<View> {
+        let c = self.session_context(principal, scope)?;
+        if c.active.provider != "custom" {
+            return Ok(View {
+                title: Some("ACTIVE PROVIDER".into()),
+                blocks: vec![Block::Paragraph {
+                    text: "This session is not using a Custom AI provider. Configure a Custom endpoint with /login.".into(),
+                }],
+                actions: vec![vec![Action::command("Login", "/login"), Action::close()]],
+                side_mode: false,
+            });
+        }
+        let Some(profile_id) = c.active.account_id.as_deref() else {
+            return Ok(View {
+                title: Some("ACTIVE PROVIDER".into()),
+                blocks: vec![Block::Paragraph {
+                    text: "No Custom profile is active for this session. Configure one with /login.".into(),
+                }],
+                actions: vec![vec![Action::command("Login", "/login"), Action::close()]],
+                side_mode: false,
+            });
+        };
+        let profiles = ProviderProfileStore::new(self.storage.clone());
+        let profile = profiles
+            .get(principal, profile_id)?
+            .ok_or_else(|| anyhow!("selected Custom profile is unavailable"))?;
+        let current_model = profiles.model(profile_id, &c.active.model)?;
+        let capability = self
+            .providers
+            .capabilities_for("custom", &c.active.model, Some(profile_id))?;
+        let rows = vec![
+            vec!["CUSTOM ALIAS".into(), profile.alias.clone()],
+            vec!["ENDPOINT".into(), profile.endpoint.clone()],
+            vec!["ACTIVE MODEL".into(), c.active.model.clone()],
+            vec!["TOOLS".into(), capability.tool_protocol.as_str().into()],
+            vec![
+                "VISION".into(),
+                current_model
+                    .as_ref()
+                    .map(|m| m.vision_state.clone())
+                    .unwrap_or_else(|| "unknown".into()),
+            ],
+            vec![
+                "FILE INPUT".into(),
+                current_model
+                    .as_ref()
+                    .map(|m| m.file_input_state.clone())
+                    .unwrap_or_else(|| "unknown".into()),
+            ],
+        ];
+        let blocks = vec![Block::Table {
+            headers: vec!["Field".into(), "Value".into()],
+            rows,
+        }];
+        let actions = vec![
+            vec![
+                Action::command("Configure / Login", "/login"),
+                Action::command("Select Model", "/model"),
+            ],
+            vec![Action::close()],
+        ];
+        Ok(View {
+            title: Some("CUSTOM PROVIDER".into()),
+            blocks,
+            actions,
+            side_mode: false,
+        })
+    }
+
     fn model_view(&self, principal: &str, scope: Option<TelegramScope>) -> Result<View> {
         self.model_picker_view(principal, scope, 1)
     }
@@ -1021,7 +1096,7 @@ impl CommandCore {
             ));
         };
         let profiles = ProviderProfileStore::new(self.storage.clone());
-        let profile = profiles
+        let _profile = profiles
             .get(principal, profile_id)?
             .ok_or_else(|| anyhow!("selected Custom profile is unavailable"))?;
         let models = profiles
@@ -1031,33 +1106,6 @@ impl CommandCore {
             .collect::<Vec<_>>();
         let pagination = Paginator::new(models.len(), page, 5);
         let visible = models[pagination.range()].to_vec();
-        let current_model = profiles.model(profile_id, &c.active.model)?;
-        let capability =
-            self.providers
-                .capabilities_for("custom", &c.active.model, Some(profile_id))?;
-        let mut blocks = vec![Block::Table {
-            headers: vec!["Field".into(), "Value".into()],
-            rows: vec![
-                vec!["CUSTOM ALIAS".into(), profile.alias.clone()],
-                vec!["ENDPOINT".into(), profile.endpoint.clone()],
-                vec!["ACTIVE MODEL".into(), c.active.model.clone()],
-                vec!["TOOLS".into(), capability.tool_protocol.as_str().into()],
-                vec![
-                    "VISION".into(),
-                    current_model
-                        .as_ref()
-                        .map(|model| model.vision_state.clone())
-                        .unwrap_or_else(|| "unknown".into()),
-                ],
-                vec![
-                    "FILE INPUT".into(),
-                    current_model
-                        .as_ref()
-                        .map(|model| model.file_input_state.clone())
-                        .unwrap_or_else(|| "unknown".into()),
-                ],
-            ],
-        }];
         let rows = visible
             .iter()
             .enumerate()
@@ -1073,10 +1121,10 @@ impl CommandCore {
                 ]
             })
             .collect();
-        blocks.push(Block::Table {
+        let blocks = vec![Block::Table {
             headers: vec!["No".into(), "Discovered model".into(), "Current".into()],
             rows,
-        });
+        }];
         let mut actions = vec![visible
             .into_iter()
             .enumerate()
@@ -1888,4 +1936,38 @@ fn safe_diagnostic(error: &impl std::fmt::Display) -> String {
         .chars()
         .take(600)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_provider_and_model_commands() {
+        assert_eq!(parse("/provider").unwrap(), Some(Command::Provider));
+        assert_eq!(parse("/model").unwrap(), Some(Command::Model));
+        assert!(parse("/provider extra").is_err());
+        assert_eq!(
+            parse_internal_callback("/provider").unwrap(),
+            Some(Command::Provider)
+        );
+        assert_eq!(
+            parse_internal_callback("/model").unwrap(),
+            Some(Command::Model)
+        );
+        assert_eq!(
+            parse_internal_callback("/model change 2").unwrap(),
+            Some(Command::ModelPicker { page: 2 })
+        );
+    }
+
+    #[test]
+    fn help_and_registry_expose_provider_and_model() {
+        let help = TelegramCommandRegistry::help_text();
+        assert!(help.contains("/provider — Show active AI provider profile summary"));
+        assert!(help.contains("/model — View or change the active model"));
+        let commands = TelegramCommandRegistry::bot_commands();
+        assert!(commands.iter().any(|c| c.command == "provider"));
+        assert!(commands.iter().any(|c| c.command == "model"));
+    }
 }

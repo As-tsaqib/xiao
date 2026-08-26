@@ -21,7 +21,7 @@ pub struct BotCommand {
 pub struct TelegramCommandRegistry;
 
 impl TelegramCommandRegistry {
-    pub const PUBLIC: [TelegramCommandDefinition; 14] = [
+    pub const PUBLIC: [TelegramCommandDefinition; 15] = [
         TelegramCommandDefinition {
             name: "start",
             description: "Start Xiao",
@@ -33,6 +33,10 @@ impl TelegramCommandRegistry {
         TelegramCommandDefinition {
             name: "login",
             description: "Configure the Custom AI endpoint",
+        },
+        TelegramCommandDefinition {
+            name: "provider",
+            description: "Show active AI provider profile summary",
         },
         TelegramCommandDefinition {
             name: "model",
@@ -162,7 +166,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "start", "help", "login", "model", "new", "sessions", "btw", "status", "context",
+                "start", "help", "login", "provider", "model", "new", "sessions", "btw", "status", "context",
                 "retry", "yolo", "stop", "skills", "tools",
             ]
         );
@@ -175,7 +179,6 @@ mod tests {
             "deny",
             "session",
             "account",
-            "provider",
             "settings",
             "usage",
             "env",
@@ -198,7 +201,7 @@ mod tests {
         for command in &native {
             assert_eq!(help.matches(&format!("/{} ", command.command)).count(), 1);
         }
-        assert_eq!(native.len(), 14);
+        assert_eq!(native.len(), 15);
         assert!(!native.iter().any(|command| command.command == "n"));
     }
 }

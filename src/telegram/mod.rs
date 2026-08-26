@@ -3912,4 +3912,163 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+
+    #[tokio::test]
+    async fn telegram_photo_attachment_with_caption_apa_ini_routes_to_provider_without_termux_or_shell() {
+        async fn get_file(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let file_id = body["file_id"].as_str().unwrap_or_default();
+            Json(json!({"ok":true,"result":{
+                "file_id":file_id,"file_unique_id":"photo-unique-apa-ini","file_size":68,"file_path":"files/photo.png"
+            }}))
+        }
+        async fn photo_download() -> Vec<u8> {
+            vec![
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100,
+                248, 15, 0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+                130,
+            ]
+        }
+
+        let telegram_probe = Arc::new(TelegramRequestProbe::default());
+        let telegram_base = serve(
+            Router::new()
+                .route("/bottest-token/getFile", post(get_file))
+                .route("/file/bottest-token/files/photo.png", get(photo_download))
+                .fallback(post(scoped_telegram_stub))
+                .with_state(telegram_probe.clone()),
+        )
+        .await;
+
+        let provider_captured_req = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let provider_captured_clone = provider_captured_req.clone();
+        let provider_base = serve(
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = provider_captured_clone.clone();
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Ini adalah gambar merah."
+                                }
+                            }]
+                        }))
+                    }
+                }),
+            ),
+        )
+        .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.storage.database = temp.path().join("xiao.db");
+        cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.logs_dir = temp.path().join("logs");
+        cfg.paths.secrets_dir = temp.path().join("secrets");
+        cfg.telegram.enabled = true;
+        cfg.telegram.access.owner_user_id = Some(10);
+        cfg.telegram.access.allowed_chat_ids = vec![100];
+        cfg.providers.custom.enabled = true;
+        cfg.providers.custom.base_url = Some(provider_base);
+        cfg.providers.custom.models = vec!["m-vision".into()];
+        cfg.providers.custom.default_model = Some("m-vision".into());
+
+        let app = AppState::build(cfg).await.unwrap();
+        let owner = app.resolve_telegram_owner(10).unwrap().owner_id;
+
+        let profile_store = crate::providers::ProviderProfileStore::new(app.storage.clone());
+        let profile = profile_store
+            .create(crate::storage::ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner.clone(),
+                alias: "vision-profile".into(),
+                endpoint: app.config.providers.custom.base_url.clone().unwrap(),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: None,
+                api_key_ref: None,
+                safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
+            })
+            .unwrap();
+        let vision_model = crate::storage::ProviderProfileModelRecord {
+            profile_id: profile.profile_id.clone(),
+            model_id: "m-vision".into(),
+            text_capable: true,
+            vision_capable: true,
+            file_input_capable: false,
+            native_tools: false,
+            structured_output: false,
+            continuation: false,
+            native_tools_state: "unsupported".into(),
+            structured_output_state: "unsupported".into(),
+            continuation_state: "unsupported".into(),
+            vision_state: "supported".into(),
+            file_input_state: "unsupported".into(),
+            model_discovery: false,
+            tool_protocol: "chat_only".into(),
+            evidence: "configured vision fixture".into(),
+            probe_status: "completed".into(),
+            probe_version: 1,
+            probed_at: "now".into(),
+        };
+        profile_store
+            .replace_models(&owner, &profile.profile_id, &[vision_model])
+            .unwrap();
+
+        let session = app
+            .sessions
+            .context_for_telegram(&owner, TelegramScope::new(100, Some(7)))
+            .unwrap()
+            .active;
+        app.storage
+            .set_session_provider(&owner, &session.id, "custom", Some(&profile.profile_id), "m-vision")
+            .unwrap();
+
+        let adapter = TelegramAdapter {
+            app: app.clone(),
+            client: TelegramClient::with_base("test-token".into(), telegram_base).unwrap(),
+            menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
+            custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
+            principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let mut photo = topic_message(72, 100, 7, 10, "");
+        let message = photo.message.as_mut().unwrap();
+        message.text = None;
+        message.caption = Some("Apa ini".into());
+        message.photo = vec![types::PhotoSize {
+            file_id: "photo-file".into(),
+            file_unique_id: "photo-unique-apa-ini".into(),
+            width: 1,
+            height: 1,
+            file_size: Some(68),
+        }];
+        adapter.handle_update(photo).await.unwrap();
+
+        let attachments = app.storage.recent_attachments(&owner, &session.id, 5).unwrap();
+        assert_eq!(attachments.len(), 1);
+        let att = &attachments[0];
+        assert_eq!(att.detected_mime, "image/png");
+        assert_eq!(att.processing_status, "ready");
+        assert!(std::path::Path::new(&att.local_path).starts_with(app.attachments.root()));
+
+        let captured = provider_captured_req.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let req_messages = captured[0]["messages"].as_array().unwrap();
+        let user_content = &req_messages[0]["content"];
+        let content_str = serde_json::to_string(user_content).unwrap();
+        assert!(content_str.contains("data:image/png;base64,"));
+        assert!(content_str.contains("Apa ini"));
+
+        let sent_requests = telegram_probe.requests.lock().unwrap();
+        assert!(sent_requests.iter().any(|(method, body)| {
+            (method == "sendMessage" || method == "editMessageText")
+                && serde_json::to_string(body).unwrap().contains("Ini adalah gambar merah.")
+        }));
+    }
 }

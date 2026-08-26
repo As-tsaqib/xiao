@@ -257,6 +257,10 @@ pub enum AgentEvent {
     GenerationFailed(String),
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderRequest {
     pub session_id: String,
@@ -276,6 +280,8 @@ pub struct ProviderRequest {
     /// explicitly file-input-capable selected model.
     #[serde(default)]
     pub files: Vec<NormalizedFile>,
+    #[serde(default = default_true)]
+    pub streaming: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +367,7 @@ pub trait Provider: Send + Sync {
                 bytes: request.pdf.clone(),
                 caption: request.prompt.clone(),
             }],
+            streaming: false,
         };
         tokio::select! {
             _ = cancellation.cancelled() => Err(anyhow!("attachment provider file input cancelled")),
@@ -400,6 +407,7 @@ pub trait Provider: Send + Sync {
             tools: Vec::new(),
             images,
             files: Vec::new(),
+            streaming: false,
         };
         tokio::select! {
             _ = cancellation.cancelled() => Err(anyhow!("attachment provider vision cancelled")),
@@ -1597,17 +1605,21 @@ impl Provider for CustomProvider {
             &progress,
             AgentEvent::Status("Sending request to custom provider".into()),
         );
+        let is_streaming = req.streaming;
         let endpoint = if target.protocol == "openai_chat_completions" {
             endpoint_with_suffix(&target.base_url, "/chat/completions")
         } else {
             endpoint_with_suffix(&target.base_url, "/responses")
         };
-        let mut request = self.client.post(endpoint);
+        let mut request = self.client.post(endpoint.clone());
         for (name, value) in &target.headers {
             request = request.header(name.as_str(), value.as_str());
         }
         if let Some(key) = target.api_key.as_deref() {
             request = request.bearer_auth(key);
+        }
+        if is_streaming {
+            request = request.header("Accept", "text/event-stream");
         }
         let mut structured_transcript = None;
         if capabilities.tool_protocol == ToolProtocol::StructuredJsonFallback {
@@ -1630,11 +1642,70 @@ impl Provider for CustomProvider {
                 capabilities.tool_protocol,
             )?
         };
-        let response = request
-            .header("Accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await?;
+        let response_res = request.json(&body).send().await;
+        let mut response = match response_res {
+            Ok(resp) => resp,
+            Err(err) => return Err(err.into()),
+        };
+        let mut parsed_non_stream = false;
+        if !response.status().is_success() && is_streaming {
+            let status = response.status();
+            let body_bytes = response.bytes().await.unwrap_or_default();
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            if is_explicit_streaming_unsupported(status.as_u16(), &body_text) {
+                if let Some(profile_id) = profile_id.as_deref() {
+                    let _ = self.profiles.record_runtime_capability(
+                        profile_id,
+                        &req.model,
+                        &target.protocol,
+                        "streaming",
+                        "unsupported",
+                        "provider_explicit_unsupported",
+                    );
+                }
+                let mut fallback_req = req.clone();
+                fallback_req.streaming = false;
+                let fallback_body = if target.protocol == "openai_chat_completions" {
+                    custom_chat_body(
+                        &fallback_req,
+                        continuation.as_ref(),
+                        &tool_results,
+                        capabilities.tool_protocol,
+                    )?
+                } else {
+                    custom_responses_body(
+                        &fallback_req,
+                        continuation.as_ref(),
+                        &tool_results,
+                        capabilities.tool_protocol,
+                    )?
+                };
+                let mut retry_request = self.client.post(endpoint);
+                for (name, value) in &target.headers {
+                    retry_request = retry_request.header(name.as_str(), value.as_str());
+                }
+                if let Some(key) = target.api_key.as_deref() {
+                    retry_request = retry_request.bearer_auth(key);
+                }
+                response = retry_request.json(&fallback_body).send().await?;
+                parsed_non_stream = true;
+            } else {
+                let summary = upstream_error_summary(&body_bytes, false);
+                if had_images && explicit_image_unsupported(&summary) {
+                    if let Some(profile_id) = profile_id.as_deref() {
+                        let _ = self.profiles.record_runtime_capability(
+                            profile_id,
+                            &req.model,
+                            &target.protocol,
+                            "vision",
+                            "unsupported",
+                            "provider_explicit_unsupported",
+                        );
+                    }
+                }
+                return Err(anyhow!("Custom provider returned {}: {}", status, summary));
+            }
+        }
         let response = match ensure_success(response, "Custom provider").await {
             Ok(response) => response,
             Err(error) => {
@@ -1653,11 +1724,13 @@ impl Provider for CustomProvider {
                 return Err(error);
             }
         };
-        if !response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.contains("text/event-stream"))
+        if parsed_non_stream
+            || !req.streaming
+            || !response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("text/event-stream"))
         {
             let value: serde_json::Value = response.json().await?;
             let (step, continuation) = match capabilities.tool_protocol {
@@ -1851,7 +1924,7 @@ fn custom_chat_body(
     let mut body = serde_json::json!({
         "model": req.model,
         "messages": messages,
-        "stream": true,
+        "stream": req.streaming,
     });
     if protocol == ToolProtocol::Native && !req.tools.is_empty() {
         body["tools"] = serde_json::Value::Array(
@@ -1905,7 +1978,7 @@ fn custom_responses_body(
     let mut body = serde_json::json!({
         "model": req.model,
         "input": input,
-        "stream": true,
+        "stream": req.streaming,
     });
     if let Some(instructions) = payload.instructions {
         body["instructions"] = serde_json::Value::String(instructions);
@@ -2730,6 +2803,18 @@ fn upstream_error_summary(body: &[u8], truncated: bool) -> String {
     safe
 }
 
+fn is_explicit_streaming_unsupported(status: u16, body: &str) -> bool {
+    let value = body.to_ascii_lowercase();
+    (status == 400 || status == 415 || status == 422)
+        && value.contains("stream")
+        && (value.contains("unsupported")
+            || value.contains("not supported")
+            || value.contains("disabled")
+            || value.contains("not enabled")
+            || value.contains("does not support")
+            || value.contains("only non-streaming"))
+}
+
 fn explicit_image_unsupported(error: &str) -> bool {
     let value = error.to_ascii_lowercase();
     value.contains("http 400")
@@ -3189,6 +3274,7 @@ mod tests {
             tools: vec![],
             images: vec![],
             files: vec![],
+            streaming: true,
         }
     }
 
@@ -4052,5 +4138,173 @@ mod tests {
         assert!(!capabilities.file_input);
         record.vision_state = "supported".into();
         assert!(profile_capabilities_from_record(record).vision);
+    }
+
+    #[tokio::test]
+    async fn custom_chat_non_streaming_when_requested_emits_no_deltas_and_returns_final_turn() {
+        let (captured_stream_flag_tx, mut captured_stream_flag_rx) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured_tx = captured_stream_flag_tx.clone();
+                async move {
+                    let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                    captured_tx.send(is_stream).unwrap();
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "chat non-stream result"
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (auth, _directory) = test_auth();
+        let config = CustomProviderConfig {
+            enabled: true,
+            base_url: Some(format!("http://{address}/v1")),
+            protocol: "openai_chat_completions".into(),
+            ..Default::default()
+        };
+        let provider = CustomProvider::new(config, auth);
+        let mut req = request(vec![message("user", "hello non-streaming")]);
+        req.streaming = false;
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let turn = provider
+            .run_turn(req, None, vec![], Some(progress_tx))
+            .await
+            .unwrap();
+
+        match turn.step {
+            ProviderStep::Final(answer) => assert_eq!(answer, "chat non-stream result"),
+            _ => panic!("expected final answer"),
+        }
+        let stream_flag = captured_stream_flag_rx.recv().await.unwrap();
+        assert!(!stream_flag);
+
+        let mut events = Vec::new();
+        while let Ok(event) = progress_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::TextDelta(_))));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_responses_non_streaming_when_requested_emits_no_deltas_and_returns_final_turn() {
+        let (captured_stream_flag_tx, mut captured_stream_flag_rx) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured_tx = captured_stream_flag_tx.clone();
+                async move {
+                    let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                    captured_tx.send(is_stream).unwrap();
+                    Json(serde_json::json!({
+                        "output_text": "responses non-stream result"
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (auth, _directory) = test_auth();
+        let config = CustomProviderConfig {
+            enabled: true,
+            base_url: Some(format!("http://{address}/v1")),
+            protocol: "openai_responses".into(),
+            ..Default::default()
+        };
+        let provider = CustomProvider::new(config, auth);
+        let mut req = request(vec![message("user", "hello responses non-streaming")]);
+        req.streaming = false;
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let turn = provider
+            .run_turn(req, None, vec![], Some(progress_tx))
+            .await
+            .unwrap();
+
+        match turn.step {
+            ProviderStep::Final(answer) => assert_eq!(answer, "responses non-stream result"),
+            _ => panic!("expected final answer"),
+        }
+        let stream_flag = captured_stream_flag_rx.recv().await.unwrap();
+        assert!(!stream_flag);
+
+        let mut events = Vec::new();
+        while let Ok(event) = progress_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::TextDelta(_))));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_chat_streaming_fallback_retries_once_on_explicit_unsupported_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempt = Arc::new(AtomicUsize::new(0));
+        let attempt_clone = attempt.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let attempt = attempt_clone.clone();
+                async move {
+                    let current = attempt.fetch_add(1, Ordering::SeqCst);
+                    if current == 0 {
+                        assert_eq!(body["stream"], true);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": { "message": "streaming is not supported on this model endpoint" }
+                            })),
+                        )
+                    } else {
+                        assert_eq!(body["stream"], false);
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "choices": [{
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "fallback non-stream works"
+                                    }
+                                }]
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (auth, _directory) = test_auth();
+        let config = CustomProviderConfig {
+            enabled: true,
+            base_url: Some(format!("http://{address}/v1")),
+            protocol: "openai_chat_completions".into(),
+            ..Default::default()
+        };
+        let provider = CustomProvider::new(config, auth);
+        let req = request(vec![message("user", "hello with auto streaming")]);
+
+        let turn = provider.run_turn(req, None, vec![], None).await.unwrap();
+        match turn.step {
+            ProviderStep::Final(answer) => assert_eq!(answer, "fallback non-stream works"),
+            _ => panic!("expected final answer"),
+        }
+        assert_eq!(attempt.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 }

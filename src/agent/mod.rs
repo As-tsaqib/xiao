@@ -825,6 +825,7 @@ impl AgentEngine {
                 tools: available_tools,
                 images,
                 files: Vec::new(),
+                streaming: config.provider_streaming,
             };
             self.storage.record_agent_run_event(&agent_run_id, "pre_provider_overhead", timing_started.elapsed().as_millis() as u64, &serde_json::json!({}))?;
             let started = AgentEvent::GenerationStarted;
@@ -3033,5 +3034,142 @@ mod tests {
 
         assert!(error.contains("does not declare vision capability"));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct StreamingTestProvider {
+        received_streaming: Arc<Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait]
+    impl Provider for StreamingTestProvider {
+        fn id(&self) -> &'static str {
+            "streaming-test"
+        }
+        fn models(&self) -> Vec<String> {
+            vec!["m".into()]
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                text: true,
+                vision: false,
+                file_input: false,
+                native_tools: false,
+                tool_protocol: ToolProtocol::ChatOnly,
+                model_discovery: false,
+                structured_output: true,
+                continuation: false,
+                evidence: "streaming test provider fixture".into(),
+            }
+        }
+        async fn run(
+            &self,
+            _: ProviderRequest,
+            _: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderResponse> {
+            Err(anyhow!("run_turn must be used"))
+        }
+        async fn run_turn(
+            &self,
+            request: ProviderRequest,
+            _: Option<serde_json::Value>,
+            _: Vec<ToolResult>,
+            progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderTurn> {
+            self.received_streaming
+                .lock()
+                .unwrap()
+                .push(request.streaming);
+            if request.streaming {
+                if let Some(tx) = progress {
+                    let _ = tx.send(AgentEvent::TextDelta("streaming token".into()));
+                }
+            }
+            Ok(ProviderTurn {
+                step: ProviderStep::Final("deterministic final response".into()),
+                continuation: None,
+                events: vec![AgentEvent::Status("completed".into())],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_engine_honors_provider_streaming_false_without_emitting_text_deltas() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(StreamingTestProvider {
+            received_streaming: recorded.clone(),
+        });
+        let (base, db, session, _fixture) = engine("streaming-test", provider);
+        let config = AgentConfig {
+            provider_streaming: false,
+            ..AgentConfig::default()
+        };
+        let agent = AgentEngine::with_registry_runtime(
+            base.sessions.clone(),
+            db.clone(),
+            base.providers.clone(),
+            config,
+            base.tools.clone(),
+            None,
+            None,
+        );
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let answer = agent
+            .submit_with_progress("u", "hello non-stream", Some(progress_tx))
+            .await
+            .unwrap();
+
+        assert_eq!(answer.final_answer, "deterministic final response");
+        assert_eq!(&*recorded.lock().unwrap(), &[false]);
+
+        let mut events = Vec::new();
+        while let Ok(event) = progress_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::TextDelta(_))));
+        let messages = db.messages("u", &session).unwrap();
+        assert_eq!(messages.last().unwrap().content, "deterministic final response");
+    }
+
+    #[tokio::test]
+    async fn agent_engine_honors_provider_streaming_true_and_preserves_streaming_deltas() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(StreamingTestProvider {
+            received_streaming: recorded.clone(),
+        });
+        let (base, db, session, _fixture) = engine("streaming-test", provider);
+        let config = AgentConfig {
+            provider_streaming: true,
+            ..AgentConfig::default()
+        };
+        let agent = AgentEngine::with_registry_runtime(
+            base.sessions.clone(),
+            db.clone(),
+            base.providers.clone(),
+            config,
+            base.tools.clone(),
+            None,
+            None,
+        );
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let answer = agent
+            .submit_with_progress("u", "hello streaming", Some(progress_tx))
+            .await
+            .unwrap();
+
+        assert_eq!(answer.final_answer, "deterministic final response");
+        assert_eq!(&*recorded.lock().unwrap(), &[true]);
+
+        let mut events = Vec::new();
+        while let Ok(event) = progress_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta(t) if t == "streaming token")));
+        let messages = db.messages("u", &session).unwrap();
+        assert_eq!(messages.last().unwrap().content, "deterministic final response");
     }
 }

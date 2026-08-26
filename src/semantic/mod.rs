@@ -76,6 +76,7 @@ impl SemanticBackend for ProviderSemanticBackend {
             tools: Vec::new(),
             images: Vec::new(),
             files: Vec::new(),
+            streaming: false,
         };
         semantic_worker().evaluate(
             self.provider.clone(),

@@ -586,4 +586,82 @@ mod tests {
         );
         assert!(verified_artifacts(&task, workspace.path(), &[PathBuf::from("missing")]).is_err());
     }
+
+    #[tokio::test]
+    async fn termux_job_rejects_su_and_root_escalation() {
+        let packages = Arc::new(FakePackages {
+            available: Mutex::new(BTreeSet::new()),
+            installs: Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(FakeExecutor {
+            commands: Mutex::new(Vec::new()),
+        });
+        let resolver = Arc::new(DependencyResolver::new(
+            capabilities(),
+            packages.clone(),
+            None,
+        ));
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let job = TermuxJobTool::new(terminal, 16);
+        let result = job
+            .execute(
+                &ToolContext {
+                    principal: "owner".into(),
+                    session_id: "session".into(),
+                    agent_run_id: "run".into(),
+                    yolo_mode: false,
+                    messages: Vec::new(),
+                    cancellation: CancellationToken::new(),
+                    progress: None,
+                },
+                json!({
+                    "steps": [{
+                        "id": "step-root",
+                        "program": "su",
+                        "args": ["-c", "id"]
+                    }]
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("denied") || err.contains("policy") || err.contains("su"));
+    }
+
+    #[tokio::test]
+    async fn termux_job_enforces_max_steps() {
+        let packages = Arc::new(FakePackages {
+            available: Mutex::new(BTreeSet::new()),
+            installs: Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(FakeExecutor {
+            commands: Mutex::new(Vec::new()),
+        });
+        let resolver = Arc::new(DependencyResolver::new(
+            capabilities(),
+            packages.clone(),
+            None,
+        ));
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let job = TermuxJobTool::new(terminal, 2);
+        let steps = (0..5)
+            .map(|i| json!({ "id": format!("step-{i}"), "program": "echo", "args": ["hi"] }))
+            .collect::<Vec<_>>();
+        let result = job
+            .execute(
+                &ToolContext {
+                    principal: "owner".into(),
+                    session_id: "session".into(),
+                    agent_run_id: "run".into(),
+                    yolo_mode: false,
+                    messages: Vec::new(),
+                    cancellation: CancellationToken::new(),
+                    progress: None,
+                },
+                json!({ "steps": steps }),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("requires 1..=2 steps"));
+    }
 }
