@@ -682,21 +682,30 @@ mod tests {
             .execute(&context, json!({"program": "python3 -c 'print(1)'"}))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("shell command strings are forbidden"));
+        assert!(err
+            .to_string()
+            .contains("shell command strings are forbidden"));
 
         // Rejects bash -c
         let err2 = terminal
             .execute(&context, json!({"program": "bash", "args": ["-c", "id"]}))
             .await
             .unwrap_err();
-        assert!(err2.to_string().contains("shell command strings are forbidden"));
+        assert!(err2
+            .to_string()
+            .contains("shell command strings are forbidden"));
 
         // Rejects artifact escape
         let err3 = terminal
-            .execute(&context, json!({"program": "ls", "artifacts": ["../../etc/passwd"]}))
+            .execute(
+                &context,
+                json!({"program": "ls", "artifacts": ["../../etc/passwd"]}),
+            )
             .await
             .unwrap_err();
-        assert!(err3.to_string().contains("relative paths within the workspace"));
+        assert!(err3
+            .to_string()
+            .contains("relative paths within the workspace"));
     }
 
     #[tokio::test]
