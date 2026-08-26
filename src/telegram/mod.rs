@@ -3914,7 +3914,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telegram_photo_attachment_with_caption_apa_ini_routes_to_provider_without_termux_or_shell() {
+    async fn telegram_photo_attachment_with_caption_apa_ini_routes_to_provider_without_termux_or_shell(
+    ) {
         async fn get_file(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
             let file_id = body["file_id"].as_str().unwrap_or_default();
             Json(json!({"ok":true,"result":{
@@ -3942,25 +3943,23 @@ mod tests {
 
         let provider_captured_req = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let provider_captured_clone = provider_captured_req.clone();
-        let provider_base = serve(
-            Router::new().route(
-                "/v1/chat/completions",
-                post(move |Json(body): Json<serde_json::Value>| {
-                    let captured = provider_captured_clone.clone();
-                    async move {
-                        captured.lock().unwrap().push(body);
-                        Json(json!({
-                            "choices": [{
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "Ini adalah gambar merah."
-                                }
-                            }]
-                        }))
-                    }
-                }),
-            ),
-        )
+        let provider_base = serve(Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = provider_captured_clone.clone();
+                async move {
+                    captured.lock().unwrap().push(body);
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "Ini adalah gambar merah."
+                            }
+                        }]
+                    }))
+                }
+            }),
+        ))
         .await;
 
         let temp = tempfile::tempdir().unwrap();
@@ -4025,7 +4024,13 @@ mod tests {
             .unwrap()
             .active;
         app.storage
-            .set_session_provider(&owner, &session.id, "custom", Some(&profile.profile_id), "m-vision")
+            .set_session_provider(
+                &owner,
+                &session.id,
+                "custom",
+                Some(&profile.profile_id),
+                "m-vision",
+            )
             .unwrap();
 
         let adapter = TelegramAdapter {
@@ -4050,7 +4055,10 @@ mod tests {
         }];
         adapter.handle_update(photo).await.unwrap();
 
-        let attachments = app.storage.recent_attachments(&owner, &session.id, 5).unwrap();
+        let attachments = app
+            .storage
+            .recent_attachments(&owner, &session.id, 5)
+            .unwrap();
         assert_eq!(attachments.len(), 1);
         let att = &attachments[0];
         assert_eq!(att.detected_mime, "image/png");
@@ -4068,7 +4076,9 @@ mod tests {
         let sent_requests = telegram_probe.requests.lock().unwrap();
         assert!(sent_requests.iter().any(|(method, body)| {
             (method == "sendMessage" || method == "editMessageText")
-                && serde_json::to_string(body).unwrap().contains("Ini adalah gambar merah.")
+                && serde_json::to_string(body)
+                    .unwrap()
+                    .contains("Ini adalah gambar merah.")
         }));
     }
 }

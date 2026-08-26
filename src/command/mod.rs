@@ -1019,7 +1019,9 @@ impl CommandCore {
             return Ok(View {
                 title: Some("ACTIVE PROVIDER".into()),
                 blocks: vec![Block::Paragraph {
-                    text: "No Custom profile is active for this session. Configure one with /login.".into(),
+                    text:
+                        "No Custom profile is active for this session. Configure one with /login."
+                            .into(),
                 }],
                 actions: vec![vec![Action::command("Login", "/login"), Action::close()]],
                 side_mode: false,
@@ -1030,9 +1032,9 @@ impl CommandCore {
             .get(principal, profile_id)?
             .ok_or_else(|| anyhow!("selected Custom profile is unavailable"))?;
         let current_model = profiles.model(profile_id, &c.active.model)?;
-        let capability = self
-            .providers
-            .capabilities_for("custom", &c.active.model, Some(profile_id))?;
+        let capability =
+            self.providers
+                .capabilities_for("custom", &c.active.model, Some(profile_id))?;
         let rows = vec![
             vec!["CUSTOM ALIAS".into(), profile.alias.clone()],
             vec!["ENDPOINT".into(), profile.endpoint.clone()],

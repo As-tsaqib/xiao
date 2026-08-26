@@ -166,8 +166,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "start", "help", "login", "provider", "model", "new", "sessions", "btw", "status", "context",
-                "retry", "yolo", "stop", "skills", "tools",
+                "start", "help", "login", "provider", "model", "new", "sessions", "btw", "status",
+                "context", "retry", "yolo", "stop", "skills", "tools",
             ]
         );
         for removed in [

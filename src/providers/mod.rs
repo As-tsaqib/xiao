@@ -4148,7 +4148,10 @@ mod tests {
             post(move |Json(body): Json<serde_json::Value>| {
                 let captured_tx = captured_stream_flag_tx.clone();
                 async move {
-                    let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let is_stream = body
+                        .get("stream")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     captured_tx.send(is_stream).unwrap();
                     Json(serde_json::json!({
                         "choices": [{
@@ -4198,14 +4201,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_responses_non_streaming_when_requested_emits_no_deltas_and_returns_final_turn() {
+    async fn custom_responses_non_streaming_when_requested_emits_no_deltas_and_returns_final_turn()
+    {
         let (captured_stream_flag_tx, mut captured_stream_flag_rx) = mpsc::unbounded_channel();
         let app = Router::new().route(
             "/v1/responses",
             post(move |Json(body): Json<serde_json::Value>| {
                 let captured_tx = captured_stream_flag_tx.clone();
                 async move {
-                    let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let is_stream = body
+                        .get("stream")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     captured_tx.send(is_stream).unwrap();
                     Json(serde_json::json!({
                         "output_text": "responses non-stream result"

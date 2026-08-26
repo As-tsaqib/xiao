@@ -662,6 +662,9 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("requires 1..=2 steps"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires 1..=2 steps"));
     }
 }

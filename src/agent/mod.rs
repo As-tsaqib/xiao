@@ -3131,7 +3131,10 @@ mod tests {
         }
         assert!(!events.iter().any(|e| matches!(e, AgentEvent::TextDelta(_))));
         let messages = db.messages("u", &session).unwrap();
-        assert_eq!(messages.last().unwrap().content, "deterministic final response");
+        assert_eq!(
+            messages.last().unwrap().content,
+            "deterministic final response"
+        );
     }
 
     #[tokio::test]
@@ -3168,8 +3171,13 @@ mod tests {
         while let Ok(event) = progress_rx.try_recv() {
             events.push(event);
         }
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta(t) if t == "streaming token")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta(t) if t == "streaming token")));
         let messages = db.messages("u", &session).unwrap();
-        assert_eq!(messages.last().unwrap().content, "deterministic final response");
+        assert_eq!(
+            messages.last().unwrap().content,
+            "deterministic final response"
+        );
     }
 }
