@@ -4157,22 +4157,38 @@ mod tests {
         .await;
 
         let provider_captured = Arc::new(Mutex::new(Vec::new()));
-        let provider_captured_clone = provider_captured.clone();
+        let captured_1 = provider_captured.clone();
+        let captured_2 = provider_captured.clone();
         let provider_base = serve(
-            Router::new().route(
-                "/v1/chat/completions",
-                post(move |Json(body): Json<serde_json::Value>| {
-                    let captured = provider_captured_clone.clone();
-                    async move {
-                        captured.lock().unwrap().push(body);
-                        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world!\"}}]}\n\ndata: [DONE]\n\n";
-                        axum::response::Response::builder()
-                            .header("content-type", "text/event-stream")
-                            .body(axum::body::Body::from(sse_body))
-                            .unwrap()
-                    }
-                }),
-            ),
+            Router::new()
+                .route(
+                    "/chat/completions",
+                    post(move |Json(body): Json<serde_json::Value>| {
+                        let captured = captured_1.clone();
+                        async move {
+                            captured.lock().unwrap().push(body);
+                            let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world!\"}}]}\n\ndata: [DONE]\n\n";
+                            axum::response::Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .body(axum::body::Body::from(sse_body))
+                                .unwrap()
+                        }
+                    }),
+                )
+                .route(
+                    "/v1/chat/completions",
+                    post(move |Json(body): Json<serde_json::Value>| {
+                        let captured = captured_2.clone();
+                        async move {
+                            captured.lock().unwrap().push(body);
+                            let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world!\"}}]}\n\ndata: [DONE]\n\n";
+                            axum::response::Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .body(axum::body::Body::from(sse_body))
+                                .unwrap()
+                        }
+                    }),
+                ),
         )
         .await;
 
