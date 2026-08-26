@@ -6,7 +6,7 @@ This record is intentionally incomplete until the exact-head CI and rooted Andro
 
 - Branch: `v0.3.1-audit`
 - Schema migration: 26 → 27
-- Exact SHA/run: 0f7d4681a505963547c99a6d379ae9243bef4d38 (Run 32910451727)
+- Exact SHA/run: db5c45e2244509b30ab06a0298bc78a0b8034f7e (Run 32916712262)
 - Device screenshot proves ProgressIcon::Thinking custom emoji ID 5535034915403333642 is clipped at bottom by Telegram line box; fixed by defaulting to Unicode fallback 💭.
 - Local Rust, WebUI, and Android builds/tests: not run (repository policy).
 
