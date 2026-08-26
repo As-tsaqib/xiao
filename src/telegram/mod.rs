@@ -4095,7 +4095,7 @@ mod tests {
 
         let sent_requests = telegram_probe.requests.lock().unwrap();
         assert!(sent_requests.iter().any(|(method, body)| {
-            (method == "sendMessage" || method == "editMessageText")
+            (method == "sendRichMessage" || method == "sendMessage" || method == "editMessageText")
                 && serde_json::to_string(body)
                     .unwrap()
                     .contains("Ini adalah gambar merah.")
