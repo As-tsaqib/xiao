@@ -1100,25 +1100,13 @@ impl CommandCore {
         {
             return Err(anyhow!("model is not in the provider catalog"));
         }
-        if let Some(binding) = c.active.account_id.clone() {
-            self.management_set_session_ai(
-                principal,
-                &c.active.id,
-                &c.active.provider,
-                Some(binding),
-                model,
-            )?;
-            Ok(())
-        } else {
-            // Compatibility for an inert pre-profile Custom default session.
-            self.storage.set_session_provider(
-                principal,
-                &c.active.id,
-                &c.active.provider,
-                None,
-                model,
-            )
-        }
+        self.storage.set_session_provider(
+            principal,
+            &c.active.id,
+            &c.active.provider,
+            c.active.account_id.as_deref(),
+            model,
+        )
     }
 
     fn session_context(
