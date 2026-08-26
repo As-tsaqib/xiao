@@ -358,17 +358,22 @@ fn parse_global_options(raw: Vec<String>) -> CliResult<(GlobalOptions, Vec<Strin
 
 async fn run(options: GlobalOptions, args: Vec<String>, presenter: &CliPresenter) -> CliResult<()> {
     if args.is_empty()
-        || matches!(
-            args.first().map(String::as_str),
-            Some("-h" | "--help" | "help")
-        )
+        || (args.len() == 1
+            && matches!(
+                args.first().map(String::as_str),
+                Some("-h" | "--help" | "help")
+            ))
     {
         print_help();
         return Ok(());
     }
+    if args.first().map(String::as_str) == Some("help") && args.len() > 1 {
+        print_subcommand_help(&args[1..]);
+        return Ok(());
+    }
     if let Some(position) = args
         .iter()
-        .position(|arg| matches!(arg.as_str(), "-h" | "--help"))
+        .position(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
     {
         print_subcommand_help(&args[..position]);
         return Ok(());
@@ -416,6 +421,7 @@ async fn public_daemon_command(
     args: &[String],
     presenter: &CliPresenter,
 ) -> CliResult<()> {
+    validate_command_syntax(args)?;
     let client = DaemonClient::load(paths, options)?;
     if matches!(args[0].as_str(), "chat" | "ask") {
         return chat(&client, options, &args[1..], presenter).await;
@@ -511,6 +517,246 @@ async fn public_daemon_command(
     }
 }
 
+fn validate_command_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("status") => exact_arity(args, 1, "usage: xiao status"),
+        Some("context") => exact_arity(args, 1, "usage: xiao context"),
+        Some("doctor") => exact_arity(args, 1, "usage: xiao doctor"),
+        Some("tools") => exact_arity(args, 1, "usage: xiao tools"),
+        Some("btw") => exact_arity(args, 1, "usage: xiao btw"),
+        Some("stop") => exact_arity(args, 1, "usage: xiao stop"),
+        Some("retry") => exact_arity(args, 1, "usage: xiao retry"),
+        Some("chat" | "ask") => validate_chat_syntax(&args[1..]),
+        Some("telegram") => validate_telegram_syntax(&args[1..]),
+        Some("login") => validate_login_syntax(&args[1..]),
+        Some("model") => validate_model_syntax(&args[1..]),
+        Some("sessions") => validate_sessions_syntax(&args[1..]),
+        Some("yolo") => validate_yolo_syntax(&args[1..]),
+        Some("memory") => validate_memory_syntax(&args[1..]),
+        Some("skills") => validate_skills_syntax(&args[1..]),
+        Some("approvals") => validate_approvals_syntax(&args[1..]),
+        Some("attachments") => validate_attachments_syntax(&args[1..]),
+        Some("runs") => validate_runs_syntax(&args[1..]),
+        _ => Ok(()),
+    }
+}
+
+fn validate_chat_syntax(args: &[String]) -> CliResult<()> {
+    let mut prompt_parts = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--file" | "--image" => {
+                let kind = if args[index] == "--image" {
+                    "image"
+                } else {
+                    "file"
+                };
+                index += 1;
+                if args.get(index).is_none() {
+                    return Err(CliFailure::usage(format!("--{kind} requires PATH")));
+                }
+            }
+            value if value.starts_with("--") => {
+                return Err(CliFailure::usage(format!("unknown chat option `{value}`")));
+            }
+            value => prompt_parts.push(value.to_owned()),
+        }
+        index += 1;
+    }
+    if prompt_parts.join(" ").trim().is_empty() {
+        return Err(CliFailure::usage(
+            "usage: xiao chat [--file PATH] [--image PATH] \"prompt\""
+        ));
+    }
+    Ok(())
+}
+
+fn validate_telegram_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("status") if args.len() == 1 => Ok(()),
+        Some("test") if args.len() == 1 => Ok(()),
+        Some("set-token-file") if args.len() == 2 => Ok(()),
+        Some("set-owner")
+            if args.len() == 2
+                || (args.len() == 3 && args[2] == "--confirm-owner-change") =>
+        {
+            parse_owner_user_id(&args[1])?;
+            Ok(())
+        }
+        Some("set-owner") => Err(CliFailure::usage(
+            "usage: xiao telegram set-owner USER_ID [--confirm-owner-change]",
+        )),
+        Some("configure") => {
+            let mut index = 1usize;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--owner" => {
+                        index += 1;
+                        let val = args
+                            .get(index)
+                            .ok_or_else(|| CliFailure::usage("--owner requires USER_ID"))?;
+                        parse_owner_user_id(val)?;
+                    }
+                    "--allowed-chat" => {
+                        index += 1;
+                        let val = args
+                            .get(index)
+                            .ok_or_else(|| CliFailure::usage("--allowed-chat requires CHAT_ID"))?;
+                        parse_i64(val, "allowed chat id")?;
+                    }
+                    "--token-file" => {
+                        index += 1;
+                        if args.get(index).is_none() {
+                            return Err(CliFailure::usage("--token-file requires PATH"));
+                        }
+                    }
+                    "--enable" | "--disable" | "--confirm-owner-change" | "--test" => {}
+                    other => {
+                        return Err(CliFailure::usage(format!(
+                            "unknown telegram configure option `{other}`"
+                        )))
+                    }
+                }
+                index += 1;
+            }
+            Ok(())
+        }
+        _ => Err(CliFailure::usage(
+            "usage: xiao telegram <status|configure|set-owner|set-token-file|test>",
+        )),
+    }
+}
+
+fn validate_login_syntax(args: &[String]) -> CliResult<()> {
+    if args.is_empty() || matches!(args, [value] if value == "custom") {
+        return Ok(());
+    }
+    match args {
+        [value] if matches!(value.as_str(), "codex" | "antigravity" | "agy") => {
+            Err(CliFailure::usage(
+                "provider_configuration_required: Codex and Antigravity are no longer supported; use `xiao login` for a Custom endpoint",
+            ))
+        }
+        _ => Err(CliFailure::usage("usage: xiao login [custom]")),
+    }
+}
+
+fn validate_model_syntax(args: &[String]) -> CliResult<()> {
+    let Some(sub) = args.first().map(String::as_str) else {
+        return Err(CliFailure::usage(
+            "usage: xiao model <show|list|use|custom>",
+        ));
+    };
+    match sub {
+        "show" if args.len() == 1 => Ok(()),
+        "list" if args.len() == 1 => Ok(()),
+        "use" if args.len() == 2 => Ok(()),
+        "custom" => validate_custom_syntax(&args[1..]),
+        _ => Err(CliFailure::usage(
+            "usage: xiao model <show|list|use> | xiao model custom ...",
+        )),
+    }
+}
+
+fn validate_custom_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => Ok(()),
+        Some("show") if args.len() == 2 => Ok(()),
+        Some("add") => Ok(()),
+        Some("edit") => {
+            if args.len() < 2 {
+                return Err(CliFailure::usage("usage: xiao model custom edit ID [options]"));
+            }
+            Ok(())
+        }
+        Some("test") if args.len() == 2 || args.len() == 3 => Ok(()),
+        Some("probe") if args.len() == 3 => Ok(()),
+        Some("models") if args.len() == 2 => Ok(()),
+        Some("use") if args.len() == 3 => Ok(()),
+        Some("delete") if args.len() == 2 => Ok(()),
+        _ => Err(CliFailure::usage(
+            "usage: xiao model custom <list|add|show|edit|test|probe|models|use|delete> ...",
+        )),
+    }
+}
+
+fn validate_sessions_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => Ok(()),
+        Some("new") if args.len() == 1 => Ok(()),
+        Some("show") if args.len() == 2 => Ok(()),
+        Some("use") if args.len() == 2 => Ok(()),
+        Some("rename") if args.len() >= 3 => Ok(()),
+        Some("delete") if args.len() == 2 => Ok(()),
+        _ => Err(CliFailure::usage(
+            "usage: xiao sessions <list|new|show|use|rename|delete> ...",
+        )),
+    }
+}
+
+fn validate_yolo_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("status" | "on" | "off") if args.len() == 1 => Ok(()),
+        _ => Err(CliFailure::usage("usage: xiao yolo <status|on|off>")),
+    }
+}
+
+fn validate_memory_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 || args.len() == 2 => Ok(()),
+        Some("search") if args.len() >= 2 => Ok(()),
+        Some("get") if args.len() == 4 => Ok(()),
+        Some("set") if args.len() >= 5 => Ok(()),
+        Some("forget") if args.len() == 4 => Ok(()),
+        _ => Err(CliFailure::usage(
+            "usage: xiao memory <list [SCOPE]|search QUERY|get SCOPE CATEGORY KEY|set SCOPE CATEGORY KEY VALUE|forget SCOPE CATEGORY KEY>",
+        )),
+    }
+}
+
+fn validate_skills_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => Ok(()),
+        Some("search") if args.len() >= 2 => Ok(()),
+        Some("show") if args.len() == 2 => Ok(()),
+        Some("enable" | "disable" | "delete") if args.len() == 2 => Ok(()),
+        _ => Err(CliFailure::usage(
+            "usage: xiao skills <list|search QUERY|show ID|enable ID|disable ID|delete ID>",
+        )),
+    }
+}
+
+fn validate_approvals_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => Ok(()),
+        Some("approve" | "deny") if args.len() == 2 => Ok(()),
+        _ => Err(CliFailure::usage(
+            "usage: xiao approvals <list|approve ID|deny ID>",
+        )),
+    }
+}
+
+fn validate_attachments_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => Ok(()),
+        Some("show" | "remove") if args.len() == 2 => Ok(()),
+        _ => Err(CliFailure::usage(
+            "usage: xiao attachments <list|show ID|remove ID>",
+        )),
+    }
+}
+
+fn validate_runs_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => Ok(()),
+        Some("show" | "cancel") if args.len() == 2 => Ok(()),
+        _ => Err(CliFailure::usage(
+            "usage: xiao runs <list|show ID|cancel ID>",
+        )),
+    }
+}
+
 async fn chat(
     client: &DaemonClient,
     options: &GlobalOptions,
@@ -544,7 +790,7 @@ async fn chat(
     let prompt = prompt_parts.join(" ").trim().to_owned();
     if prompt.is_empty() {
         return Err(CliFailure::usage(
-            "usage: xiao chat [--file PATH] [--image PATH] \"prompt\"",
+            "usage: xiao chat [--file PATH] [--image PATH] "prompt"",
         ));
     }
     let exact_session = if !files.is_empty() || options.session.is_some() {
@@ -997,6 +1243,17 @@ async fn custom_add(
                     .ok_or_else(|| CliFailure::usage("--header requires NAME=VALUE"))?;
                 headers.insert(name.to_owned(), value.to_owned());
             }
+            "--headers-file" => {
+                index += 1;
+                let path = Path::new(required_arg(args, index, "--headers-file")?);
+                let raw = fs::read_to_string(path).map_err(|error| {
+                    CliFailure::local(format!("read {}: {error}", path.display()))
+                })?;
+                let file_headers: BTreeMap<String, String> = serde_json::from_str(&raw).map_err(|error| {
+                    CliFailure::usage(format!("invalid headers JSON: {error}"))
+                })?;
+                headers.extend(file_headers);
+            }
             "--secret-headers-file" => {
                 index += 1;
                 let path = Path::new(required_arg(args, index, "--secret-headers-file")?);
@@ -1119,6 +1376,17 @@ async fn custom_edit(
             "--keep-safe-headers" => keep_safe_headers = true,
             "--keep-secret-headers" => keep_secret_headers = true,
             "--clear-secret-headers" => clear_secret_headers = true,
+            "--header" => {
+                index += 1;
+                let pair = args
+                    .get(index)
+                    .ok_or_else(|| CliFailure::usage("--header requires NAME=VALUE"))?;
+                let (name, value) = pair
+                    .split_once('=')
+                    .ok_or_else(|| CliFailure::usage("--header requires NAME=VALUE"))?;
+                let map = headers.get_or_insert_with(BTreeMap::new);
+                map.insert(name.to_owned(), value.to_owned());
+            }
             "--headers-file" => {
                 index += 1;
                 let path = Path::new(required_arg(args, index, "--headers-file")?);
@@ -2408,20 +2676,76 @@ fn print_subcommand_help(path: &[String]) {
     let text = match key.as_slice() {
         ["chat"] | ["ask"] => r#"Usage: xiao chat [--file PATH] [--image PATH] [--session ID] [--json] [--quiet] "PROMPT""#,
         ["telegram"] => "Usage: xiao telegram <status|configure|set-owner|set-token-file|test>",
+        ["telegram", "status"] => "Usage: xiao telegram status",
         ["telegram", "configure"] => "Usage: xiao telegram configure [--owner ID] [--allowed-chat ID] [--token-file PATH] [--enable|--disable] [--test]",
+        ["telegram", "set-owner"] => "Usage: xiao telegram set-owner ID [--confirm-owner-change]",
+        ["telegram", "set-token-file"] => "Usage: xiao telegram set-token-file PATH",
+        ["telegram", "test"] => "Usage: xiao telegram test",
         ["model"] => "Usage: xiao model <show|list|use|custom> ...",
+        ["model", "show"] => "Usage: xiao model show [--session ID]",
+        ["model", "list"] => "Usage: xiao model list [--session ID]",
+        ["model", "use"] => "Usage: xiao model use MODEL [--session ID]",
         ["model", "custom"] => "Usage: xiao model custom <list|add|show|edit|test|probe|models|use|delete> ...",
+        ["model", "custom", "list"] => "Usage: xiao model custom list",
+        ["model", "custom", "add"] => "Usage: xiao model custom add ALIAS ENDPOINT [--protocol PROTO] [--key-file PATH] [--header NAME=VALUE] [--headers-file PATH] [--secret-headers-file PATH]",
+        ["model", "custom", "show"] => "Usage: xiao model custom show ID",
+        ["model", "custom", "edit"] => "Usage: xiao model custom edit ID [--alias ALIAS] [--endpoint URL] [--protocol PROTO] [--key-file PATH] [--header NAME=VALUE] [--headers-file PATH] [--secret-headers-file PATH] [--remove-key] [--keep-credential] [--keep-safe-headers] [--keep-secret-headers] [--clear-secret-headers]",
+        ["model", "custom", "test"] => "Usage: xiao model custom test ID [MODEL]",
+        ["model", "custom", "probe"] => "Usage: xiao model custom probe ID MODEL",
+        ["model", "custom", "models"] => "Usage: xiao model custom models ID",
+        ["model", "custom", "use"] => "Usage: xiao model custom use ID MODEL [--session ID]",
+        ["model", "custom", "delete"] => "Usage: xiao model custom delete ID",
         ["sessions"] => "Usage: xiao sessions <list|new|show|use|rename|delete> ...",
+        ["sessions", "list"] => "Usage: xiao sessions list",
+        ["sessions", "new"] => "Usage: xiao sessions new",
+        ["sessions", "show"] => "Usage: xiao sessions show ID",
+        ["sessions", "use"] => "Usage: xiao sessions use ID",
+        ["sessions", "rename"] => "Usage: xiao sessions rename ID NAME...",
+        ["sessions", "delete"] => "Usage: xiao sessions delete ID",
         ["yolo"] => "Usage: xiao yolo <status|on|off> [--session ID]",
+        ["yolo", "status"] => "Usage: xiao yolo status [--session ID]",
+        ["yolo", "on"] => "Usage: xiao yolo on [--session ID]",
+        ["yolo", "off"] => "Usage: xiao yolo off [--session ID]",
         ["memory"] => "Usage: xiao memory <list|search|get|set|forget> ...",
+        ["memory", "list"] => "Usage: xiao memory list [SCOPE]",
+        ["memory", "search"] => "Usage: xiao memory search QUERY",
+        ["memory", "get"] => "Usage: xiao memory get SCOPE CATEGORY KEY",
+        ["memory", "set"] => "Usage: xiao memory set SCOPE CATEGORY KEY VALUE...",
+        ["memory", "forget"] => "Usage: xiao memory forget SCOPE CATEGORY KEY",
         ["skills"] => "Usage: xiao skills <list|search|show|enable|disable|delete> ...",
+        ["skills", "list"] => "Usage: xiao skills list",
+        ["skills", "search"] => "Usage: xiao skills search QUERY",
+        ["skills", "show"] => "Usage: xiao skills show ID",
+        ["skills", "enable"] => "Usage: xiao skills enable ID",
+        ["skills", "disable"] => "Usage: xiao skills disable ID",
+        ["skills", "delete"] => "Usage: xiao skills delete ID",
         ["approvals"] => "Usage: xiao approvals <list|approve|deny> ...",
+        ["approvals", "list"] => "Usage: xiao approvals list",
+        ["approvals", "approve"] => "Usage: xiao approvals approve ID",
+        ["approvals", "deny"] => "Usage: xiao approvals deny ID",
         ["attachments"] => "Usage: xiao attachments <list|show|remove> [--session ID] ...",
+        ["attachments", "list"] => "Usage: xiao attachments list [--session ID]",
+        ["attachments", "show"] => "Usage: xiao attachments show ID",
+        ["attachments", "remove"] => "Usage: xiao attachments remove ID",
         ["runs"] => "Usage: xiao runs <list|show|cancel> ...",
+        ["runs", "list"] => "Usage: xiao runs list",
+        ["runs", "show"] => "Usage: xiao runs show ID",
+        ["runs", "cancel"] => "Usage: xiao runs cancel ID",
         ["daemon"] => "Usage: xiao daemon <start|foreground|stop|restart|status|logs> ...",
+        ["daemon", "start"] => "Usage: xiao daemon start",
+        ["daemon", "foreground"] => "Usage: xiao daemon foreground",
+        ["daemon", "stop"] => "Usage: xiao daemon stop",
+        ["daemon", "restart"] => "Usage: xiao daemon restart",
+        ["daemon", "status"] => "Usage: xiao daemon status",
+        ["daemon", "logs"] => "Usage: xiao daemon logs [LINES]",
         ["config"] => "Usage: xiao config <path|check|show>",
+        ["config", "path"] => "Usage: xiao config path",
+        ["config", "check"] => "Usage: xiao config check",
+        ["config", "show"] => "Usage: xiao config show",
         ["login"] => "Usage: xiao login [custom]",
-        ["setup"] => "Usage: xiao setup\nInteractive secure setup. Secrets are read from hidden TTY input; they are never required as argv values.",
+        ["login", "custom"] => "Usage: xiao login custom",
+        ["setup"] => "Usage: xiao setup
+Interactive secure setup. Secrets are read from hidden TTY input; they are never required as argv values.",
         ["status"] => "Usage: xiao status [--json] [--quiet]",
         ["context"] => "Usage: xiao context [--session ID] [--json]",
         ["doctor"] => "Usage: xiao doctor [--json]",
