@@ -3972,7 +3972,7 @@ mod tests {
         cfg.telegram.access.owner_user_id = Some(10);
         cfg.telegram.access.allowed_chat_ids = vec![100];
         cfg.providers.custom.enabled = true;
-        cfg.providers.custom.base_url = Some(provider_base);
+        cfg.providers.custom.base_url = Some(provider_base.clone());
         cfg.providers.custom.models = vec!["m-vision".into()];
         cfg.providers.custom.default_model = Some("m-vision".into());
 
