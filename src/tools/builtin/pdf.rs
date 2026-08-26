@@ -513,7 +513,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.contains("created successfully"));
+        assert!(result.contains("succeeded"));
         let pdf_path = temp
             .path()
             .join(".xiao/workspaces/test-aliases/aliased.pdf");

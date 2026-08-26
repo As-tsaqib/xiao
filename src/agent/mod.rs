@@ -2907,12 +2907,12 @@ mod tests {
             .unwrap();
         assert_eq!(answer.final_answer, "Repaired and verified");
         let run = &db.agent_runs("u", 1).unwrap()[0];
-        assert_eq!(run.status, "completed");
+        assert_eq!(run.status, "succeeded");
         let audit = db.tool_runs("u", &run.id).unwrap();
         assert_eq!(audit.len(), 3);
         assert_eq!(audit[0].status, "failed");
-        assert_eq!(audit[1].status, "completed");
-        assert_eq!(audit[2].status, "completed");
+        assert_eq!(audit[1].status, "succeeded");
+        assert_eq!(audit[2].status, "succeeded");
     }
 
     #[tokio::test]
