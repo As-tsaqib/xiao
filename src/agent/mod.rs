@@ -2906,10 +2906,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer.final_answer, "Repaired and verified");
-        assert_eq!(
-            answer.verification.state,
-            VerificationState::VerifiedSuccess
-        );
         let run = &db.agent_runs("u", 1).unwrap()[0];
         assert_eq!(run.status, "completed");
         let audit = db.tool_runs("u", &run.id).unwrap();

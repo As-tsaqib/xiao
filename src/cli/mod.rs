@@ -766,7 +766,8 @@ fn validate_runs_syntax(args: &[String]) -> CliResult<()> {
 
 fn validate_quickstart_syntax(args: &[String]) -> CliResult<()> {
     match args {
-        [] | [arg] if arg == "--no-start" => Ok(()),
+        [] => Ok(()),
+        [arg] if arg == "--no-start" => Ok(()),
         _ => Err(CliFailure::usage("usage: xiao quickstart [--no-start]")),
     }
 }

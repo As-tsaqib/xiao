@@ -991,39 +991,43 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_accepts_common_field_aliases() {
-        let executor = Arc::new(MockExecutor::new());
-        executor.register(
-            "git",
-            &["status"],
-            outcome("git", "On branch main\nnothing to commit"),
-        );
-        let dependencies = Arc::new(DependencyResolver::new(
-            executor.clone(),
+        let packages = Arc::new(FakePackages {
+            available: Mutex::new(BTreeSet::new()),
+            installs: Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(FakeExecutor {
+            commands: Mutex::new(Vec::new()),
+        });
+        let resolver = Arc::new(DependencyResolver::with_trusted_repository(
             capabilities(),
-            Arc::new(PackagePolicy::permissive()),
+            packages.clone(),
+            None,
+            Arc::new(FakeRepository),
         ));
-        let tool = TermuxTerminalTool::new(executor, dependencies, "/tmp");
+        let temp = tempdir().unwrap();
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, temp.path());
         let context = ToolContext {
-            principal: "p".into(),
-            session_id: "test-aliases".into(),
-            agent_run_id: "run-aliases".into(),
+            principal: "owner".into(),
+            session_id: "session".into(),
+            agent_run_id: "run".into(),
             yolo_mode: false,
             messages: Vec::new(),
             cancellation: CancellationToken::new(),
             progress: None,
         };
 
-        let result = tool
+        let result = terminal
             .execute(
                 &context,
                 json!({
-                    "command": "git",
-                    "argv": ["status"]
+                    "command": "python",
+                    "argv": ["script.py"]
                 }),
             )
             .await
             .unwrap();
 
-        assert!(result.contains("On branch main"));
+        assert!(result.contains("python"));
+        assert_eq!(executor.commands.lock().unwrap().len(), 1);
     }
 }
