@@ -214,9 +214,15 @@ async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
         .unwrap();
 
     let answer = engine
-        .submit_to_session_with_progress("owner-1", &session.id, "run two parallel reads", None)
+        .submit_to_session_with_progress(
+            "owner-1",
+            &session.id,
+            "inspect both readings in parallel",
+            None,
+        )
         .await
         .unwrap();
 
     assert_eq!(answer.final_answer, "both reads completed");
+    assert!(max_concurrent_seen.load(Ordering::SeqCst) >= 2);
 }
