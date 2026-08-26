@@ -1361,6 +1361,33 @@ struct CustomTarget {
 }
 
 impl CustomProvider {
+    fn streaming_supported_for(
+        &self,
+        model: &str,
+        profile_id: Option<&str>,
+        protocol: &str,
+    ) -> bool {
+        let Some(profile_id) = profile_id else {
+            return true;
+        };
+        match self
+            .profiles
+            .capability_override(profile_id, model, protocol, "streaming")
+            .as_deref()
+        {
+            Ok("force_supported") => return true,
+            Ok("force_unsupported") => return false,
+            _ => {}
+        }
+        match self
+            .profiles
+            .capability_state(profile_id, model, protocol, "streaming")
+            .as_deref()
+        {
+            Ok("unsupported") => false,
+            _ => true,
+        }
+    }
     fn new(cfg: CustomProviderConfig, auth: Arc<AuthManager>) -> Self {
         let storage = auth.storage();
         Self {
@@ -1522,33 +1549,7 @@ impl Provider for CustomProvider {
     fn supports_semantic_evaluation_for(&self, model: &str, profile_id: Option<&str>) -> bool {
         self.capabilities_for(model, profile_id).structured_output
     }
-    fn streaming_supported_for(
-        &self,
-        model: &str,
-        profile_id: Option<&str>,
-        protocol: &str,
-    ) -> bool {
-        let Some(profile_id) = profile_id else {
-            return true;
-        };
-        match self
-            .profiles
-            .capability_override(profile_id, model, protocol, "streaming")
-            .as_deref()
-        {
-            Ok("force_supported") => return true,
-            Ok("force_unsupported") => return false,
-            _ => {}
-        }
-        match self
-            .profiles
-            .capability_state(profile_id, model, protocol, "streaming")
-            .as_deref()
-        {
-            Ok("unsupported") => false,
-            _ => true,
-        }
-    }
+
     async fn generate_text(&self, mut req: ProviderRequest) -> Result<String> {
         req.tools.clear();
         if req.account_id.is_none() && !self.cfg.enabled {

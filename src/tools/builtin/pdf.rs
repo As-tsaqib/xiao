@@ -334,7 +334,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.contains(""status":"succeeded""));
+        assert!(result.contains(r#""status":"succeeded""#));
         assert!(result.contains("test.pdf"));
 
         let file_path = temp
@@ -380,7 +380,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.contains(""status":"succeeded""));
+        assert!(result.contains(r#""status":"succeeded""#));
         let file_path = temp
             .path()
             .join(".xiao/workspaces/test-multipage/reports/summary.pdf");
