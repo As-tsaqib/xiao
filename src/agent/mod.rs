@@ -16,7 +16,7 @@ use crate::{
     config::AgentConfig,
     context::{ContextEngine, SessionHistoryStore},
     learning::{LearningTrace, SafeToolObservation},
-    memory::{MemoryEvaluator, MemoryStore},
+    memory::MemoryStore,
     providers::{
         AgentEvent, ProviderPdfFallback, ProviderRegistry, ProviderRequest, ProviderStep,
         ToolProtocol,
@@ -672,12 +672,7 @@ impl AgentEngine {
                 SemanticEvaluator::deterministic()
             },
         );
-        let memory_evaluator = Arc::new(MemoryEvaluator::with_semantic(
-            self.memory_store.clone(),
-            semantic.clone(),
-        ));
-        let completion = CompletionVerifier::with_semantic(semantic.clone());
-        let _ = semantic;
+        let completion = CompletionVerifier::with_semantic(semantic);
 
         let goal = bound_text(redact_text(prompt), 4_096);
         let agent_run_id = match self.storage.create_agent_run(

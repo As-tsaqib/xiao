@@ -1006,34 +1006,6 @@ async fn manager_custom_profile_action(
     let cfg = state.app.config.read().await.clone();
     let secrets = SecretStore::new(cfg.paths.secrets_dir.clone());
     match req.action.as_str() {
-        "capability_override" => {
-            let profile_id = req
-                .profile_id
-                .as_deref()
-                .ok_or_else(|| bad("profile_id is required"))?;
-            let model_id = req
-                .model
-                .as_deref()
-                .ok_or_else(|| bad("model is required"))?;
-            let capability = req.capability.as_deref().unwrap_or("vision");
-            let owner_override = req.owner_override.as_deref().unwrap_or("auto");
-            let profile = profiles
-                .get(&owner, profile_id)
-                .map_err(bad)?
-                .ok_or_else(|| bad("Custom profile not found"))?;
-            state
-                .app
-                .storage
-                .set_capability_override(
-                    profile_id,
-                    model_id,
-                    &profile.protocol,
-                    capability,
-                    owner_override,
-                )
-                .map_err(bad)?;
-            Ok(Json(json!({"ok": true})))
-        }
         "create" => {
             let alias = req
                 .alias
