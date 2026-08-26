@@ -241,7 +241,10 @@ async fn termux_job_rejects_approval_requiring_substeps_with_distinct_status_and
     assert_eq!(parsed["job_status"], "failed");
     let step0 = &parsed["steps"][0];
     assert_eq!(step0["status"], "approval_required");
-    assert!(step0["error"].as_str().unwrap().contains("unsupported inside termux_job; call termux_terminal separately for exact approval"));
+    assert!(step0["error"]
+        .as_str()
+        .unwrap()
+        .contains("unsupported inside termux_job; call termux_terminal separately for exact approval"));
     // Since continue_on_error defaults to false, step 2 was not reached
     assert_eq!(parsed["steps"].as_array().unwrap().len(), 1);
     assert_eq!(executor.commands.lock().unwrap().len(), 0);
@@ -250,7 +253,11 @@ async fn termux_job_rejects_approval_requiring_substeps_with_distinct_status_and
     let steps = storage.tool_run_steps(&tool_run_id).unwrap();
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0].status, "approval_required");
-    assert!(steps[0].error.as_deref().unwrap().contains("unsupported inside termux_job; call termux_terminal separately for exact approval"));
+    assert!(steps[0]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("unsupported inside termux_job; call termux_terminal separately for exact approval"));
 }
 
 #[tokio::test]

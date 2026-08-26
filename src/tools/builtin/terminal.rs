@@ -384,9 +384,8 @@ fn preflight_validate_command(
         return Err(anyhow!("program must not be empty"));
     }
     if trimmed_prog.contains(' ')
-        || trimmed_prog.contains('	')
-        || trimmed_prog.contains('
-')
+        || trimmed_prog.contains('\t')
+        || trimmed_prog.contains('\n')
         || trimmed_prog.contains('|')
         || trimmed_prog.contains(';')
         || trimmed_prog.contains('&')
