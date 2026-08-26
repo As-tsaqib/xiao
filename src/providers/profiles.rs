@@ -46,19 +46,23 @@ impl ProviderProfileStore {
         let profile = self
             .get(owner_id, profile_id)?
             .ok_or_else(|| anyhow!("Custom profile not found"))?;
-        let model = self
+        let state = self
             .model(profile_id, model_id)?
-            .ok_or_else(|| anyhow!("Custom model not found"))?;
-        let state = if capability == "vision" {
-            &model.vision_state
-        } else {
-            &model.file_input_state
-        };
+            .map(|m| {
+                if capability == "vision" {
+                    m.vision_state
+                } else if capability == "file_input" {
+                    m.file_input_state
+                } else {
+                    "unknown".to_string()
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
         let now = Utc::now().to_rfc3339();
         self.storage.with_conn(|connection| {
             connection.execute(
                 "INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET owner_override=excluded.owner_override,source=excluded.source,observed_at=excluded.observed_at",
-                params![profile_id, model_id, profile.protocol, capability, state, owner_override, "owner_override", now],
+                params![profile_id, model_id, profile.protocol, capability, &state, owner_override, "owner_override", now],
             )?;
             Ok(())
         })
