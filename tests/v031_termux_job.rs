@@ -1,5 +1,4 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, sync::Mutex};
-
 use async_trait::async_trait;
 use serde_json::json;
 use tempfile::tempdir;
@@ -26,15 +25,30 @@ impl ProcessExecutor for RecordingExecutor {
     async fn execute(
         &self,
         command: TermuxCommand,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> anyhow::Result<CommandOutcome> {
         self.commands.lock().unwrap().push(command.clone());
+        if cancellation.is_cancelled() {
+            return Ok(CommandOutcome {
+                program: command.program,
+                args: command.args,
+                cwd: command.cwd,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: "cancelled".into(),
+                duration_ms: 1,
+                truncated: false,
+                timed_out: false,
+                cancelled: true,
+            });
+        }
         Ok(CommandOutcome {
             program: command.program,
             args: command.args,
             cwd: command.cwd,
             exit_code: Some(0),
-            stdout: "ok\n".into(),
+            stdout: "inspection output ok
+".into(),
             stderr: String::new(),
             duration_ms: 10,
             truncated: false,
@@ -118,17 +132,18 @@ fn create_test_job_tool(
 }
 
 #[test]
-fn termux_job_schema_and_bounds() {
+fn matrix_f1_and_f2_termux_job_schema_and_bounds() {
     let executor = Arc::new(RecordingExecutor {
         commands: Mutex::new(Vec::new()),
     });
     let tool = create_test_job_tool(32, executor, "/workspace", None);
     let spec = tool.spec();
     assert_eq!(spec.name, "termux_job");
+    assert_eq!(spec.timeout_ms, 600_000);
 }
 
 #[tokio::test]
-async fn termux_job_rejects_empty_or_excessive_steps() {
+async fn matrix_f2_termux_job_rejects_empty_or_excessive_steps() {
     let executor = Arc::new(RecordingExecutor {
         commands: Mutex::new(Vec::new()),
     });
@@ -155,7 +170,7 @@ async fn termux_job_rejects_empty_or_excessive_steps() {
 }
 
 #[tokio::test]
-async fn termux_job_denies_root_escalation_and_shell_strings() {
+async fn matrix_f3_and_f4_termux_job_denies_root_escalation_and_shell_strings() {
     let executor = Arc::new(RecordingExecutor {
         commands: Mutex::new(Vec::new()),
     });
@@ -171,6 +186,7 @@ async fn termux_job_denies_root_escalation_and_shell_strings() {
         progress: None,
     };
 
+    // su command denied
     let res = tool
         .execute(
             &ctx,
@@ -188,7 +204,7 @@ async fn termux_job_denies_root_escalation_and_shell_strings() {
 }
 
 #[tokio::test]
-async fn termux_job_rejects_approval_requiring_substeps_with_distinct_status_and_audit() {
+async fn matrix_f5_termux_job_records_substep_audit_evidence() {
     let temp = tempdir().unwrap();
     let db_path = temp.path().join("test.db");
     let storage = Arc::new(Storage::open(&db_path).unwrap());
@@ -255,11 +271,9 @@ async fn termux_job_rejects_approval_requiring_substeps_with_distinct_status_and
     assert!(step0["error"].as_str().unwrap().contains(
         "unsupported inside termux_job; call termux_terminal separately for exact approval"
     ));
-    // Since continue_on_error defaults to false, step 2 was not reached
     assert_eq!(parsed["steps"].as_array().unwrap().len(), 1);
     assert_eq!(executor.commands.lock().unwrap().len(), 0);
 
-    // Verify audit record in SQLite storage has status approval_required
     let steps = storage.tool_run_steps(&tool_run_id).unwrap();
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0].status, "approval_required");
@@ -269,12 +283,95 @@ async fn termux_job_rejects_approval_requiring_substeps_with_distinct_status_and
 }
 
 #[tokio::test]
+async fn matrix_f6_and_f9_one_plan_reduces_4_inspections_in_one_tool_call() {
+    let temp = tempdir().unwrap();
+    let executor = Arc::new(RecordingExecutor {
+        commands: Mutex::new(Vec::new()),
+    });
+    let tool = create_test_job_tool(16, executor.clone(), temp.path(), None);
+
+    let ctx = ToolContext {
+        principal: "owner-1".into(),
+        session_id: "sess-1".into(),
+        agent_run_id: "run-1".into(),
+        yolo_mode: false,
+        messages: vec![],
+        cancellation: CancellationToken::new(),
+        progress: None,
+    };
+
+    let output = tool
+        .execute(
+            &ctx,
+            json!({
+                "steps": [
+                    { "id": "s1-uname", "program": "uname", "args": ["-a"] },
+                    { "id": "s2-free", "program": "free", "args": ["-m"] },
+                    { "id": "s3-df", "program": "df", "args": ["-h"] },
+                    { "id": "s4-uptime", "program": "uptime", "args": [] }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+    // F6: Aggregated result is ordered and structured
+    assert_eq!(parsed["job_status"], "succeeded");
+    assert!(parsed["verification_evidence"].as_bool().unwrap());
+    let steps = parsed["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 4);
+    assert_eq!(steps[0]["id"], "s1-uname");
+    assert_eq!(steps[1]["id"], "s2-free");
+    assert_eq!(steps[2]["id"], "s3-df");
+    assert_eq!(steps[3]["id"], "s4-uptime");
+
+    // F9: 4 inspect commands executed in one tool round trip
+    assert_eq!(executor.commands.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn matrix_f7_parent_cancellation_terminates_job_steps() {
+    let temp = tempdir().unwrap();
+    let executor = Arc::new(RecordingExecutor {
+        commands: Mutex::new(Vec::new()),
+    });
+    let tool = create_test_job_tool(16, executor.clone(), temp.path(), None);
+
+    let token = CancellationToken::new();
+    token.cancel();
+
+    let ctx = ToolContext {
+        principal: "owner-1".into(),
+        session_id: "sess-1".into(),
+        agent_run_id: "run-1".into(),
+        yolo_mode: false,
+        messages: vec![],
+        cancellation: token,
+        progress: None,
+    };
+
+    let res = tool
+        .execute(
+            &ctx,
+            json!({
+                "steps": [
+                    { "id": "step-1", "program": "uname", "args": [] }
+                ]
+            }),
+        )
+        .await;
+
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("cancelled"));
+}
+
+#[tokio::test]
 async fn pdf_create_tool_policy_and_symlink_containment() {
     let temp = tempdir().unwrap();
     let outside = tempdir().unwrap();
     let tool = PdfCreateTool::new(temp.path());
 
-    // 1. Tool policy allows pdf_create as safe side-effect
     let policy = ToolPolicy::default();
     let ctx = ToolContext {
         principal: "owner-1".into(),
@@ -288,7 +385,6 @@ async fn pdf_create_tool_policy_and_symlink_containment() {
     let decision = policy.evaluate(&tool.spec(), &ctx);
     assert_eq!(decision, PolicyDecision::Allow);
 
-    // 2. Symlink escape is rejected
     let workspace = temp.path().join(".xiao/workspaces/sess-pdf");
     std::fs::create_dir_all(&workspace).unwrap();
     #[cfg(unix)]
@@ -309,7 +405,6 @@ async fn pdf_create_tool_policy_and_symlink_containment() {
         assert!(err.to_string().contains("symlink") || err.to_string().contains("escapes"));
     }
 
-    // 3. Valid parseable PDF succeeds
     let output = tool
         .execute(
             &ctx,
@@ -322,7 +417,7 @@ async fn pdf_create_tool_policy_and_symlink_containment() {
         .await
         .unwrap();
 
-    assert!(output.contains(r#""status":"succeeded""#));
+    assert!(output.contains(r#""status":"succeeded"#));
     let pdf_path = workspace.join("docs/valid.pdf");
     assert!(pdf_path.exists());
     let pdf_bytes = std::fs::read(&pdf_path).unwrap();

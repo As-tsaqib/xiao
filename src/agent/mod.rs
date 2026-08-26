@@ -832,7 +832,7 @@ impl AgentEngine {
             }
             let available_tools = if provider_capabilities.is_agent_capable() {
                 let all_specs = self.tools.available_specs(&tool_context);
-                if task_kind == TaskKind::Informational {
+                let filtered: Vec<_> = if task_kind == TaskKind::Informational {
                     all_specs
                         .into_iter()
                         .filter(|spec| {
@@ -845,6 +845,14 @@ impl AgentEngine {
                         .collect()
                 } else {
                     all_specs
+                };
+                if config.execution_plan_enabled {
+                    filtered
+                } else {
+                    filtered
+                        .into_iter()
+                        .filter(|spec| spec.name != "termux_job")
+                        .collect()
                 }
             } else {
                 Vec::new()
@@ -897,9 +905,17 @@ impl AgentEngine {
                             verification: blocked,
                         });
                     }
+                    let last_state = request
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "system" || m.role == "tool")
+                        .map(|m| format!("; last observable state: {}", &m.content))
+                        .unwrap_or_default();
                     return Err(anyhow!(
-                        "agent turn limit ({}) reached before a final answer",
-                        config.max_turns
+                        "agent turn limit ({}) reached before a final answer{}",
+                        config.max_turns,
+                        last_state
                     ));
                 }
                 turns += 1;
@@ -1101,6 +1117,17 @@ impl AgentEngine {
                                     continue;
                                 }
                             };
+                            if call.name == "termux_job" && !config.execution_plan_enabled {
+                                let msg = "termux_job is disabled by configuration (execution_plan_enabled = false)";
+                                self.storage.set_tool_run_status(&tool_run_id, "failed", None, Some(msg))?;
+                                next.push(ToolResult {
+                                    call_id: call.call_id.clone(),
+                                    name: call.name.clone(),
+                                    output: msg.into(),
+                                    is_error: true,
+                                });
+                                continue;
+                            }
                             let action_signature = format!("{}:{arguments}", call.name);
                             if failed_actions.contains(&action_signature) {
                                 identical_failure_repeats += 1;

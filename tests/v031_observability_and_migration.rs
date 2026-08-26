@@ -1,8 +1,233 @@
+use rusqlite::Connection;
+use serde_json::json;
+use std::sync::Arc;
+use tempfile::tempdir;
 use xiao::storage::Storage;
 
 #[test]
-fn capability_overrides_and_evidence_persist() {
-    let dir = tempfile::tempdir().unwrap();
+fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("v030_legacy.db");
+
+    // 1. Manually instantiate a pre-migration schema 26 SQLite database
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
+            INSERT INTO schema_migrations(version) VALUES(1),(26);
+
+            CREATE TABLE installation_owner(
+              id TEXT PRIMARY KEY,
+              telegram_user_id INTEGER UNIQUE,
+              created_at TEXT NOT NULL
+            );
+            INSERT INTO installation_owner VALUES('owner-1', 12345678, '2026-08-20T00:00:00Z');
+
+            CREATE TABLE sessions(
+              id TEXT PRIMARY KEY,
+              owner_principal TEXT NOT NULL,
+              name TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              account_id TEXT,
+              model TEXT NOT NULL,
+              yolo_mode INTEGER NOT NULL DEFAULT 0,
+              agent_profile TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              context_summary TEXT,
+              summary_updated_at TEXT
+            );
+            INSERT INTO sessions VALUES('sess-1', 'owner-1', 'Legacy Session', 'custom', NULL, 'model-v26', 0, NULL, '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z', NULL, NULL);
+
+            CREATE TABLE messages(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              owner_principal TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              role TEXT NOT NULL,
+              content TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            INSERT INTO messages(owner_principal, session_id, role, content, created_at)
+            VALUES('owner-1', 'sess-1', 'user', 'legacy question', '2026-08-20T00:00:00Z');
+
+            CREATE TABLE memories(
+              id TEXT PRIMARY KEY,
+              owner_principal TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              key TEXT NOT NULL,
+              content TEXT NOT NULL,
+              tags_csv TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(owner_principal, kind, key)
+            );
+            INSERT INTO memories VALUES('mem-1', 'owner-1', 'fact', 'user_lang', 'en', 'pref,lang', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
+
+            CREATE TABLE skills(
+              id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              version TEXT NOT NULL,
+              description TEXT NOT NULL,
+              definition_yaml TEXT NOT NULL,
+              entrypoint TEXT NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            INSERT INTO skills VALUES('sk-1', 'owner-1', 'custom_tool', '1.0.0', 'skill desc', 'steps: []', 'main.sh', 'enabled', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
+
+            CREATE TABLE provider_profiles(
+              profile_id TEXT PRIMARY KEY,
+              owner_id TEXT NOT NULL,
+              alias TEXT NOT NULL,
+              endpoint TEXT NOT NULL,
+              protocol TEXT NOT NULL,
+              credential_ref TEXT,
+              api_key_ref TEXT,
+              safe_headers_json TEXT NOT NULL DEFAULT '{}',
+              secret_headers_ref TEXT,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              reachability TEXT NOT NULL DEFAULT 'unknown',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              last_probe_at TEXT
+            );
+            INSERT INTO provider_profiles VALUES('prof-1', 'owner-1', 'Custom Provider', 'https://api.example.com/v1', 'openai_chat_completions', NULL, NULL, '{}', NULL, 1, 'reachable', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z', NULL);
+
+            CREATE TABLE provider_profile_models(
+              profile_id TEXT NOT NULL,
+              model_id TEXT NOT NULL,
+              text_capable INTEGER NOT NULL DEFAULT 1,
+              vision_capable INTEGER NOT NULL DEFAULT 0,
+              file_input_capable INTEGER NOT NULL DEFAULT 0,
+              native_tools INTEGER NOT NULL DEFAULT 1,
+              structured_output INTEGER NOT NULL DEFAULT 1,
+              continuation INTEGER NOT NULL DEFAULT 1,
+              native_tools_state TEXT NOT NULL DEFAULT 'supported',
+              structured_output_state TEXT NOT NULL DEFAULT 'supported',
+              continuation_state TEXT NOT NULL DEFAULT 'supported',
+              vision_state TEXT NOT NULL DEFAULT 'unknown',
+              file_input_state TEXT NOT NULL DEFAULT 'unknown',
+              model_discovery INTEGER NOT NULL DEFAULT 0,
+              tool_protocol TEXT NOT NULL DEFAULT 'native',
+              evidence TEXT NOT NULL DEFAULT '',
+              probe_status TEXT NOT NULL DEFAULT 'completed',
+              probe_version INTEGER NOT NULL DEFAULT 1,
+              probed_at TEXT NOT NULL DEFAULT '',
+              PRIMARY KEY(profile_id, model_id)
+            );
+            INSERT INTO provider_profile_models VALUES('prof-1', 'model-v26', 1, 0, 0, 1, 1, 1, 'supported', 'supported', 'supported', 'unknown', 'unknown', 0, 'native', 'probed v26', 'completed', 1, '2026-08-20T00:00:00Z');
+
+            CREATE TABLE agent_runs(
+              id TEXT PRIMARY KEY,
+              owner_principal TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              model TEXT NOT NULL,
+              goal TEXT,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              completed_at TEXT,
+              error TEXT
+            );
+
+            CREATE TABLE tool_runs(
+              id TEXT PRIMARY KEY,
+              agent_run_id TEXT NOT NULL,
+              call_id TEXT NOT NULL,
+              tool_name TEXT NOT NULL,
+              arguments_json TEXT NOT NULL,
+              risk TEXT NOT NULL,
+              status TEXT NOT NULL,
+              output TEXT,
+              error TEXT,
+              started_at TEXT NOT NULL,
+              completed_at TEXT
+            );
+            "#,
+        )
+        .unwrap();
+    }
+
+    // 2. Open via Xiao Storage (runs Migration 26 -> 27)
+    let storage = Storage::open(&db_path).unwrap();
+    assert_eq!(storage.schema_version().unwrap(), 27);
+
+    // 3. Verify all legacy data is preserved intact
+    let sess = storage.session("owner-1", "sess-1").unwrap().unwrap();
+    assert_eq!(sess.name, "Legacy Session");
+    assert_eq!(sess.model, "model-v26");
+
+    let msgs = storage.stored_messages("owner-1", "sess-1").unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].content, "legacy question");
+
+    let mems = storage.list_memories("owner-1", None, 10).unwrap();
+    assert_eq!(mems.len(), 1);
+    assert_eq!(mems[0].key, "user_lang");
+    assert_eq!(mems[0].content, "en");
+
+    let skills = storage.list_skills("owner-1", 10).unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].name, "custom_tool");
+
+    let profiles = storage.provider_profiles("owner-1").unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].alias, "Custom Provider");
+}
+
+#[test]
+fn matrix_i2_and_i3_production_learning_payload_survives_restart_and_stale_lease_recovery() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("xiao.db");
+    let storage = Arc::new(Storage::open(&db_path).unwrap());
+
+    let session = storage
+        .create_session("owner-1", "Test", "custom", None, "m", false, None)
+        .unwrap();
+    let run_id = storage
+        .create_agent_run("owner-1", &session.id, "custom", "m", Some("learning goal"))
+        .unwrap();
+
+    let payload = json!({
+        "trace": {
+            "goal": "learning goal",
+            "steps": [{"tool": "uname", "output": "Linux"}]
+        },
+        "explicit_prompt": "learning goal"
+    });
+
+    // Enqueue production learning payload
+    storage
+        .enqueue_learning_payload("owner-1", &run_id, &payload)
+        .unwrap();
+
+    // Release after frontend delivery
+    storage.release_learning_job_after_delivery(&run_id).unwrap();
+
+    // Claim job by background worker
+    let (job_id, owner, run, claimed_payload) = storage.claim_learning_job().unwrap().unwrap();
+    assert_eq!(owner, "owner-1");
+    assert_eq!(run, run_id);
+    assert_eq!(claimed_payload, payload);
+
+    // Simulate daemon restart while job is in 'running' state
+    drop(storage);
+    let reopened = Storage::open(&db_path).unwrap();
+
+    // After restart, stale running jobs are reset to pending and reclaimed safely
+    let reclaimed = reopened.claim_learning_job().unwrap().unwrap();
+    assert_eq!(reclaimed.0, job_id);
+    assert_eq!(reclaimed.1, "owner-1");
+    assert_eq!(reclaimed.2, run_id);
+    assert_eq!(reclaimed.3, payload);
+}
+
+#[test]
+fn matrix_i4_capability_overrides_and_evidence_persist() {
+    let dir = tempdir().unwrap();
     let db_path = dir.path().join("xiao.db");
     let storage = Storage::open(&db_path).unwrap();
 
@@ -87,130 +312,8 @@ fn capability_overrides_and_evidence_persist() {
 }
 
 #[test]
-fn learning_job_queue_durable_recovery_across_restart() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("xiao.db");
-    let storage = Storage::open(&db_path).unwrap();
-
-    // Create session and agent run
-    let session = storage
-        .create_session("owner-1", "Test", "custom", None, "m", false, None)
-        .unwrap();
-    let run_id = storage
-        .create_agent_run("owner-1", &session.id, "custom", "m", Some("learning goal"))
-        .unwrap();
-
-    // Enqueue learning job
-    let job_id = storage
-        .enqueue_learning_job("owner-1", &run_id, None)
-        .unwrap();
-    let job = storage.learning_job(&job_id).unwrap().unwrap();
-    assert_eq!(job.status, "pending");
-    assert_eq!(job.run_id, run_id);
-
-    // Claim pending job
-    let claimed = storage.claim_pending_learning_job(3).unwrap().unwrap();
-    assert_eq!(claimed.id, job_id);
-    assert_eq!(claimed.status, "running");
-    assert_eq!(claimed.attempts, 1);
-
-    // Reopen database to simulate daemon restart during execution
-    drop(storage);
-    let reopened = Storage::open(&db_path).unwrap();
-
-    // The stale running job should be safely recovered to pending
-    let recovered_job = reopened.learning_job(&job_id).unwrap().unwrap();
-    assert_eq!(recovered_job.status, "pending");
-
-    // Can be claimed again after restart
-    let reclaimed = reopened.claim_pending_learning_job(3).unwrap().unwrap();
-    assert_eq!(reclaimed.id, job_id);
-    assert_eq!(reclaimed.status, "running");
-    assert_eq!(reclaimed.attempts, 2);
-
-    // Finish successfully
-    reopened
-        .finish_learning_job(&job_id, "succeeded", None)
-        .unwrap();
-    let finished = reopened.learning_job(&job_id).unwrap().unwrap();
-    assert_eq!(finished.status, "succeeded");
-}
-
-#[test]
-fn tool_run_steps_and_agent_run_events_stored_and_retrieved() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("xiao.db");
-    let storage = Storage::open(&db_path).unwrap();
-
-    let session = storage
-        .create_session("owner-1", "Test", "custom", None, "m", false, None)
-        .unwrap();
-    let run_id = storage
-        .create_agent_run("owner-1", &session.id, "custom", "m", Some("goal"))
-        .unwrap();
-    let tool_run_id = storage
-        .create_tool_run(&run_id, "call-1", "termux_job", "{}", "side_effect")
-        .unwrap();
-
-    // Record tool substeps
-    storage
-        .record_tool_run_step(
-            &tool_run_id,
-            0,
-            "step-free",
-            "free",
-            r#"["-m"]"#,
-            "succeeded",
-            Some("Mem: 8000"),
-            None,
-        )
-        .unwrap();
-
-    storage
-        .record_tool_run_step(
-            &tool_run_id,
-            1,
-            "step-ps",
-            "ps",
-            r#"["-A"]"#,
-            "succeeded",
-            Some("PID CMD"),
-            None,
-        )
-        .unwrap();
-
-    let steps = storage.tool_run_steps(&tool_run_id).unwrap();
-    assert_eq!(steps.len(), 2);
-    assert_eq!(steps[0].step_id, "step-free");
-    assert_eq!(steps[1].step_id, "step-ps");
-
-    // Record agent run events
-    storage
-        .record_run_event(&run_id, "run_started", 0, None)
-        .unwrap();
-    storage
-        .record_run_event(
-            &run_id,
-            "provider_first_text_delta",
-            320,
-            Some(r#"{"tokens":1}"#),
-        )
-        .unwrap();
-    storage
-        .record_run_event(&run_id, "final_answer_ready", 1200, None)
-        .unwrap();
-
-    let events = storage.agent_run_events(&run_id).unwrap();
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0].event_kind, "run_started");
-    assert_eq!(events[1].event_kind, "provider_first_text_delta");
-    assert_eq!(events[1].elapsed_ms, 320);
-    assert_eq!(events[2].event_kind, "final_answer_ready");
-}
-
-#[test]
-fn final_frontend_delivery_and_background_learning_timing_nonzero_and_ordered() {
-    let dir = tempfile::tempdir().unwrap();
+fn matrix_i5_final_frontend_delivery_and_background_learning_timing_nonzero_and_ordered() {
+    let dir = tempdir().unwrap();
     let db_path = dir.path().join("xiao.db");
     let storage = Storage::open(&db_path).unwrap();
 
@@ -221,17 +324,15 @@ fn final_frontend_delivery_and_background_learning_timing_nonzero_and_ordered() 
         .create_agent_run("owner-1", &session.id, "custom", "m", Some("timing goal"))
         .unwrap();
 
-    // Verify agent_run_elapsed_ms helper returns non-zero elapsed time
     let elapsed = storage.agent_run_elapsed_ms(&run_id);
     assert!(elapsed >= 1);
 
-    // Record delivery and background learning events
     storage
         .record_agent_run_event(
             &run_id,
             "final_frontend_delivery",
             elapsed,
-            &serde_json::json!({"frontend":"telegram"}),
+            &json!({"frontend":"telegram"}),
         )
         .unwrap();
 
@@ -241,7 +342,7 @@ fn final_frontend_delivery_and_background_learning_timing_nonzero_and_ordered() 
             &run_id,
             "background_learning",
             later_elapsed,
-            &serde_json::json!({"status":"succeeded"}),
+            &json!({"status":"succeeded"}),
         )
         .unwrap();
 

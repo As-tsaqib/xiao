@@ -2,8 +2,20 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
 
 use crate::security::redact::contains_secret_material;
+
+const TRUSTED_INTERPRETERS: &[&str] = &[
+    "/bin/sh",
+    "/bin/bash",
+    "/usr/bin/sh",
+    "/usr/bin/bash",
+    "/system/bin/sh",
+    "/data/data/com.termux/files/usr/bin/sh",
+    "/data/data/com.termux/files/usr/bin/bash",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CachedPlan {
@@ -19,6 +31,31 @@ impl CachedPlan {
             return Err(anyhow!("secret-bearing plan cannot be cached"));
         }
         Ok(format!("{:x}", Sha256::digest(normalized)))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlanCache {
+    plans: Arc<RwLock<HashMap<String, CachedPlan>>>,
+}
+
+impl PlanCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&self, plan: CachedPlan) -> Result<String> {
+        let key = plan.key()?;
+        self.plans.write().unwrap().insert(key.clone(), plan);
+        Ok(key)
+    }
+
+    pub fn get(&self, key: &str) -> Option<CachedPlan> {
+        self.plans.read().unwrap().get(key).cloned()
+    }
+
+    pub fn clear(&self) {
+        self.plans.write().unwrap().clear();
     }
 }
 
@@ -38,9 +75,25 @@ impl CachedScript {
                 "cached script manifest is not file-backed and auditable"
             ));
         }
+        let interp_str = self.interpreter.to_string_lossy();
+        if !TRUSTED_INTERPRETERS.iter().any(|allowed| interp_str == *allowed) {
+            return Err(anyhow!("untrusted script interpreter: {}", interp_str));
+        }
         let bytes = std::fs::read(&self.path)?;
-        if contains_secret_material(&String::from_utf8_lossy(&bytes)) {
+        let content = String::from_utf8_lossy(&bytes);
+        if contains_secret_material(&content) {
             return Err(anyhow!("secret-bearing script cannot be cached"));
+        }
+        let lower = content.to_ascii_lowercase();
+        if lower.contains("su ")
+            || lower.contains("tsu ")
+            || lower.contains("sudo ")
+            || lower.starts_with("su
+")
+            || lower.starts_with("tsu
+")
+        {
+            return Err(anyhow!("script contains root escalation commands"));
         }
         let actual = format!("{:x}", Sha256::digest(bytes));
         if actual != self.sha256 {
@@ -99,5 +152,30 @@ mod tests {
         cached.verify().unwrap();
         std::fs::write(path, "printf changed").unwrap();
         assert!(cached.verify().is_err());
+    }
+
+    #[test]
+    fn script_cannot_become_root_escalation_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_script.sh");
+        std::fs::write(&path, "su -c 'id'").unwrap();
+        let cached = CachedScript {
+            path: path.clone(),
+            interpreter: "/bin/sh".into(),
+            sha256: script_hash(&path).unwrap(),
+            source: "builtin:test".into(),
+        };
+        assert!(cached.verify().is_err());
+
+        // Untrusted interpreter
+        let safe_path = dir.path().join("safe.sh");
+        std::fs::write(&safe_path, "echo hello").unwrap();
+        let untrusted_interp = CachedScript {
+            path: safe_path.clone(),
+            interpreter: "/usr/local/bin/custom_sh".into(),
+            sha256: script_hash(&safe_path).unwrap(),
+            source: "builtin:test".into(),
+        };
+        assert!(untrusted_interp.verify().is_err());
     }
 }

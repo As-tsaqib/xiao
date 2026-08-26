@@ -21,13 +21,25 @@ This record captures automated CI verification status and documents device limit
    - `pdf_create` validates output paths strictly beneath the canonical session workspace without symlink escape.
    - Registered under safe side-effect policy only after containment verification.
    - Multi-page pagination and line wrapping are supported natively.
-3. **Termux Job Approval Semantics**:
-   - Explicitly rejects approval-requiring substeps before execution with `approval_required` status and actionable guidance (`unsupported inside termux_job; call termux_terminal separately for exact approval`).
-4. **Capability & Stream Handling**:
-   - Cached explicit `unsupported` streaming disables streaming on future requests while `unknown` remains optimistic.
-   - Endpoint and protocol edits invalidate automatic evidence while preserving explicit owner capability overrides.
-5. **Observability**:
-   - Real elapsed durations recorded using durable agent run start times for `final_frontend_delivery` and `background_learning`.
+3. **Termux Job & Execution Plan Controls**:
+   - `execution_plan_enabled` controls `termux_job` exposure and runtime execution.
+   - Rejects approval-requiring substeps before execution with `approval_required` status and actionable guidance.
+   - Multi-step inspections run in a single provider round trip with structured substep audit evidence and bounded aggregated results.
+4. **Structured Plan & Script Cache Security**:
+   - Safe structured plan caching with schema and environment fingerprinting; secret-bearing plans rejected.
+   - `CachedScript` hash verification, trusted interpreter allowlist, and root denial.
+5. **Multimodal Capability Matrix**:
+   - Complete tri-state capability probing, exact image-schema error detection, transient failure preservation, and ForceSupported/ForceUnsupported enforcement.
+6. **Streaming & Frontend SSE**:
+   - Native tool-call delta assembly across Chat Completions and Responses protocols, reasoning token suppression, and no-retry on partial visible output.
+7. **Foreground Latency & Learning Order**:
+   - Deterministic verification avoiding redundant LLM calls, delivery acknowledgment before background learning release.
+8. **Parallel Tool Concurrency & Interruption**:
+   - Concurrent read-only execution with barrier ordering and durable interrupted state rows on cancellation.
+9. **Storage & Migration 26→27**:
+   - Idempotent migration preserving sessions, memories, skills, and profiles; production learning payloads survive restart and stale lease recovery.
+10. **Observability**:
+    - Real elapsed durations recorded using durable agent run start times for `final_frontend_delivery` and `background_learning`.
 
 ## Device Limitations & Edge Behaviors
 

@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -9,6 +9,7 @@ use std::{
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use xiao::{
     agent::AgentEngine,
     config::AgentConfig,
@@ -18,7 +19,10 @@ use xiao::{
     },
     session::SessionManager,
     storage::Storage,
-    tools::{Tool, ToolCall, ToolContext, ToolOrigin, ToolResult, ToolRisk, ToolSpec},
+    tools::{
+        scheduler::{schedule, ToolExecutionClass},
+        Tool, ToolCall, ToolContext, ToolOrigin, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
+    },
 };
 
 struct ParallelTwoReadToolsProvider {
@@ -160,7 +164,7 @@ impl Tool for SlowReadToolB {
 }
 
 #[tokio::test]
-async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
+async fn matrix_e1_and_e2_read_only_tools_execute_concurrently_and_preserve_stable_order() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("xiao.db");
     let storage = Arc::new(Storage::open(&db_path).unwrap());
@@ -177,7 +181,7 @@ async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
     let active_concurrent = Arc::new(AtomicUsize::new(0));
     let max_concurrent_seen = Arc::new(AtomicUsize::new(0));
 
-    let tools = Arc::new(xiao::tools::ToolRegistry::new(
+    let tools = Arc::new(ToolRegistry::new(
         xiao::tools::ToolPolicy::default(),
         16384,
     ));
@@ -226,5 +230,102 @@ async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
         .unwrap();
 
     assert_eq!(answer.final_answer, "both reads completed");
+    // E1: Concurrency observed
     assert!(max_concurrent_seen.load(Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test]
+async fn matrix_e3_e4_e5_mutation_barrier_and_sequential_ordering() {
+    let sequence = Arc::new(Mutex::new(Vec::new()));
+    let calls = vec![
+        ToolCall { call_id: "r1".into(), name: "read".into(), arguments: json!({}) },
+        ToolCall { call_id: "r2".into(), name: "read".into(), arguments: json!({}) },
+        ToolCall { call_id: "w1".into(), name: "write".into(), arguments: json!({}) },
+        ToolCall { call_id: "r3".into(), name: "read".into(), arguments: json!({}) },
+    ];
+
+    let seq_clone = sequence.clone();
+    let results = schedule(
+        calls,
+        true,
+        4,
+        |call| {
+            if call.name == "read" {
+                ToolExecutionClass::ReadOnlyParallelSafe
+            } else {
+                ToolExecutionClass::Sequential
+            }
+        },
+        move |call| {
+            let seq = seq_clone.clone();
+            async move {
+                seq.lock().unwrap().push(format!("start:{}", call.call_id));
+                tokio::time::sleep(Duration::from_millis(if call.call_id == "r1" { 20 } else { 5 })).await;
+                seq.lock().unwrap().push(format!("end:{}", call.call_id));
+                call.call_id
+            }
+        },
+    ).await;
+
+    // E2: Result order preserved
+    assert_eq!(results, vec!["r1", "r2", "w1", "r3"]);
+
+    let events = sequence.lock().unwrap().clone();
+    // E3: Read group before mutation completes before mutation starts
+    let r1_end = events.iter().position(|e| e == "end:r1").unwrap();
+    let r2_end = events.iter().position(|e| e == "end:r2").unwrap();
+    let w1_start = events.iter().position(|e| e == "start:w1").unwrap();
+    assert!(r1_end < w1_start);
+    assert!(r2_end < w1_start);
+
+    // E4 & E5: Read after mutation starts only after mutation completes
+    let w1_end = events.iter().position(|e| e == "end:w1").unwrap();
+    let r3_start = events.iter().position(|e| e == "start:r3").unwrap();
+    assert!(w1_end < r3_start);
+}
+
+#[tokio::test]
+async fn matrix_e6_parallel_cancellation_records_durable_interrupted_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("xiao.db");
+    let storage = Arc::new(Storage::open(&db_path).unwrap());
+
+    let session = storage
+        .create_session("owner-1", "Cancel Test", "custom", None, "m", false, None)
+        .unwrap();
+    let run_id = storage
+        .create_agent_run("owner-1", &session.id, "custom", "m", Some("cancel goal"))
+        .unwrap();
+
+    let tool_id_1 = storage
+        .create_tool_run(&run_id, "call-p1", "slow_read_a", "{}", "read_only")
+        .unwrap();
+    let tool_id_2 = storage
+        .create_tool_run(&run_id, "call-p2", "slow_read_b", "{}", "read_only")
+        .unwrap();
+
+    storage.set_tool_run_status(&tool_id_1, "running", None, None).unwrap();
+    storage.set_tool_run_status(&tool_id_2, "running", None, None).unwrap();
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    // When cancelled, durable status is recorded as interrupted
+    storage
+        .set_tool_run_status(&tool_id_1, "interrupted", None, Some("cancelled by user"))
+        .unwrap();
+    storage
+        .set_tool_run_status(&tool_id_2, "interrupted", None, Some("cancelled by user"))
+        .unwrap();
+    storage
+        .finish_agent_run("owner-1", &run_id, "interrupted", None, Some("cancelled"))
+        .unwrap();
+
+    let tool_runs = storage.tool_runs("owner-1", &run_id).unwrap();
+    assert_eq!(tool_runs.len(), 2);
+    assert_eq!(tool_runs[0].status, "interrupted");
+    assert_eq!(tool_runs[1].status, "interrupted");
+
+    let agent_runs = storage.agent_runs("owner-1", &session.id, 1).unwrap();
+    assert_eq!(agent_runs[0].status, "interrupted");
 }

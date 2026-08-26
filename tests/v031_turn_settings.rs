@@ -325,3 +325,48 @@ async fn no_progress_guard_stops_repeated_loop_at_threshold() {
     assert!(answer.final_answer.contains("no-progress limit reached"));
     assert!(provider.turns.load(Ordering::SeqCst) <= 5);
 }
+
+#[tokio::test]
+async fn matrix_h6_turn_limit_error_is_useful_and_contains_last_observable_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("xiao.db");
+    let storage = Arc::new(Storage::open(&db_path).unwrap());
+    let sessions = Arc::new(SessionManager::new(storage.clone()));
+    let provider = Arc::new(MultiTurnScriptedProvider::new(10));
+    let auth = Arc::new(xiao::auth::AuthManager::new(
+        storage.clone(),
+        dir.path().join("secrets"),
+    ));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider.clone(),
+        auth,
+    ));
+
+    let config = AgentConfig {
+        max_turns: 2,
+        max_tool_calls: 10,
+        ..Default::default()
+    };
+
+    let tools = Arc::new(xiao::tools::ToolRegistry::new(
+        xiao::tools::ToolPolicy::default(),
+        16384,
+    ));
+    tools.register(StepTool).unwrap();
+
+    let engine =
+        AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
+
+    let session = storage
+        .create_session("owner-1", "Turn Limit Test", "custom", None, "test-model", false, None)
+        .unwrap();
+    let err = engine
+        .submit_to_session_with_progress("owner-1", &session.id, "inspect multi-turn until limit", None)
+        .await
+        .unwrap_err();
+
+    let err_msg = err.to_string();
+    assert!(err_msg.contains("agent turn limit (2) reached"));
+    assert!(err_msg.contains("last observable state") || err_msg.contains("step"));
+}
