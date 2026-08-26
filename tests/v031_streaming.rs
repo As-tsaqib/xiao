@@ -8,11 +8,11 @@ use xiao::{
     config::AgentConfig,
     providers::{
         AgentEvent, Provider, ProviderCapabilities, ProviderRegistry, ProviderRequest,
-        ProviderStep, ProviderTurn, ToolCall, ToolProtocol,
+        ProviderResponse, ProviderStep, ProviderTurn, ToolCall, ToolProtocol,
     },
     session::SessionManager,
     storage::Storage,
-    tools::ToolRegistry,
+    tools::{ToolRegistry, ToolResult},
 };
 
 struct StreamingMockProvider {
@@ -44,9 +44,18 @@ impl Provider for StreamingMockProvider {
             evidence: "streaming test".into(),
         }
     }
-    async fn generate_agent_step(
+    async fn run(
         &self,
         _req: ProviderRequest,
+        _progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> anyhow::Result<ProviderResponse> {
+        Err(anyhow::anyhow!("run_turn must be used"))
+    }
+    async fn run_turn(
+        &self,
+        _req: ProviderRequest,
+        _continuation: Option<serde_json::Value>,
+        _tool_results: Vec<ToolResult>,
         progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> anyhow::Result<ProviderTurn> {
         let mut full_text = String::new();
@@ -88,7 +97,7 @@ async fn streamed_text_deltas_reach_progress_channel_before_completion() {
     });
     let auth = Arc::new(xiao::auth::AuthManager::new(
         storage.clone(),
-        xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
+        dir.path().join("secrets"),
     ));
     let providers = Arc::new(ProviderRegistry::from_single("custom", provider, auth));
 
@@ -101,7 +110,7 @@ async fn streamed_text_deltas_reach_progress_channel_before_completion() {
         tools,
     );
 
-    let session = sessions
+    let session = storage
         .create_session(
             "owner-1",
             "Stream Test",
@@ -119,7 +128,7 @@ async fn streamed_text_deltas_reach_progress_channel_before_completion() {
         .await
         .unwrap();
 
-    assert_eq!(answer.answer, "Hello world!");
+    assert_eq!(answer.final_answer, "Hello world!");
 
     let mut deltas = Vec::new();
     while let Ok(event) = progress_rx.try_recv() {
@@ -143,7 +152,7 @@ async fn raw_tool_json_never_appears_in_text_deltas() {
     });
     let auth = Arc::new(xiao::auth::AuthManager::new(
         storage.clone(),
-        xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
+        dir.path().join("secrets"),
     ));
     let providers = Arc::new(ProviderRegistry::from_single("custom", provider, auth));
 
@@ -156,7 +165,7 @@ async fn raw_tool_json_never_appears_in_text_deltas() {
         tools,
     );
 
-    let session = sessions
+    let session = storage
         .create_session(
             "owner-1",
             "Stream Test",
@@ -170,7 +179,12 @@ async fn raw_tool_json_never_appears_in_text_deltas() {
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let _ = engine
-        .submit_to_session_with_progress("owner-1", &session.id, "call tool", Some(progress_tx))
+        .submit_to_session_with_progress(
+            "owner-1",
+            &session.id,
+            "call tool",
+            Some(progress_tx),
+        )
         .await;
 
     while let Ok(event) = progress_rx.try_recv() {

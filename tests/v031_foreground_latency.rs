@@ -10,11 +10,11 @@ use xiao::{
     config::AgentConfig,
     providers::{
         AgentEvent, Provider, ProviderCapabilities, ProviderRegistry, ProviderRequest,
-        ProviderStep, ProviderTurn, ToolProtocol,
+        ProviderResponse, ProviderStep, ProviderTurn, ToolProtocol,
     },
     session::SessionManager,
     storage::Storage,
-    tools::ToolRegistry,
+    tools::{ToolRegistry, ToolResult},
 };
 
 struct LatencyMockProvider {
@@ -46,9 +46,18 @@ impl Provider for LatencyMockProvider {
             evidence: "latency test".into(),
         }
     }
-    async fn generate_agent_step(
+    async fn run(
         &self,
         _req: ProviderRequest,
+        _progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> anyhow::Result<ProviderResponse> {
+        Err(anyhow::anyhow!("run_turn must be used"))
+    }
+    async fn run_turn(
+        &self,
+        _req: ProviderRequest,
+        _continuation: Option<serde_json::Value>,
+        _tool_results: Vec<ToolResult>,
         _progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> anyhow::Result<ProviderTurn> {
         self.first_request_received.store(true, Ordering::SeqCst);
@@ -72,7 +81,7 @@ async fn informational_answer_completes_deterministically_without_semantic_overh
     });
     let auth = Arc::new(xiao::auth::AuthManager::new(
         storage.clone(),
-        xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
+        dir.path().join("secrets"),
     ));
     let providers = Arc::new(ProviderRegistry::from_single(
         "custom",
@@ -89,7 +98,7 @@ async fn informational_answer_completes_deterministically_without_semantic_overh
         tools,
     );
 
-    let session = sessions
+    let session = storage
         .create_session(
             "owner-1",
             "Latency Test",
@@ -111,7 +120,7 @@ async fn informational_answer_completes_deterministically_without_semantic_overh
         .await
         .unwrap();
 
-    assert_eq!(answer.answer, "Direct informational answer");
+    assert_eq!(answer.final_answer, "Direct informational answer");
     assert!(provider.first_request_received.load(Ordering::SeqCst));
     assert!(!provider.semantic_eval_called.load(Ordering::SeqCst));
 }

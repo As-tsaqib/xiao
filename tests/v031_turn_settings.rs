@@ -11,11 +11,11 @@ use xiao::{
     config::{AgentConfig, AppConfig},
     providers::{
         AgentEvent, Provider, ProviderCapabilities, ProviderRegistry, ProviderRequest,
-        ProviderStep, ProviderTurn, ToolCall, ToolProtocol,
+        ProviderResponse, ProviderStep, ProviderTurn, ToolCall, ToolProtocol,
     },
     session::SessionManager,
     storage::Storage,
-    tools::{Tool, ToolContext, ToolOrigin, ToolRisk, ToolSpec},
+    tools::{Tool, ToolContext, ToolOrigin, ToolResult, ToolRisk, ToolSpec},
 };
 
 struct MultiTurnScriptedProvider {
@@ -56,9 +56,18 @@ impl Provider for MultiTurnScriptedProvider {
             evidence: "test".into(),
         }
     }
-    async fn generate_agent_step(
+    async fn run(
+        &self,
+        _: ProviderRequest,
+        _: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> anyhow::Result<ProviderResponse> {
+        Err(anyhow::anyhow!("run_turn must be used"))
+    }
+    async fn run_turn(
         &self,
         _req: ProviderRequest,
+        _continuation: Option<serde_json::Value>,
+        _tool_results: Vec<ToolResult>,
         _progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> anyhow::Result<ProviderTurn> {
         let current = self.turns_requested.fetch_add(1, Ordering::SeqCst);
@@ -143,9 +152,18 @@ impl Provider for FailingLoopProvider {
             evidence: "test".into(),
         }
     }
-    async fn generate_agent_step(
+    async fn run(
+        &self,
+        _: ProviderRequest,
+        _: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> anyhow::Result<ProviderResponse> {
+        Err(anyhow::anyhow!("run_turn must be used"))
+    }
+    async fn run_turn(
         &self,
         _req: ProviderRequest,
+        _continuation: Option<serde_json::Value>,
+        _tool_results: Vec<ToolResult>,
         _progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> anyhow::Result<ProviderTurn> {
         let turn = self.turns.fetch_add(1, Ordering::SeqCst);
@@ -226,7 +244,7 @@ async fn scripted_provider_exceeds_eight_turns_without_premature_failure() {
     let provider = Arc::new(MultiTurnScriptedProvider::new(12));
     let auth = Arc::new(xiao::auth::AuthManager::new(
         storage.clone(),
-        xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
+        dir.path().join("secrets"),
     ));
     let providers = Arc::new(ProviderRegistry::from_single(
         "custom",
@@ -246,7 +264,7 @@ async fn scripted_provider_exceeds_eight_turns_without_premature_failure() {
     let engine =
         AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
 
-    let session = sessions
+    let session = storage
         .create_session("owner-1", "Test", "custom", None, "test-model", false, None)
         .unwrap();
     let answer = engine
@@ -254,7 +272,7 @@ async fn scripted_provider_exceeds_eight_turns_without_premature_failure() {
         .await
         .unwrap();
 
-    assert!(answer.answer.contains("completed after 12 turns"));
+    assert!(answer.final_answer.contains("completed after 12 turns"));
     assert_eq!(provider.turns_requested.load(Ordering::SeqCst), 13);
 }
 
@@ -269,7 +287,7 @@ async fn no_progress_guard_stops_repeated_loop_at_threshold() {
     });
     let auth = Arc::new(xiao::auth::AuthManager::new(
         storage.clone(),
-        xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
+        dir.path().join("secrets"),
     ));
     let providers = Arc::new(ProviderRegistry::from_single(
         "custom",
@@ -290,7 +308,7 @@ async fn no_progress_guard_stops_repeated_loop_at_threshold() {
     let engine =
         AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
 
-    let session = sessions
+    let session = storage
         .create_session("owner-1", "Test", "custom", None, "fail-model", false, None)
         .unwrap();
     let answer = engine
@@ -298,7 +316,7 @@ async fn no_progress_guard_stops_repeated_loop_at_threshold() {
         .await
         .unwrap();
 
-    assert!(answer.answer.to_lowercase().contains("blocked"));
-    assert!(answer.answer.contains("no-progress limit reached"));
+    assert!(answer.final_answer.to_lowercase().contains("blocked"));
+    assert!(answer.final_answer.contains("no-progress limit reached"));
     assert!(provider.turns.load(Ordering::SeqCst) <= 5);
 }
