@@ -566,7 +566,7 @@ fn validate_chat_syntax(args: &[String]) -> CliResult<()> {
     }
     if prompt_parts.join(" ").trim().is_empty() {
         return Err(CliFailure::usage(
-            "usage: xiao chat [--file PATH] [--image PATH] \"prompt\""
+            "usage: xiao chat [--file PATH] [--image PATH] \"prompt\"",
         ));
     }
     Ok(())
@@ -790,7 +790,7 @@ async fn chat(
     let prompt = prompt_parts.join(" ").trim().to_owned();
     if prompt.is_empty() {
         return Err(CliFailure::usage(
-            "usage: xiao chat [--file PATH] [--image PATH] "prompt"",
+            "usage: xiao chat [--file PATH] [--image PATH] \"prompt\"",
         ));
     }
     let exact_session = if !files.is_empty() || options.session.is_some() {

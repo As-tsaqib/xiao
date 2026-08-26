@@ -9,7 +9,8 @@ fn root_help_matches_snapshot() {
     let output = xiao().arg("--help").output().expect("run xiao --help");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("help utf8");
-    let (version, body) = stdout.split_once('\n').expect("help first line");
+    let (version, body) = stdout.split_once('
+').expect("help first line");
     assert!(version.starts_with("xiao v"));
     assert_eq!(body, include_str!("snapshots/cli_help_body.txt"));
 }
@@ -81,41 +82,119 @@ fn subcommand_help_for_all_command_families_is_terminal_native() {
     let cases = [
         (&["chat", "--help"][..], "Usage: xiao chat"),
         (&["ask", "--help"][..], "Usage: xiao chat"),
-        (&["telegram", "--help"][..], "Usage: xiao telegram <status|configure|set-owner|set-token-file|test>"),
-        (&["telegram", "configure", "--help"][..], "Usage: xiao telegram configure"),
-        (&["telegram", "set-owner", "--help"][..], "Usage: xiao telegram set-owner"),
-        (&["telegram", "set-token-file", "--help"][..], "Usage: xiao telegram set-token-file"),
+        (
+            &["telegram", "--help"][..],
+            "Usage: xiao telegram <status|configure|set-owner|set-token-file|test>",
+        ),
+        (
+            &["telegram", "configure", "--help"][..],
+            "Usage: xiao telegram configure",
+        ),
+        (
+            &["telegram", "set-owner", "--help"][..],
+            "Usage: xiao telegram set-owner",
+        ),
+        (
+            &["telegram", "set-token-file", "--help"][..],
+            "Usage: xiao telegram set-token-file",
+        ),
         (&["telegram", "test", "--help"][..], "Usage: xiao telegram test"),
-        (&["model", "--help"][..], "Usage: xiao model <show|list|use|custom> ..."),
-        (&["model", "show", "--help"][..], "Usage: xiao model show [--session ID]"),
-        (&["model", "list", "--help"][..], "Usage: xiao model list [--session ID]"),
-        (&["model", "use", "--help"][..], "Usage: xiao model use MODEL [--session ID]"),
-        (&["model", "custom", "--help"][..], "Usage: xiao model custom <list|add|show|edit|test|probe|models|use|delete> ..."),
-        (&["model", "custom", "list", "--help"][..], "Usage: xiao model custom list"),
-        (&["model", "custom", "add", "--help"][..], "Usage: xiao model custom add"),
-        (&["model", "custom", "show", "--help"][..], "Usage: xiao model custom show ID"),
-        (&["model", "custom", "edit", "--help"][..], "Usage: xiao model custom edit"),
-        (&["model", "custom", "test", "--help"][..], "Usage: xiao model custom test"),
-        (&["model", "custom", "probe", "--help"][..], "Usage: xiao model custom probe"),
-        (&["model", "custom", "models", "--help"][..], "Usage: xiao model custom models"),
-        (&["model", "custom", "use", "--help"][..], "Usage: xiao model custom use"),
-        (&["model", "custom", "delete", "--help"][..], "Usage: xiao model custom delete"),
-        (&["sessions", "--help"][..], "Usage: xiao sessions <list|new|show|use|rename|delete> ..."),
+        (
+            &["model", "--help"][..],
+            "Usage: xiao model <show|list|use|custom> ...",
+        ),
+        (
+            &["model", "show", "--help"][..],
+            "Usage: xiao model show [--session ID]",
+        ),
+        (
+            &["model", "list", "--help"][..],
+            "Usage: xiao model list [--session ID]",
+        ),
+        (
+            &["model", "use", "--help"][..],
+            "Usage: xiao model use MODEL [--session ID]",
+        ),
+        (
+            &["model", "custom", "--help"][..],
+            "Usage: xiao model custom <list|add|show|edit|test|probe|models|use|delete> ...",
+        ),
+        (
+            &["model", "custom", "list", "--help"][..],
+            "Usage: xiao model custom list",
+        ),
+        (
+            &["model", "custom", "add", "--help"][..],
+            "Usage: xiao model custom add",
+        ),
+        (
+            &["model", "custom", "show", "--help"][..],
+            "Usage: xiao model custom show ID",
+        ),
+        (
+            &["model", "custom", "edit", "--help"][..],
+            "Usage: xiao model custom edit",
+        ),
+        (
+            &["model", "custom", "test", "--help"][..],
+            "Usage: xiao model custom test",
+        ),
+        (
+            &["model", "custom", "probe", "--help"][..],
+            "Usage: xiao model custom probe",
+        ),
+        (
+            &["model", "custom", "models", "--help"][..],
+            "Usage: xiao model custom models",
+        ),
+        (
+            &["model", "custom", "use", "--help"][..],
+            "Usage: xiao model custom use",
+        ),
+        (
+            &["model", "custom", "delete", "--help"][..],
+            "Usage: xiao model custom delete",
+        ),
+        (
+            &["sessions", "--help"][..],
+            "Usage: xiao sessions <list|new|show|use|rename|delete> ...",
+        ),
         (&["sessions", "list", "--help"][..], "Usage: xiao sessions list"),
         (&["sessions", "new", "--help"][..], "Usage: xiao sessions new"),
         (&["sessions", "show", "--help"][..], "Usage: xiao sessions show"),
         (&["sessions", "use", "--help"][..], "Usage: xiao sessions use"),
         (&["sessions", "rename", "--help"][..], "Usage: xiao sessions rename"),
         (&["sessions", "delete", "--help"][..], "Usage: xiao sessions delete"),
-        (&["yolo", "--help"][..], "Usage: xiao yolo <status|on|off> [--session ID]"),
-        (&["memory", "--help"][..], "Usage: xiao memory <list|search|get|set|forget> ..."),
-        (&["skills", "--help"][..], "Usage: xiao skills <list|search|show|enable|disable|delete> ..."),
-        (&["approvals", "--help"][..], "Usage: xiao approvals <list|approve|deny> ..."),
-        (&["attachments", "--help"][..], "Usage: xiao attachments <list|show|remove> [--session ID] ..."),
+        (
+            &["yolo", "--help"][..],
+            "Usage: xiao yolo <status|on|off> [--session ID]",
+        ),
+        (
+            &["memory", "--help"][..],
+            "Usage: xiao memory <list|search|get|set|forget> ...",
+        ),
+        (
+            &["skills", "--help"][..],
+            "Usage: xiao skills <list|search|show|enable|disable|delete> ...",
+        ),
+        (
+            &["approvals", "--help"][..],
+            "Usage: xiao approvals <list|approve|deny> ...",
+        ),
+        (
+            &["attachments", "--help"][..],
+            "Usage: xiao attachments <list|show|remove> [--session ID] ...",
+        ),
         (&["runs", "--help"][..], "Usage: xiao runs <list|show|cancel> ..."),
-        (&["daemon", "--help"][..], "Usage: xiao daemon <start|foreground|stop|restart|status|logs> ..."),
+        (
+            &["daemon", "--help"][..],
+            "Usage: xiao daemon <start|foreground|stop|restart|status|logs> ...",
+        ),
         (&["daemon", "start", "--help"][..], "Usage: xiao daemon start"),
-        (&["daemon", "foreground", "--help"][..], "Usage: xiao daemon foreground"),
+        (
+            &["daemon", "foreground", "--help"][..],
+            "Usage: xiao daemon foreground",
+        ),
         (&["daemon", "stop", "--help"][..], "Usage: xiao daemon stop"),
         (&["daemon", "restart", "--help"][..], "Usage: xiao daemon restart"),
         (&["daemon", "status", "--help"][..], "Usage: xiao daemon status"),
@@ -137,7 +216,10 @@ fn subcommand_help_for_all_command_families_is_terminal_native() {
     ];
 
     for (args, expected_prefix) in cases {
-        let output = xiao().args(args).output().unwrap_or_else(|_| panic!("run {args:?}"));
+        let output = xiao()
+            .args(args)
+            .output()
+            .unwrap_or_else(|_| panic!("run {args:?}"));
         assert!(output.status.success(), "failed {args:?}");
         let stdout = String::from_utf8(output.stdout).expect("utf8");
         assert!(
@@ -159,7 +241,10 @@ fn help_subcommand_prefix_works() {
     ];
 
     for (args, expected_prefix) in cases {
-        let output = xiao().args(args).output().unwrap_or_else(|_| panic!("run {args:?}"));
+        let output = xiao()
+            .args(args)
+            .output()
+            .unwrap_or_else(|_| panic!("run {args:?}"));
         assert!(output.status.success(), "failed {args:?}");
         let stdout = String::from_utf8(output.stdout).expect("utf8");
         assert!(
@@ -173,14 +258,26 @@ fn help_subcommand_prefix_works() {
 fn global_options_validation_contract() {
     let cases = [
         (&["status", "--timeout"][..], "--timeout requires seconds"),
-        (&["status", "--timeout", "0"][..], "--timeout must be between 1 and 3600 seconds"),
-        (&["status", "--timeout", "5000"][..], "--timeout must be between 1 and 3600 seconds"),
-        (&["status", "--timeout", "invalid"][..], "--timeout must be an integer number of seconds"),
+        (
+            &["status", "--timeout", "0"][..],
+            "--timeout must be between 1 and 3600 seconds",
+        ),
+        (
+            &["status", "--timeout", "5000"][..],
+            "--timeout must be between 1 and 3600 seconds",
+        ),
+        (
+            &["status", "--timeout", "invalid"][..],
+            "--timeout must be an integer number of seconds",
+        ),
         (&["status", "--session"][..], "--session requires an id"),
     ];
 
     for (args, expected_error) in cases {
-        let output = xiao().args(args).output().unwrap_or_else(|_| panic!("run {args:?}"));
+        let output = xiao()
+            .args(args)
+            .output()
+            .unwrap_or_else(|_| panic!("run {args:?}"));
         assert_eq!(output.status.code(), Some(2), "args {args:?}");
         let stderr = String::from_utf8(output.stderr).expect("utf8");
         assert!(
@@ -199,19 +296,31 @@ fn subcommand_syntax_and_arity_errors_are_usage_errors() {
         (&["tools", "extra"][..], "usage: xiao tools"),
         (&["btw", "extra"][..], "usage: xiao btw"),
         (&["yolo", "foo"][..], "usage: xiao yolo <status|on|off>"),
-        (&["chat", "--unknown-flag"][..], "unknown chat option `--unknown-flag`"),
+        (
+            &["chat", "--unknown-flag"][..],
+            "unknown chat option `--unknown-flag`",
+        ),
         (&["memory", "get", "foo"][..], "usage: xiao memory"),
         (&["skills", "invalid"][..], "usage: xiao skills"),
         (&["approvals", "invalid"][..], "usage: xiao approvals"),
         (&["attachments", "invalid"][..], "usage: xiao attachments"),
         (&["runs", "invalid"][..], "usage: xiao runs"),
-        (&["config", "invalid"][..], "usage: xiao config <path|check|show>"),
-        (&["daemon", "invalid"][..], "usage: xiao daemon <start|foreground|stop|restart|status|logs>"),
+        (
+            &["config", "invalid"][..],
+            "usage: xiao config <path|check|show>",
+        ),
+        (
+            &["daemon", "invalid"][..],
+            "usage: xiao daemon <start|foreground|stop|restart|status|logs>",
+        ),
         (&["logs", "10", "extra"][..], "usage: xiao logs [N]"),
     ];
 
     for (args, expected_error) in cases {
-        let output = xiao().args(args).output().unwrap_or_else(|_| panic!("run {args:?}"));
+        let output = xiao()
+            .args(args)
+            .output()
+            .unwrap_or_else(|_| panic!("run {args:?}"));
         assert_eq!(output.status.code(), Some(2), "args {args:?}");
         let stderr = String::from_utf8(output.stderr).expect("utf8");
         assert!(
@@ -224,7 +333,10 @@ fn subcommand_syntax_and_arity_errors_are_usage_errors() {
 #[test]
 fn version_flag_and_command_works() {
     for flag in ["--version", "-V", "version"] {
-        let output = xiao().arg(flag).output().unwrap_or_else(|_| panic!("run {flag}"));
+        let output = xiao()
+            .arg(flag)
+            .output()
+            .unwrap_or_else(|_| panic!("run {flag}"));
         assert!(output.status.success(), "{flag}");
         let stdout = String::from_utf8(output.stdout).expect("utf8");
         assert!(stdout.starts_with("xiao "), "{flag}: {stdout}");
@@ -234,9 +346,15 @@ fn version_flag_and_command_works() {
 #[test]
 fn deprecated_providers_give_helpful_guidance() {
     for provider in ["codex", "antigravity", "agy"] {
-        let output = xiao().args(["login", provider]).output().unwrap_or_else(|_| panic!("run login {provider}"));
+        let output = xiao()
+            .args(["login", provider])
+            .output()
+            .unwrap_or_else(|_| panic!("run login {provider}"));
         assert_eq!(output.status.code(), Some(2), "login {provider}");
         let stderr = String::from_utf8(output.stderr).expect("utf8");
-        assert!(stderr.contains("use `xiao login` for a Custom endpoint"), "login {provider}: {stderr}");
+        assert!(
+            stderr.contains("use `xiao login` for a Custom endpoint"),
+            "login {provider}: {stderr}"
+        );
     }
 }
