@@ -83,35 +83,34 @@ impl ToolPolicy {
 
 pub(crate) fn is_sensitive_path_or_value(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    const SENSITIVE_MARKERS: &[&str] = &[
-        "/.ssh/",
-        "/.ssh",
+    const SENSITIVE_SUBSTRINGS: &[&str] = &[
         "id_rsa",
         "id_ed25519",
         "id_ecdsa",
         "id_dsa",
         "known_hosts",
         "authorized_keys",
-        "/.gnupg/",
-        "/.gnupg",
         "secring.gpg",
-        "/.aws/",
-        "/.aws",
-        "/secrets/",
         "credentials.json",
         ".netrc",
-        "/.netrc",
         "/etc/shadow",
         "/etc/passwd",
-        "/.env",
-        "/.config/gcloud",
-        "/.azure",
+        ".config/gcloud",
     ];
-    if SENSITIVE_MARKERS
+    if SENSITIVE_SUBSTRINGS
         .iter()
         .any(|marker| lower.contains(marker))
     {
         return true;
+    }
+    for part in lower.split(|c| matches!(c, '/' | '\\')) {
+        if matches!(
+            part,
+            ".ssh" | ".gnupg" | ".aws" | ".azure" | ".env" | "secrets" | ".netrc"
+        ) || part.starts_with(".env.")
+        {
+            return true;
+        }
     }
     crate::security::redact::contains_secret_material(value)
 }
