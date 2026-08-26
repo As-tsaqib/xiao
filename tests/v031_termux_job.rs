@@ -1,7 +1,8 @@
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use xiao::tools::{
-    builtin::{TermuxJobTool, TermuxTerminalTool}, Tool, ToolContext,
+    builtin::{TermuxJobTool, TermuxTerminalTool},
+    Tool, ToolContext,
 };
 
 #[test]
