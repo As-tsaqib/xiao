@@ -138,3 +138,88 @@ fn endpoint_edit_invalidates_automatic_evidence_preserving_override() {
         .unwrap();
     assert_eq!(ev_b.owner_override, "force_supported");
 }
+
+#[test]
+fn custom_profile_service_edit_preserves_owner_override_and_invalidates_automatic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("xiao.db");
+    let storage = std::sync::Arc::new(Storage::open(&db_path).unwrap());
+    let secrets = xiao::security::secrets::SecretStore::new(dir.path().join("secrets"));
+    let auth = std::sync::Arc::new(xiao::auth::AuthManager::new(
+        storage.clone(),
+        dir.path().join("auth_secrets"),
+    ));
+    let service = xiao::providers::CustomProfileService::with_auth(storage.clone(), secrets, auth);
+
+    let profile = service
+        .create_profile(
+            "owner:test",
+            "test-prof",
+            "https://initial.example/v1",
+            "openai_chat_completions",
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .unwrap()
+        .profile;
+
+    // Automatic evidence on model-A
+    storage
+        .set_capability_evidence(
+            &profile.profile_id,
+            "model-A",
+            "openai_chat_completions",
+            "vision",
+            "supported",
+            "runtime_success",
+            None,
+        )
+        .unwrap();
+
+    // Owner override on model-B
+    storage
+        .set_capability_override(
+            &profile.profile_id,
+            "model-B",
+            "openai_chat_completions",
+            "vision",
+            "force_supported",
+        )
+        .unwrap();
+
+    // Edit endpoint using CustomProfileService::edit_with_warnings
+    service
+        .edit_with_warnings(
+            "owner:test",
+            &profile.profile_id,
+            xiao::providers::CustomProfileEdit {
+                endpoint: Some("https://updated.example/v1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let ev_a = storage
+        .get_capability_evidence(
+            &profile.profile_id,
+            "model-A",
+            "openai_chat_completions",
+            "vision",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(ev_a.state, "unknown");
+    assert_eq!(ev_a.source, "invalidated_on_endpoint_change");
+
+    let ev_b = storage
+        .get_capability_evidence(
+            &profile.profile_id,
+            "model-B",
+            "openai_chat_completions",
+            "vision",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(ev_b.owner_override, "force_supported");
+}

@@ -2925,4 +2925,36 @@ mod tests {
         assert_eq!(req.allowed_chat_ids.as_deref(), Some("-100"));
         assert_eq!(req.allowed_user_ids.as_deref(), Some("1,2"));
     }
+
+    #[tokio::test]
+    async fn manager_agent_get_and_post_updates_turn_settings() {
+        let (state, _directory) = test_state().await;
+        let headers = admin_headers("admin-test-token");
+
+        let get_result = manager_agent(State(state.clone()), headers.clone()).await.unwrap();
+        let settings = get_result.0.get("settings").cloned().unwrap();
+        assert_eq!(settings.get("max_turns").and_then(serde_json::Value::as_u64), Some(150));
+
+        let update_result = manager_agent_action(
+            State(state.clone()),
+            headers.clone(),
+            Json(serde_json::json!({
+                "action": "update",
+                "max_turns": 200,
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(update_result.0.get("applied"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            update_result.0.get("settings").and_then(|s| s.get("max_turns")).and_then(serde_json::Value::as_u64),
+            Some(200)
+        );
+
+        let post_get = manager_agent(State(state.clone()), headers.clone()).await.unwrap();
+        assert_eq!(
+            post_get.0.get("settings").and_then(|s| s.get("max_turns")).and_then(serde_json::Value::as_u64),
+            Some(200)
+        );
+    }
 }

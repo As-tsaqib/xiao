@@ -456,7 +456,7 @@ impl TelegramAdapter {
             };
 
             let is_agent_request =
-                !text.trim_start().starts_with('/') || text.trim_start().starts_with("/retry");
+                !text.trim_start().starts_with('/') || is_retry_command(text);
             let result = if is_agent_request {
                 // Every Telegram generation receives observable live events so an
                 // exact ASK decision can surface as a scoped inline card. Private
@@ -619,7 +619,7 @@ impl TelegramAdapter {
         cancellation: CancellationToken,
     ) -> Result<CommandResult> {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let is_retry = text.trim_start().starts_with("/retry");
+        let is_retry = is_retry_command(text);
         let future = async {
             if is_retry {
                 self.app
@@ -1548,7 +1548,7 @@ impl TelegramAdapter {
                 let fast = command
                     .split_whitespace()
                     .next()
-                    .is_some_and(|x| matches!(x.split('@').next(), Some("/stop") | Some("/retry")));
+                    .is_some_and(|x| matches!(x.split('@').next(), Some("/stop") | Some("/retry") | Some("/r")));
                 let result = if fast {
                     self.app
                         .commands
@@ -2355,6 +2355,12 @@ fn parse_internal_approval_command(command: &str) -> Option<(bool, &str)> {
     valid.then_some((approve, id))
 }
 
+fn is_retry_command(text: &str) -> bool {
+    text.split_whitespace()
+        .next()
+        .is_some_and(|command| matches!(command.split('@').next(), Some("/retry") | Some("/r")))
+}
+
 fn is_stop_command(text: &str) -> bool {
     text.split_whitespace()
         .next()
@@ -2838,6 +2844,16 @@ mod tests {
         assert!(is_stop_command("  /stop@xiao_test_bot extra"));
         assert!(!is_stop_command("/s"));
         assert!(!is_stop_command("/stop-now"));
+    }
+
+    #[test]
+    fn retry_detection_accepts_canonical_and_alias() {
+        assert!(is_retry_command("/retry"));
+        assert!(is_retry_command("  /retry@xiao_test_bot extra"));
+        assert!(is_retry_command("/r"));
+        assert!(is_retry_command("  /r@xiao_test_bot"));
+        assert!(!is_retry_command("/reset"));
+        assert!(!is_retry_command("/report"));
     }
 
     #[test]

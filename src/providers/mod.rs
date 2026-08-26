@@ -1777,8 +1777,16 @@ impl Provider for CustomProvider {
                     (ProviderStep::Final(answer), None)
                 }
             };
-            if had_images {
-                if let Some(profile_id) = profile_id.as_deref() {
+            if let Some(profile_id) = profile_id.as_deref() {
+                let _ = self.profiles.record_runtime_capability(
+                    profile_id,
+                    &req.model,
+                    &target.protocol,
+                    "streaming",
+                    "supported",
+                    "runtime_success",
+                );
+                if had_images {
                     let _ = self.profiles.record_runtime_capability(
                         profile_id,
                         &req.model,
@@ -1878,8 +1886,16 @@ impl Provider for CustomProvider {
                 Some(serde_json::json!({ "input": input })),
             )
         };
-        if had_images {
-            if let Some(profile_id) = profile_id.as_deref() {
+        if let Some(profile_id) = profile_id.as_deref() {
+            let _ = self.profiles.record_runtime_capability(
+                profile_id,
+                &req.model,
+                &target.protocol,
+                "streaming",
+                "supported",
+                "runtime_success",
+            );
+            if had_images {
                 let _ = self.profiles.record_runtime_capability(
                     profile_id,
                     &req.model,
@@ -4314,6 +4330,56 @@ mod tests {
             _ => panic!("expected final answer"),
         }
         assert_eq!(attempt.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_chat_streaming_success_records_streaming_supported_capability() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(body["stream"], true);
+                let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"streamed success\"}}]}\n\ndata: [DONE]\n\n";
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse_body))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (auth, _directory) = test_auth();
+        let storage = auth.storage();
+        let config = CustomProviderConfig {
+            enabled: true,
+            base_url: Some(format!("http://{address}/v1")),
+            protocol: "openai_chat_completions".into(),
+            profile_id: Some("prof-stream-test".into()),
+            ..Default::default()
+        };
+        let provider = CustomProvider::new(config, auth);
+        let req = request(vec![message("user", "hello streaming capability test")]);
+
+        let turn = provider.run_turn(req, None, vec![], None).await.unwrap();
+        match turn.step {
+            ProviderStep::Final(answer) => assert_eq!(answer, "streamed success"),
+            _ => panic!("expected final answer"),
+        }
+
+        let evidence = storage
+            .get_capability_evidence(
+                "prof-stream-test",
+                "model-a",
+                "openai_chat_completions",
+                "streaming",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.state, "supported");
+        assert_eq!(evidence.source, "runtime_success");
+
         server.abort();
     }
 }

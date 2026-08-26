@@ -25,4 +25,4 @@ All remain manual and unverified in this workspace:
 - I: `/stop` during SSE, parallel tools, and `termux_job`
 - J: final delivery before background learning start
 
-Required device metadata and measured timings from `XIAO_v0.3.1_ARCHITECTURE/20_REAL_DEVICE_ACCEPTANCE.md` must be recorded here by the device operator before release readiness. PR #2 remains draft and must not be merged or marked ready based on CI alone.
+Required device metadata and measured timings from `XIAO_v0.3.1_ARCHITECTURE/20_REAL_DEVICE_ACCEPTANCE.md` must be recorded here by the device operator before release readiness. Automated verification runs directly on main; release readiness requires real-device evidence.

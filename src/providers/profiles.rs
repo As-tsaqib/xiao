@@ -448,10 +448,13 @@ impl ProviderProfileStore {
                 params![next_alias, next_protocol, next_headers, Utc::now().to_rfc3339(), owner_id, profile_id],
             )?;
             if protocol.is_some_and(|value| value != current.1) {
-                transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
                 transaction.execute(
                     "DELETE FROM provider_profile_models WHERE profile_id=?",
                     params![profile_id],
+                )?;
+                transaction.execute(
+                    "UPDATE provider_capability_evidence SET state='unknown',source='invalidated_on_endpoint_change',observed_at=? WHERE profile_id=? AND source != 'owner_override'",
+                    params![Utc::now().to_rfc3339(), profile_id],
                 )?;
             }
             transaction.commit()?;
@@ -477,7 +480,10 @@ impl ProviderProfileStore {
                 "DELETE FROM provider_profile_models WHERE profile_id=?",
                 params![profile_id],
             )?;
-            transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
+            transaction.execute(
+                "UPDATE provider_capability_evidence SET state='unknown',source='invalidated_on_endpoint_change',observed_at=? WHERE profile_id=? AND source != 'owner_override'",
+                params![Utc::now().to_rfc3339(), profile_id],
+            )?;
             transaction.commit()?;
             Ok(())
         })
@@ -517,7 +523,10 @@ impl ProviderProfileStore {
                 "DELETE FROM provider_profile_models WHERE profile_id=?",
                 params![profile_id],
             )?;
-            transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
+            transaction.execute(
+                "UPDATE provider_capability_evidence SET state='unknown',source='invalidated_on_endpoint_change',observed_at=? WHERE profile_id=? AND source != 'owner_override'",
+                params![Utc::now().to_rfc3339(), profile_id],
+            )?;
             transaction.commit()?;
             Ok(())
         })?;
@@ -1224,7 +1233,6 @@ impl CustomProfileService {
                 params![next_alias, next_endpoint, next_protocol, next_safe_headers, next_secret_ref, next_credential_ref, Utc::now().to_rfc3339(), owner_id, profile_id],
             )?;
             if endpoint_changed || protocol_changed {
-                transaction.execute("DELETE FROM provider_capability_evidence WHERE profile_id=?", params![profile_id])?;
                 transaction.execute(
                     "DELETE FROM provider_profile_models WHERE profile_id=?",
                     params![profile_id],
