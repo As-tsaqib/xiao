@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::collections::HashMap;
 
 use crate::security::redact::contains_secret_material;
 
@@ -76,7 +76,10 @@ impl CachedScript {
             ));
         }
         let interp_str = self.interpreter.to_string_lossy();
-        if !TRUSTED_INTERPRETERS.iter().any(|allowed| interp_str == *allowed) {
+        if !TRUSTED_INTERPRETERS
+            .iter()
+            .any(|allowed| interp_str == *allowed)
+        {
             return Err(anyhow!("untrusted script interpreter: {}", interp_str));
         }
         let bytes = std::fs::read(&self.path)?;
@@ -88,10 +91,14 @@ impl CachedScript {
         if lower.contains("su ")
             || lower.contains("tsu ")
             || lower.contains("sudo ")
-            || lower.starts_with("su
-")
-            || lower.starts_with("tsu
-")
+            || lower.starts_with(
+                "su
+",
+            )
+            || lower.starts_with(
+                "tsu
+",
+            )
         {
             return Err(anyhow!("script contains root escalation commands"));
         }

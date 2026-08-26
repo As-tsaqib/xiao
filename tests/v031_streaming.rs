@@ -1,9 +1,9 @@
+use async_trait::async_trait;
+use serde_json::json;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
-use async_trait::async_trait;
-use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use xiao::{
@@ -196,7 +196,9 @@ impl Provider for PartialOutputFailProvider {
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
         if attempt == 0 {
             if let Some(tx) = &progress {
-                let _ = tx.send(AgentEvent::TextDelta("Partial visible chunk before network crash".into()));
+                let _ = tx.send(AgentEvent::TextDelta(
+                    "Partial visible chunk before network crash".into(),
+                ));
             }
             self.emitted_partial.store(true, Ordering::SeqCst);
             return Err(anyhow::anyhow!("upstream connection dropped mid-stream"));
@@ -302,7 +304,12 @@ async fn matrix_c2_responses_sse_text_reaches_frontend_before_completion() {
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let answer = engine
-        .submit_to_session_with_progress("owner-1", &session.id, "stream responses", Some(progress_tx))
+        .submit_to_session_with_progress(
+            "owner-1",
+            &session.id,
+            "stream responses",
+            Some(progress_tx),
+        )
         .await
         .unwrap();
 
@@ -468,7 +475,11 @@ async fn matrix_c8_no_retry_after_partial_visible_output() {
         storage.clone(),
         dir.path().join("secrets"),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider.clone(), auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider.clone(),
+        auth,
+    ));
 
     let tools = Arc::new(ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
     let engine = AgentEngine::with_registry(
@@ -493,7 +504,12 @@ async fn matrix_c8_no_retry_after_partial_visible_output() {
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let result = engine
-        .submit_to_session_with_progress("owner-1", &session.id, "test partial failure", Some(progress_tx))
+        .submit_to_session_with_progress(
+            "owner-1",
+            &session.id,
+            "test partial failure",
+            Some(progress_tx),
+        )
         .await;
 
     // Must fail without performing a duplicate non-streaming retry

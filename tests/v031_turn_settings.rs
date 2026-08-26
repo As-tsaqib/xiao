@@ -359,10 +359,23 @@ async fn matrix_h6_turn_limit_error_is_useful_and_contains_last_observable_state
         AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
 
     let session = storage
-        .create_session("owner-1", "Turn Limit Test", "custom", None, "test-model", false, None)
+        .create_session(
+            "owner-1",
+            "Turn Limit Test",
+            "custom",
+            None,
+            "test-model",
+            false,
+            None,
+        )
         .unwrap();
     let err = engine
-        .submit_to_session_with_progress("owner-1", &session.id, "inspect multi-turn until limit", None)
+        .submit_to_session_with_progress(
+            "owner-1",
+            &session.id,
+            "inspect multi-turn until limit",
+            None,
+        )
         .await
         .unwrap_err();
 

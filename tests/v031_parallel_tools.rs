@@ -181,10 +181,7 @@ async fn matrix_e1_and_e2_read_only_tools_execute_concurrently_and_preserve_stab
     let active_concurrent = Arc::new(AtomicUsize::new(0));
     let max_concurrent_seen = Arc::new(AtomicUsize::new(0));
 
-    let tools = Arc::new(ToolRegistry::new(
-        xiao::tools::ToolPolicy::default(),
-        16384,
-    ));
+    let tools = Arc::new(ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
     tools
         .register(SlowReadToolA {
             active_concurrent: active_concurrent.clone(),
@@ -238,10 +235,26 @@ async fn matrix_e1_and_e2_read_only_tools_execute_concurrently_and_preserve_stab
 async fn matrix_e3_e4_e5_mutation_barrier_and_sequential_ordering() {
     let sequence = Arc::new(Mutex::new(Vec::new()));
     let calls = vec![
-        ToolCall { call_id: "r1".into(), name: "read".into(), arguments: json!({}) },
-        ToolCall { call_id: "r2".into(), name: "read".into(), arguments: json!({}) },
-        ToolCall { call_id: "w1".into(), name: "write".into(), arguments: json!({}) },
-        ToolCall { call_id: "r3".into(), name: "read".into(), arguments: json!({}) },
+        ToolCall {
+            call_id: "r1".into(),
+            name: "read".into(),
+            arguments: json!({}),
+        },
+        ToolCall {
+            call_id: "r2".into(),
+            name: "read".into(),
+            arguments: json!({}),
+        },
+        ToolCall {
+            call_id: "w1".into(),
+            name: "write".into(),
+            arguments: json!({}),
+        },
+        ToolCall {
+            call_id: "r3".into(),
+            name: "read".into(),
+            arguments: json!({}),
+        },
     ];
 
     let seq_clone = sequence.clone();
@@ -260,12 +273,18 @@ async fn matrix_e3_e4_e5_mutation_barrier_and_sequential_ordering() {
             let seq = seq_clone.clone();
             async move {
                 seq.lock().unwrap().push(format!("start:{}", call.call_id));
-                tokio::time::sleep(Duration::from_millis(if call.call_id == "r1" { 20 } else { 5 })).await;
+                tokio::time::sleep(Duration::from_millis(if call.call_id == "r1" {
+                    20
+                } else {
+                    5
+                }))
+                .await;
                 seq.lock().unwrap().push(format!("end:{}", call.call_id));
                 call.call_id
             }
         },
-    ).await;
+    )
+    .await;
 
     // E2: Result order preserved
     assert_eq!(results, vec!["r1", "r2", "w1", "r3"]);
@@ -304,8 +323,12 @@ async fn matrix_e6_parallel_cancellation_records_durable_interrupted_rows() {
         .create_tool_run(&run_id, "call-p2", "slow_read_b", "{}", "read_only")
         .unwrap();
 
-    storage.set_tool_run_status(&tool_id_1, "running", None, None).unwrap();
-    storage.set_tool_run_status(&tool_id_2, "running", None, None).unwrap();
+    storage
+        .set_tool_run_status(&tool_id_1, "running", None, None)
+        .unwrap();
+    storage
+        .set_tool_run_status(&tool_id_2, "running", None, None)
+        .unwrap();
 
     let cancellation = CancellationToken::new();
     cancellation.cancel();

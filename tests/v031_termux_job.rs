@@ -1,6 +1,6 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, sync::Mutex};
 use async_trait::async_trait;
 use serde_json::json;
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, sync::Mutex};
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use xiao::{
@@ -48,7 +48,8 @@ impl ProcessExecutor for RecordingExecutor {
             cwd: command.cwd,
             exit_code: Some(0),
             stdout: "inspection output ok
-".into(),
+"
+            .into(),
             stderr: String::new(),
             duration_ms: 10,
             truncated: false,

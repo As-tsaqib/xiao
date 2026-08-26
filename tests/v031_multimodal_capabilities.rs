@@ -4,9 +4,8 @@ use tempfile::tempdir;
 use xiao::{
     auth::AuthManager,
     providers::{
-        profile_model_from_probe, CapabilityState, CustomCapabilityProbe,
-        CustomProfileEdit, CustomProfileService, ProviderCapabilities, ProviderProfileStore,
-        ToolProtocol,
+        profile_model_from_probe, CapabilityState, CustomCapabilityProbe, CustomProfileEdit,
+        CustomProfileService, ProviderCapabilities, ProviderProfileStore, ToolProtocol,
     },
     security::secrets::SecretStore,
     storage::Storage,
@@ -48,7 +47,8 @@ fn matrix_a2_probe_content_mismatch_yields_unknown_not_unsupported() {
         file_input: CapabilityState::Unknown,
     };
     assert_eq!(probe.vision, CapabilityState::Unknown);
-    let record = profile_model_from_probe("prof-1", "model-mismatch", &probe, "2026-08-26T00:00:00Z");
+    let record =
+        profile_model_from_probe("prof-1", "model-mismatch", &probe, "2026-08-26T00:00:00Z");
     assert!(!record.vision_capable);
     assert_eq!(record.vision_state, "unknown");
     assert!(!record.file_input_capable);
@@ -66,7 +66,8 @@ fn matrix_a3_probe_timeout_or_500_yields_unknown() {
         vision: CapabilityState::Unknown,
         file_input: CapabilityState::Unknown,
     };
-    let record = profile_model_from_probe("prof-1", "model-timeout", &probe, "2026-08-26T00:00:00Z");
+    let record =
+        profile_model_from_probe("prof-1", "model-timeout", &probe, "2026-08-26T00:00:00Z");
     assert_eq!(record.vision_state, "unknown");
     assert!(!record.vision_capable);
 }

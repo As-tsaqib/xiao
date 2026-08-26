@@ -205,7 +205,9 @@ fn matrix_i2_and_i3_production_learning_payload_survives_restart_and_stale_lease
         .unwrap();
 
     // Release after frontend delivery
-    storage.release_learning_job_after_delivery(&run_id).unwrap();
+    storage
+        .release_learning_job_after_delivery(&run_id)
+        .unwrap();
 
     // Claim job by background worker
     let (job_id, owner, run, claimed_payload) = storage.claim_learning_job().unwrap().unwrap();

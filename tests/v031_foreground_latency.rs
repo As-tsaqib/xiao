@@ -1,9 +1,9 @@
+use async_trait::async_trait;
+use serde_json::json;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use async_trait::async_trait;
-use serde_json::json;
 use tokio::sync::mpsc;
 use xiao::{
     agent::AgentEngine,
@@ -14,7 +14,9 @@ use xiao::{
     },
     session::SessionManager,
     storage::Storage,
-    tools::{Tool, ToolCall, ToolContext, ToolOrigin, ToolRegistry, ToolResult, ToolRisk, ToolSpec},
+    tools::{
+        Tool, ToolCall, ToolContext, ToolOrigin, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
+    },
 };
 
 struct TrackingMockProvider {
@@ -61,13 +63,17 @@ impl Provider for TrackingMockProvider {
     }
     async fn generate_text(&self, _req: ProviderRequest) -> anyhow::Result<String> {
         self.semantic_calls.fetch_add(1, Ordering::SeqCst);
-        self.calls.lock().unwrap().push("semantic_generate_text".into());
+        self.calls
+            .lock()
+            .unwrap()
+            .push("semantic_generate_text".into());
         Ok(json!({
             "verified": true,
             "state": "verified_success",
             "confidence": 0.95,
             "reason": "verified by semantic model"
-        }).to_string())
+        })
+        .to_string())
     }
     async fn run(
         &self,
@@ -84,7 +90,10 @@ impl Provider for TrackingMockProvider {
         _progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> anyhow::Result<ProviderTurn> {
         let idx = self.turn_index.fetch_add(1, Ordering::SeqCst);
-        self.calls.lock().unwrap().push(format!("main_provider_turn_{idx}"));
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("main_provider_turn_{idx}"));
         if idx < self.turn_responses.len() {
             Ok(self.turn_responses[idx].clone())
         } else {
@@ -123,7 +132,8 @@ impl Tool for DeterministicSuccessTool {
             "status": "succeeded",
             "verification_evidence": true,
             "output": "operation completed successfully"
-        }).to_string())
+        })
+        .to_string())
     }
 }
 
@@ -142,7 +152,11 @@ async fn matrix_d1_and_d2_ordinary_info_no_pre_provider_call_and_no_verifier_cal
         storage.clone(),
         dir.path().join("secrets"),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider.clone(), auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider.clone(),
+        auth,
+    ));
 
     let tools = Arc::new(ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
     let engine = AgentEngine::with_registry(
@@ -154,11 +168,24 @@ async fn matrix_d1_and_d2_ordinary_info_no_pre_provider_call_and_no_verifier_cal
     );
 
     let session = storage
-        .create_session("owner-1", "Info Test", "custom", None, "latency-model", false, None)
+        .create_session(
+            "owner-1",
+            "Info Test",
+            "custom",
+            None,
+            "latency-model",
+            false,
+            None,
+        )
         .unwrap();
 
     let answer = engine
-        .submit_to_session_with_progress("owner-1", &session.id, "What is the speed of light?", None)
+        .submit_to_session_with_progress(
+            "owner-1",
+            &session.id,
+            "What is the speed of light?",
+            None,
+        )
         .await
         .unwrap();
 
@@ -166,7 +193,10 @@ async fn matrix_d1_and_d2_ordinary_info_no_pre_provider_call_and_no_verifier_cal
 
     let call_history = provider.calls.lock().unwrap().clone();
     // D1: First call was main_provider_turn_0 (no semantic calls before)
-    assert_eq!(call_history.first().map(String::as_str), Some("main_provider_turn_0"));
+    assert_eq!(
+        call_history.first().map(String::as_str),
+        Some("main_provider_turn_0")
+    );
     // D2: Total semantic verifier calls is exactly 0 for informational prompt
     assert_eq!(provider.semantic_calls.load(Ordering::SeqCst), 0);
 }
@@ -197,7 +227,11 @@ async fn matrix_d3_deterministic_action_makes_no_verifier_call() {
         storage.clone(),
         dir.path().join("secrets"),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider.clone(), auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider.clone(),
+        auth,
+    ));
 
     let tools = Arc::new(ToolRegistry::new(
         xiao::tools::ToolPolicy::default().allow_side_effect("deterministic_tool"),
@@ -214,7 +248,15 @@ async fn matrix_d3_deterministic_action_makes_no_verifier_call() {
     );
 
     let session = storage
-        .create_session("owner-1", "Action Test", "custom", None, "latency-model", false, None)
+        .create_session(
+            "owner-1",
+            "Action Test",
+            "custom",
+            None,
+            "latency-model",
+            false,
+            None,
+        )
         .unwrap();
 
     let answer = engine
@@ -253,7 +295,11 @@ async fn matrix_d5_and_d6_final_delivery_before_background_learning() {
         storage.clone(),
         dir.path().join("secrets"),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider.clone(), auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider.clone(),
+        auth,
+    ));
 
     let tools = Arc::new(ToolRegistry::new(
         xiao::tools::ToolPolicy::default().allow_side_effect("deterministic_tool"),
@@ -266,16 +312,19 @@ async fn matrix_d5_and_d6_final_delivery_before_background_learning() {
         ..Default::default()
     };
 
-    let engine = AgentEngine::with_registry(
-        sessions.clone(),
-        storage.clone(),
-        providers,
-        config,
-        tools,
-    );
+    let engine =
+        AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
 
     let session = storage
-        .create_session("owner-1", "Learning Order Test", "custom", None, "latency-model", false, None)
+        .create_session(
+            "owner-1",
+            "Learning Order Test",
+            "custom",
+            None,
+            "latency-model",
+            false,
+            None,
+        )
         .unwrap();
 
     // D6: AgentAnswer returns immediately without holding for background learning
@@ -306,7 +355,9 @@ async fn matrix_d5_and_d6_final_delivery_before_background_learning() {
     let agent_run_id = &runs[0].id;
 
     // Release after frontend delivery
-    storage.release_learning_job_after_delivery(agent_run_id).unwrap();
+    storage
+        .release_learning_job_after_delivery(agent_run_id)
+        .unwrap();
 
     // Now background worker claims the job
     let claim_after = storage.claim_learning_job().unwrap();
