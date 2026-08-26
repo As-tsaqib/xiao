@@ -192,10 +192,13 @@ async fn termux_job_rejects_approval_requiring_substeps_with_distinct_status_and
     let temp = tempdir().unwrap();
     let db_path = temp.path().join("test.db");
     let storage = Arc::new(Storage::open(&db_path).unwrap());
+    let session = storage
+        .create_session("owner-1", "Test", "custom", None, "test-model", false, None)
+        .unwrap();
     let run_id = storage
         .create_agent_run(
             "owner-1",
-            "sess-1",
+            &session.id,
             "custom",
             "test-model",
             Some("test goal"),
@@ -213,7 +216,7 @@ async fn termux_job_rejects_approval_requiring_substeps_with_distinct_status_and
 
     let ctx = ToolContext {
         principal: "owner-1".into(),
-        session_id: "sess-1".into(),
+        session_id: session.id.clone(),
         agent_run_id: run_id.clone(),
         yolo_mode: false,
         messages: vec![],
