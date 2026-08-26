@@ -167,8 +167,34 @@ impl CompletionVerifier {
     }
 }
 
+fn is_informational_or_code_example(clean_goal: &str) -> bool {
+    let lower = clean_goal.to_ascii_lowercase();
+    let question_or_example_markers = [
+        "how to", "how do", "how can", "how does", "what is", "what are", "what's", "why",
+        "explain", "describe", "tell me", "show me", "give me", "code example", "example",
+        "sample", "tutorial", "guide", "contoh", "jelaskan", "bagaimana", "apa itu",
+        "mengapa", "tunjukkan cara", "berikan contoh",
+    ];
+    let is_query = question_or_example_markers.iter().any(|m| lower.contains(m)) || lower.trim().ends_with('?');
+    let explicit_actions = [
+        "run this", "execute this", "compile this", "install this", "build the project",
+        "create file", "write to file", "save to file", "save as", "save it to",
+        "edit file", "delete file", "update the file", "fix the bug in",
+        "jalankan script", "buat file", "simpan ke file", "tulis ke file",
+        "pasang di sistem", "perbaiki file",
+    ];
+    let has_explicit_action = explicit_actions.iter().any(|a| lower.contains(a));
+    is_query && !has_explicit_action
+}
+
 fn deterministic_task_kind(goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind {
     let clean_goal = strip_attachment_envelope(goal);
+    let observed_side_effect = tool_runs
+        .iter()
+        .any(|run| run.risk != "read_only" && run.risk != "unknown");
+    if is_informational_or_code_example(clean_goal) && !observed_side_effect {
+        return TaskKind::Informational;
+    }
     let normalized = clean_goal.to_ascii_lowercase();
     let installation = ["install", "package", "dependency", "pasang"]
         .iter()
@@ -217,9 +243,6 @@ fn deterministic_task_kind(goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind 
     let verification = ["verify", "validate", "prove", "pastikan", "verifikasi"]
         .iter()
         .any(|marker| normalized.contains(marker));
-    let observed_side_effect = tool_runs
-        .iter()
-        .any(|run| run.risk != "read_only" && run.risk != "unknown");
     let kinds = usize::from(installation)
         + usize::from(modification || observed_side_effect)
         + usize::from(inspection)
@@ -327,20 +350,18 @@ impl CompletionVerifier {
                         .iter()
                         .skip_while(|candidate| candidate.id != run.id)
                         .skip(1)
-                        .any(|later| later.status == "succeeded")
+                        .any(|later| is_relevant_recovery(run, later))
             });
-            return evidence(
-                if terminal_denial {
-                    VerificationState::Failed
-                } else {
-                    VerificationState::NotYetVerified
-                },
-                task_kind,
-                format!("{unresolved} tool failure(s) remain unresolved"),
-                succeeded_tools,
-                unresolved,
-                Vec::new(),
-            );
+            if terminal_denial {
+                return evidence(
+                    VerificationState::Failed,
+                    task_kind,
+                    format!("{unresolved} tool failure(s) remain unresolved (denied/interrupted)"),
+                    succeeded_tools,
+                    unresolved,
+                    Vec::new(),
+                );
+            }
         }
         if !task_kind.is_action_like() {
             return evidence(
@@ -353,16 +374,28 @@ impl CompletionVerifier {
                     } else {
                         "informational answer is present; no external action was requested".into()
                     }
+                } else if unresolved > 0 {
+                    format!("informational answer is present; {succeeded_tools} observation(s) recorded, {unresolved} exploratory tool failure(s) did not block answer")
                 } else {
                     format!("{succeeded_tools} read-only observation(s) support the answer")
                 },
                 succeeded_tools,
-                0,
+                unresolved,
                 tool_runs
                     .iter()
                     .filter(|run| run.status == "succeeded")
                     .map(observation)
                     .collect(),
+            );
+        }
+        if unresolved > 0 {
+            return evidence(
+                VerificationState::NotYetVerified,
+                task_kind,
+                format!("{unresolved} tool failure(s) remain unresolved"),
+                succeeded_tools,
+                unresolved,
+                Vec::new(),
             );
         }
 
@@ -606,6 +639,32 @@ fn evidence(
     }
 }
 
+fn is_relevant_recovery(failed: &ToolRunRecord, later: &ToolRunRecord) -> bool {
+    if later.status != "succeeded" {
+        return false;
+    }
+    if failed.status == "denied" {
+        return false;
+    }
+    if failed.tool_name == later.tool_name {
+        return true;
+    }
+    let is_terminal = |name: &str| matches!(name, "termux_terminal" | "termux_job");
+    if is_terminal(&failed.tool_name) && is_terminal(&later.tool_name) {
+        return true;
+    }
+    let is_read_or_inspect = |run: &ToolRunRecord| {
+        run.risk == "read_only" || verification_tool(&run.tool_name)
+    };
+    if is_read_or_inspect(failed) && is_read_or_inspect(later) {
+        return true;
+    }
+    if failed.risk == "side_effect" && later.risk == "side_effect" {
+        return true;
+    }
+    false
+}
+
 fn unresolved_failures(tool_runs: &[ToolRunRecord]) -> usize {
     tool_runs
         .iter()
@@ -614,7 +673,7 @@ fn unresolved_failures(tool_runs: &[ToolRunRecord]) -> usize {
             matches!(run.status.as_str(), "failed" | "denied" | "interrupted")
                 && !tool_runs[index + 1..]
                     .iter()
-                    .any(|later| later.status == "succeeded")
+                    .any(|later| is_relevant_recovery(run, later))
         })
         .count()
 }
@@ -824,5 +883,64 @@ mod tests {
         let evidence = verifier.verify_for_task_with_images(goal, "Done", &[], true);
         assert_eq!(evidence.state, VerificationState::NotYetVerified);
         assert!(!evidence.verified);
+    }
+
+    #[test]
+    fn informational_code_example_with_exploratory_failure_succeeds_without_blocked() {
+        let verifier = CompletionVerifier::default();
+        let goal = "Show me a code example for binary search in Rust";
+        assert_eq!(verifier.classify(goal, &[]), TaskKind::Informational);
+        let failed_search = run("search", "read_only", "failed", Some("file not found"));
+        let evidence = verifier.verify_for_task(
+            goal,
+            "```rust
+fn binary_search<T: Ord>(slice: &[T], target: &T) -> Option<usize> { ... }
+```",
+            &[failed_search],
+        );
+        assert_eq!(evidence.state, VerificationState::VerifiedSuccess);
+        assert_eq!(evidence.task_kind, TaskKind::Informational);
+        assert!(evidence.verified);
+    }
+
+    #[test]
+    fn informational_with_privileged_denial_remains_failed() {
+        let verifier = CompletionVerifier::default();
+        let goal = "Explain how to restart service";
+        let denied_run = run("android_restart", "privileged", "denied", Some("denied by owner"));
+        let evidence = verifier.verify_for_task(
+            goal,
+            "To restart service, run the command.",
+            &[denied_run],
+        );
+        assert_eq!(evidence.state, VerificationState::Failed);
+    }
+
+    #[test]
+    fn action_failure_not_resolved_by_unrelated_readonly_tool() {
+        let verifier = CompletionVerifier::default();
+        let goal = "Build the binary";
+        let build_failed = run("termux_terminal", "side_effect", "failed", Some("syntax error"));
+        let file_check = run("file_check", "read_only", "succeeded", Some("{"exists":false}"));
+        let evidence = verifier.verify_for_task(
+            goal,
+            "Done",
+            &[build_failed, file_check],
+        );
+        assert_eq!(evidence.state, VerificationState::NotYetVerified);
+        assert!(!evidence.verified);
+        assert_eq!(evidence.unresolved_tool_failures, 1);
+
+        let build_fixed = run("termux_terminal", "side_effect", "succeeded", Some("compiled successfully"));
+        let evidence_recovered = verifier.verify_for_task(
+            goal,
+            "Done",
+            &[
+                run("termux_terminal", "side_effect", "failed", None),
+                build_fixed,
+                run("file_check", "read_only", "succeeded", Some("{"exists":true}")),
+            ],
+        );
+        assert_eq!(evidence_recovered.state, VerificationState::VerifiedSuccess);
     }
 }

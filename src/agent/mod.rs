@@ -3180,4 +3180,28 @@ mod tests {
             "deterministic final response"
         );
     }
+
+    #[test]
+    fn ping_pong_guard_detects_true_identical_hashes_and_allows_changing_repair_progress() {
+        let mut progress_signatures = std::collections::VecDeque::new();
+        // Turn 1: create artifact v1 (hash1)
+        progress_signatures.push_back("termux_terminal:false:hash1".into());
+        // Turn 2: inspect artifact v1 (error: invalid xref)
+        progress_signatures.push_back("termux_terminal:true:invalid_xref".into());
+        // Turn 3: repair artifact v2 (hash2 - DIFFERENT!)
+        progress_signatures.push_back("termux_terminal:false:hash2".into());
+        // Turn 4: inspect artifact v2 (valid - DIFFERENT!)
+        progress_signatures.push_back("termux_terminal:false:valid_pdf".into());
+
+        assert!(!result_aware_ping_pong(&progress_signatures, 2));
+
+        // In contrast, true identical alternating results A-B-A-B:
+        let mut loop_signatures = std::collections::VecDeque::new();
+        loop_signatures.push_back("termux_terminal:false:hash1".into());
+        loop_signatures.push_back("termux_terminal:true:invalid_xref".into());
+        loop_signatures.push_back("termux_terminal:false:hash1".into());
+        loop_signatures.push_back("termux_terminal:true:invalid_xref".into());
+
+        assert!(result_aware_ping_pong(&loop_signatures, 2));
+    }
 }
