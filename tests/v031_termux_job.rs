@@ -5,9 +5,9 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use xiao::{
     runtime::{
-        CapabilityRegistry, CommandOutcome, DependencyResolver, ExecutionBackend,
-        PackageBackend, PackageCandidate, ProcessExecutor, RuntimeEnvironment, SelinuxState,
-        TermuxCommand, TrustedPackageRepository,
+        CapabilityRegistry, CommandOutcome, DependencyResolver, ExecutionBackend, PackageBackend,
+        PackageCandidate, ProcessExecutor, RuntimeEnvironment, SelinuxState, TermuxCommand,
+        TrustedPackageRepository,
     },
     tools::{
         builtin::{TermuxJobTool, TermuxTerminalTool},
