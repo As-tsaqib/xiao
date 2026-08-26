@@ -697,7 +697,12 @@ mod tests {
         let temp = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let packages = Arc::new(FakePackages {
-            available: Mutex::new(BTreeSet::new()),
+            available: Mutex::new(BTreeSet::from([
+                "ls".to_string(),
+                "cat".to_string(),
+                "echo".to_string(),
+                "ffmpeg".to_string(),
+            ])),
             installs: Mutex::new(Vec::new()),
         });
         let executor = Arc::new(FakeExecutor {
