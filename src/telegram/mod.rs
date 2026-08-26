@@ -2389,6 +2389,30 @@ mod tests {
         let session = app.sessions.ensure_telegram_session(owner, scope).unwrap();
 
         let profiles = crate::providers::ProviderProfileStore::new(app.storage.clone());
+        let test_model_rec = crate::storage::ProviderProfileModelRecord {
+            profile_id: "test".into(),
+            model_id: "test_model".into(),
+            text_capable: true,
+            vision_capable: false,
+            file_input_capable: false,
+            native_tools: false,
+            structured_output: false,
+            continuation: false,
+            native_tools_state: "unknown".into(),
+            structured_output_state: "unknown".into(),
+            continuation_state: "unknown".into(),
+            vision_state: "unknown".into(),
+            file_input_state: "unknown".into(),
+            model_discovery: false,
+            tool_protocol: "chat_only".into(),
+            evidence: "test".into(),
+            probe_status: "unprobed".into(),
+            probe_version: 1,
+            probed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let mut slow_model_rec = test_model_rec.clone();
+        slow_model_rec.model_id = "slow_model".into();
+
         profiles
             .create_with_models_and_activate_session(
                 crate::storage::ProviderProfileInput {
@@ -2402,27 +2426,7 @@ mod tests {
                     safe_headers_json: "{}".into(),
                     secret_headers_ref: None,
                 },
-                &[crate::storage::ProviderProfileModelRecord {
-                    profile_id: "test".into(),
-                    model_id: "slow_model".into(),
-                    text_capable: true,
-                    vision_capable: false,
-                    file_input_capable: false,
-                    native_tools: false,
-                    structured_output: false,
-                    continuation: false,
-                    native_tools_state: "unknown".into(),
-                    structured_output_state: "unknown".into(),
-                    continuation_state: "unknown".into(),
-                    vision_state: "unknown".into(),
-                    file_input_state: "unknown".into(),
-                    model_discovery: false,
-                    tool_protocol: "chat_only".into(),
-                    evidence: "test".into(),
-                    probe_status: "unprobed".into(),
-                    probe_version: 1,
-                    probed_at: chrono::Utc::now().to_rfc3339(),
-                }],
+                &[test_model_rec, slow_model_rec],
                 &session.id,
                 "test_model",
             )
@@ -2493,9 +2497,32 @@ mod tests {
 
         let owner1 = "owner1";
         let owner2 = "owner2";
+        let session1 = app.sessions.ensure_default_session(owner1).unwrap();
 
         let p1 = tg.resolve_custom_alias(owner1, "custom").unwrap();
         assert_eq!(p1, "custom");
+
+        let model_rec = crate::storage::ProviderProfileModelRecord {
+            profile_id: "test".into(),
+            model_id: "m".into(),
+            text_capable: true,
+            vision_capable: false,
+            file_input_capable: false,
+            native_tools: false,
+            structured_output: false,
+            continuation: false,
+            native_tools_state: "unknown".into(),
+            structured_output_state: "unknown".into(),
+            continuation_state: "unknown".into(),
+            vision_state: "unknown".into(),
+            file_input_state: "unknown".into(),
+            model_discovery: false,
+            tool_protocol: "chat_only".into(),
+            evidence: "test".into(),
+            probe_status: "unprobed".into(),
+            probe_version: 1,
+            probed_at: chrono::Utc::now().to_rfc3339(),
+        };
 
         let profiles = crate::providers::ProviderProfileStore::new(app.storage.clone());
         profiles
@@ -2511,9 +2538,9 @@ mod tests {
                     safe_headers_json: "{}".into(),
                     secret_headers_ref: None,
                 },
-                &[],
-                "test_session",
-                "test_model",
+                &[model_rec.clone()],
+                &session1.id,
+                "m",
             )
             .unwrap();
 
@@ -2534,9 +2561,9 @@ mod tests {
                     safe_headers_json: "{}".into(),
                     secret_headers_ref: None,
                 },
-                &[],
-                "test_session",
-                "test_model",
+                &[model_rec],
+                &session1.id,
+                "m",
             )
             .unwrap();
 
