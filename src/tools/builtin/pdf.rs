@@ -269,7 +269,7 @@ endstream",
         format!(
             "<< /Type /Pages /Kids [{}] /Count {} >>",
             kids_refs.join(" "),
-            num_pages
+            page_chunks.len()
         ),
     );
     let font_obj = (
