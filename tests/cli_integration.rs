@@ -190,7 +190,10 @@ fn subcommand_help_for_all_command_families_is_terminal_native() {
             &["attachments", "--help"],
             "Usage: xiao attachments <list|show|remove> [--session ID] ...",
         ),
-        (&["runs", "--help"], "Usage: xiao runs <list|show|cancel> ..."),
+        (
+            &["runs", "--help"],
+            "Usage: xiao runs <list|show|cancel> ...",
+        ),
         (
             &["daemon", "--help"],
             "Usage: xiao daemon <start|foreground|stop|restart|status|logs> ...",
@@ -210,13 +213,19 @@ fn subcommand_help_for_all_command_families_is_terminal_native() {
             &["daemon", "logs", "--help"],
             "Usage: xiao daemon logs [LINES]",
         ),
-        (&["config", "--help"], "Usage: xiao config <path|check|show>"),
+        (
+            &["config", "--help"],
+            "Usage: xiao config <path|check|show>",
+        ),
         (&["config", "path", "--help"], "Usage: xiao config path"),
         (&["config", "check", "--help"], "Usage: xiao config check"),
         (&["config", "show", "--help"], "Usage: xiao config show"),
         (&["login", "--help"], "Usage: xiao login [custom]"),
         (&["setup", "--help"], "Usage: xiao setup"),
-        (&["status", "--help"], "Usage: xiao status [--json] [--quiet]"),
+        (
+            &["status", "--help"],
+            "Usage: xiao status [--json] [--quiet]",
+        ),
         (
             &["context", "--help"],
             "Usage: xiao context [--session ID] [--json]",
