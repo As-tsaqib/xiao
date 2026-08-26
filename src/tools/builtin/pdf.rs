@@ -208,9 +208,7 @@ pub fn generate_valid_pdf(text: &str) -> Vec<u8> {
         .chunks(LINES_PER_PAGE)
         .map(|chunk| chunk.to_vec())
         .collect();
-    if page_chunks.is_empty() {
-        page_chunks.push(Vec::new());
-    }
+
 
     let font_obj_id = 3;
     let mut objects: Vec<(usize, String)> = Vec::new();
