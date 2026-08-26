@@ -9,8 +9,7 @@ fn root_help_matches_snapshot() {
     let output = xiao().arg("--help").output().expect("run xiao --help");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("help utf8");
-    let (version, body) = stdout.split_once('
-').expect("help first line");
+    let (version, body) = stdout.split_once('\n').expect("help first line");
     assert!(version.starts_with("xiao v"));
     assert_eq!(body, include_str!("snapshots/cli_help_body.txt"));
 }

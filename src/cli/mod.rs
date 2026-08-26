@@ -578,8 +578,7 @@ fn validate_telegram_syntax(args: &[String]) -> CliResult<()> {
         Some("test") if args.len() == 1 => Ok(()),
         Some("set-token-file") if args.len() == 2 => Ok(()),
         Some("set-owner")
-            if args.len() == 2
-                || (args.len() == 3 && args[2] == "--confirm-owner-change") =>
+            if args.len() == 2 || (args.len() == 3 && args[2] == "--confirm-owner-change") =>
         {
             parse_owner_user_id(&args[1])?;
             Ok(())
@@ -666,7 +665,9 @@ fn validate_custom_syntax(args: &[String]) -> CliResult<()> {
         Some("add") => Ok(()),
         Some("edit") => {
             if args.len() < 2 {
-                return Err(CliFailure::usage("usage: xiao model custom edit ID [options]"));
+                return Err(CliFailure::usage(
+                    "usage: xiao model custom edit ID [options]",
+                ));
             }
             Ok(())
         }
@@ -1249,9 +1250,8 @@ async fn custom_add(
                 let raw = fs::read_to_string(path).map_err(|error| {
                     CliFailure::local(format!("read {}: {error}", path.display()))
                 })?;
-                let file_headers: BTreeMap<String, String> = serde_json::from_str(&raw).map_err(|error| {
-                    CliFailure::usage(format!("invalid headers JSON: {error}"))
-                })?;
+                let file_headers: BTreeMap<String, String> = serde_json::from_str(&raw)
+                    .map_err(|error| CliFailure::usage(format!("invalid headers JSON: {error}")))?;
                 headers.extend(file_headers);
             }
             "--secret-headers-file" => {
