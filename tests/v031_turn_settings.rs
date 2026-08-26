@@ -268,7 +268,7 @@ async fn scripted_provider_exceeds_eight_turns_without_premature_failure() {
         .create_session("owner-1", "Test", "custom", None, "test-model", false, None)
         .unwrap();
     let answer = engine
-        .submit_to_session_with_progress("owner-1", &session.id, "run 12 turns", None)
+        .submit_to_session_with_progress("owner-1", &session.id, "inspect 12 turns", None)
         .await
         .unwrap();
 
