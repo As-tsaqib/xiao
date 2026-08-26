@@ -1082,13 +1082,12 @@ impl TelegramAdapter {
                         Ok(()) => break,
                         Err(error) => {
                             let msg = error.to_string().to_ascii_lowercase();
-                            if (msg.contains("already exists") && msg.contains("alias"))
-                                || (msg.contains("unique") && msg.contains("alias"))
+                            if ((msg.contains("already exists") && msg.contains("alias"))
+                                || (msg.contains("unique") && msg.contains("alias")))
+                                && retries < 5
                             {
-                                if retries < 5 {
-                                    retries += 1;
-                                    continue;
-                                }
+                                retries += 1;
+                                continue;
                             }
                             return Err(error);
                         }
@@ -1134,13 +1133,12 @@ impl TelegramAdapter {
                             Ok(()) => break,
                             Err(error) => {
                                 let msg = error.to_string().to_ascii_lowercase();
-                                if (msg.contains("already exists") && msg.contains("alias"))
-                                    || (msg.contains("unique") && msg.contains("alias"))
+                                if ((msg.contains("already exists") && msg.contains("alias"))
+                                    || (msg.contains("unique") && msg.contains("alias")))
+                                    && retries < 5
                                 {
-                                    if retries < 5 {
-                                        retries += 1;
-                                        continue;
-                                    }
+                                    retries += 1;
+                                    continue;
                                 }
                                 return Err(error);
                             }
@@ -2538,7 +2536,7 @@ mod tests {
                     safe_headers_json: "{}".into(),
                     secret_headers_ref: None,
                 },
-                &[model_rec.clone()],
+                std::slice::from_ref(&model_rec),
                 &session1.id,
                 "m",
             )
