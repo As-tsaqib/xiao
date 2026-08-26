@@ -2,13 +2,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tempfile::tempdir;
 use xiao::{
+    attachments::NormalizedImage,
     auth::AuthManager,
+    config::AppConfig,
     providers::{
         profile_model_from_probe, CapabilityState, CustomCapabilityProbe, CustomProfileEdit,
-        CustomProfileService, ProviderCapabilities, ProviderProfileStore, ToolProtocol,
+        CustomProfileService, ProviderCapabilities, ProviderProfileStore, ProviderRegistry,
+        ProviderRequest, ToolProtocol,
     },
     security::secrets::SecretStore,
-    storage::Storage,
+    storage::{ProviderProfileInput, Storage},
 };
 
 #[test]
@@ -186,12 +189,41 @@ fn matrix_a7_runtime_transient_failure_leaves_unknown_intact() {
     assert_eq!(state, "unknown");
 }
 
-#[test]
-fn matrix_a8_force_supported_overrides_auto_state_and_admits_request() {
+#[tokio::test]
+async fn matrix_a8_force_supported_overrides_auto_state_and_admits_request() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("xiao.db");
     let storage = Arc::new(Storage::open(&db_path).unwrap());
     let store = ProviderProfileStore::new(storage.clone());
+    let auth = Arc::new(AuthManager::new(
+        storage.clone(),
+        dir.path().join("auth_secrets"),
+    ));
+
+    store
+        .create(ProviderProfileInput {
+            profile_id: Some("prof-1".into()),
+            owner_id: "owner-1".into(),
+            alias: "prof-1".into(),
+            endpoint: "https://custom.example.com/v1".into(),
+            protocol: "openai_chat_completions".into(),
+            safe_headers_json: "{}".into(),
+            api_key_ref: None,
+            credential_ref: None,
+            secret_headers_ref: None,
+        })
+        .unwrap();
+
+    let probe = CustomCapabilityProbe {
+        capabilities: ProviderCapabilities::chat_only("inconclusive probe"),
+        native_tools: CapabilityState::Unknown,
+        structured_output: CapabilityState::Unknown,
+        continuation: CapabilityState::Unknown,
+        vision: CapabilityState::Unknown,
+        file_input: CapabilityState::Unknown,
+    };
+    let record = profile_model_from_probe("prof-1", "model-forced", &probe, "2026-08-26T00:00:00Z");
+    store.replace_models("owner-1", "prof-1", &[record]).unwrap();
 
     // Probed state is unknown
     storage
@@ -226,14 +258,61 @@ fn matrix_a8_force_supported_overrides_auto_state_and_admits_request() {
         )
         .unwrap();
     assert_eq!(effective_override, "force_supported");
+
+    // End-to-end check: ForceSupported admits request
+    let mut config = AppConfig::default();
+    config.providers.custom.enabled = true;
+    let registry = ProviderRegistry::new(config, auth.clone());
+    let custom = registry.get("custom").unwrap();
+    let caps = custom.capabilities_for("model-forced", Some("prof-1"));
+    assert!(caps.vision);
 }
 
-#[test]
-fn matrix_a9_force_unsupported_prevents_image_request() {
+#[tokio::test]
+async fn matrix_a9_force_unsupported_prevents_image_request() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("xiao.db");
     let storage = Arc::new(Storage::open(&db_path).unwrap());
     let store = ProviderProfileStore::new(storage.clone());
+    let auth = Arc::new(AuthManager::new(
+        storage.clone(),
+        dir.path().join("auth_secrets"),
+    ));
+
+    store
+        .create(ProviderProfileInput {
+            profile_id: Some("prof-1".into()),
+            owner_id: "owner-1".into(),
+            alias: "prof-1".into(),
+            endpoint: "https://custom.example.com/v1".into(),
+            protocol: "openai_chat_completions".into(),
+            safe_headers_json: "{}".into(),
+            api_key_ref: None,
+            credential_ref: None,
+            secret_headers_ref: None,
+        })
+        .unwrap();
+
+    let probe = CustomCapabilityProbe {
+        capabilities: ProviderCapabilities {
+            text: true,
+            vision: true,
+            file_input: false,
+            native_tools: true,
+            tool_protocol: ToolProtocol::Native,
+            model_discovery: false,
+            structured_output: true,
+            continuation: true,
+            evidence: "probe success fixture".into(),
+        },
+        native_tools: CapabilityState::Supported,
+        structured_output: CapabilityState::Supported,
+        continuation: CapabilityState::Supported,
+        vision: CapabilityState::Supported,
+        file_input: CapabilityState::Unknown,
+    };
+    let record = profile_model_from_probe("prof-1", "model-blocked", &probe, "2026-08-26T00:00:00Z");
+    store.replace_models("owner-1", "prof-1", &[record]).unwrap();
 
     // Probed state was supported
     storage
@@ -268,6 +347,38 @@ fn matrix_a9_force_unsupported_prevents_image_request() {
         )
         .unwrap();
     assert_eq!(effective_override, "force_unsupported");
+
+    // End-to-end check: ForceUnsupported prevents image request with zero provider call
+    let mut config = AppConfig::default();
+    config.providers.custom.enabled = true;
+    let registry = ProviderRegistry::new(config, auth.clone());
+    let custom = registry.get("custom").unwrap();
+    let caps = custom.capabilities_for("model-blocked", Some("prof-1"));
+    assert!(!caps.vision);
+
+    let req = ProviderRequest {
+        session_id: "test-session".into(),
+        account_id: Some("prof-1".into()),
+        model: "model-blocked".into(),
+        messages: vec![],
+        tools: vec![],
+        images: vec![NormalizedImage {
+            attachment_id: "img-1".into(),
+            mime_type: "image/png".into(),
+            bytes: vec![1, 2, 3],
+            width: 10,
+            height: 10,
+            caption: "test image".into(),
+        }],
+        files: vec![],
+        streaming: false,
+    };
+    let err = custom.run(req, None).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("selected Custom profile/model does not declare vision capability"),
+        "expected vision capability error, got: {err}"
+    );
 }
 
 #[test]
