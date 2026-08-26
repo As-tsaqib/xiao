@@ -1686,7 +1686,6 @@ mod tests {
         }
     }
 
-
     struct VisionPhotoProvider {
         calls: AtomicUsize,
         expected_bytes: Vec<u8>,
@@ -2961,7 +2960,10 @@ mod tests {
 
         let prompt = format!(
             "Attachment received: {} (id={}, type={}, status={}). Apa ini",
-            record.original_name, record.attachment_id, record.detected_mime, record.processing_status
+            record.original_name,
+            record.attachment_id,
+            record.detected_mime,
+            record.processing_status
         );
         let answer = agent
             .submit_with_progress("u", &prompt, None)
@@ -3018,7 +3020,10 @@ mod tests {
 
         let prompt = format!(
             "Attachment received: {} (id={}, type={}, status={}). Apa ini",
-            record.original_name, record.attachment_id, record.detected_mime, record.processing_status
+            record.original_name,
+            record.attachment_id,
+            record.detected_mime,
+            record.processing_status
         );
         let error = agent
             .submit_with_progress("u", &prompt, None)

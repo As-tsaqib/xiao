@@ -254,7 +254,12 @@ impl CompletionVerifier {
         final_answer: &str,
         tool_runs: &[ToolRunRecord],
     ) -> CompletionEvidence {
-        self.verify_for_task_with_images(goal, final_answer, tool_runs, has_attachment_context(goal))
+        self.verify_for_task_with_images(
+            goal,
+            final_answer,
+            tool_runs,
+            has_attachment_context(goal),
+        )
     }
 
     pub fn verify_for_task_with_images(
@@ -343,7 +348,8 @@ impl CompletionVerifier {
                 task_kind,
                 if tool_runs.is_empty() {
                     if has_images {
-                        "informational vision answer is present; no external action was requested".into()
+                        "informational vision answer is present; no external action was requested"
+                            .into()
                     } else {
                         "informational answer is present; no external action was requested".into()
                     }
@@ -775,18 +781,13 @@ mod tests {
     }
 
     #[test]
-    fn vision_photo_caption_apa_ini_with_attachment_envelope_is_informational_and_verified_success() {
-        let goal = "Attachment received: photo-1.jpg (id=att-1, type=image/jpeg, status=ready). Apa ini";
+    fn vision_photo_caption_apa_ini_with_attachment_envelope_is_informational_and_verified_success(
+    ) {
+        let goal =
+            "Attachment received: photo-1.jpg (id=att-1, type=image/jpeg, status=ready). Apa ini";
         let verifier = CompletionVerifier::default();
-        assert_eq!(
-            verifier.classify(goal, &[]),
-            TaskKind::Informational
-        );
-        let evidence = verifier.verify_for_task(
-            goal,
-            "Ini adalah gambar bunga mawar merah.",
-            &[],
-        );
+        assert_eq!(verifier.classify(goal, &[]), TaskKind::Informational);
+        let evidence = verifier.verify_for_task(goal, "Ini adalah gambar bunga mawar merah.", &[]);
         assert_eq!(evidence.state, VerificationState::VerifiedSuccess);
         assert_eq!(evidence.task_kind, TaskKind::Informational);
         assert!(evidence.verified);
