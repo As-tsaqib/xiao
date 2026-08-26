@@ -81,22 +81,61 @@ impl Tool for PdfCreateTool {
         let session_workspace = if context.session_id.is_empty() {
             self.default_cwd.clone()
         } else {
-            let dir = self
-                .default_cwd
+            self.default_cwd
                 .join(".xiao/workspaces")
-                .join(&context.session_id);
-            let _ = std::fs::create_dir_all(&dir);
-            dir
+                .join(&context.session_id)
         };
+        std::fs::create_dir_all(&session_workspace)?;
+        let canonical_workspace = session_workspace.canonicalize()?;
 
-        let target_path = session_workspace.join(&rel_path);
+        let mut current_ancestor = canonical_workspace.clone();
+        for component in rel_path.components() {
+            match component {
+                std::path::Component::Normal(part) => {
+                    current_ancestor = current_ancestor.join(part);
+                    if current_ancestor.is_symlink() {
+                        return Err(anyhow!(
+                            "symlink components in pdf_create path are forbidden: {}",
+                            current_ancestor.display()
+                        ));
+                    }
+                }
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(anyhow!("invalid path component in pdf_create path"));
+                }
+            }
+        }
+
+        let target_path = canonical_workspace.join(&rel_path);
         if let Some(parent) = target_path.parent() {
+            if parent.exists() {
+                let canonical_parent = parent.canonicalize()?;
+                if !canonical_parent.starts_with(&canonical_workspace) {
+                    return Err(anyhow!("parent directory escapes canonical session workspace"));
+                }
+            }
             std::fs::create_dir_all(parent)?;
+            let canonical_parent = parent.canonicalize()?;
+            if !canonical_parent.starts_with(&canonical_workspace) {
+                return Err(anyhow!("parent directory escapes canonical session workspace"));
+            }
+        }
+
+        if target_path.is_symlink() {
+            return Err(anyhow!("pdf_create target path cannot be a symlink"));
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&target_path) {
+            if meta.file_type().is_symlink() {
+                return Err(anyhow!("symlink destination rejected"));
+            }
         }
 
         let full_text = match arguments.title {
             Some(title) if !title.trim().is_empty() => {
-                format!("{}\n\n{}", title.trim(), arguments.content)
+                format!("{}
+
+{}", title.trim(), arguments.content)
             }
             _ => arguments.content,
         };
@@ -104,8 +143,13 @@ impl Tool for PdfCreateTool {
         let pdf_bytes = generate_valid_pdf(&full_text);
         std::fs::write(&target_path, &pdf_bytes)?;
 
+        let canonical_target = target_path.canonicalize()?;
+        if !canonical_target.starts_with(&canonical_workspace) {
+            return Err(anyhow!("created pdf file escapes canonical session workspace"));
+        }
+
         let size_bytes = pdf_bytes.len() as u64;
-        let file_name = target_path
+        let file_name = canonical_target
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("document.pdf")
@@ -113,12 +157,12 @@ impl Tool for PdfCreateTool {
 
         Ok(serde_json::to_string(&json!({
             "status": "succeeded",
-            "path": target_path.display().to_string(),
+            "path": canonical_target.display().to_string(),
             "size_bytes": size_bytes,
             "artifacts": [
                 {
                     "name": file_name,
-                    "path": target_path,
+                    "path": canonical_target,
                     "size_bytes": size_bytes
                 }
             ],
@@ -155,51 +199,120 @@ pub fn generate_valid_pdf(text: &str) -> Vec<u8> {
         lines.push(String::new());
     }
 
-    let mut stream_ops = Vec::new();
-    stream_ops.push("BT\n/F1 12 Tf\n72 750 Td\n16 TL".to_owned());
-    for (i, line) in lines.iter().enumerate() {
-        let escaped = line
-            .replace('\\', "\\\\")
-            .replace('(', "\\(")
-            .replace(')', "\\)");
-        if i == 0 {
-            stream_ops.push(format!("({escaped}) Tj"));
-        } else {
-            stream_ops.push(format!("T* ({escaped}) Tj"));
-        }
-    }
-    stream_ops.push("ET".to_owned());
-    let stream_content = stream_ops.join("\n");
+    const LINES_PER_PAGE: usize = 40;
+    let page_chunks: Vec<Vec<String>> = lines
+        .chunks(LINES_PER_PAGE)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let num_pages = page_chunks.len().max(1);
 
-    let objects = [
-        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_owned(),
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
-        format!(
-            "<< /Length {} >>\nstream\n{}\nendstream",
+    let font_obj_id = 3;
+    let mut objects: Vec<(usize, String)> = Vec::new();
+    let mut kids_refs = Vec::new();
+
+    for i in 0..num_pages {
+        let page_obj_id = 4 + 2 * i;
+        let content_obj_id = page_obj_id + 1;
+        kids_refs.push(format!("{page_obj_id} 0 R"));
+
+        let lines_for_page = &page_chunks[i];
+        let mut stream_ops = Vec::new();
+        stream_ops.push("BT
+/F1 12 Tf
+72 750 Td
+16 TL".to_owned());
+        for (line_idx, line) in lines_for_page.iter().enumerate() {
+            let sanitized: String = line
+                .chars()
+                .map(|c| {
+                    if c.is_ascii() && !c.is_ascii_control() {
+                        c
+                    } else if c.is_ascii_whitespace() {
+                        ' '
+                    } else {
+                        '?'
+                    }
+                })
+                .collect();
+            let escaped = sanitized
+                .replace('\\', "\\\\")
+                .replace('(', "\\(")
+                .replace(')', "\\)");
+            if line_idx == 0 {
+                stream_ops.push(format!("({escaped}) Tj"));
+            } else {
+                stream_ops.push(format!("T* ({escaped}) Tj"));
+            }
+        }
+        stream_ops.push("ET".to_owned());
+        let stream_content = stream_ops.join("
+");
+
+        let page_obj_content = format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 {font_obj_id} 0 R >> >> /Contents {content_obj_id} 0 R >>"
+        );
+        let content_obj_content = format!(
+            "<< /Length {} >>
+stream
+{}
+endstream",
             stream_content.len(),
             stream_content
-        ),
-    ];
-
-    let mut pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
-    let mut offsets = Vec::new();
-    for (index, object) in objects.iter().enumerate() {
-        offsets.push(pdf.len());
-        pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+        );
+        objects.push((page_obj_id, page_obj_content));
+        objects.push((content_obj_id, content_obj_content));
     }
+
+    let catalog_obj = (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned());
+    let pages_obj = (
+        2,
+        format!(
+            "<< /Type /Pages /Kids [{}] /Count {} >>",
+            kids_refs.join(" "),
+            num_pages
+        ),
+    );
+    let font_obj = (
+        font_obj_id,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+    );
+
+    let mut all_objects = vec![catalog_obj, pages_obj, font_obj];
+    all_objects.extend(objects);
+    all_objects.sort_by_key(|(id, _)| *id);
+
+    let mut pdf = b"%PDF-1.4
+%\xE2\xE3\xCF\xD3
+".to_vec();
+    let mut offsets = Vec::new();
+    for (id, content) in &all_objects {
+        offsets.push((*id, pdf.len()));
+        pdf.extend_from_slice(format!("{id} 0 obj
+{content}
+endobj
+").as_bytes());
+    }
+    offsets.sort_by_key(|(id, _)| *id);
+
     let xref = pdf.len();
-    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
-    pdf.extend_from_slice(b"0000000000 65535 f \n");
-    for offset in offsets {
-        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    let total_objs = all_objects.len() + 1;
+    pdf.extend_from_slice(format!("xref
+0 {total_objs}
+").as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f 
+");
+    for (_, offset) in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n 
+").as_bytes());
     }
     pdf.extend_from_slice(
         format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            objects.len() + 1,
-            xref
+            "trailer
+<< /Size {total_objs} /Root 1 0 R >>
+startxref
+{xref}
+%%EOF
+"
         )
         .as_bytes(),
     );
@@ -237,7 +350,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.contains("\"status\":\"succeeded\""));
+        assert!(result.contains(""status":"succeeded""));
         assert!(result.contains("test.pdf"));
 
         let file_path = temp
@@ -252,6 +365,48 @@ mod tests {
         let extracted = pdf_extract::extract_text_from_mem(&bytes).unwrap();
         assert!(extracted.contains("Document Title"));
         assert!(extracted.contains("verified test document"));
+    }
+
+    #[tokio::test]
+    async fn pdf_create_handles_multipage_and_unicode_text() {
+        let temp = tempdir().unwrap();
+        let tool = PdfCreateTool::new(temp.path());
+        let context = ToolContext {
+            principal: "p".into(),
+            session_id: "test-multipage".into(),
+            agent_run_id: "run-2".into(),
+            yolo_mode: false,
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+            progress: None,
+        };
+        let mut long_content = String::new();
+        for i in 1..=100 {
+            long_content.push_str(&format!("Line item number {i} with details and notes.
+"));
+        }
+        let result = tool
+            .execute(
+                &context,
+                json!({
+                    "path": "reports/summary.pdf",
+                    "title": "Quarterly Report",
+                    "content": long_content
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains(""status":"succeeded""));
+        let file_path = temp
+            .path()
+            .join(".xiao/workspaces/test-multipage/reports/summary.pdf");
+        assert!(file_path.exists());
+        let bytes = std::fs::read(&file_path).unwrap();
+        let extracted = pdf_extract::extract_text_from_mem(&bytes).unwrap();
+        assert!(extracted.contains("Quarterly Report"));
+        assert!(extracted.contains("Line item number 1"));
+        assert!(extracted.contains("Line item number 99"));
     }
 
     #[tokio::test]
@@ -279,5 +434,69 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("parent directory traversal"));
+    }
+
+    #[tokio::test]
+    async fn pdf_create_rejects_absolute_path() {
+        let temp = tempdir().unwrap();
+        let tool = PdfCreateTool::new(temp.path());
+        let context = ToolContext {
+            principal: "p".into(),
+            session_id: "test-session".into(),
+            agent_run_id: "run-1".into(),
+            yolo_mode: false,
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+            progress: None,
+        };
+        let err = tool
+            .execute(
+                &context,
+                json!({
+                    "path": "/tmp/evil.pdf",
+                    "content": "hello"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("workspace-relative"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pdf_create_rejects_symlink_escape() {
+        let temp = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let workspace = temp.path().join(".xiao/workspaces/test-symlink");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // Create a symlink dir pointing outside
+        let link_dir = workspace.join("symlink_dir");
+        std::os::unix::fs::symlink(outside.path(), &link_dir).unwrap();
+
+        let tool = PdfCreateTool::new(temp.path());
+        let context = ToolContext {
+            principal: "p".into(),
+            session_id: "test-symlink".into(),
+            agent_run_id: "run-3".into(),
+            yolo_mode: false,
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+            progress: None,
+        };
+
+        let err = tool
+            .execute(
+                &context,
+                json!({
+                    "path": "symlink_dir/escaped.pdf",
+                    "content": "malicious"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symlink"));
     }
 }

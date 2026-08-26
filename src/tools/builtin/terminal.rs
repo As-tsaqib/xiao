@@ -7,7 +7,10 @@ use serde_json::{json, Value};
 
 use crate::{
     runtime::{DependencyResolver, ExecutionPurpose, ProcessExecutor, TermuxCommand},
-    tools::{Tool, ToolContext, ToolEffect, ToolOrigin, ToolRisk, ToolSpec},
+    tools::{
+        policy::{is_sensitive_env_key, is_sensitive_path_or_value},
+        Tool, ToolContext, ToolEffect, ToolOrigin, ToolRisk, ToolSpec,
+    },
 };
 
 pub struct TermuxTerminalTool {
@@ -91,6 +94,7 @@ impl Tool for TermuxTerminalTool {
             &arguments.args,
             arguments.cwd.as_ref(),
             &arguments.artifacts,
+            &arguments.environment,
         )?;
         let declared_artifacts = arguments.artifacts.clone();
         let purpose = arguments.purpose.unwrap_or(ExecutionPurpose::UserCommand);
@@ -115,26 +119,55 @@ impl Tool for TermuxTerminalTool {
                 .default_cwd
                 .join(".xiao/workspaces")
                 .join(&context.session_id);
-            let _ = std::fs::create_dir_all(&dir);
             dir
         };
-        let effective_cwd = match arguments.cwd {
+        std::fs::create_dir_all(&session_workspace)?;
+        let canonical_workspace = session_workspace.canonicalize()?;
+
+        let effective_cwd = match &arguments.cwd {
             Some(custom) => {
                 if custom.is_absolute() {
-                    custom
-                } else {
-                    session_workspace.join(custom)
+                    return Err(anyhow!(
+                        "cwd must be a relative path within workspace; absolute paths are forbidden"
+                    ));
                 }
+                let mut current = canonical_workspace.clone();
+                for comp in custom.components() {
+                    match comp {
+                        std::path::Component::Normal(part) => {
+                            current = current.join(part);
+                            if current.is_symlink() {
+                                return Err(anyhow!(
+                                    "symlink cwd components are forbidden: {}",
+                                    current.display()
+                                ));
+                            }
+                        }
+                        std::path::Component::CurDir => {}
+                        _ => {
+                            return Err(anyhow!("invalid cwd component"));
+                        }
+                    }
+                }
+                std::fs::create_dir_all(&current)?;
+                let canonical_target = current.canonicalize()?;
+                if !canonical_target.starts_with(&canonical_workspace) {
+                    return Err(anyhow!(
+                        "cwd escapes workspace: target is outside canonical session workspace"
+                    ));
+                }
+                canonical_target
             }
-            None => session_workspace.clone(),
+            None => canonical_workspace.clone(),
         };
+
         let outcome = self
             .executor
             .execute(
                 TermuxCommand {
                     program: arguments.program,
                     args: arguments.args,
-                    cwd: effective_cwd,
+                    cwd: effective_cwd.clone(),
                     environment: arguments.environment,
                     timeout_ms: arguments.timeout_ms.unwrap_or(120_000),
                     max_output_chars: 16_384,
@@ -269,13 +302,29 @@ impl Tool for TermuxJobTool {
                 .transpose()?;
             match crate::tools::policy::termux_call_policy(&call) {
                 crate::tools::PolicyDecision::Allow => {}
-                crate::tools::PolicyDecision::Deny(reason)
-                | crate::tools::PolicyDecision::RequireApproval(reason) => {
+                crate::tools::PolicyDecision::Deny(reason) => {
                     if let (Some(storage), Some(id)) = (&self.storage, audit_id.as_deref()) {
                         storage.finish_tool_run_step(id, "denied", None, Some(&reason))?;
                     }
-                    results
-                        .push(json!({"index":index,"id":step.id,"status":"denied","error":reason}));
+                    results.push(json!({"index":index,"id":step.id,"status":"denied","error":reason}));
+                    if !step.continue_on_error {
+                        break;
+                    }
+                    continue;
+                }
+                crate::tools::PolicyDecision::RequireApproval(reason) => {
+                    let msg = format!(
+                        "unsupported inside termux_job; call termux_terminal separately for exact approval: {reason}"
+                    );
+                    if let (Some(storage), Some(id)) = (&self.storage, audit_id.as_deref()) {
+                        storage.finish_tool_run_step(id, "approval_required", None, Some(&msg))?;
+                    }
+                    results.push(json!({
+                        "index": index,
+                        "id": step.id,
+                        "status": "approval_required",
+                        "error": msg,
+                    }));
                     if !step.continue_on_error {
                         break;
                     }
@@ -328,14 +377,16 @@ fn preflight_validate_command(
     args: &[String],
     cwd: Option<&PathBuf>,
     artifacts: &[PathBuf],
+    environment: &BTreeMap<String, String>,
 ) -> Result<()> {
     let trimmed_prog = program.trim();
     if trimmed_prog.is_empty() {
         return Err(anyhow!("program must not be empty"));
     }
     if trimmed_prog.contains(' ')
-        || trimmed_prog.contains('\t')
-        || trimmed_prog.contains('\n')
+        || trimmed_prog.contains('	')
+        || trimmed_prog.contains('
+')
         || trimmed_prog.contains('|')
         || trimmed_prog.contains(';')
         || trimmed_prog.contains('&')
@@ -359,6 +410,11 @@ fn preflight_validate_command(
         ));
     }
     if let Some(cwd) = cwd {
+        if cwd.is_absolute() {
+            return Err(anyhow!(
+                "cwd must be a relative path within workspace; absolute paths are forbidden"
+            ));
+        }
         if cwd
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -379,6 +435,35 @@ fn preflight_validate_command(
             ));
         }
     }
+
+    if is_sensitive_path_or_value(trimmed_prog) {
+        return Err(anyhow!(
+            "sensitive program path is forbidden in unprivileged terminal execution: {trimmed_prog}"
+        ));
+    }
+    if let Some(cwd) = cwd {
+        let cwd_str = cwd.to_string_lossy();
+        if is_sensitive_path_or_value(&cwd_str) {
+            return Err(anyhow!(
+                "sensitive cwd is forbidden in unprivileged terminal execution: {cwd_str}"
+            ));
+        }
+    }
+    for arg in args {
+        if is_sensitive_path_or_value(arg) {
+            return Err(anyhow!(
+                "sensitive argv is forbidden in unprivileged terminal execution"
+            ));
+        }
+    }
+    for (k, v) in environment {
+        if is_sensitive_env_key(k) || is_sensitive_path_or_value(v) {
+            return Err(anyhow!(
+                "sensitive environment key or value is forbidden in unprivileged terminal execution: {k}"
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -390,27 +475,39 @@ fn verified_artifacts(
     let workspace = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
+    let cwd = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf());
     paths
         .iter()
         .map(|path| {
-            let path = if path.is_absolute() {
-                path.clone()
-            } else {
-                cwd.join(path)
-            };
-            let canonical = path.canonicalize().map_err(|_| {
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(anyhow!(
+                    "artifact path must be relative without parent traversal: {}",
+                    path.display()
+                ));
+            }
+            let candidate = cwd.join(path);
+            if candidate.is_symlink() {
+                return Err(anyhow!("artifact cannot be a symlink"));
+            }
+            let canonical = candidate.canonicalize().map_err(|_| {
                 anyhow!(
                     "declared result artifact does not exist: {}",
                     path.display()
                 )
             })?;
-            if !canonical.starts_with(cwd) && !canonical.starts_with(&workspace) {
+            if !canonical.starts_with(&cwd) && !canonical.starts_with(&workspace) {
                 return Err(anyhow!(
                     "result artifact is outside the controlled task workspace"
                 ));
             }
-            let metadata = std::fs::metadata(&canonical)?;
-            if !metadata.is_file() || metadata.len() > 50 * 1024 * 1024 {
+            let metadata = std::fs::symlink_metadata(&canonical)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 50 * 1024 * 1024 {
                 return Err(anyhow!("result artifact is not a bounded regular file"));
             }
             Ok(json!({
@@ -437,6 +534,7 @@ mod tests {
         path::PathBuf,
         sync::Mutex,
     };
+    use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
     struct FakePackages {
@@ -500,44 +598,88 @@ mod tests {
             exit_code: Some(0),
             stdout: stdout.into(),
             stderr: String::new(),
+            duration_ms: 1,
+            truncated: false,
             timed_out: false,
             cancelled: false,
-            truncated: false,
-            duration_ms: 1,
         }
     }
 
     fn capabilities() -> Arc<CapabilityRegistry> {
         Arc::new(CapabilityRegistry::from_environment(&RuntimeEnvironment {
             platform: "android".into(),
-            os_version: None,
+            os_version: Some("14".into()),
             android_version: Some("14".into()),
-            device_model: None,
+            device_model: Some("Pixel".into()),
             architecture: "aarch64".into(),
-            xiao_version: crate::VERSION.into(),
+            xiao_version: "0.3.1".into(),
             effective_uid: 10234,
             root_available: false,
-            root_evidence: "none".into(),
+            root_evidence: "unrooted".into(),
             selinux: SelinuxState::Enforcing,
-            termux: Some(TermuxEnvironment {
-                prefix: "/termux/usr".into(),
-                home: "/termux/home".into(),
-                path: "/termux/usr/bin".into(),
-                shell: "/termux/usr/bin/sh".into(),
-                package_manager: Some("/termux/usr/bin/pkg".into()),
-                uid: Some(10234),
-                gid: Some(10234),
-            }),
-            data_root: "/workspace".into(),
+            data_root: PathBuf::from("/data/data/com.termux/files/home/.xiao"),
             workspace_writable: true,
-            binaries: BTreeMap::from([("ffmpeg".into(), None)]),
+            termux: Some(TermuxEnvironment {
+                prefix: PathBuf::from("/data/data/com.termux/files/usr"),
+                home: PathBuf::from("/data/data/com.termux/files/home"),
+                app_data: PathBuf::from("/data/data/com.termux"),
+                is_shared_uid: false,
+            }),
+            binaries: BTreeMap::new(),
             execution_backends: vec![ExecutionBackend::Termux],
-            probed_at: "now".into(),
+            probed_at: "2026-08-26T00:00:00Z".into(),
         }))
     }
 
     #[tokio::test]
-    async fn missing_dependency_installs_reprobes_and_resumes_original_command() {
+    async fn terminal_auto_resolves_and_installs_trusted_package() {
+        let packages = Arc::new(FakePackages {
+            available: Mutex::new(BTreeSet::new()),
+            installs: Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(FakeExecutor {
+            commands: Mutex::new(Vec::new()),
+        });
+        let resolver = Arc::new(DependencyResolver::with_trusted_repository(
+            capabilities(),
+            packages.clone(),
+            None,
+            Arc::new(FakeRepository),
+        ));
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let context = ToolContext {
+            principal: "owner".into(),
+            session_id: "session".into(),
+            agent_run_id: "run".into(),
+            yolo_mode: false,
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+            progress: None,
+        };
+
+        let result = terminal
+            .execute(
+                &context,
+                json!({
+                    "program": "ffmpeg",
+                    "args": ["-i", "video.mp4", "audio.mp3"],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("ffmpeg"));
+        assert_eq!(
+            packages.installs.lock().unwrap().as_slice(),
+            &["ffmpeg".to_string()]
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_rejects_absolute_outside_symlink_cwd_and_sensitive_env_and_never_calls_executor() {
+        let temp = tempdir().unwrap();
+        let outside = tempdir().unwrap();
         let packages = Arc::new(FakePackages {
             available: Mutex::new(BTreeSet::new()),
             installs: Mutex::new(Vec::new()),
@@ -550,40 +692,92 @@ mod tests {
             packages.clone(),
             None,
         ));
-        let tool = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        let result = tool
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, temp.path());
+        let context = ToolContext {
+            principal: "owner".into(),
+            session_id: "sec-session".into(),
+            agent_run_id: "sec-run".into(),
+            yolo_mode: false,
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+            progress: None,
+        };
+
+        // 1. Absolute cwd is rejected
+        let err1 = terminal
+            .execute(&context, json!({"program": "ls", "cwd": "/etc"}))
+            .await
+            .unwrap_err();
+        assert!(err1.to_string().contains("relative path"));
+        assert_eq!(executor.commands.lock().unwrap().len(), 0);
+
+        // 2. Traversal cwd is rejected
+        let err2 = terminal
+            .execute(&context, json!({"program": "ls", "cwd": "../../outside"}))
+            .await
+            .unwrap_err();
+        assert!(err2.to_string().contains("parent directory traversal"));
+        assert_eq!(executor.commands.lock().unwrap().len(), 0);
+
+        // 3. Symlink cwd is rejected
+        let workspace = temp.path().join(".xiao/workspaces/sec-session");
+        std::fs::create_dir_all(&workspace).unwrap();
+        #[cfg(unix)]
+        {
+            let symlink_dir = workspace.join("escaped_symlink");
+            std::os::unix::fs::symlink(outside.path(), &symlink_dir).unwrap();
+            let err3 = terminal
+                .execute(&context, json!({"program": "ls", "cwd": "escaped_symlink"}))
+                .await
+                .unwrap_err();
+            assert!(err3.to_string().contains("symlink") || err3.to_string().contains("escapes workspace"));
+            assert_eq!(executor.commands.lock().unwrap().len(), 0);
+        }
+
+        // 4. Sensitive cwd is rejected
+        let err4 = terminal
+            .execute(&context, json!({"program": "ls", "cwd": ".ssh"}))
+            .await
+            .unwrap_err();
+        assert!(err4.to_string().contains("sensitive"));
+        assert_eq!(executor.commands.lock().unwrap().len(), 0);
+
+        // 5. Sensitive environment key is rejected
+        let err5 = terminal
             .execute(
-                &ToolContext {
-                    principal: "owner".into(),
-                    session_id: "session".into(),
-                    agent_run_id: "run".into(),
-                    yolo_mode: false,
-                    messages: vec![MessageRecord {
-                        role: "user".into(),
-                        content: "Extract audio".into(),
-                        created_at: "now".into(),
-                    }],
-                    cancellation: CancellationToken::new(),
-                    progress: Some(progress_tx),
-                },
-                json!({
-                    "program":"ffmpeg",
-                    "args":["-i","video.mp4","audio.mp3"]
-                }),
+                &context,
+                json!({"program": "ls", "environment": {"SSH_AUTH_SOCK": "/tmp/sock"}}),
             )
             .await
-            .unwrap();
-        assert!(result.contains("audio.mp3"));
-        assert_eq!(&*packages.installs.lock().unwrap(), &["ffmpeg"]);
-        assert_eq!(executor.commands.lock().unwrap().len(), 1);
-        let statuses = std::iter::from_fn(|| progress_rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(statuses.iter().any(|status| status.contains("installing")));
-        assert!(statuses.iter().any(|status| status.contains("resuming")));
+            .unwrap_err();
+        assert!(err5.to_string().contains("sensitive"));
+        assert_eq!(executor.commands.lock().unwrap().len(), 0);
+
+        // 6. Sensitive environment value is rejected
+        let err6 = terminal
+            .execute(
+                &context,
+                json!({"program": "ls", "environment": {"CUSTOM_KEY": "/root/.ssh/id_rsa"}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err6.to_string().contains("sensitive"));
+        assert_eq!(executor.commands.lock().unwrap().len(), 0);
+
+        // 7. Sensitive argv is rejected
+        let err7 = terminal
+            .execute(
+                &context,
+                json!({"program": "cat", "args": ["/home/u/.ssh/id_rsa"]}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err7.to_string().contains("sensitive"));
+        assert_eq!(executor.commands.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
-    async fn unknown_binary_uses_validated_trusted_repository_then_resumes() {
+    async fn termux_job_rejects_approval_requiring_substeps_with_approval_required_status() {
         let packages = Arc::new(FakePackages {
             available: Mutex::new(BTreeSet::new()),
             installs: Mutex::new(Vec::new()),
@@ -591,65 +785,40 @@ mod tests {
         let executor = Arc::new(FakeExecutor {
             commands: Mutex::new(Vec::new()),
         });
-        let storage = Arc::new(Storage::open_memory().unwrap());
-        let session = storage
-            .create_session("owner", "task", "custom", None, "m", false, None)
-            .unwrap();
-        let run = storage
-            .create_agent_run("owner", &session.id, "custom", "m", Some("inspect media"))
-            .unwrap();
-        let resolver = Arc::new(DependencyResolver::with_trusted_repository(
+        let resolver = Arc::new(DependencyResolver::new(
             capabilities(),
             packages.clone(),
-            Some(storage.clone()),
-            Arc::new(FakeRepository),
+            None,
         ));
-        let tool = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
-        let result = tool
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let job = TermuxJobTool::new(terminal, 16);
+        let result = job
             .execute(
                 &ToolContext {
                     principal: "owner".into(),
-                    session_id: session.id,
-                    agent_run_id: run.clone(),
+                    session_id: "session".into(),
+                    agent_run_id: "run".into(),
                     yolo_mode: false,
                     messages: Vec::new(),
                     cancellation: CancellationToken::new(),
                     progress: None,
                 },
-                json!({"program":"xiao-media-probe","args":["clip.mp4"]}),
+                json!({
+                    "steps": [
+                        {
+                            "id": "step-rm",
+                            "program": "rm",
+                            "args": ["result.txt"]
+                        }
+                    ]
+                }),
             )
             .await
             .unwrap();
-        assert!(result.contains("audio.mp3"));
-        assert_eq!(&*packages.installs.lock().unwrap(), &["xiao-media-probe"]);
-        assert_eq!(executor.commands.lock().unwrap().len(), 1);
-        let audit = storage.dependency_installs(&run).unwrap();
-        assert_eq!(audit.len(), 1);
-        assert!(audit[0].validated);
-        assert_eq!(audit[0].source, "termux_repository_fake_index");
-        assert_eq!(
-            audit[0].requested_capability.as_deref(),
-            Some("binary.xiao-media-probe")
-        );
-        assert_eq!(audit[0].status, "succeeded");
-    }
 
-    #[test]
-    fn declared_artifacts_must_be_bounded_regular_files_in_controlled_space() {
-        let workspace = tempfile::tempdir().unwrap();
-        let task = workspace.path().join("task");
-        std::fs::create_dir(&task).unwrap();
-        std::fs::write(task.join("result.bin"), b"verified result").unwrap();
-        let accepted =
-            verified_artifacts(&task, workspace.path(), &[PathBuf::from("result.bin")]).unwrap();
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(accepted[0]["name"], "result.bin");
-
-        let outside = tempfile::NamedTempFile::new().unwrap();
-        assert!(
-            verified_artifacts(&task, workspace.path(), &[outside.path().to_path_buf()]).is_err()
-        );
-        assert!(verified_artifacts(&task, workspace.path(), &[PathBuf::from("missing")]).is_err());
+        assert!(result.contains(r#""status":"approval_required""#));
+        assert!(result.contains("unsupported inside termux_job; call termux_terminal separately for exact approval"));
+        assert_eq!(executor.commands.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]

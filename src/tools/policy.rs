@@ -24,6 +24,7 @@ impl Default for ToolPolicy {
                 "memory_delete",
                 "termux_terminal",
                 "termux_job",
+                "pdf_create",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -80,6 +81,62 @@ impl ToolPolicy {
     }
 }
 
+pub(crate) fn is_sensitive_path_or_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    const SENSITIVE_MARKERS: &[&str] = &[
+        "/.ssh/",
+        "/.ssh",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        "known_hosts",
+        "authorized_keys",
+        "/.gnupg/",
+        "/.gnupg",
+        "secring.gpg",
+        "/.aws/",
+        "/.aws",
+        "/secrets/",
+        "credentials.json",
+        ".netrc",
+        "/.netrc",
+        "/etc/shadow",
+        "/etc/passwd",
+        "/.env",
+        "/.config/gcloud",
+        "/.azure",
+    ];
+    if SENSITIVE_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return true;
+    }
+    crate::security::redact::contains_secret_material(value)
+}
+
+pub(crate) fn is_sensitive_env_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    const SENSITIVE_KEYS: &[&str] = &[
+        "authorization",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "bot_token",
+        "token",
+        "secret",
+        "password",
+        "passcode",
+        "ssh_auth_sock",
+        "ssh_key",
+        "aws_secret_access_key",
+        "aws_access_key_id",
+        "aws_session_token",
+    ];
+    SENSITIVE_KEYS.iter().any(|k| lower.contains(k))
+}
+
 pub(crate) fn termux_call_policy(arguments: &Value) -> PolicyDecision {
     let Some(object) = arguments.as_object() else {
         return PolicyDecision::Deny("termux_terminal arguments must be an object".into());
@@ -118,6 +175,19 @@ pub(crate) fn termux_call_policy(arguments: &Value) -> PolicyDecision {
         .and_then(Value::as_array)
         .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
         .unwrap_or_default();
+
+    if let Some(raw_cwd) = object.get("cwd").and_then(Value::as_str) {
+        let cwd_path = std::path::Path::new(raw_cwd);
+        if cwd_path.is_absolute()
+            || cwd_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return PolicyDecision::Deny(
+                "cwd must be a relative path within the workspace; parent traversal and absolute escapes are forbidden".into(),
+            );
+        }
+    }
 
     let destructive = matches!(
         program.as_str(),
@@ -159,19 +229,23 @@ pub(crate) fn termux_call_policy(arguments: &Value) -> PolicyDecision {
         ));
     }
 
-    let sensitive = args.iter().any(|argument| {
-        let value = argument.to_ascii_lowercase();
-        [
-            "/.ssh/",
-            "/.gnupg/",
-            "/.aws/",
-            "/secrets/",
-            "credentials.json",
-            ".netrc",
-        ]
-        .iter()
-        .any(|marker| value.contains(marker))
-    });
+    let sensitive = is_sensitive_path_or_value(trimmed_raw)
+        || object
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(is_sensitive_path_or_value)
+            .unwrap_or(false)
+        || args.iter().any(|argument| is_sensitive_path_or_value(argument))
+        || object
+            .get("environment")
+            .and_then(Value::as_object)
+            .map(|env| {
+                env.iter().any(|(k, v)| {
+                    is_sensitive_env_key(k)
+                        || v.as_str().map(is_sensitive_path_or_value).unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
     if sensitive {
         return PolicyDecision::RequireApproval(format!(
             "Termux command {program} requests credential-sensitive file access"
