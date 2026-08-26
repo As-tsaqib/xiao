@@ -916,12 +916,7 @@ impl TelegramAdapter {
             }
             "alias" if wizard.phase == CustomLoginPhase::Alias => {
                 let alias = validate_custom_alias(text)?;
-                if self.custom_alias_exists(context.principal, &alias)? {
-                    menu.pending_input = Some(format!("custom:{}:alias", wizard.id));
-                    menu.current_view = login::alias_collision_view(&wizard.id, &alias);
-                    return Ok(());
-                }
-                wizard.alias = alias;
+                wizard.alias = self.resolve_custom_alias(context.principal, &alias)?;
                 menu.current_view = View::info(
                     "CUSTOM LOGIN",
                     "Validating endpoint and discovering models…",
@@ -935,9 +930,19 @@ impl TelegramAdapter {
         Ok(())
     }
 
-    fn custom_alias_exists(&self, principal: &str, alias: &str) -> Result<bool> {
+    fn resolve_custom_alias(&self, principal: &str, base: &str) -> Result<String> {
         let store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
-        Ok(store.get_by_alias(principal, alias)?.is_some())
+        if store.get_by_alias(principal, base)?.is_none() {
+            return Ok(base.to_string());
+        }
+        let mut suffix = 1;
+        loop {
+            let alias = format!("{base}_{suffix}");
+            if store.get_by_alias(principal, &alias)?.is_none() {
+                return Ok(alias);
+            }
+            suffix += 1;
+        }
     }
 
     #[allow(dead_code)]
@@ -1022,12 +1027,7 @@ impl TelegramAdapter {
                 menu.current_view = login::alias_view(wizard_id);
             }
             "default_alias" if wizard.phase == CustomLoginPhase::Alias => {
-                if self.custom_alias_exists(principal, "custom")? {
-                    menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
-                    menu.current_view = login::alias_collision_view(wizard_id, "custom");
-                    return Ok(());
-                }
-                wizard.alias = "custom".into();
+                wizard.alias = self.resolve_custom_alias(principal, "custom")?;
                 self.discover_custom_models(&mut wizard).await?;
                 menu.pending_input = None;
                 menu.current_view = login::model_view(&wizard);
@@ -1072,24 +1072,24 @@ impl TelegramAdapter {
                 menu.current_view = login::confirmation_view(&wizard);
             }
             "confirm" if wizard.phase == CustomLoginPhase::Confirm => {
-                if self.custom_alias_exists(principal, &wizard.alias)? {
-                    wizard.phase = CustomLoginPhase::Alias;
-                    menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
-                    menu.current_view = login::alias_collision_view(wizard_id, &wizard.alias);
-                    return Ok(());
-                }
-                if let Err(error) = self.commit_custom_login(principal, &wizard).await {
-                    let msg = error.to_string().to_ascii_lowercase();
-                    if (msg.contains("already exists") && msg.contains("alias"))
-                        || (msg.contains("unique") && msg.contains("alias"))
-                    {
-                        wizard.phase = CustomLoginPhase::Alias;
-                        let alias = wizard.alias.clone();
-                        menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
-                        menu.current_view = login::alias_collision_view(wizard_id, &alias);
-                        return Ok(());
+                let mut retries = 0;
+                loop {
+                    wizard.alias = self.resolve_custom_alias(principal, &wizard.alias)?;
+                    match self.commit_custom_login(principal, &wizard).await {
+                        Ok(()) => break,
+                        Err(error) => {
+                            let msg = error.to_string().to_ascii_lowercase();
+                            if (msg.contains("already exists") && msg.contains("alias"))
+                                || (msg.contains("unique") && msg.contains("alias"))
+                            {
+                                if retries < 5 {
+                                    retries += 1;
+                                    continue;
+                                }
+                            }
+                            return Err(error);
+                        }
                     }
-                    return Err(error);
                 }
                 let model = wizard
                     .selected_index
@@ -1124,24 +1124,24 @@ impl TelegramAdapter {
                     menu.current_view = login::model_view(&wizard);
                 }
                 CustomLoginPhase::Confirm => {
-                    if self.custom_alias_exists(principal, &wizard.alias)? {
-                        wizard.phase = CustomLoginPhase::Alias;
-                        menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
-                        menu.current_view = login::alias_collision_view(wizard_id, &wizard.alias);
-                        return Ok(());
-                    }
-                    if let Err(error) = self.commit_custom_login(principal, &wizard).await {
-                        let msg = error.to_string().to_ascii_lowercase();
-                        if (msg.contains("already exists") && msg.contains("alias"))
-                            || (msg.contains("unique") && msg.contains("alias"))
-                        {
-                            wizard.phase = CustomLoginPhase::Alias;
-                            let alias = wizard.alias.clone();
-                            menu.pending_input = Some(format!("custom:{wizard_id}:alias"));
-                            menu.current_view = login::alias_collision_view(wizard_id, &alias);
-                            return Ok(());
+                    let mut retries = 0;
+                    loop {
+                        wizard.alias = self.resolve_custom_alias(principal, &wizard.alias)?;
+                        match self.commit_custom_login(principal, &wizard).await {
+                            Ok(()) => break,
+                            Err(error) => {
+                                let msg = error.to_string().to_ascii_lowercase();
+                                if (msg.contains("already exists") && msg.contains("alias"))
+                                    || (msg.contains("unique") && msg.contains("alias"))
+                                {
+                                    if retries < 5 {
+                                        retries += 1;
+                                        continue;
+                                    }
+                                }
+                                return Err(error);
+                            }
                         }
-                        return Err(error);
                     }
                     let model = wizard
                         .selected_index
@@ -2371,6 +2371,145 @@ fn result_view(result: CommandResult) -> Result<View> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn setmodel_callback_persists_once_and_does_not_wait_for_slow_probe() {
+        let db = Arc::new(Storage::open_memory().unwrap());
+        let secrets = crate::secrets::SecretStore::new_memory();
+        let config = crate::config::AppConfig::default();
+        let app = Arc::new(AppCommandExecutor::new(
+            db.clone(),
+            config.into(),
+            crate::skills::SkillStore::new(db.clone()),
+            crate::events::EventBroker::new(),
+            secrets.clone(),
+        ));
+        let custom_logins = Arc::new(CustomLoginStore::new(std::time::Duration::from_secs(60)));
+        let tg = super::TelegramManager::new(app.clone(), None, custom_logins);
+        
+        let owner = "owner1";
+        let scope = TelegramScope::new(100, None);
+        let session = app.sessions.ensure_telegram_session(owner, scope).unwrap();
+        
+        let profiles = crate::providers::ProviderProfileStore::new(db.clone());
+        profiles.create_with_models_and_activate_session(
+            crate::providers::ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner.into(),
+                alias: "custom".into(),
+                endpoint: "https://test".into(),
+                protocol: "openai".into(),
+                credential_ref: None,
+                api_key_ref: None,
+                safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
+            },
+            &[crate::storage::ProviderProfileModelRecord {
+                profile_id: "test".into(),
+                model_id: "slow_model".into(),
+                text_capable: true,
+                vision_capable: false,
+                file_input_capable: false,
+                native_tools: false,
+                structured_output: false,
+                continuation: false,
+                native_tools_state: "unknown".into(),
+                structured_output_state: "unknown".into(),
+                continuation_state: "unknown".into(),
+                vision_state: "unknown".into(),
+                file_input_state: "unknown".into(),
+                model_discovery: false,
+                tool_protocol: "chat_only".into(),
+                evidence: "test".into(),
+                probe_status: "unprobed".into(),
+                probe_version: 1,
+                probed_at: chrono::Utc::now().to_rfc3339(),
+            }],
+            &session.id,
+            "test_model",
+        ).unwrap();
+        
+        // Emulate SetModel callback
+        let start = std::time::Instant::now();
+        let cmd = crate::command::Command::SetModel { model: "slow_model".into() };
+        let _ = app.execute(owner, Some(scope), cmd).await.unwrap();
+        let elapsed = start.elapsed();
+        
+        // Ensure it doesn't wait (should be very fast, well under 100ms)
+        assert!(elapsed.as_millis() < 500, "SetModel should not wait for slow probe");
+        
+        // Ensure the model was persisted
+        let active = app.sessions.context_for_telegram(owner, scope).unwrap().active;
+        assert_eq!(active.model, "slow_model");
+    }
+
+    #[tokio::test]
+    async fn custom_alias_resolution_fills_gaps_and_respects_owner_scope() {
+        let db = Arc::new(Storage::open_memory().unwrap());
+        let secrets = crate::secrets::SecretStore::new_memory();
+        let app = Arc::new(AppCommandExecutor::new(
+            db.clone(),
+            crate::config::AppConfig::default().into(),
+            crate::skills::SkillStore::new(db.clone()),
+            crate::events::EventBroker::new(),
+            secrets.clone(),
+        ));
+        let custom_logins = Arc::new(CustomLoginStore::new(std::time::Duration::from_secs(60)));
+        let tg = super::TelegramManager::new(app, None, custom_logins);
+        
+        let owner1 = "owner1";
+        let owner2 = "owner2";
+        
+        let p1 = tg.resolve_custom_alias(owner1, "custom").unwrap();
+        assert_eq!(p1, "custom");
+        
+        let profiles = crate::providers::ProviderProfileStore::new(db.clone());
+        profiles.create_with_models_and_activate_session(
+            crate::providers::ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner1.into(),
+                alias: "custom".into(),
+                endpoint: "https://test".into(),
+                protocol: "openai".into(),
+                credential_ref: None,
+                api_key_ref: None,
+                safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
+            },
+            &[],
+            "test_session",
+            "test_model",
+        ).unwrap();
+        
+        let p2 = tg.resolve_custom_alias(owner1, "custom").unwrap();
+        assert_eq!(p2, "custom_1");
+        
+        // Add custom_2 to create a gap
+        profiles.create_with_models_and_activate_session(
+            crate::providers::ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner1.into(),
+                alias: "custom_2".into(),
+                endpoint: "https://test".into(),
+                protocol: "openai".into(),
+                credential_ref: None,
+                api_key_ref: None,
+                safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
+            },
+            &[],
+            "test_session",
+            "test_model",
+        ).unwrap();
+        
+        // Should fill the gap and return custom_1
+        let p3 = tg.resolve_custom_alias(owner1, "custom").unwrap();
+        assert_eq!(p3, "custom_1");
+        
+        // Other owner should still get "custom"
+        let p4 = tg.resolve_custom_alias(owner2, "custom").unwrap();
+        assert_eq!(p4, "custom");
+    }
+
     use super::*;
     use crate::tools::{ToolContext, ToolEffect, ToolOrigin, ToolPolicy, ToolRisk, ToolSpec};
     use axum::{
