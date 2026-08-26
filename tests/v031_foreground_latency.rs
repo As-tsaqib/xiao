@@ -340,7 +340,7 @@ async fn matrix_d5_and_d6_final_delivery_before_background_learning() {
     assert!(claim_before.is_none());
 
     // Acknowledge delivery from frontend
-    let run_id = storage
+    let _run_id = storage
         .stored_messages("owner-1", &session.id)
         .unwrap()
         .into_iter()
@@ -362,7 +362,7 @@ async fn matrix_d5_and_d6_final_delivery_before_background_learning() {
     // Now background worker claims the job
     let claim_after = storage.claim_learning_job().unwrap();
     assert!(claim_after.is_some());
-    let (job_id, owner, run, payload) = claim_after.unwrap();
+    let (_job_id, owner, run, payload) = claim_after.unwrap();
     assert_eq!(owner, "owner-1");
     assert_eq!(run, *agent_run_id);
     assert!(payload.get("trace").is_some());

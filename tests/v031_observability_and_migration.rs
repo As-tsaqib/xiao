@@ -152,7 +152,7 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
     }
 
     // 2. Open via Xiao Storage (runs Migration 26 -> 27)
-    let storage = Storage::open(&db_path).unwrap();
+    let storage = std::sync::Arc::new(Storage::open(&db_path).unwrap());
     assert_eq!(storage.schema_version().unwrap(), 27);
 
     // 3. Verify all legacy data is preserved intact
@@ -164,16 +164,16 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].content, "legacy question");
 
-    let mems = storage.list_memories("owner-1", None, 10).unwrap();
+    let mems = xiao::memory::MemoryStore::new(storage.clone()).list("owner-1", None, 10).unwrap();
     assert_eq!(mems.len(), 1);
     assert_eq!(mems[0].key, "user_lang");
     assert_eq!(mems[0].content, "en");
 
-    let skills = storage.list_skills("owner-1", 10).unwrap();
+    let skills = xiao::skills::SkillStore::new(storage.clone()).list("owner-1", 10).unwrap();
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].name, "custom_tool");
 
-    let profiles = storage.provider_profiles("owner-1").unwrap();
+    let profiles = xiao::providers::ProviderProfileStore::new(storage.clone()).list("owner-1").unwrap();
     assert_eq!(profiles.len(), 1);
     assert_eq!(profiles[0].alias, "Custom Provider");
 }
