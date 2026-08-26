@@ -79,8 +79,14 @@ fn subcommand_help_is_terminal_native_and_does_not_require_daemon() {
 #[test]
 fn subcommand_help_for_all_command_families_is_terminal_native() {
     let cases = [
-        (&["chat", "--help"][..], "Usage: xiao chat"),
-        (&["ask", "--help"][..], "Usage: xiao chat"),
+        (
+            &["chat", "--help"][..],
+            "Usage: xiao chat",
+        ),
+        (
+            &["ask", "--help"][..],
+            "Usage: xiao chat",
+        ),
         (
             &["telegram", "--help"][..],
             "Usage: xiao telegram <status|configure|set-owner|set-token-file|test>",
@@ -97,7 +103,10 @@ fn subcommand_help_for_all_command_families_is_terminal_native() {
             &["telegram", "set-token-file", "--help"][..],
             "Usage: xiao telegram set-token-file",
         ),
-        (&["telegram", "test", "--help"][..], "Usage: xiao telegram test"),
+        (
+            &["telegram", "test", "--help"][..],
+            "Usage: xiao telegram test",
+        ),
         (
             &["model", "--help"][..],
             "Usage: xiao model <show|list|use|custom> ...",
@@ -158,12 +167,30 @@ fn subcommand_help_for_all_command_families_is_terminal_native() {
             &["sessions", "--help"][..],
             "Usage: xiao sessions <list|new|show|use|rename|delete> ...",
         ),
-        (&["sessions", "list", "--help"][..], "Usage: xiao sessions list"),
-        (&["sessions", "new", "--help"][..], "Usage: xiao sessions new"),
-        (&["sessions", "show", "--help"][..], "Usage: xiao sessions show"),
-        (&["sessions", "use", "--help"][..], "Usage: xiao sessions use"),
-        (&["sessions", "rename", "--help"][..], "Usage: xiao sessions rename"),
-        (&["sessions", "delete", "--help"][..], "Usage: xiao sessions delete"),
+        (
+            &["sessions", "list", "--help"][..],
+            "Usage: xiao sessions list",
+        ),
+        (
+            &["sessions", "new", "--help"][..],
+            "Usage: xiao sessions new",
+        ),
+        (
+            &["sessions", "show", "--help"][..],
+            "Usage: xiao sessions show",
+        ),
+        (
+            &["sessions", "use", "--help"][..],
+            "Usage: xiao sessions use",
+        ),
+        (
+            &["sessions", "rename", "--help"][..],
+            "Usage: xiao sessions rename",
+        ),
+        (
+            &["sessions", "delete", "--help"][..],
+            "Usage: xiao sessions delete",
+        ),
         (
             &["yolo", "--help"][..],
             "Usage: xiao yolo <status|on|off> [--session ID]",
@@ -184,34 +211,94 @@ fn subcommand_help_for_all_command_families_is_terminal_native() {
             &["attachments", "--help"][..],
             "Usage: xiao attachments <list|show|remove> [--session ID] ...",
         ),
-        (&["runs", "--help"][..], "Usage: xiao runs <list|show|cancel> ..."),
+        (
+            &["runs", "--help"][..],
+            "Usage: xiao runs <list|show|cancel> ...",
+        ),
         (
             &["daemon", "--help"][..],
             "Usage: xiao daemon <start|foreground|stop|restart|status|logs> ...",
         ),
-        (&["daemon", "start", "--help"][..], "Usage: xiao daemon start"),
+        (
+            &["daemon", "start", "--help"][..],
+            "Usage: xiao daemon start",
+        ),
         (
             &["daemon", "foreground", "--help"][..],
             "Usage: xiao daemon foreground",
         ),
-        (&["daemon", "stop", "--help"][..], "Usage: xiao daemon stop"),
-        (&["daemon", "restart", "--help"][..], "Usage: xiao daemon restart"),
-        (&["daemon", "status", "--help"][..], "Usage: xiao daemon status"),
-        (&["daemon", "logs", "--help"][..], "Usage: xiao daemon logs [LINES]"),
-        (&["config", "--help"][..], "Usage: xiao config <path|check|show>"),
-        (&["config", "path", "--help"][..], "Usage: xiao config path"),
-        (&["config", "check", "--help"][..], "Usage: xiao config check"),
-        (&["config", "show", "--help"][..], "Usage: xiao config show"),
-        (&["login", "--help"][..], "Usage: xiao login [custom]"),
-        (&["setup", "--help"][..], "Usage: xiao setup"),
-        (&["status", "--help"][..], "Usage: xiao status [--json] [--quiet]"),
-        (&["context", "--help"][..], "Usage: xiao context [--session ID] [--json]"),
-        (&["doctor", "--help"][..], "Usage: xiao doctor [--json]"),
-        (&["tools", "--help"][..], "Usage: xiao tools [--json]"),
-        (&["btw", "--help"][..], "Usage: xiao btw"),
-        (&["stop", "--help"][..], "Usage: xiao stop [--session ID]"),
-        (&["retry", "--help"][..], "Usage: xiao retry [--session ID]"),
-        (&["logs", "--help"][..], "Usage: xiao logs [LINES]"),
+        (
+            &["daemon", "stop", "--help"][..],
+            "Usage: xiao daemon stop",
+        ),
+        (
+            &["daemon", "restart", "--help"][..],
+            "Usage: xiao daemon restart",
+        ),
+        (
+            &["daemon", "status", "--help"][..],
+            "Usage: xiao daemon status",
+        ),
+        (
+            &["daemon", "logs", "--help"][..],
+            "Usage: xiao daemon logs [LINES]",
+        ),
+        (
+            &["config", "--help"][..],
+            "Usage: xiao config <path|check|show>",
+        ),
+        (
+            &["config", "path", "--help"][..],
+            "Usage: xiao config path",
+        ),
+        (
+            &["config", "check", "--help"][..],
+            "Usage: xiao config check",
+        ),
+        (
+            &["config", "show", "--help"][..],
+            "Usage: xiao config show",
+        ),
+        (
+            &["login", "--help"][..],
+            "Usage: xiao login [custom]",
+        ),
+        (
+            &["setup", "--help"][..],
+            "Usage: xiao setup",
+        ),
+        (
+            &["status", "--help"][..],
+            "Usage: xiao status [--json] [--quiet]",
+        ),
+        (
+            &["context", "--help"][..],
+            "Usage: xiao context [--session ID] [--json]",
+        ),
+        (
+            &["doctor", "--help"][..],
+            "Usage: xiao doctor [--json]",
+        ),
+        (
+            &["tools", "--help"][..],
+            "Usage: xiao tools [--json]",
+        ),
+        (
+            &["btw", "--help"][..],
+            "Usage: xiao btw",
+        ),
+        (
+            &["stop", "--help"][..],
+            "Usage: xiao stop [--session ID]",
+        ),
+        (
+            &["retry", "--help"][..],
+            "Usage: xiao retry [--session ID]",
+        ),
+        (
+            &["logs", "--help"][..],
+            "Usage: xiao logs [LINES]",
+        ),
     ];
 
     for (args, expected_prefix) in cases {
@@ -231,12 +318,30 @@ fn subcommand_help_for_all_command_families_is_terminal_native() {
 #[test]
 fn help_subcommand_prefix_works() {
     let cases = [
-        (&["help", "sessions"][..], "Usage: xiao sessions"),
-        (&["help", "model", "custom"][..], "Usage: xiao model custom"),
-        (&["help", "telegram"][..], "Usage: xiao telegram"),
-        (&["help", "memory"][..], "Usage: xiao memory"),
-        (&["help", "skills"][..], "Usage: xiao skills"),
-        (&["help", "daemon"][..], "Usage: xiao daemon"),
+        (
+            &["help", "sessions"][..],
+            "Usage: xiao sessions",
+        ),
+        (
+            &["help", "model", "custom"][..],
+            "Usage: xiao model custom",
+        ),
+        (
+            &["help", "telegram"][..],
+            "Usage: xiao telegram",
+        ),
+        (
+            &["help", "memory"][..],
+            "Usage: xiao memory",
+        ),
+        (
+            &["help", "skills"][..],
+            "Usage: xiao skills",
+        ),
+        (
+            &["help", "daemon"][..],
+            "Usage: xiao daemon",
+        ),
     ];
 
     for (args, expected_prefix) in cases {
@@ -256,7 +361,10 @@ fn help_subcommand_prefix_works() {
 #[test]
 fn global_options_validation_contract() {
     let cases = [
-        (&["status", "--timeout"][..], "--timeout requires seconds"),
+        (
+            &["status", "--timeout"][..],
+            "--timeout requires seconds",
+        ),
         (
             &["status", "--timeout", "0"][..],
             "--timeout must be between 1 and 3600 seconds",
@@ -269,7 +377,10 @@ fn global_options_validation_contract() {
             &["status", "--timeout", "invalid"][..],
             "--timeout must be an integer number of seconds",
         ),
-        (&["status", "--session"][..], "--session requires an id"),
+        (
+            &["status", "--session"][..],
+            "--session requires an id",
+        ),
     ];
 
     for (args, expected_error) in cases {
@@ -289,21 +400,54 @@ fn global_options_validation_contract() {
 #[test]
 fn subcommand_syntax_and_arity_errors_are_usage_errors() {
     let cases = [
-        (&["status", "extra"][..], "usage: xiao status"),
-        (&["context", "extra"][..], "usage: xiao context"),
-        (&["doctor", "extra"][..], "usage: xiao doctor"),
-        (&["tools", "extra"][..], "usage: xiao tools"),
-        (&["btw", "extra"][..], "usage: xiao btw"),
-        (&["yolo", "foo"][..], "usage: xiao yolo <status|on|off>"),
+        (
+            &["status", "extra"][..],
+            "usage: xiao status",
+        ),
+        (
+            &["context", "extra"][..],
+            "usage: xiao context",
+        ),
+        (
+            &["doctor", "extra"][..],
+            "usage: xiao doctor",
+        ),
+        (
+            &["tools", "extra"][..],
+            "usage: xiao tools",
+        ),
+        (
+            &["btw", "extra"][..],
+            "usage: xiao btw",
+        ),
+        (
+            &["yolo", "foo"][..],
+            "usage: xiao yolo <status|on|off>",
+        ),
         (
             &["chat", "--unknown-flag"][..],
             "unknown chat option `--unknown-flag`",
         ),
-        (&["memory", "get", "foo"][..], "usage: xiao memory"),
-        (&["skills", "invalid"][..], "usage: xiao skills"),
-        (&["approvals", "invalid"][..], "usage: xiao approvals"),
-        (&["attachments", "invalid"][..], "usage: xiao attachments"),
-        (&["runs", "invalid"][..], "usage: xiao runs"),
+        (
+            &["memory", "get", "foo"][..],
+            "usage: xiao memory",
+        ),
+        (
+            &["skills", "invalid"][..],
+            "usage: xiao skills",
+        ),
+        (
+            &["approvals", "invalid"][..],
+            "usage: xiao approvals",
+        ),
+        (
+            &["attachments", "invalid"][..],
+            "usage: xiao attachments",
+        ),
+        (
+            &["runs", "invalid"][..],
+            "usage: xiao runs",
+        ),
         (
             &["config", "invalid"][..],
             "usage: xiao config <path|check|show>",
@@ -312,7 +456,10 @@ fn subcommand_syntax_and_arity_errors_are_usage_errors() {
             &["daemon", "invalid"][..],
             "usage: xiao daemon <start|foreground|stop|restart|status|logs>",
         ),
-        (&["logs", "10", "extra"][..], "usage: xiao logs [N]"),
+        (
+            &["logs", "10", "extra"][..],
+            "usage: xiao logs [N]",
+        ),
     ];
 
     for (args, expected_error) in cases {
