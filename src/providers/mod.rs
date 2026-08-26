@@ -280,7 +280,7 @@ pub struct ProviderRequest {
     /// explicitly file-input-capable selected model.
     #[serde(default)]
     pub files: Vec<NormalizedFile>,
-    #[serde(default = default_true)]
+    #[serde(default = "default_true")]
     pub streaming: bool,
 }
 

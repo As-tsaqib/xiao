@@ -3985,7 +3985,7 @@ mod tests {
                 profile_id: None,
                 owner_id: owner.clone(),
                 alias: "vision-profile".into(),
-                endpoint: app.config.providers.custom.base_url.clone().unwrap(),
+                endpoint: provider_base.clone(),
                 protocol: "openai_chat_completions".into(),
                 credential_ref: None,
                 api_key_ref: None,
