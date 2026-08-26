@@ -780,4 +780,88 @@ mod tests {
             Some((100, Some(10)))
         );
     }
+
+    #[test]
+    fn new_session_inherits_from_active_main_within_same_scope() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let manager = SessionManager::new(storage.clone());
+
+        let owner_a = "user:alice";
+        let owner_b = "user:bob";
+        let scope_1 = TelegramScope::new(100, Some(1));
+        let scope_2 = TelegramScope::new(100, Some(2));
+
+        // 1. First session gets defaults: custom / None / default
+        let first_a1 = manager.ensure_telegram_session(owner_a, scope_1).unwrap();
+        assert_eq!(first_a1.provider, "custom");
+        assert_eq!(first_a1.account_id, None);
+        assert_eq!(first_a1.model, "default");
+
+        // First session for owner_a in generic scope also gets defaults
+        let first_gen = manager.ensure_default_session(owner_a).unwrap();
+        assert_eq!(first_gen.provider, "custom");
+        assert_eq!(first_gen.account_id, None);
+        assert_eq!(first_gen.model, "default");
+
+        // Add a message to first_a1 to verify history is NOT inherited
+        storage
+            .append_message(owner_a, &first_a1.id, "user", "hello in first")
+            .unwrap();
+        assert_eq!(
+            storage.session_messages(owner_a, &first_a1.id).unwrap().len(),
+            1
+        );
+
+        // Update active session in scope_1 to custom provider profile and new model
+        storage
+            .set_session_provider(
+                owner_a,
+                &first_a1.id,
+                "custom",
+                Some("profile_123"),
+                "gpt-5-turbo",
+            )
+            .unwrap();
+
+        // 2. /new (create_and_switch_telegram) inherits provider/account/model from active main in same scope
+        let second_a1 = manager.create_and_switch_telegram(owner_a, scope_1).unwrap();
+        assert_eq!(second_a1.provider, "custom");
+        assert_eq!(second_a1.account_id.as_deref(), Some("profile_123"));
+        assert_eq!(second_a1.model, "gpt-5-turbo");
+
+        // Verify NO history inheritance into the new session
+        let msgs = storage.session_messages(owner_a, &second_a1.id).unwrap();
+        assert!(msgs.is_empty());
+
+        // 3. No cross-topic inheritance: scope_2 on owner_a should get default
+        let first_a2 = manager.ensure_telegram_session(owner_a, scope_2).unwrap();
+        assert_eq!(first_a2.provider, "custom");
+        assert_eq!(first_a2.account_id, None);
+        assert_eq!(first_a2.model, "default");
+
+        // 4. No cross-owner inheritance: owner_b on scope_1 should get default
+        let first_b1 = manager.ensure_telegram_session(owner_b, scope_1).unwrap();
+        assert_eq!(first_b1.provider, "custom");
+        assert_eq!(first_b1.account_id, None);
+        assert_eq!(first_b1.model, "default");
+
+        // 5. Test generic (non-telegram) create_and_switch inheritance
+        storage
+            .set_session_provider(
+                owner_a,
+                &first_gen.id,
+                "custom",
+                Some("profile_gen"),
+                "claude-sonnet",
+            )
+            .unwrap();
+        let second_gen = manager.create_and_switch(owner_a).unwrap();
+        assert_eq!(second_gen.provider, "custom");
+        assert_eq!(second_gen.account_id.as_deref(), Some("profile_gen"));
+        assert_eq!(second_gen.model, "claude-sonnet");
+        assert!(storage
+            .session_messages(owner_a, &second_gen.id)
+            .unwrap()
+            .is_empty());
+    }
 }

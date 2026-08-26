@@ -930,12 +930,25 @@ impl TelegramAdapter {
         Ok(())
     }
 
-    fn resolve_custom_alias(&self, principal: &str, base: &str) -> Result<String> {
+    fn resolve_custom_alias(&self, principal: &str, candidate: &str) -> Result<String> {
+        let raw = candidate.trim();
+        let base = if raw.is_empty() {
+            "custom"
+        } else if let Some((prefix, suffix)) = raw.rsplit_once('_') {
+            if !prefix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                prefix
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+
         let store = crate::providers::ProviderProfileStore::new(self.app.storage.clone());
         if store.get_by_alias(principal, base)?.is_none() {
             return Ok(base.to_string());
         }
-        let mut suffix = 1;
+        let mut suffix = 1usize;
         loop {
             let alias = format!("{base}_{suffix}");
             if store.get_by_alias(principal, &alias)?.is_none() {
@@ -943,16 +956,6 @@ impl TelegramAdapter {
             }
             suffix += 1;
         }
-    }
-
-    #[allow(dead_code)]
-    fn ensure_custom_alias_available(&self, principal: &str, alias: &str) -> Result<()> {
-        if self.custom_alias_exists(principal, alias)? {
-            return Err(anyhow!(
-                "Custom profile alias `{alias}` already exists. Choose a different alias."
-            ));
-        }
-        Ok(())
     }
 
     async fn discover_custom_models(&self, wizard: &mut login::CustomLoginWizard) -> Result<()> {
@@ -2373,27 +2376,20 @@ fn result_view(result: CommandResult) -> Result<View> {
 mod tests {
     #[tokio::test]
     async fn setmodel_callback_persists_once_and_does_not_wait_for_slow_probe() {
-        let db = Arc::new(Storage::open_memory().unwrap());
-        let secrets = crate::secrets::SecretStore::new_memory();
-        let config = crate::config::AppConfig::default();
-        let app = Arc::new(AppCommandExecutor::new(
-            db.clone(),
-            config.into(),
-            crate::skills::SkillStore::new(db.clone()),
-            crate::events::EventBroker::new(),
-            secrets.clone(),
-        ));
-        let custom_logins = Arc::new(CustomLoginStore::new(std::time::Duration::from_secs(60)));
-        let tg = super::TelegramManager::new(app.clone(), None, custom_logins);
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.secrets_dir = temp.path().join("secrets");
+        let app = crate::app::AppState::build(cfg).await.unwrap();
 
         let owner = "owner1";
         let scope = TelegramScope::new(100, None);
         let session = app.sessions.ensure_telegram_session(owner, scope).unwrap();
 
-        let profiles = crate::providers::ProviderProfileStore::new(db.clone());
+        let profiles = crate::providers::ProviderProfileStore::new(app.storage.clone());
         profiles
             .create_with_models_and_activate_session(
-                crate::providers::ProviderProfileInput {
+                crate::storage::ProviderProfileInput {
                     profile_id: None,
                     owner_id: owner.into(),
                     alias: "custom".into(),
@@ -2435,10 +2431,14 @@ mod tests {
         let cmd = crate::command::Command::SetModel {
             model: "slow_model".into(),
         };
-        let _ = app.execute(owner, Some(scope), cmd).await.unwrap();
+        let _ = app
+            .commands
+            .execute_in_scope(owner, Some(scope), cmd)
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
 
-        // Ensure it doesn't wait (should be very fast, well under 100ms)
+        // Ensure it doesn't wait (should be very fast, well under 500ms)
         assert!(
             elapsed.as_millis() < 500,
             "SetModel should not wait for slow probe"
@@ -2451,21 +2451,40 @@ mod tests {
             .unwrap()
             .active;
         assert_eq!(active.model, "slow_model");
+
+        // Duplicate call is idempotent
+        let cmd_dup = crate::command::Command::SetModel {
+            model: "slow_model".into(),
+        };
+        let _ = app
+            .commands
+            .execute_in_scope(owner, Some(scope), cmd_dup)
+            .await
+            .unwrap();
+        let active_dup = app
+            .sessions
+            .context_for_telegram(owner, scope)
+            .unwrap()
+            .active;
+        assert_eq!(active_dup.model, "slow_model");
     }
 
     #[tokio::test]
     async fn custom_alias_resolution_fills_gaps_and_respects_owner_scope() {
-        let db = Arc::new(Storage::open_memory().unwrap());
-        let secrets = crate::secrets::SecretStore::new_memory();
-        let app = Arc::new(AppCommandExecutor::new(
-            db.clone(),
-            crate::config::AppConfig::default().into(),
-            crate::skills::SkillStore::new(db.clone()),
-            crate::events::EventBroker::new(),
-            secrets.clone(),
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.secrets_dir = temp.path().join("secrets");
+        let app = crate::app::AppState::build(cfg).await.unwrap();
         let custom_logins = Arc::new(CustomLoginStore::new(std::time::Duration::from_secs(60)));
-        let tg = super::TelegramManager::new(app, None, custom_logins);
+        let tg = TelegramAdapter {
+            app: app.clone(),
+            client: TelegramClient::with_base("test-token".into(), "http://127.0.0.1:9".into())
+                .unwrap(),
+            menus: Arc::new(MenuStore::new(std::time::Duration::from_secs(60))),
+            custom_logins,
+            principal_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        };
 
         let owner1 = "owner1";
         let owner2 = "owner2";
@@ -2473,10 +2492,10 @@ mod tests {
         let p1 = tg.resolve_custom_alias(owner1, "custom").unwrap();
         assert_eq!(p1, "custom");
 
-        let profiles = crate::providers::ProviderProfileStore::new(db.clone());
+        let profiles = crate::providers::ProviderProfileStore::new(app.storage.clone());
         profiles
             .create_with_models_and_activate_session(
-                crate::providers::ProviderProfileInput {
+                crate::storage::ProviderProfileInput {
                     profile_id: None,
                     owner_id: owner1.into(),
                     alias: "custom".into(),
@@ -2499,7 +2518,7 @@ mod tests {
         // Add custom_2 to create a gap
         profiles
             .create_with_models_and_activate_session(
-                crate::providers::ProviderProfileInput {
+                crate::storage::ProviderProfileInput {
                     profile_id: None,
                     owner_id: owner1.into(),
                     alias: "custom_2".into(),
