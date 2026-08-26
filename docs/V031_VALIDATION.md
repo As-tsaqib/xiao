@@ -6,7 +6,7 @@ This record is intentionally incomplete until the exact-head CI and rooted Andro
 
 - Branch: `v0.3.1-audit`
 - Schema migration: 26 → 27
-- Exact SHA/run: pending after the Android draft-rendering compatibility fix.
+- Exact SHA/run: ef3959e59b011340460fb5d4d111c48370d4250d (Run 32922557500)
 - Device comparison shows Telegram Android clips multiple custom emoji inside `RichBlockThinking`, while iOS renders them fully. Draft progress now uses Unicode fallbacks for cross-client consistency; completed `✓`/`✗` markers are unchanged.
 - Local Rust, WebUI, and Android builds/tests: not run (repository policy).
 
