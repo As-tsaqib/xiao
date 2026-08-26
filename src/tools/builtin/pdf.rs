@@ -137,9 +137,7 @@ impl Tool for PdfCreateTool {
 
         let full_text = match arguments.title {
             Some(title) if !title.trim().is_empty() => {
-                format!("{}
-
-{}", title.trim(), arguments.content)
+                format!("{}\n\n{}", title.trim(), arguments.content)
             }
             _ => arguments.content,
         };
@@ -299,10 +297,8 @@ endstream",
         pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
     }
     pdf.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {total_objs} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
-        )
-        .as_bytes(),
+        format!("trailer\n<< /Size {total_objs} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+            .as_bytes(),
     );
     pdf
 }
@@ -370,8 +366,7 @@ mod tests {
         };
         let mut long_content = String::new();
         for i in 1..=100 {
-            long_content.push_str(&format!("Line item number {i} with details and notes.
-"));
+            long_content.push_str(&format!("Line item number {i} with details and notes.\n"));
         }
         let result = tool
             .execute(

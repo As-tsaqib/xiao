@@ -306,7 +306,8 @@ impl Tool for TermuxJobTool {
                     if let (Some(storage), Some(id)) = (&self.storage, audit_id.as_deref()) {
                         storage.finish_tool_run_step(id, "denied", None, Some(&reason))?;
                     }
-                    results.push(json!({"index":index,"id":step.id,"status":"denied","error":reason}));
+                    results
+                        .push(json!({"index":index,"id":step.id,"status":"denied","error":reason}));
                     if !step.continue_on_error {
                         break;
                     }
@@ -474,9 +475,7 @@ fn verified_artifacts(
     let workspace = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
-    let cwd = cwd
-        .canonicalize()
-        .unwrap_or_else(|_| cwd.to_path_buf());
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     paths
         .iter()
         .map(|path| {
@@ -506,7 +505,10 @@ fn verified_artifacts(
                 ));
             }
             let metadata = std::fs::symlink_metadata(&canonical)?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 50 * 1024 * 1024 {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > 50 * 1024 * 1024
+            {
                 return Err(anyhow!("result artifact is not a bounded regular file"));
             }
             Ok(json!({
