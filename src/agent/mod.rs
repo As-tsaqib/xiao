@@ -896,9 +896,10 @@ impl AgentEngine {
                             None,
                         )?;
                         let audit = self.storage.tool_runs(principal, &agent_run_id)?;
+                        let has_images = !request.images.is_empty();
                         let verification = tokio::select! {
                             _ = token.cancelled() => return Err(anyhow!("generation cancelled during completion verification")),
-                            evidence = completion.verify_for_task_async(prompt, &answer, &audit) => evidence,
+                            evidence = completion.verify_for_task_with_images_async(prompt, &answer, &audit, has_images) => evidence,
                         };
                         match verification.state {
                             VerificationState::VerifiedSuccess => {
@@ -1685,6 +1686,76 @@ mod tests {
         }
     }
 
+
+    struct VisionPhotoProvider {
+        calls: AtomicUsize,
+        expected_bytes: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl Provider for VisionPhotoProvider {
+        fn id(&self) -> &'static str {
+            "vision-photo"
+        }
+        fn models(&self) -> Vec<String> {
+            vec!["m".into()]
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                text: true,
+                vision: true,
+                file_input: false,
+                native_tools: true,
+                tool_protocol: ToolProtocol::Native,
+                model_discovery: false,
+                structured_output: true,
+                continuation: false,
+                evidence: "deterministic vision photo provider fixture".into(),
+            }
+        }
+        async fn run(
+            &self,
+            _: ProviderRequest,
+            _: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderResponse> {
+            Err(anyhow!("run_turn must be used"))
+        }
+        async fn run_turn(
+            &self,
+            request: ProviderRequest,
+            continuation: Option<serde_json::Value>,
+            tool_results: Vec<ToolResult>,
+            progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> Result<ProviderTurn> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.images.len(), 1);
+            assert_eq!(request.images[0].bytes, self.expected_bytes);
+            assert!(continuation.is_none());
+            assert!(tool_results.is_empty());
+            if let Some(tx) = progress {
+                let _ = tx.send(AgentEvent::Delta("Ini adalah gambar merah.".into()));
+            }
+            Ok(ProviderTurn {
+                step: ProviderStep::Final("Ini adalah gambar merah.".into()),
+                continuation: None,
+                events: vec![],
+            })
+        }
+    }
+
+    fn sample_png() -> Vec<u8> {
+        let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
+            image::ImageBuffer::from_pixel(2, 2, image::Rgb([255, 0, 0]));
+        let mut buf = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut buf);
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
     struct AgentPdfProvider {
         calls: AtomicUsize,
     }
@@ -2845,5 +2916,117 @@ mod tests {
         );
         assert!(!title.contains('\n'));
         assert!(title.chars().count() <= 53);
+    }
+
+    #[tokio::test]
+    async fn agent_engine_delivers_vision_photo_final_answer_without_blocked_no_progress() {
+        let png_bytes = sample_png();
+        let provider = Arc::new(VisionPhotoProvider {
+            calls: AtomicUsize::new(0),
+            expected_bytes: png_bytes.clone(),
+        });
+        let (base, db, session, _fixture) = engine("vision-photo", provider.clone());
+        let attachment_root = tempfile::tempdir().unwrap();
+        let attachments = Arc::new(
+            AttachmentManager::new(
+                db.clone(),
+                attachment_root.path(),
+                AttachmentConfig::default(),
+            )
+            .unwrap(),
+        );
+        let record = attachments
+            .ingest(AttachmentIngest {
+                owner_id: "u".into(),
+                session_id: session.clone(),
+                telegram_file_id: None,
+                telegram_unique_id: Some("photo-unique-1".into()),
+                original_name: "photo-1.jpg".into(),
+                declared_mime: Some("image/png".into()),
+                expected_kind: AttachmentKind::Image,
+                bytes: png_bytes,
+            })
+            .unwrap();
+        assert_eq!(record.processing_status, "ready");
+
+        let agent = AgentEngine::with_registry_runtime(
+            base.sessions.clone(),
+            db.clone(),
+            base.providers.clone(),
+            AgentConfig::default(),
+            base.tools.clone(),
+            None,
+            Some(attachments.clone()),
+        );
+
+        let prompt = format!(
+            "Attachment received: {} (id={}, type={}, status={}). Apa ini",
+            record.original_name, record.attachment_id, record.detected_mime, record.processing_status
+        );
+        let answer = agent
+            .submit_with_progress("u", &prompt, None)
+            .await
+            .unwrap();
+
+        assert_eq!(answer.final_answer, "Ini adalah gambar merah.");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let runs = db.agent_runs("u", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "completed");
+        let messages = db.messages("u", &session).unwrap();
+        assert_eq!(messages.last().unwrap().content, "Ini adalah gambar merah.");
+    }
+
+    #[tokio::test]
+    async fn agent_engine_truthfully_rejects_vision_when_provider_lacks_vision_capability() {
+        let provider = Arc::new(ChatOnlyProbeProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (base, db, session, _fixture) = engine("chat-only", provider.clone());
+        let attachment_root = tempfile::tempdir().unwrap();
+        let attachments = Arc::new(
+            AttachmentManager::new(
+                db.clone(),
+                attachment_root.path(),
+                AttachmentConfig::default(),
+            )
+            .unwrap(),
+        );
+        let record = attachments
+            .ingest(AttachmentIngest {
+                owner_id: "u".into(),
+                session_id: session.clone(),
+                telegram_file_id: None,
+                telegram_unique_id: Some("photo-unique-2".into()),
+                original_name: "photo-2.jpg".into(),
+                declared_mime: Some("image/png".into()),
+                expected_kind: AttachmentKind::Image,
+                bytes: sample_png(),
+            })
+            .unwrap();
+        assert_eq!(record.processing_status, "ready");
+
+        let agent = AgentEngine::with_registry_runtime(
+            base.sessions.clone(),
+            db.clone(),
+            base.providers.clone(),
+            AgentConfig::default(),
+            base.tools.clone(),
+            None,
+            Some(attachments.clone()),
+        );
+
+        let prompt = format!(
+            "Attachment received: {} (id={}, type={}, status={}). Apa ini",
+            record.original_name, record.attachment_id, record.detected_mime, record.processing_status
+        );
+        let error = agent
+            .submit_with_progress("u", &prompt, None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not declare vision capability"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
 }

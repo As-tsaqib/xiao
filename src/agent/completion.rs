@@ -86,6 +86,7 @@ impl CompletionVerifier {
     }
 
     pub fn classify(&self, goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind {
+        let clean_goal = strip_attachment_envelope(goal);
         match self.semantic.evaluate::<TaskIntentDecision>(
             "task_intent",
             serde_json::json!({
@@ -99,7 +100,7 @@ impl CompletionVerifier {
                 }
             }),
             serde_json::json!({
-                "goal": goal,
+                "goal": clean_goal,
                 "observed_tools": tool_runs.iter().take(64).map(|run| serde_json::json!({
                     "tool":run.tool_name,"risk":run.risk,"status":run.status
                 })).collect::<Vec<_>>()
@@ -113,7 +114,7 @@ impl CompletionVerifier {
             }
             SemanticResult::Malformed | SemanticResult::Unavailable | SemanticResult::Valid(_) => {}
         }
-        deterministic_task_kind(goal, tool_runs)
+        deterministic_task_kind(clean_goal, tool_runs)
     }
 
     /// Provider-backed semantic evaluation bridges an async provider through
@@ -167,7 +168,8 @@ impl CompletionVerifier {
 }
 
 fn deterministic_task_kind(goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind {
-    let normalized = goal.to_ascii_lowercase();
+    let clean_goal = strip_attachment_envelope(goal);
+    let normalized = clean_goal.to_ascii_lowercase();
     let installation = ["install", "package", "dependency", "pasang"]
         .iter()
         .any(|marker| normalized.contains(marker));
@@ -252,6 +254,16 @@ impl CompletionVerifier {
         final_answer: &str,
         tool_runs: &[ToolRunRecord],
     ) -> CompletionEvidence {
+        self.verify_for_task_with_images(goal, final_answer, tool_runs, has_attachment_context(goal))
+    }
+
+    pub fn verify_for_task_with_images(
+        &self,
+        goal: &str,
+        final_answer: &str,
+        tool_runs: &[ToolRunRecord],
+        has_images: bool,
+    ) -> CompletionEvidence {
         let task_kind = self.classify(goal, tool_runs);
         let succeeded_tools = tool_runs
             .iter()
@@ -330,7 +342,11 @@ impl CompletionVerifier {
                 VerificationState::VerifiedSuccess,
                 task_kind,
                 if tool_runs.is_empty() {
-                    "informational answer is present; no external action was requested".into()
+                    if has_images {
+                        "informational vision answer is present; no external action was requested".into()
+                    } else {
+                        "informational answer is present; no external action was requested".into()
+                    }
                 } else {
                     format!("{succeeded_tools} read-only observation(s) support the answer")
                 },
@@ -351,6 +367,16 @@ impl CompletionVerifier {
                 .map(observation)
                 .collect::<Vec<_>>();
             if observations.is_empty() {
+                if has_images {
+                    return evidence(
+                        VerificationState::VerifiedSuccess,
+                        task_kind,
+                        "visual inspection completed directly from input image(s)".into(),
+                        succeeded_tools,
+                        0,
+                        Vec::new(),
+                    );
+                }
                 return evidence(
                     VerificationState::NotYetVerified,
                     task_kind,
@@ -487,19 +513,72 @@ impl CompletionVerifier {
         final_answer: &str,
         tool_runs: &[ToolRunRecord],
     ) -> CompletionEvidence {
+        self.verify_for_task_with_images_async(
+            goal,
+            final_answer,
+            tool_runs,
+            has_attachment_context(goal),
+        )
+        .await
+    }
+
+    pub async fn verify_for_task_with_images_async(
+        &self,
+        goal: &str,
+        final_answer: &str,
+        tool_runs: &[ToolRunRecord],
+        has_images: bool,
+    ) -> CompletionEvidence {
         let evaluator = self.clone();
         let owned_goal = goal.to_owned();
         let owned_answer = final_answer.to_owned();
         let owned_runs = tool_runs.to_vec();
         match tokio::task::spawn_blocking(move || {
-            evaluator.verify_for_task(&owned_goal, &owned_answer, &owned_runs)
+            evaluator.verify_for_task_with_images(
+                &owned_goal,
+                &owned_answer,
+                &owned_runs,
+                has_images,
+            )
         })
         .await
         {
             Ok(evidence) => evidence,
-            Err(_) => CompletionVerifier::default().verify_for_task(goal, final_answer, tool_runs),
+            Err(_) => CompletionVerifier::default().verify_for_task_with_images(
+                goal,
+                final_answer,
+                tool_runs,
+                has_images,
+            ),
         }
     }
+}
+
+fn strip_attachment_envelope(goal: &str) -> &str {
+    let trimmed = goal.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("attachment received:") {
+        if let Some(pos) = trimmed.find("). ") {
+            return trimmed[pos + 3..].trim();
+        }
+        if let Some(pos) = trimmed.find(").") {
+            return trimmed[pos + 2..].trim();
+        }
+    }
+    trimmed
+}
+
+fn has_attachment_context(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    lower.starts_with("attachment received:")
+        || lower.contains("gambar ini")
+        || lower.contains("gambar tadi")
+        || lower.contains("foto ini")
+        || lower.contains("foto tadi")
+        || lower.contains("this image")
+        || lower.contains("this photo")
+        || lower.contains("attached image")
+        || lower.contains("screenshot")
 }
 
 fn evidence(
@@ -693,5 +772,56 @@ mod tests {
         let evidence =
             CompletionVerifier::default().verify_for_task("Restart Xiao", "Waiting", &[approval]);
         assert_eq!(evidence.state, VerificationState::Blocked);
+    }
+
+    #[test]
+    fn vision_photo_caption_apa_ini_with_attachment_envelope_is_informational_and_verified_success() {
+        let goal = "Attachment received: photo-1.jpg (id=att-1, type=image/jpeg, status=ready). Apa ini";
+        let verifier = CompletionVerifier::default();
+        assert_eq!(
+            verifier.classify(goal, &[]),
+            TaskKind::Informational
+        );
+        let evidence = verifier.verify_for_task(
+            goal,
+            "Ini adalah gambar bunga mawar merah.",
+            &[],
+        );
+        assert_eq!(evidence.state, VerificationState::VerifiedSuccess);
+        assert_eq!(evidence.task_kind, TaskKind::Informational);
+        assert!(evidence.verified);
+    }
+
+    #[test]
+    fn vision_photo_caption_visual_inspection_with_images_is_verified_success() {
+        let goal = "Attachment received: photo-1.jpg (id=att-1, type=image/jpeg, status=ready). Periksa gambar ini";
+        let verifier = CompletionVerifier::default();
+        let evidence = verifier.verify_for_task_with_images(
+            goal,
+            "Gambar ini menunjukkan log sistem tanpa kesalahan.",
+            &[],
+            true,
+        );
+        assert_eq!(evidence.state, VerificationState::VerifiedSuccess);
+        assert_eq!(evidence.task_kind, TaskKind::Inspection);
+        assert!(evidence.verified);
+    }
+
+    #[test]
+    fn inspection_without_images_or_tools_remains_not_yet_verified() {
+        let goal = "Periksa log sistem";
+        let verifier = CompletionVerifier::default();
+        let evidence = verifier.verify_for_task_with_images(goal, "Log terlihat baik.", &[], false);
+        assert_eq!(evidence.state, VerificationState::NotYetVerified);
+        assert!(!evidence.verified);
+    }
+
+    #[test]
+    fn action_with_images_still_requires_action_and_verification_tools() {
+        let goal = "Attachment received: photo-1.jpg (id=att-1, type=image/jpeg, status=ready). Create the file result.txt with summary";
+        let verifier = CompletionVerifier::default();
+        let evidence = verifier.verify_for_task_with_images(goal, "Done", &[], true);
+        assert_eq!(evidence.state, VerificationState::NotYetVerified);
+        assert!(!evidence.verified);
     }
 }
