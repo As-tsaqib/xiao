@@ -2378,7 +2378,9 @@ mod tests {
     async fn setmodel_callback_persists_once_and_does_not_wait_for_slow_probe() {
         let temp = tempfile::tempdir().unwrap();
         let mut cfg = crate::config::AppConfig::default();
+        cfg.storage.database = temp.path().join("xiao.db");
         cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.logs_dir = temp.path().join("logs");
         cfg.paths.secrets_dir = temp.path().join("secrets");
         let app = crate::app::AppState::build(cfg).await.unwrap();
 
@@ -2473,7 +2475,9 @@ mod tests {
     async fn custom_alias_resolution_fills_gaps_and_respects_owner_scope() {
         let temp = tempfile::tempdir().unwrap();
         let mut cfg = crate::config::AppConfig::default();
+        cfg.storage.database = temp.path().join("xiao.db");
         cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.logs_dir = temp.path().join("logs");
         cfg.paths.secrets_dir = temp.path().join("secrets");
         let app = crate::app::AppState::build(cfg).await.unwrap();
         let custom_logins = Arc::new(CustomLoginStore::new(std::time::Duration::from_secs(60)));

@@ -53,12 +53,20 @@ impl SessionManager {
         let mut account_id = None;
         let mut model = "default".to_string();
 
-        if let Ok(Some((main_id, _, _))) = self.storage.frontend_state(principal) {
-            if let Ok(Some(s)) = self.storage.session(principal, &main_id) {
-                provider = s.provider;
-                account_id = s.account_id;
-                model = s.model;
-            }
+        let current_main =
+            if let Ok(Some((main_id, _, _))) = self.storage.frontend_state(principal) {
+                self.storage.session(principal, &main_id).ok().flatten()
+            } else {
+                self.storage
+                    .list_main_sessions(principal, 1, 0, false)
+                    .ok()
+                    .and_then(|list| list.into_iter().next())
+            };
+
+        if let Some(s) = current_main {
+            provider = s.provider;
+            account_id = s.account_id;
+            model = s.model;
         }
 
         self.storage.create_session(
@@ -299,12 +307,21 @@ impl SessionManager {
         let mut account_id = None;
         let mut model = "default".to_string();
 
-        if let Ok(Some((main_id, _, _))) = self.storage.telegram_frontend_state(principal, scope) {
-            if let Ok(Some(s)) = self.storage.session(principal, &main_id) {
-                provider = s.provider;
-                account_id = s.account_id;
-                model = s.model;
-            }
+        let current_main = if let Ok(Some((main_id, _, _))) =
+            self.storage.telegram_frontend_state(principal, scope)
+        {
+            self.storage.session(principal, &main_id).ok().flatten()
+        } else {
+            self.storage
+                .list_main_sessions_in_telegram_scope(principal, scope, 1, 0, false)
+                .ok()
+                .and_then(|list| list.into_iter().next())
+        };
+
+        if let Some(s) = current_main {
+            provider = s.provider;
+            account_id = s.account_id;
+            model = s.model;
         }
 
         let session = self.storage.create_session(
