@@ -781,8 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn vision_photo_caption_apa_ini_with_attachment_envelope_is_informational_and_verified_success(
-    ) {
+    fn photo_caption_apa_ini_with_envelope_is_informational_and_verified() {
         let goal =
             "Attachment received: photo-1.jpg (id=att-1, type=image/jpeg, status=ready). Apa ini";
         let verifier = CompletionVerifier::default();
@@ -794,8 +793,9 @@ mod tests {
     }
 
     #[test]
-    fn vision_photo_caption_visual_inspection_with_images_is_verified_success() {
-        let goal = "Attachment received: photo-1.jpg (id=att-1, type=image/jpeg, status=ready). Periksa gambar ini";
+    fn photo_caption_visual_inspection_with_images_is_verified() {
+        let goal =
+            "Attachment received: photo-1.jpg (id=att-1, type=image/jpeg, status=ready). Periksa gambar ini";
         let verifier = CompletionVerifier::default();
         let evidence = verifier.verify_for_task_with_images(
             goal,
