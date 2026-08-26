@@ -785,10 +785,11 @@ impl TelegramAdapter {
                             .await?;
                     }
                 }
+                let elapsed_ms = self.app.storage.agent_run_elapsed_ms(&run_id);
                 self.app.storage.record_agent_run_event(
                     &run_id,
                     "final_frontend_delivery",
-                    0,
+                    elapsed_ms,
                     &serde_json::json!({"frontend":"telegram"}),
                 )?;
                 self.app

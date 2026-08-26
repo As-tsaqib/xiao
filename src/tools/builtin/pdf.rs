@@ -112,13 +112,17 @@ impl Tool for PdfCreateTool {
             if parent.exists() {
                 let canonical_parent = parent.canonicalize()?;
                 if !canonical_parent.starts_with(&canonical_workspace) {
-                    return Err(anyhow!("parent directory escapes canonical session workspace"));
+                    return Err(anyhow!(
+                        "parent directory escapes canonical session workspace"
+                    ));
                 }
             }
             std::fs::create_dir_all(parent)?;
             let canonical_parent = parent.canonicalize()?;
             if !canonical_parent.starts_with(&canonical_workspace) {
-                return Err(anyhow!("parent directory escapes canonical session workspace"));
+                return Err(anyhow!(
+                    "parent directory escapes canonical session workspace"
+                ));
             }
         }
 
@@ -145,7 +149,9 @@ impl Tool for PdfCreateTool {
 
         let canonical_target = target_path.canonicalize()?;
         if !canonical_target.starts_with(&canonical_workspace) {
-            return Err(anyhow!("created pdf file escapes canonical session workspace"));
+            return Err(anyhow!(
+                "created pdf file escapes canonical session workspace"
+            ));
         }
 
         let size_bytes = pdf_bytes.len() as u64;

@@ -373,10 +373,11 @@ fn spawn_learning_worker(storage: Arc<Storage>, identity: Arc<IdentityWorkspace>
                         }
                         Ok(()) => storage.finish_learning_job(&id, "succeeded", None),
                     };
+                    let elapsed_ms = storage.agent_run_elapsed_ms(&run);
                     let _ = storage.record_agent_run_event(
                         &run,
                         "background_learning",
-                        0,
+                        elapsed_ms,
                         &serde_json::json!({"status":if result.is_ok(){"succeeded"}else{"failed"}}),
                     );
                 }

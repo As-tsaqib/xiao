@@ -46,6 +46,10 @@ impl Provider for LatencyMockProvider {
             evidence: "latency test".into(),
         }
     }
+    async fn generate_text(&self, _req: ProviderRequest) -> anyhow::Result<String> {
+        self.semantic_eval_called.store(true, Ordering::SeqCst);
+        Ok("{}".into())
+    }
     async fn run(
         &self,
         _req: ProviderRequest,

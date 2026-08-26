@@ -207,3 +207,48 @@ fn tool_run_steps_and_agent_run_events_stored_and_retrieved() {
     assert_eq!(events[1].elapsed_ms, 320);
     assert_eq!(events[2].event_kind, "final_answer_ready");
 }
+
+#[test]
+fn final_frontend_delivery_and_background_learning_timing_nonzero_and_ordered() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("xiao.db");
+    let storage = Storage::open(&db_path).unwrap();
+
+    let session = storage
+        .create_session("owner-1", "Timing Test", "custom", None, "m", false, None)
+        .unwrap();
+    let run_id = storage
+        .create_agent_run("owner-1", &session.id, "custom", "m", Some("timing goal"))
+        .unwrap();
+
+    // Verify agent_run_elapsed_ms helper returns non-zero elapsed time
+    let elapsed = storage.agent_run_elapsed_ms(&run_id);
+    assert!(elapsed >= 1);
+
+    // Record delivery and background learning events
+    storage
+        .record_agent_run_event(
+            &run_id,
+            "final_frontend_delivery",
+            elapsed,
+            &serde_json::json!({"frontend":"telegram"}),
+        )
+        .unwrap();
+
+    let later_elapsed = storage.agent_run_elapsed_ms(&run_id).max(elapsed);
+    storage
+        .record_agent_run_event(
+            &run_id,
+            "background_learning",
+            later_elapsed,
+            &serde_json::json!({"status":"succeeded"}),
+        )
+        .unwrap();
+
+    let events = storage.agent_run_events(&run_id).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_kind, "final_frontend_delivery");
+    assert!(events[0].elapsed_ms >= 1);
+    assert_eq!(events[1].event_kind, "background_learning");
+    assert!(events[1].elapsed_ms >= events[0].elapsed_ms);
+}

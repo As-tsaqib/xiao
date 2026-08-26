@@ -147,7 +147,7 @@ async fn raw_tool_json_never_appears_in_text_deltas() {
     let storage = Arc::new(Storage::open(&db_path).unwrap());
     let sessions = Arc::new(SessionManager::new(storage.clone()));
     let provider = Arc::new(StreamingMockProvider {
-        text_deltas: vec![],
+        text_deltas: vec!["Processing request..."],
         emit_tool_deltas: true,
     });
     let auth = Arc::new(xiao::auth::AuthManager::new(
@@ -182,10 +182,80 @@ async fn raw_tool_json_never_appears_in_text_deltas() {
         .submit_to_session_with_progress("owner-1", &session.id, "call tool", Some(progress_tx))
         .await;
 
+    let mut saw_delta = false;
     while let Ok(event) = progress_rx.try_recv() {
         if let AgentEvent::TextDelta(text) = event {
+            saw_delta = true;
             assert!(!text.contains("stream-call-1"));
             assert!(!text.contains("assembled_val"));
         }
     }
+    assert!(saw_delta);
+}
+
+#[tokio::test]
+async fn cached_unsupported_streaming_disables_streaming_on_future_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("xiao.db");
+    let storage = Arc::new(Storage::open(&db_path).unwrap());
+    let secrets = xiao::security::secrets::SecretStore::new(dir.path().join("secrets"));
+    let auth = Arc::new(xiao::auth::AuthManager::new(
+        storage.clone(),
+        dir.path().join("auth_secrets"),
+    ));
+    let service = xiao::providers::CustomProfileService::with_auth(storage.clone(), secrets, auth);
+
+    let profile = service
+        .create_profile(
+            "owner-1",
+            "stream-prof",
+            "https://stream.example/v1",
+            "openai_chat_completions",
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .unwrap()
+        .profile;
+
+    let store = xiao::providers::ProviderProfileStore::new(storage.clone());
+
+    // 1. Initially state is unknown -> optimistic streaming enabled
+    let state = store
+        .capability_state(&profile.profile_id, "model-1", "openai_chat_completions", "streaming")
+        .unwrap();
+    assert_eq!(state, "unknown");
+
+    // 2. Record explicit unsupported streaming capability
+    store
+        .record_runtime_capability(
+            &profile.profile_id,
+            "model-1",
+            "openai_chat_completions",
+            "streaming",
+            "unsupported",
+            "provider_explicit_unsupported",
+        )
+        .unwrap();
+
+    let updated_state = store
+        .capability_state(&profile.profile_id, "model-1", "openai_chat_completions", "streaming")
+        .unwrap();
+    assert_eq!(updated_state, "unsupported");
+
+    // 3. Explicit owner override force_supported overrides cached unsupported
+    store
+        .set_capability_override(
+            "owner-1",
+            &profile.profile_id,
+            "model-1",
+            "streaming",
+            "force_supported",
+        )
+        .unwrap();
+
+    let effective_override = store
+        .capability_override(&profile.profile_id, "model-1", "openai_chat_completions", "streaming")
+        .unwrap();
+    assert_eq!(effective_override, "force_supported");
 }

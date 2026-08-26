@@ -729,7 +729,10 @@ mod tests {
                 .execute(&context, json!({"program": "ls", "cwd": "escaped_symlink"}))
                 .await
                 .unwrap_err();
-            assert!(err3.to_string().contains("symlink") || err3.to_string().contains("escapes workspace"));
+            assert!(
+                err3.to_string().contains("symlink")
+                    || err3.to_string().contains("escapes workspace")
+            );
             assert_eq!(executor.commands.lock().unwrap().len(), 0);
         }
 
@@ -816,7 +819,9 @@ mod tests {
             .unwrap();
 
         assert!(result.contains(r#""status":"approval_required""#));
-        assert!(result.contains("unsupported inside termux_job; call termux_terminal separately for exact approval"));
+        assert!(result.contains(
+            "unsupported inside termux_job; call termux_terminal separately for exact approval"
+        ));
         assert_eq!(executor.commands.lock().unwrap().len(), 0);
     }
 

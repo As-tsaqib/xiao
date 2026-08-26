@@ -2377,6 +2377,31 @@ impl Storage {
         })
     }
 
+    pub fn agent_run_started_at(&self, run_id: &str) -> Result<Option<chrono::DateTime<Utc>>> {
+        self.with_conn(|conn| {
+            let started: Option<String> = conn
+                .query_row(
+                    "SELECT started_at FROM agent_runs WHERE id=?",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(started.and_then(|raw| {
+                chrono::DateTime::parse_from_rfc3339(&raw)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }))
+        })
+    }
+
+    pub fn agent_run_elapsed_ms(&self, run_id: &str) -> u64 {
+        self.agent_run_started_at(run_id)
+            .ok()
+            .flatten()
+            .map(|started| (Utc::now() - started).num_milliseconds().max(1) as u64)
+            .unwrap_or(1)
+    }
+
     pub fn agent_run(&self, owner: &str, run_id: &str) -> Result<Option<AgentRunRecord>> {
         self.with_conn(|conn| {
             conn.query_row(

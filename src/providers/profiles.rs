@@ -32,8 +32,10 @@ impl ProviderProfileStore {
         capability: &str,
         owner_override: &str,
     ) -> Result<()> {
-        if !matches!(capability, "vision" | "file_input") {
-            return Err(anyhow!("capability must be vision or file_input"));
+        if !matches!(capability, "vision" | "file_input" | "streaming") {
+            return Err(anyhow!(
+                "capability must be vision, file_input, or streaming"
+            ));
         }
         if !matches!(
             owner_override,
@@ -70,10 +72,33 @@ impl ProviderProfileStore {
         capability: &str,
     ) -> Result<String> {
         self.storage.with_conn(|connection| {
-            Ok(connection.query_row(
-                "SELECT owner_override FROM provider_capability_evidence WHERE profile_id=? AND model_id=? AND protocol=? AND capability=?",
-                params![profile_id, model_id, protocol, capability], |row| row.get(0),
-            ).optional()?.unwrap_or_else(|| "auto".into()))
+            Ok(connection
+                .query_row(
+                    "SELECT owner_override FROM provider_capability_evidence WHERE profile_id=? AND model_id=? AND protocol=? AND capability=?",
+                    params![profile_id, model_id, protocol, capability],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or_else(|| "auto".into()))
+        })
+    }
+
+    pub fn capability_state(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        protocol: &str,
+        capability: &str,
+    ) -> Result<String> {
+        self.storage.with_conn(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT state FROM provider_capability_evidence WHERE profile_id=? AND model_id=? AND protocol=? AND capability=?",
+                    params![profile_id, model_id, protocol, capability],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or_else(|| "unknown".into()))
         })
     }
 
@@ -451,6 +476,10 @@ impl ProviderProfileStore {
                 transaction.execute(
                     "DELETE FROM provider_profile_models WHERE profile_id=?",
                     params![profile_id],
+                )?;
+                transaction.execute(
+                    "INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) SELECT profile_id,model_id,?1,capability,'unknown',owner_override,'owner_override',?2 FROM provider_capability_evidence WHERE profile_id=?3 AND owner_override!='auto' ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET owner_override=excluded.owner_override,observed_at=excluded.observed_at",
+                    params![next_protocol, Utc::now().to_rfc3339(), profile_id],
                 )?;
                 transaction.execute(
                     "UPDATE provider_capability_evidence SET state='unknown',source='invalidated_on_endpoint_change',observed_at=? WHERE profile_id=? AND source != 'owner_override'",
@@ -1237,6 +1266,12 @@ impl CustomProfileService {
                     "DELETE FROM provider_profile_models WHERE profile_id=?",
                     params![profile_id],
                 )?;
+                if protocol_changed {
+                    transaction.execute(
+                        "INSERT INTO provider_capability_evidence(profile_id,model_id,protocol,capability,state,owner_override,source,observed_at) SELECT profile_id,model_id,?1,capability,'unknown',owner_override,'owner_override',?2 FROM provider_capability_evidence WHERE profile_id=?3 AND owner_override!='auto' ON CONFLICT(profile_id,model_id,protocol,capability) DO UPDATE SET owner_override=excluded.owner_override,observed_at=excluded.observed_at",
+                        params![next_protocol, Utc::now().to_rfc3339(), profile_id],
+                    )?;
+                }
                 transaction.execute(
                     "UPDATE provider_capability_evidence SET state='unknown',source='invalidated_on_endpoint_change',observed_at=? WHERE profile_id=? AND source != 'owner_override'",
                     params![Utc::now().to_rfc3339(), profile_id],

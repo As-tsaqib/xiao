@@ -107,7 +107,10 @@ pub(crate) fn is_sensitive_path_or_value(value: &str) -> bool {
         "/.config/gcloud",
         "/.azure",
     ];
-    if SENSITIVE_MARKERS.iter().any(|marker| lower.contains(marker)) {
+    if SENSITIVE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
         return true;
     }
     crate::security::redact::contains_secret_material(value)
@@ -235,7 +238,9 @@ pub(crate) fn termux_call_policy(arguments: &Value) -> PolicyDecision {
             .and_then(Value::as_str)
             .map(is_sensitive_path_or_value)
             .unwrap_or(false)
-        || args.iter().any(|argument| is_sensitive_path_or_value(argument))
+        || args
+            .iter()
+            .any(|argument| is_sensitive_path_or_value(argument))
         || object
             .get("environment")
             .and_then(Value::as_object)

@@ -1522,6 +1522,33 @@ impl Provider for CustomProvider {
     fn supports_semantic_evaluation_for(&self, model: &str, profile_id: Option<&str>) -> bool {
         self.capabilities_for(model, profile_id).structured_output
     }
+    fn streaming_supported_for(
+        &self,
+        model: &str,
+        profile_id: Option<&str>,
+        protocol: &str,
+    ) -> bool {
+        let Some(profile_id) = profile_id else {
+            return true;
+        };
+        match self
+            .profiles
+            .capability_override(profile_id, model, protocol, "streaming")
+            .as_deref()
+        {
+            Ok("force_supported") => return true,
+            Ok("force_unsupported") => return false,
+            _ => {}
+        }
+        match self
+            .profiles
+            .capability_state(profile_id, model, protocol, "streaming")
+            .as_deref()
+        {
+            Ok("unsupported") => false,
+            _ => true,
+        }
+    }
     async fn generate_text(&self, mut req: ProviderRequest) -> Result<String> {
         req.tools.clear();
         if req.account_id.is_none() && !self.cfg.enabled {
@@ -1605,6 +1632,11 @@ impl Provider for CustomProvider {
             &progress,
             AgentEvent::Status("Sending request to custom provider".into()),
         );
+        let streaming_supported =
+            self.streaming_supported_for(&req.model, req.account_id.as_deref(), &target.protocol);
+        if req.streaming && !streaming_supported {
+            req.streaming = false;
+        }
         let is_streaming = req.streaming;
         let endpoint = if target.protocol == "openai_chat_completions" {
             endpoint_with_suffix(&target.base_url, "/chat/completions")

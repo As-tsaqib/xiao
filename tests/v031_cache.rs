@@ -1,6 +1,5 @@
 use serde_json::json;
-use sha2::{Digest, Sha256};
-use xiao::security::redact::redact_text;
+use xiao::{security::redact::redact_text, tools::cache::CachedPlan};
 
 #[test]
 fn secret_bearing_content_is_detected_and_redacted() {
@@ -11,19 +10,32 @@ fn secret_bearing_content_is_detected_and_redacted() {
 
 #[test]
 fn stable_hash_for_safe_plan() {
-    let plan = json!({
-        "steps": [
-            { "id": "1", "program": "free", "args": ["-m"] },
-            { "id": "2", "program": "ps", "args": ["-A"] }
-        ]
-    });
-    let mut hasher1 = Sha256::new();
-    hasher1.update(plan.to_string().as_bytes());
-    let key1 = format!("{:x}", hasher1.finalize());
-
-    let mut hasher2 = Sha256::new();
-    hasher2.update(plan.to_string().as_bytes());
-    let key2 = format!("{:x}", hasher2.finalize());
-
+    let plan = CachedPlan {
+        steps: json!({
+            "steps": [
+                { "id": "1", "program": "free", "args": ["-m"] },
+                { "id": "2", "program": "ps", "args": ["-A"] }
+            ]
+        }),
+        schema_version: 1,
+        environment_fingerprint: "termux-env".into(),
+    };
+    let key1 = plan.key().unwrap();
+    let key2 = plan.key().unwrap();
     assert_eq!(key1, key2);
+
+    let secret_plan = CachedPlan {
+        steps: json!({
+            "steps": [
+                {
+                    "id": "1",
+                    "program": "echo",
+                    "args": ["Authorization: Bearer sk-1234567890abcdef"]
+                }
+            ]
+        }),
+        schema_version: 1,
+        environment_fingerprint: "termux-env".into(),
+    };
+    assert!(secret_plan.key().is_err());
 }
