@@ -638,6 +638,7 @@ impl AgentEngine {
             self.storage
                 .set_agent_run_model(principal, &agent_run_id, &resolved_model)?;
             let _ = self.storage.record_run_event(&agent_run_id, "run_started", 0, None);
+            let run_started = std::time::Instant::now();
             let (tool_progress_tx, mut tool_progress_rx) = mpsc::unbounded_channel::<String>();
             let progress_relay = progress.clone();
             tokio::spawn(async move {
@@ -783,7 +784,6 @@ impl AgentEngine {
             let mut last_unverified_signature = None::<String>;
             let mut last_unverified_evidence = None::<CompletionEvidence>;
             let mut no_progress_repeats = 0usize;
-            let run_started = std::time::Instant::now();
             loop {
                 if run_started.elapsed().as_secs() >= config.max_runtime_seconds {
                     return Err(anyhow!(
