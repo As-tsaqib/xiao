@@ -4282,6 +4282,7 @@ impl Storage {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn set_capability_evidence(
         &self,
         profile_id: &str,
@@ -4472,6 +4473,7 @@ impl Storage {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_tool_run_step(
         &self,
         parent_tool_run_id: &str,
