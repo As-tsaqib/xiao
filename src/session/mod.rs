@@ -809,7 +809,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             storage
-                .session_messages(owner_a, &first_a1.id)
+                .messages(owner_a, &first_a1.id)
                 .unwrap()
                 .len(),
             1
@@ -835,7 +835,7 @@ mod tests {
         assert_eq!(second_a1.model, "gpt-5-turbo");
 
         // Verify NO history inheritance into the new session
-        let msgs = storage.session_messages(owner_a, &second_a1.id).unwrap();
+        let msgs = storage.messages(owner_a, &second_a1.id).unwrap();
         assert!(msgs.is_empty());
 
         // 3. No cross-topic inheritance: scope_2 on owner_a should get default
@@ -865,7 +865,7 @@ mod tests {
         assert_eq!(second_gen.account_id.as_deref(), Some("profile_gen"));
         assert_eq!(second_gen.model, "claude-sonnet");
         assert!(storage
-            .session_messages(owner_a, &second_gen.id)
+            .messages(owner_a, &second_gen.id)
             .unwrap()
             .is_empty());
     }

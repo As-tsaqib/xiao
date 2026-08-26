@@ -2481,9 +2481,10 @@ mod tests {
             app: app.clone(),
             client: TelegramClient::with_base("test-token".into(), "http://127.0.0.1:9".into())
                 .unwrap(),
-            menus: Arc::new(MenuStore::new(std::time::Duration::from_secs(60))),
+            menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
             custom_logins,
-            principal_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            principal_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            active_work: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let owner1 = "owner1";
