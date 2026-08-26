@@ -306,6 +306,11 @@ impl CommandCore {
         }
     }
 
+    pub fn reload_config(&self, config: &AppConfig) {
+        self.agent.reload_config(config.agent.clone());
+        self.providers.reload_config(config);
+    }
+
     pub async fn execute_text(&self, principal: &str, input: &str) -> Result<CommandResult> {
         self.execute_text_with_progress(principal, input, None)
             .await

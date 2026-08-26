@@ -89,6 +89,47 @@ impl CapabilityState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityOverride {
+    Auto,
+    ForceSupported,
+    ForceUnsupported,
+}
+
+impl CapabilityOverride {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ForceSupported => "force_supported",
+            Self::ForceUnsupported => "force_unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityEvidenceSource {
+    ProbeSuccess,
+    RuntimeSuccess,
+    ProviderExplicitUnsupported,
+    OwnerOverride,
+    Migration,
+}
+
+impl CapabilityEvidenceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProbeSuccess => "probe_success",
+            Self::RuntimeSuccess => "runtime_success",
+            Self::ProviderExplicitUnsupported => "provider_explicit_unsupported",
+            Self::OwnerOverride => "owner_override",
+            Self::Migration => "migration",
+        }
+    }
+}
+
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomCapabilityProbe {
     pub capabilities: ProviderCapabilities,
@@ -585,8 +626,7 @@ impl ProviderRegistry {
         self.auth.clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_single(
+    pub fn from_single(
         id: &str,
         provider: Arc<dyn Provider>,
         auth: Arc<AuthManager>,
@@ -599,8 +639,7 @@ impl ProviderRegistry {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_test(
+    pub fn from_test(
         providers: Vec<(&str, Arc<dyn Provider>)>,
         auth: Arc<AuthManager>,
     ) -> Self {

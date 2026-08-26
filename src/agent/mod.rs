@@ -70,7 +70,7 @@ pub struct AgentEngine {
     providers: Arc<ProviderRegistry>,
     active: Mutex<HashMap<String, CancellationToken>>,
     tools: Arc<ToolRegistry>,
-    config: AgentConfig,
+    config: std::sync::RwLock<AgentConfig>,
     memory_store: Arc<MemoryStore>,
     skill_registry: Arc<SkillRegistry>,
     context_engine: ContextEngine,
@@ -78,6 +78,13 @@ pub struct AgentEngine {
 }
 
 impl AgentEngine {
+    pub fn reload_config(&self, config: AgentConfig) {
+        *self.config.write().unwrap() = config;
+    }
+
+    pub fn current_config(&self) -> AgentConfig {
+        self.config.read().unwrap().clone()
+    }
     pub fn new(
         sessions: Arc<SessionManager>,
         storage: Arc<Storage>,
@@ -301,7 +308,7 @@ impl AgentEngine {
             providers,
             active: Mutex::new(HashMap::new()),
             tools,
-            config,
+            config: std::sync::RwLock::new(config),
             memory_store: memory,
             skill_registry,
             context_engine,
@@ -602,6 +609,7 @@ impl AgentEngine {
             semantic,
         );
 
+        let config = self.current_config();
         let goal = bound_text(redact_text(prompt), 4_096);
         let agent_run_id = match self.storage.create_agent_run(
             principal,
@@ -629,6 +637,7 @@ impl AgentEngine {
             }
             self.storage
                 .set_agent_run_model(principal, &agent_run_id, &resolved_model)?;
+            let _ = self.storage.record_run_event(&agent_run_id, "run_started", 0, None);
             let (tool_progress_tx, mut tool_progress_rx) = mpsc::unbounded_channel::<String>();
             let progress_relay = progress.clone();
             tokio::spawn(async move {
@@ -776,13 +785,13 @@ impl AgentEngine {
             let mut no_progress_repeats = 0usize;
             let run_started = std::time::Instant::now();
             loop {
-                if run_started.elapsed().as_secs() >= self.config.max_runtime_seconds {
+                if run_started.elapsed().as_secs() >= config.max_runtime_seconds {
                     return Err(anyhow!(
                         "agent runtime limit ({} seconds) reached",
-                        self.config.max_runtime_seconds
+                        config.max_runtime_seconds
                     ));
                 }
-                if turns >= self.config.max_turns {
+                if turns >= config.max_turns {
                     if let Some(mut blocked) = last_unverified_evidence {
                         blocked.state = VerificationState::Blocked;
                         blocked.verified = false;
@@ -797,11 +806,11 @@ impl AgentEngine {
                     }
                     return Err(anyhow!(
                         "agent turn limit ({}) reached before a final answer",
-                        self.config.max_turns
+                        config.max_turns
                     ));
                 }
                 turns += 1;
-                let remaining = std::time::Duration::from_secs(self.config.max_runtime_seconds)
+                let remaining = std::time::Duration::from_secs(config.max_runtime_seconds)
                     .saturating_sub(run_started.elapsed());
                 if request.messages.len() > 20 {
                     let mut keep = Vec::new();
@@ -882,7 +891,7 @@ impl AgentEngine {
                                     no_progress_repeats = 0;
                                     last_unverified_signature = Some(signature);
                                 }
-                                if no_progress_repeats >= self.config.max_no_progress_repeats {
+                                if no_progress_repeats >= config.max_no_progress_repeats {
                                     let mut blocked = verification;
                                     blocked.state = VerificationState::Blocked;
                                     blocked.verified = false;
@@ -912,8 +921,8 @@ impl AgentEngine {
                                     &installs,
                                     artifacts.values(),
                                     turns,
-                                    self.config.max_turns.saturating_sub(turns),
-                                    self.config.max_tool_calls.saturating_sub(tool_calls),
+                                    config.max_turns.saturating_sub(turns),
+                                    config.max_tool_calls.saturating_sub(tool_calls),
                                     remaining.as_secs(),
                                 );
                                 request.messages.push(crate::storage::MessageRecord {
@@ -955,7 +964,7 @@ impl AgentEngine {
                                     return Ok(LoopOutcome { final_answer: format!("Blocked: {}", blocked.summary), verification: blocked });
                                 }
                             }
-                            if tool_calls > self.config.max_tool_calls {
+                            if tool_calls > config.max_tool_calls {
                                 let audit = self.storage.tool_runs(principal, &agent_run_id)?;
                                 let mut blocked = completion
                                     .verify_for_task_async(
@@ -968,7 +977,7 @@ impl AgentEngine {
                                 blocked.verified = false;
                                 blocked.summary = format!(
                                     "agent tool-call limit ({}) reached without verified success",
-                                    self.config.max_tool_calls
+                                    config.max_tool_calls
                                 );
                                 return Ok(LoopOutcome {
                                     final_answer: format!("Blocked: {}", blocked.summary),
@@ -1008,7 +1017,7 @@ impl AgentEngine {
                                     next.push(ToolResult {
                                         call_id: call.call_id.clone(),
                                         name: call.name.clone(),
-                                        output: bound_text(redact_text(&format!("tool was not executed because its audit record could not be created: {error}")), self.config.tool_output_max_chars),
+                                        output: bound_text(redact_text(&format!("tool was not executed because its audit record could not be created: {error}")), config.tool_output_max_chars),
                                         is_error: true,
                                     });
                                     continue;
@@ -1043,7 +1052,7 @@ impl AgentEngine {
                                 provider_events.push(completed);
                                 next.push(result);
                                 if identical_failure_repeats
-                                    >= self.config.max_no_progress_repeats
+                                    >= config.max_no_progress_repeats
                                 {
                                     let audit = self.storage.tool_runs(principal, &agent_run_id)?;
                                     let mut blocked = completion
@@ -1060,7 +1069,7 @@ impl AgentEngine {
                                 continue;
                             }
                             self.storage.set_tool_run_status(&tool_run_id, "running", None, None)?;
-                            let tool_remaining = std::time::Duration::from_secs(self.config.max_runtime_seconds)
+                            let tool_remaining = std::time::Duration::from_secs(config.max_runtime_seconds)
                                 .saturating_sub(run_started.elapsed());
                             let mut execution=tokio::select!{
                                 _=token.cancelled()=>{
@@ -1289,20 +1298,26 @@ impl AgentEngine {
                 };
                 // Learning is post-completion and best-effort; failure cannot
                 // rewrite a successfully delivered task into a failed one.
-                if self.config.background_learning {
+                let _ = self.storage.record_run_event(&agent_run_id, "final_answer_ready", run_started.elapsed().as_millis() as u64, None);
+                let _ = self.storage.enqueue_learning_job(principal, &agent_run_id, None);
+                if config.background_learning {
                     let learning = learning.clone();
                     let memory_evaluator = memory_evaluator.clone();
+                    let storage = self.storage.clone();
                     let principal = principal.to_owned();
                     let session_id = ctx.active.id.clone();
                     let prompt = prompt.to_owned();
                     let token = CancellationToken::new();
                     tokio::spawn(async move {
-                        if append_user {
-                            let _ = memory_evaluator
-                                .apply_explicit_async(&principal, &session_id, &prompt, token)
-                                .await;
+                        if let Ok(Some(job)) = storage.claim_pending_learning_job(3) {
+                            if append_user {
+                                let _ = memory_evaluator
+                                    .apply_explicit_async(&principal, &session_id, &prompt, token)
+                                    .await;
+                            }
+                            let _ = learning.evaluate_async(&principal, &trace).await;
+                            let _ = storage.finish_learning_job(&job.id, "succeeded", None);
                         }
-                        let _ = learning.evaluate_async(&principal, &trace).await;
                     });
                 }
             } else {
