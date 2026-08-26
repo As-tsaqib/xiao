@@ -96,7 +96,6 @@ pub struct AgentRunRecord {
     pub error: Option<String>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolRunRecord {
     pub id: String,

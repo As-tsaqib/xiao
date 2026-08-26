@@ -368,7 +368,9 @@ fn spawn_learning_worker(storage: Arc<Storage>, identity: Arc<IdentityWorkspace>
                         .and_then(|value| serde_json::from_value(value).map_err(Into::into))
                         .and_then(|trace| evaluator.evaluate(&owner, &trace).map(|_| ()));
                     let _ = match &result {
-                        Err(error) => storage.finish_learning_job(&id, "failed", Some(&error.to_string())),
+                        Err(error) => {
+                            storage.finish_learning_job(&id, "failed", Some(&error.to_string()))
+                        }
                         Ok(()) => storage.finish_learning_job(&id, "succeeded", None),
                     };
                     let _ = storage.record_agent_run_event(
