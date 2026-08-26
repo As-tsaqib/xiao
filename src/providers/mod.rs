@@ -1777,16 +1777,8 @@ impl Provider for CustomProvider {
                     (ProviderStep::Final(answer), None)
                 }
             };
-            if let Some(profile_id) = profile_id.as_deref() {
-                let _ = self.profiles.record_runtime_capability(
-                    profile_id,
-                    &req.model,
-                    &target.protocol,
-                    "streaming",
-                    "supported",
-                    "runtime_success",
-                );
-                if had_images {
+            if had_images {
+                if let Some(profile_id) = profile_id.as_deref() {
                     let _ = self.profiles.record_runtime_capability(
                         profile_id,
                         &req.model,
@@ -1834,8 +1826,16 @@ impl Provider for CustomProvider {
                     streamed.continuation,
                 )
             };
-            if had_images {
-                if let Some(profile_id) = profile_id.as_deref() {
+            if let Some(profile_id) = profile_id.as_deref() {
+                let _ = self.profiles.record_runtime_capability(
+                    profile_id,
+                    &req.model,
+                    &target.protocol,
+                    "streaming",
+                    "supported",
+                    "runtime_success",
+                );
+                if had_images {
                     let _ = self.profiles.record_runtime_capability(
                         profile_id,
                         &req.model,
