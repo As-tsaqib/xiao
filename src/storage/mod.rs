@@ -2533,7 +2533,24 @@ impl Storage {
         let id = Uuid::new_v4().to_string();
         let arguments = serde_json::to_string(&crate::security::redact::redact_json(arguments))?;
         self.with_conn(|connection| {
-            let parent:String=connection.query_row("SELECT id FROM tool_runs WHERE agent_run_id=? AND tool_name='termux_job' AND status='running' ORDER BY started_at DESC LIMIT 1", params![agent_run_id], |row| row.get(0))?;
+            let parent: Option<String> = connection
+                .query_row(
+                    "SELECT id FROM tool_runs WHERE agent_run_id=? AND tool_name='termux_job' AND status='running' ORDER BY started_at DESC LIMIT 1",
+                    params![agent_run_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let parent = match parent {
+                Some(p) => p,
+                None => connection
+                    .query_row(
+                        "SELECT id FROM tool_runs WHERE agent_run_id=? AND tool_name='termux_job' ORDER BY started_at DESC LIMIT 1",
+                        params![agent_run_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or_else(|| agent_run_id.to_string()),
+            };
             connection.execute("INSERT INTO tool_run_steps(id,parent_tool_run_id,step_index,step_id,program,arguments_json,status,created_at) VALUES(?,?,?,?,?,?,'running',?)", params![id,parent,step_index as i64,step_id,program,arguments,Utc::now().to_rfc3339()])?;
             Ok(id.clone())
         })

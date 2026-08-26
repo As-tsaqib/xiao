@@ -208,6 +208,9 @@ async fn termux_job_rejects_approval_requiring_substeps_with_distinct_status_and
     let tool_run_id = storage
         .create_tool_run(&run_id, "call-job-1", "termux_job", "{}", "side_effect")
         .unwrap();
+    storage
+        .set_tool_run_status(&tool_run_id, "running", None, None)
+        .unwrap();
 
     let executor = Arc::new(RecordingExecutor {
         commands: Mutex::new(Vec::new()),
