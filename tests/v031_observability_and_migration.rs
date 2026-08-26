@@ -169,7 +169,7 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
         .unwrap();
     assert_eq!(mems.len(), 1);
     assert_eq!(mems[0].key, "user_lang");
-    assert_eq!(mems[0].content, "en");
+    assert_eq!(mems[0].value, "en");
 
     let skills = xiao::skills::SkillStore::new(storage.clone())
         .list("owner-1", 10)
