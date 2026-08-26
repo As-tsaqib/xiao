@@ -53,15 +53,15 @@ impl SessionManager {
         let mut account_id = None;
         let mut model = "default".to_string();
 
-        let current_main =
-            if let Ok(Some((main_id, _, _))) = self.storage.frontend_state(principal) {
-                self.storage.session(principal, &main_id).ok().flatten()
-            } else {
-                self.storage
-                    .list_main_sessions(principal, 1, 0, false)
-                    .ok()
-                    .and_then(|list| list.into_iter().next())
-            };
+        let current_main = if let Ok(Some((main_id, _, _))) = self.storage.frontend_state(principal)
+        {
+            self.storage.session(principal, &main_id).ok().flatten()
+        } else {
+            self.storage
+                .list_main_sessions(principal, 1, 0, false)
+                .ok()
+                .and_then(|list| list.into_iter().next())
+        };
 
         if let Some(s) = current_main {
             provider = s.provider;
