@@ -629,7 +629,17 @@ mod tests {
             }),
             data_root: "/workspace".into(),
             workspace_writable: true,
-            binaries: BTreeMap::from([("ffmpeg".into(), None)]),
+            binaries: BTreeMap::from([
+                ("ffmpeg".into(), None),
+                ("ls".into(), None),
+                ("cat".into(), None),
+                ("echo".into(), None),
+                ("rm".into(), None),
+                ("su".into(), None),
+                ("python".into(), None),
+                ("python3".into(), None),
+                ("bash".into(), None),
+            ]),
             execution_backends: vec![ExecutionBackend::Termux],
             probed_at: "now".into(),
         }))
@@ -650,7 +660,8 @@ mod tests {
             None,
             Arc::new(FakeRepository),
         ));
-        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let temp = tempdir().unwrap();
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, temp.path());
         let context = ToolContext {
             principal: "owner".into(),
             session_id: "session".into(),
@@ -798,7 +809,8 @@ mod tests {
             packages.clone(),
             None,
         ));
-        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let temp = tempdir().unwrap();
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, temp.path());
         let job = TermuxJobTool::new(terminal, 16);
         let result = job
             .execute(
@@ -845,7 +857,8 @@ mod tests {
             packages.clone(),
             None,
         ));
-        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let temp = tempdir().unwrap();
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, temp.path());
         let context = ToolContext {
             principal: "owner".into(),
             session_id: "session".into(),
@@ -901,7 +914,8 @@ mod tests {
             packages.clone(),
             None,
         ));
-        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let temp = tempdir().unwrap();
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, temp.path());
         let job = TermuxJobTool::new(terminal, 16);
         let result = job
             .execute(
@@ -941,7 +955,8 @@ mod tests {
             packages.clone(),
             None,
         ));
-        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, "/workspace");
+        let temp = tempdir().unwrap();
+        let terminal = TermuxTerminalTool::new(executor.clone(), resolver, temp.path());
         let job = TermuxJobTool::new(terminal, 2);
         let steps = (0..5)
             .map(|i| json!({ "id": format!("step-{i}"), "program": "echo", "args": ["hi"] }))
