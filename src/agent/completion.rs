@@ -170,18 +170,57 @@ impl CompletionVerifier {
 fn is_informational_or_code_example(clean_goal: &str) -> bool {
     let lower = clean_goal.to_ascii_lowercase();
     let question_or_example_markers = [
-        "how to", "how do", "how can", "how does", "what is", "what are", "what's", "why",
-        "explain", "describe", "tell me", "show me", "give me", "code example", "example",
-        "sample", "tutorial", "guide", "contoh", "jelaskan", "bagaimana", "apa itu",
-        "mengapa", "tunjukkan cara", "berikan contoh",
+        "how to",
+        "how do",
+        "how can",
+        "how does",
+        "what is",
+        "what are",
+        "what's",
+        "why",
+        "explain",
+        "describe",
+        "tell me",
+        "show me",
+        "give me",
+        "code example",
+        "example",
+        "sample",
+        "tutorial",
+        "guide",
+        "contoh",
+        "jelaskan",
+        "bagaimana",
+        "apa itu",
+        "mengapa",
+        "tunjukkan cara",
+        "berikan contoh",
     ];
-    let is_query = question_or_example_markers.iter().any(|m| lower.contains(m)) || lower.trim().ends_with('?');
+    let is_query = question_or_example_markers
+        .iter()
+        .any(|m| lower.contains(m))
+        || lower.trim().ends_with('?');
     let explicit_actions = [
-        "run this", "execute this", "compile this", "install this", "build the project",
-        "create file", "write to file", "save to file", "save as", "save it to",
-        "edit file", "delete file", "update the file", "fix the bug in",
-        "jalankan script", "buat file", "simpan ke file", "tulis ke file",
-        "pasang di sistem", "perbaiki file",
+        "run this",
+        "execute this",
+        "compile this",
+        "install this",
+        "build the project",
+        "create file",
+        "write to file",
+        "save to file",
+        "save as",
+        "save it to",
+        "edit file",
+        "delete file",
+        "update the file",
+        "fix the bug in",
+        "jalankan script",
+        "buat file",
+        "simpan ke file",
+        "tulis ke file",
+        "pasang di sistem",
+        "perbaiki file",
     ];
     let has_explicit_action = explicit_actions.iter().any(|a| lower.contains(a));
     is_query && !has_explicit_action
@@ -653,9 +692,8 @@ fn is_relevant_recovery(failed: &ToolRunRecord, later: &ToolRunRecord) -> bool {
     if is_terminal(&failed.tool_name) && is_terminal(&later.tool_name) {
         return true;
     }
-    let is_read_or_inspect = |run: &ToolRunRecord| {
-        run.risk == "read_only" || verification_tool(&run.tool_name)
-    };
+    let is_read_or_inspect =
+        |run: &ToolRunRecord| run.risk == "read_only" || verification_tool(&run.tool_name);
     if is_read_or_inspect(failed) && is_read_or_inspect(later) {
         return true;
     }
@@ -907,12 +945,14 @@ fn binary_search<T: Ord>(slice: &[T], target: &T) -> Option<usize> { ... }
     fn informational_with_privileged_denial_remains_failed() {
         let verifier = CompletionVerifier::default();
         let goal = "Explain how to restart service";
-        let denied_run = run("android_restart", "privileged", "denied", Some("denied by owner"));
-        let evidence = verifier.verify_for_task(
-            goal,
-            "To restart service, run the command.",
-            &[denied_run],
+        let denied_run = run(
+            "android_restart",
+            "privileged",
+            "denied",
+            Some("denied by owner"),
         );
+        let evidence =
+            verifier.verify_for_task(goal, "To restart service, run the command.", &[denied_run]);
         assert_eq!(evidence.state, VerificationState::Failed);
     }
 
@@ -921,24 +961,35 @@ fn binary_search<T: Ord>(slice: &[T], target: &T) -> Option<usize> { ... }
         let verifier = CompletionVerifier::default();
         let goal = "Build the binary";
         let build_failed = run("termux_terminal", "side_effect", "failed", Some("syntax error"));
-        let file_check = run("file_check", "read_only", "succeeded", Some(r#"{"exists":false}"#));
-        let evidence = verifier.verify_for_task(
-            goal,
-            "Done",
-            &[build_failed, file_check],
+        let file_check = run(
+            "file_check",
+            "read_only",
+            "succeeded",
+            Some(r#"{"exists":false}"#),
         );
+        let evidence = verifier.verify_for_task(goal, "Done", &[build_failed, file_check]);
         assert_eq!(evidence.state, VerificationState::NotYetVerified);
         assert!(!evidence.verified);
         assert_eq!(evidence.unresolved_tool_failures, 1);
 
-        let build_fixed = run("termux_terminal", "side_effect", "succeeded", Some("compiled successfully"));
+        let build_fixed = run(
+            "termux_terminal",
+            "side_effect",
+            "succeeded",
+            Some("compiled successfully"),
+        );
         let evidence_recovered = verifier.verify_for_task(
             goal,
             "Done",
             &[
                 run("termux_terminal", "side_effect", "failed", None),
                 build_fixed,
-                run("file_check", "read_only", "succeeded", Some(r#"{"exists":true}"#)),
+                run(
+                    "file_check",
+                    "read_only",
+                    "succeeded",
+                    Some(r#"{"exists":true}"#),
+                ),
             ],
         );
         assert_eq!(evidence_recovered.state, VerificationState::VerifiedSuccess);
