@@ -219,26 +219,15 @@ fn progress_text(items: &[ProgressItem], registry: &TelegramEmojiRegistry) -> Va
             text.push(json!("\n"));
         }
         if item.state == ProgressState::Active {
-            text.push(activity_icon(item.icon, registry));
+            // Telegram Android clips custom emoji inside RichBlockThinking.
+            // Use the registry fallback for consistent draft rendering.
+            text.push(json!(registry.get(item.icon).fallback));
             text.push(json!(format!(" {}", item.label)));
         } else {
             text.push(json!(format!("{} {}", icon(&item.state), item.label)));
         }
     }
     Value::Array(text)
-}
-
-fn activity_icon(icon: ProgressIcon, registry: &TelegramEmojiRegistry) -> Value {
-    let emoji = registry.get(icon);
-    if let Some(custom_emoji_id) = emoji.custom_emoji_id {
-        json!({
-            "type": "custom_emoji",
-            "custom_emoji_id": custom_emoji_id,
-            "alternative_text": emoji.fallback,
-        })
-    } else {
-        json!(emoji.fallback)
-    }
 }
 
 fn icon(s: &ProgressState) -> &'static str {
@@ -356,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn active_progress_uses_the_official_ai_actions_emoji() {
+    fn active_draft_progress_uses_unicode_fallback() {
         let view = View {
             title: None,
             blocks: vec![Block::Progress {
@@ -376,12 +365,9 @@ mod tests {
         };
         let rendered = render(&view, true);
         assert_eq!(rendered["blocks"][0]["type"], "thinking");
-        assert_eq!(
-            rendered["blocks"][0]["text"][0]["custom_emoji_id"],
-            AI_ACTION_SEARCHING
-        );
-        assert_eq!(rendered["blocks"][0]["text"][0]["alternative_text"], "🔎");
+        assert_eq!(rendered["blocks"][0]["text"][0], "🔎");
         assert_eq!(rendered["blocks"][0]["text"][1], " Searching the web");
+        assert!(!rendered.to_string().contains("custom_emoji"));
     }
 
     #[test]
