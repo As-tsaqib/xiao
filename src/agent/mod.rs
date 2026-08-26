@@ -818,11 +818,12 @@ impl AgentEngine {
                 cancellation: token.clone(),
                 progress: Some(tool_progress_tx),
             };
+            let task_kind = tokio::select! {
+                _ = token.cancelled() => return Err(anyhow!("generation cancelled during task classification")),
+                kind = completion.classify_async(prompt, &[]) => kind,
+            };
             if provider_capabilities.tool_protocol == ToolProtocol::ChatOnly
-                && tokio::select! {
-                    _ = token.cancelled() => return Err(anyhow!("generation cancelled during task classification")),
-                    kind = completion.classify_async(prompt, &[]) => kind,
-                } != TaskKind::Informational
+                && task_kind != TaskKind::Informational
             {
                 return Err(anyhow!(
                     "selected provider/model is explicitly ChatOnly and cannot safely execute this action task: {}",
@@ -3239,7 +3240,7 @@ mod tests {
     #[tokio::test]
     async fn informational_prompts_do_not_expose_execution_tools() {
         let provider = Arc::new(EchoProvider);
-        let (engine, db, session, _tmp) = engine("info-tool-filter", provider);
+        let (engine, db, _session, _tmp) = engine("info-tool-filter", provider);
         let run = engine
             .submit_with_progress(
                 "u",
