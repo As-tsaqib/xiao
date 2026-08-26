@@ -209,7 +209,6 @@ pub fn generate_valid_pdf(text: &str) -> Vec<u8> {
         .map(|chunk| chunk.to_vec())
         .collect();
 
-
     let font_obj_id = 3;
     let mut objects: Vec<(usize, String)> = Vec::new();
     let mut kids_refs = Vec::new();
