@@ -4307,7 +4307,7 @@ mod tests {
             .filter(|(_, body)| {
                 body.pointer("/rich_message/blocks")
                     .and_then(Value::as_array)
-                    .map_or(false, |b| b.is_empty())
+                    .is_some_and(|b| b.is_empty())
             })
             .collect();
         assert_eq!(
@@ -4324,7 +4324,7 @@ mod tests {
                     && body
                         .pointer("/rich_message/blocks")
                         .and_then(Value::as_array)
-                        .map_or(false, |b| b.is_empty())
+                        .is_some_and(|b| b.is_empty())
             })
             .unwrap();
         let first_final_pos = reqs
