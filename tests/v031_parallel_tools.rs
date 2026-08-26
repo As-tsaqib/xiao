@@ -341,7 +341,7 @@ async fn matrix_e6_parallel_cancellation_records_durable_interrupted_rows() {
         .set_tool_run_status(&tool_id_2, "interrupted", None, Some("cancelled by user"))
         .unwrap();
     storage
-        .finish_agent_run("owner-1", &run_id, "interrupted", None, Some("cancelled"))
+        .set_agent_run_status("owner-1", &run_id, "interrupted", Some("cancelled"))
         .unwrap();
 
     let tool_runs = storage.tool_runs("owner-1", &run_id).unwrap();
@@ -349,6 +349,6 @@ async fn matrix_e6_parallel_cancellation_records_durable_interrupted_rows() {
     assert_eq!(tool_runs[0].status, "interrupted");
     assert_eq!(tool_runs[1].status, "interrupted");
 
-    let agent_runs = storage.agent_runs("owner-1", &session.id, 1).unwrap();
-    assert_eq!(agent_runs[0].status, "interrupted");
+    let agent_run = storage.agent_run("owner-1", &run_id).unwrap().unwrap();
+    assert_eq!(agent_run.status, "interrupted");
 }

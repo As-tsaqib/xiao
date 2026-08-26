@@ -350,7 +350,7 @@ async fn matrix_d5_and_d6_final_delivery_before_background_learning() {
         .unwrap();
 
     // Find the latest agent run
-    let runs = storage.agent_runs("owner-1", &session.id, 1).unwrap();
+    let runs = storage.agent_runs("owner-1", 1).unwrap();
     assert!(!runs.is_empty());
     let agent_run_id = &runs[0].id;
 
