@@ -641,7 +641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_auto_resolves_and_installs_trusted_package() {
+    async fn missing_dependency_installs_reprobes_and_resumes_original_command() {
         let packages = Arc::new(FakePackages {
             available: Mutex::new(BTreeSet::new()),
             installs: Mutex::new(Vec::new()),
