@@ -223,7 +223,9 @@ async fn matrix_a8_force_supported_overrides_auto_state_and_admits_request() {
         file_input: CapabilityState::Unknown,
     };
     let record = profile_model_from_probe("prof-1", "model-forced", &probe, "2026-08-26T00:00:00Z");
-    store.replace_models("owner-1", "prof-1", &[record]).unwrap();
+    store
+        .replace_models("owner-1", "prof-1", &[record])
+        .unwrap();
 
     // Probed state is unknown
     storage
@@ -311,8 +313,11 @@ async fn matrix_a9_force_unsupported_prevents_image_request() {
         vision: CapabilityState::Supported,
         file_input: CapabilityState::Unknown,
     };
-    let record = profile_model_from_probe("prof-1", "model-blocked", &probe, "2026-08-26T00:00:00Z");
-    store.replace_models("owner-1", "prof-1", &[record]).unwrap();
+    let record =
+        profile_model_from_probe("prof-1", "model-blocked", &probe, "2026-08-26T00:00:00Z");
+    store
+        .replace_models("owner-1", "prof-1", &[record])
+        .unwrap();
 
     // Probed state was supported
     storage
