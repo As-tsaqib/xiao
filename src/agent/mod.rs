@@ -37,7 +37,7 @@ use crate::{
             MemorySearchTool, MemorySetTool, SkillSearchTool, SkillViewTool, TermuxJobTool,
             TermuxTerminalTool,
         },
-        ToolContext, ToolPolicy, ToolRegistry, ToolResult,
+        ToolContext, ToolPolicy, ToolRegistry, ToolResult, ToolRisk,
     },
 };
 
@@ -948,7 +948,168 @@ impl AgentEngine {
                         if calls.is_empty(){return Err(anyhow!("provider returned an empty tool-call turn"));}
                         continuation=turn.continuation;
                         let mut next=Vec::with_capacity(calls.len());
+
+                        let mut groups: Vec<(bool, Vec<crate::tools::ToolCall>)> = Vec::new();
                         for call in calls {
+                            let is_ro = self
+                                .tools
+                                .spec(&call.name)
+                                .map(|s| s.risk == ToolRisk::ReadOnly)
+                                .unwrap_or(false);
+                            if let Some((current_ro, current_group)) = groups.last_mut() {
+                                if *current_ro == is_ro {
+                                    current_group.push(call);
+                                    continue;
+                                }
+                            }
+                            groups.push((is_ro, vec![call]));
+                        }
+
+                        for (is_readonly, group) in groups {
+                            if is_readonly && group.len() > 1 && config.parallel_readonly_tools {
+                                let mut group_items = Vec::new();
+                                for call in group {
+                                    tool_calls += 1;
+                                    let audit = self.storage.tool_runs(principal, &agent_run_id)?;
+                                    let mut recent_calls: Vec<String> = audit.iter().map(|r| r.tool_name.clone()).collect();
+                                    recent_calls.push(call.name.clone());
+                                    if recent_calls.len() >= 6 {
+                                        let len = recent_calls.len();
+                                        if recent_calls[len-2] == recent_calls[len-4] && recent_calls[len-4] == recent_calls[len-6] &&
+                                           recent_calls[len-1] == recent_calls[len-3] && recent_calls[len-3] == recent_calls[len-5] {
+                                            let mut blocked = completion.verify_for_task_async(prompt, "ping-pong sequence", &audit).await;
+                                            blocked.state = VerificationState::Blocked;
+                                            blocked.verified = false;
+                                            blocked.summary = "ping-pong repeating tool sequence detected".into();
+                                            return Ok(LoopOutcome { final_answer: format!("Blocked: {}", blocked.summary), verification: blocked });
+                                        }
+                                    }
+                                    if tool_calls > config.max_tool_calls {
+                                        let audit = self.storage.tool_runs(principal, &agent_run_id)?;
+                                        let mut blocked = completion
+                                            .verify_for_task_async(
+                                                prompt,
+                                                "tool-call budget exhausted",
+                                                &audit,
+                                            )
+                                            .await;
+                                        blocked.state = VerificationState::Blocked;
+                                        blocked.verified = false;
+                                        blocked.summary = format!(
+                                            "agent tool-call limit ({}) reached without verified success",
+                                            config.max_tool_calls
+                                        );
+                                        return Ok(LoopOutcome {
+                                            final_answer: format!("Blocked: {}", blocked.summary),
+                                            verification: blocked,
+                                        });
+                                    }
+                                    let started = AgentEvent::ToolStartedWithId {
+                                        tool: call.name.clone(),
+                                        call_id: call.call_id.clone(),
+                                    };
+                                    if let Some(tx) = &progress {
+                                        let _ = tx.send(started.clone());
+                                    }
+                                    provider_events.push(AgentEvent::ToolStarted(call.name.clone()));
+                                    provider_events.push(started);
+                                    let risk = "read_only";
+                                    let arguments = bounded_json(&redact_json(&call.arguments), 16_384);
+                                    let redacted_call_id = bound_text(redact_text(&call.call_id), 256);
+                                    let audit_call_id = if redacted_call_id.trim().is_empty() {
+                                        format!("malformed-{turns}-{}", next.len() + group_items.len())
+                                    } else {
+                                        redacted_call_id
+                                    };
+                                    let redacted_tool_name = bound_text(redact_text(&call.name), 128);
+                                    let audit_tool_name = if redacted_tool_name.trim().is_empty() {
+                                        "unknown".into()
+                                    } else {
+                                        redacted_tool_name
+                                    };
+                                    let tool_run_id = self.storage.create_tool_run(
+                                        &agent_run_id,
+                                        &audit_call_id,
+                                        &audit_tool_name,
+                                        &arguments,
+                                        risk,
+                                    )?;
+                                    let action_signature = format!("{}:{arguments}", call.name);
+                                    self.storage.set_tool_run_status(&tool_run_id, "running", None, None)?;
+                                    group_items.push((call, tool_run_id, action_signature));
+                                }
+
+                                let sem = Arc::new(tokio::sync::Semaphore::new(config.max_parallel_readonly_tools.max(1)));
+                                let mut futures = Vec::with_capacity(group_items.len());
+                                for (call, _, _) in &group_items {
+                                    let sem = sem.clone();
+                                    let tools = self.tools.clone();
+                                    let call = call.clone();
+                                    let ctx = tool_context.clone();
+                                    let tok = token.clone();
+                                    futures.push(async move {
+                                        let _permit = sem.acquire().await.ok();
+                                        tokio::select! {
+                                            _ = tok.cancelled() => None,
+                                            res = tools.execute(&call, &ctx) => Some(res),
+                                        }
+                                    });
+                                }
+                                let executions = futures_util::future::join_all(futures).await;
+
+                                for ((call, tool_run_id, action_signature), maybe_exec) in group_items.into_iter().zip(executions) {
+                                    let Some(execution) = maybe_exec else {
+                                        self.storage.set_tool_run_status(
+                                            &tool_run_id,
+                                            "interrupted",
+                                            None,
+                                            Some("generation cancelled during tool execution"),
+                                        )?;
+                                        return Err(anyhow!("generation cancelled during tool execution"));
+                                    };
+                                    let result = execution.result;
+                                    let (output, error) = if result.is_error {
+                                        (None, Some(result.output.as_str()))
+                                    } else {
+                                        (Some(result.output.as_str()), None)
+                                    };
+                                    self.storage.set_tool_run_status(
+                                        &tool_run_id,
+                                        execution.status.as_str(),
+                                        output,
+                                        error,
+                                    )?;
+                                    if result.is_error {
+                                        failed_actions.insert(action_signature);
+                                    } else {
+                                        for artifact in artifacts_from_tool_output(&result.output) {
+                                            artifacts.insert(artifact.path.clone(), artifact);
+                                        }
+                                    }
+                                    let summary = if result.is_error {
+                                        format!("failed: {}", result.output)
+                                    } else {
+                                        "completed".into()
+                                    };
+                                    let completed = AgentEvent::ToolCompletedWithId {
+                                        tool: call.name.clone(),
+                                        call_id: call.call_id.clone(),
+                                        summary: summary.clone(),
+                                    };
+                                    if let Some(tx) = &progress {
+                                        let _ = tx.send(completed.clone());
+                                    }
+                                    provider_events.push(AgentEvent::ToolCompleted {
+                                        tool: call.name.clone(),
+                                        summary,
+                                    });
+                                    provider_events.push(completed);
+                                    next.push(result);
+                                }
+                                continue;
+                            }
+
+                            for call in group {
                             tool_calls += 1;
                             let audit = self.storage.tool_runs(principal, &agent_run_id)?;
                             let mut recent_calls: Vec<String> = audit.iter().map(|r| r.tool_name.clone()).collect();
@@ -1186,6 +1347,7 @@ impl AgentEngine {
                             provider_events.push(AgentEvent::ToolCompleted { tool: call.name.clone(), summary });
                             provider_events.push(completed);
                             next.push(result);
+                            }
                         }
                         tool_results=next;
                     }
