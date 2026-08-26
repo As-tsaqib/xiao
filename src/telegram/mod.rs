@@ -462,15 +462,13 @@ impl TelegramAdapter {
                 // exact ASK decision can surface as a scoped inline card. Private
                 // chats retain the existing draft transport; topics intentionally
                 // receive no draft updates but do receive the same approval card.
-                let draft_id = (message.chat.kind == "private")
-                    .then_some(if update_id <= 0 { 1 } else { update_id });
                 self.execute_with_live_events(
                     &principal,
                     scope,
                     update_id,
                     user.id,
                     text,
-                    draft_id,
+                    (message.chat.kind == "private").then_some(update_id.max(1)),
                     work.child_token(),
                 )
                 .await
@@ -663,14 +661,7 @@ impl TelegramAdapter {
             .storage
             .setting(&format!("telegram.progress_detail:{principal}"))?
             .unwrap_or(configured_detail);
-        let configured_direct_final = self
-            .app
-            .config
-            .read()
-            .await
-            .telegram
-            .ui
-            .direct_final;
+        let configured_direct_final = self.app.config.read().await.telegram.ui.direct_final;
         let direct_final = self
             .app
             .storage
@@ -2162,9 +2153,7 @@ impl ProgressAggregator {
             } else {
                 self.visible_text.clone()
             };
-            blocks.push(Block::Paragraph {
-                text: display_text,
-            });
+            blocks.push(Block::Paragraph { text: display_text });
         }
         View {
             title: None,
