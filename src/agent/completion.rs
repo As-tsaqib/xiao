@@ -960,7 +960,12 @@ fn binary_search<T: Ord>(slice: &[T], target: &T) -> Option<usize> { ... }
     fn action_failure_not_resolved_by_unrelated_readonly_tool() {
         let verifier = CompletionVerifier::default();
         let goal = "Build the binary";
-        let build_failed = run("termux_terminal", "side_effect", "failed", Some("syntax error"));
+        let build_failed = run(
+            "termux_terminal",
+            "side_effect",
+            "failed",
+            Some("syntax error"),
+        );
         let file_check = run(
             "file_check",
             "read_only",
