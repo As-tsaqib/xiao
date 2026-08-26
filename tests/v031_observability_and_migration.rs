@@ -9,162 +9,59 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("v030_legacy.db");
 
-    // 1. Manually instantiate a pre-migration schema 26 SQLite database
+    // 1. Populate database with pre-migration v0.3.0 data, then reset schema state to 26
     {
+        let storage = Storage::open(&db_path).unwrap();
+        let session = storage
+            .create_session("owner-1", "Legacy Session", "custom", None, "model-v26", false, None)
+            .unwrap();
+        storage
+            .append_message("owner-1", &session.id, "user", "legacy question")
+            .unwrap();
+
+        let memory_store = xiao::memory::MemoryStore::new(Arc::new(Storage::open(&db_path).unwrap()));
+        memory_store
+            .put("owner-1", "preference", "user_lang", "en", "user_statement", Some(&session.id))
+            .unwrap();
+
+        let skill_store = xiao::skills::SkillStore::new(Arc::new(Storage::open(&db_path).unwrap()));
+        skill_store
+            .save(
+                "owner-1",
+                "custom_tool",
+                "skill desc",
+                "when to use",
+                "main.sh",
+                "",
+                "",
+                "",
+            )
+            .unwrap();
+
+        let profile_store = xiao::providers::ProviderProfileStore::new(Arc::new(Storage::open(&db_path).unwrap()));
+        profile_store
+            .create(xiao::storage::ProviderProfileInput {
+                profile_id: Some("prof-1".into()),
+                owner_id: "owner-1".into(),
+                alias: "Custom Provider".into(),
+                endpoint: "https://api.example.com/v1".into(),
+                protocol: "openai_chat_completions".into(),
+                safe_headers_json: "{}".into(),
+                api_key_ref: None,
+                credential_ref: None,
+                secret_headers_ref: None,
+            })
+            .unwrap();
+
+        // Roll back schema state to 26 (drop migration 27 tables & migration 27 record)
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
             r#"
-            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
-            INSERT INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14),(15),(16),(17),(18),(19),(20),(21),(22),(23),(24),(25),(26);
-
-            CREATE TABLE installation_owner(
-              id TEXT PRIMARY KEY,
-              telegram_user_id INTEGER UNIQUE,
-              created_at TEXT NOT NULL
-            );
-            INSERT INTO installation_owner VALUES('owner-1', 12345678, '2026-08-20T00:00:00Z');
-
-            CREATE TABLE owners(
-              owner_id TEXT PRIMARY KEY,
-              telegram_user_id INTEGER UNIQUE,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-            INSERT INTO owners VALUES('owner-1', 12345678, '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
-
-            CREATE TABLE sessions(
-              id TEXT PRIMARY KEY,
-              owner_principal TEXT NOT NULL,
-              name TEXT NOT NULL,
-              provider TEXT NOT NULL DEFAULT 'custom',
-              account_id TEXT,
-              model TEXT NOT NULL DEFAULT 'default',
-              archived INTEGER NOT NULL DEFAULT 0,
-              is_side INTEGER NOT NULL DEFAULT 0,
-              parent_id TEXT,
-              created_at TEXT NOT NULL,
-              last_active_at TEXT NOT NULL,
-              yolo_mode INTEGER NOT NULL DEFAULT 0,
-              agent_profile TEXT,
-              context_summary TEXT,
-              summary_updated_at TEXT
-            );
-            INSERT INTO sessions VALUES('sess-1', 'owner-1', 'Legacy Session', 'custom', NULL, 'model-v26', 0, 0, NULL, '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z', 0, NULL, NULL, NULL);
-
-            CREATE TABLE messages(
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              session_id TEXT NOT NULL,
-              role TEXT NOT NULL,
-              content TEXT NOT NULL,
-              created_at TEXT NOT NULL
-            );
-            INSERT INTO messages(session_id, role, content, created_at)
-            VALUES('sess-1', 'user', 'legacy question', '2026-08-20T00:00:00Z');
-
-            CREATE TABLE memories(
-              id TEXT PRIMARY KEY,
-              owner_principal TEXT NOT NULL,
-              scope TEXT NOT NULL CHECK(scope IN ('user','agent')),
-              category TEXT NOT NULL,
-              key TEXT NOT NULL,
-              value TEXT NOT NULL,
-              confidence REAL NOT NULL DEFAULT 1.0,
-              source_kind TEXT NOT NULL,
-              source_session_id TEXT,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              UNIQUE(owner_principal, scope, category, key)
-            );
-            INSERT INTO memories VALUES('mem-1', 'owner-1', 'user', 'preference', 'user_lang', 'en', 1.0, 'user_statement', 'sess-1', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
-
-            CREATE TABLE skills(
-              id TEXT PRIMARY KEY,
-              owner_principal TEXT NOT NULL,
-              name TEXT NOT NULL,
-              summary TEXT NOT NULL,
-              when_to_use TEXT NOT NULL,
-              procedure TEXT NOT NULL,
-              pitfalls TEXT NOT NULL DEFAULT '',
-              verification TEXT NOT NULL DEFAULT '',
-              prerequisites TEXT NOT NULL DEFAULT '',
-              source_kind TEXT NOT NULL DEFAULT 'local',
-              enabled INTEGER NOT NULL DEFAULT 1,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              UNIQUE(owner_principal, name)
-            );
-            INSERT INTO skills VALUES('sk-1', 'owner-1', 'custom_tool', 'skill desc', 'when to use', 'procedure', '', '', '', 'local', 1, '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
-
-            CREATE TABLE provider_profiles(
-              profile_id TEXT PRIMARY KEY,
-              owner_id TEXT NOT NULL,
-              provider_kind TEXT NOT NULL DEFAULT 'custom',
-              alias TEXT NOT NULL,
-              endpoint TEXT NOT NULL,
-              protocol TEXT NOT NULL,
-              credential_ref TEXT,
-              api_key_ref TEXT,
-              safe_headers_json TEXT NOT NULL DEFAULT '{}',
-              secret_headers_ref TEXT,
-              enabled INTEGER NOT NULL DEFAULT 1,
-              reachability TEXT NOT NULL DEFAULT 'unknown',
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              last_probe_at TEXT
-            );
-            INSERT INTO provider_profiles VALUES('prof-1', 'owner-1', 'custom', 'Custom Provider', 'https://api.example.com/v1', 'openai_chat_completions', NULL, NULL, '{}', NULL, 1, 'reachable', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z', NULL);
-
-            CREATE TABLE provider_profile_models(
-              profile_id TEXT NOT NULL,
-              model_id TEXT NOT NULL,
-              text_capable INTEGER NOT NULL DEFAULT 1,
-              vision_capable INTEGER NOT NULL DEFAULT 0,
-              file_input_capable INTEGER NOT NULL DEFAULT 0,
-              native_tools INTEGER NOT NULL DEFAULT 1,
-              structured_output INTEGER NOT NULL DEFAULT 1,
-              continuation INTEGER NOT NULL DEFAULT 1,
-              native_tools_state TEXT NOT NULL DEFAULT 'supported',
-              structured_output_state TEXT NOT NULL DEFAULT 'supported',
-              continuation_state TEXT NOT NULL DEFAULT 'supported',
-              vision_state TEXT NOT NULL DEFAULT 'unknown',
-              file_input_state TEXT NOT NULL DEFAULT 'unknown',
-              model_discovery INTEGER NOT NULL DEFAULT 0,
-              tool_protocol TEXT NOT NULL DEFAULT 'native',
-              evidence TEXT NOT NULL DEFAULT '',
-              probe_status TEXT NOT NULL DEFAULT 'completed',
-              probe_version INTEGER NOT NULL DEFAULT 1,
-              probed_at TEXT NOT NULL DEFAULT '',
-              PRIMARY KEY(profile_id, model_id)
-            );
-            INSERT INTO provider_profile_models VALUES('prof-1', 'model-v26', 1, 0, 0, 1, 1, 1, 'supported', 'supported', 'supported', 'unknown', 'unknown', 0, 'native', 'probed v26', 'completed', 1, '2026-08-20T00:00:00Z');
-
-            CREATE TABLE agent_runs(
-              id TEXT PRIMARY KEY,
-              owner_principal TEXT NOT NULL,
-              session_id TEXT NOT NULL,
-              provider TEXT NOT NULL,
-              model TEXT NOT NULL,
-              goal TEXT,
-              status TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              completed_at TEXT,
-              error TEXT
-            );
-
-            CREATE TABLE tool_runs(
-              id TEXT PRIMARY KEY,
-              agent_run_id TEXT NOT NULL,
-              call_id TEXT NOT NULL,
-              tool_name TEXT NOT NULL,
-              arguments_json TEXT NOT NULL,
-              risk TEXT NOT NULL,
-              status TEXT NOT NULL,
-              output TEXT,
-              error TEXT,
-              started_at TEXT NOT NULL,
-              finished_at TEXT,
-              UNIQUE(agent_run_id, call_id)
-            );
+            DELETE FROM schema_migrations WHERE version >= 27;
+            DROP TABLE IF EXISTS provider_capability_evidence;
+            DROP TABLE IF EXISTS learning_jobs;
+            DROP TABLE IF EXISTS tool_run_steps;
+            DROP TABLE IF EXISTS agent_run_events;
             "#,
         )
         .unwrap();
@@ -175,11 +72,13 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
     assert_eq!(storage.schema_version().unwrap(), 27);
 
     // 3. Verify all legacy data is preserved intact
-    let sess = storage.session("owner-1", "sess-1").unwrap().unwrap();
+    let sess_list = storage.list_main_sessions("owner-1", 10, 0, true).unwrap();
+    assert_eq!(sess_list.len(), 1);
+    let sess = &sess_list[0];
     assert_eq!(sess.name, "Legacy Session");
     assert_eq!(sess.model, "model-v26");
 
-    let msgs = storage.stored_messages("owner-1", "sess-1").unwrap();
+    let msgs = storage.stored_messages("owner-1", &sess.id).unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].content, "legacy question");
 
