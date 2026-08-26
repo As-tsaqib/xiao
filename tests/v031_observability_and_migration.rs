@@ -101,7 +101,9 @@ fn learning_job_queue_durable_recovery_across_restart() {
         .unwrap();
 
     // Enqueue learning job
-    let job_id = storage.enqueue_learning_job("owner-1", &run_id, None).unwrap();
+    let job_id = storage
+        .enqueue_learning_job("owner-1", &run_id, None)
+        .unwrap();
     let job = storage.learning_job(&job_id).unwrap().unwrap();
     assert_eq!(job.status, "pending");
     assert_eq!(job.run_id, run_id);
@@ -127,7 +129,9 @@ fn learning_job_queue_durable_recovery_across_restart() {
     assert_eq!(reclaimed.attempts, 2);
 
     // Finish successfully
-    reopened.finish_learning_job(&job_id, "succeeded", None).unwrap();
+    reopened
+        .finish_learning_job(&job_id, "succeeded", None)
+        .unwrap();
     let finished = reopened.learning_job(&job_id).unwrap().unwrap();
     assert_eq!(finished.status, "succeeded");
 }

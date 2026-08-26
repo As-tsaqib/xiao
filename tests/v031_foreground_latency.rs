@@ -80,10 +80,7 @@ async fn informational_answer_completes_deterministically_without_semantic_overh
         auth,
     ));
 
-    let tools = Arc::new(ToolRegistry::new(
-        xiao::tools::ToolPolicy::default(),
-        16384,
-    ));
+    let tools = Arc::new(ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
     let engine = AgentEngine::with_registry(
         sessions.clone(),
         storage.clone(),

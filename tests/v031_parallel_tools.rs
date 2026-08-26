@@ -108,7 +108,8 @@ impl Tool for SlowReadToolA {
         _args: serde_json::Value,
     ) -> anyhow::Result<String> {
         let current = self.active_concurrent.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_concurrent_seen.fetch_max(current, Ordering::SeqCst);
+        self.max_concurrent_seen
+            .fetch_max(current, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.active_concurrent.fetch_sub(1, Ordering::SeqCst);
         Ok(json!({ "result": "A", "verification_evidence": true }).to_string())
@@ -141,7 +142,8 @@ impl Tool for SlowReadToolB {
         _args: serde_json::Value,
     ) -> anyhow::Result<String> {
         let current = self.active_concurrent.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_concurrent_seen.fetch_max(current, Ordering::SeqCst);
+        self.max_concurrent_seen
+            .fetch_max(current, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.active_concurrent.fetch_sub(1, Ordering::SeqCst);
         Ok(json!({ "result": "B", "verification_evidence": true }).to_string())
@@ -161,11 +163,7 @@ async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
         storage.clone(),
         xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single(
-        "custom",
-        provider,
-        auth,
-    ));
+    let providers = Arc::new(ProviderRegistry::from_single("custom", provider, auth));
 
     let active_concurrent = Arc::new(AtomicUsize::new(0));
     let max_concurrent_seen = Arc::new(AtomicUsize::new(0));
@@ -191,13 +189,8 @@ async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
     config.parallel_readonly_tools = true;
     config.max_parallel_readonly_tools = 8;
 
-    let engine = AgentEngine::with_registry(
-        sessions.clone(),
-        storage.clone(),
-        providers,
-        config,
-        tools,
-    );
+    let engine =
+        AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
 
     let session = sessions
         .create_session(
