@@ -130,7 +130,7 @@ impl Tool for DeterministicSuccessTool {
     ) -> anyhow::Result<String> {
         Ok(json!({
             "status": "succeeded",
-            "verification_evidence": true,
+            "verified": true,
             "output": "operation completed successfully"
         })
         .to_string())

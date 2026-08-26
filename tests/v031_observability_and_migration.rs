@@ -9,143 +9,84 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("v030_legacy.db");
 
-    // 1. Manually instantiate a pre-migration schema 26 SQLite database
+    // 1. Populate database with pre-migration v0.3.0 data, then reset schema state to 26
     {
+        let storage = Arc::new(Storage::open(&db_path).unwrap());
+        let session = storage
+            .create_session(
+                "owner-1",
+                "Legacy Session",
+                "custom",
+                None,
+                "model-v26",
+                false,
+                None,
+            )
+            .unwrap();
+        storage
+            .append_message("owner-1", &session.id, "user", "legacy question")
+            .unwrap();
+
+        let memory_store = xiao::memory::MemoryStore::new(storage.clone());
+        memory_store
+            .upsert(
+                "owner-1",
+                xiao::memory::MemoryScope::User,
+                "preference",
+                "user_lang",
+                "en",
+                1.0,
+                "user_statement",
+                Some(&session.id),
+            )
+            .unwrap();
+
+        let skill_store = xiao::skills::SkillStore::new(storage.clone());
+        skill_store
+            .create_or_update(
+                "owner-1",
+                xiao::skills::SkillCandidate {
+                    name: "custom-tool".into(),
+                    summary: "skill desc".into(),
+                    when_to_use: "when to use".into(),
+                    prerequisites: String::new(),
+                    procedure: "main.sh".into(),
+                    pitfalls: String::new(),
+                    verification: String::new(),
+                },
+                None,
+            )
+            .unwrap();
+
+        let profile_store = xiao::providers::ProviderProfileStore::new(storage.clone());
+        profile_store
+            .create(xiao::storage::ProviderProfileInput {
+                profile_id: Some("prof-1".into()),
+                owner_id: "owner-1".into(),
+                alias: "custom-provider".into(),
+                endpoint: "https://api.example.com/v1".into(),
+                protocol: "openai_chat_completions".into(),
+                safe_headers_json: "{}".into(),
+                api_key_ref: None,
+                credential_ref: None,
+                secret_headers_ref: None,
+            })
+            .unwrap();
+
+        drop(profile_store);
+        drop(skill_store);
+        drop(memory_store);
+        drop(storage);
+
+        // Roll back schema state to 26 (drop migration 27 tables & migration 27 record)
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
             r#"
-            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
-            INSERT INTO schema_migrations(version) VALUES(1),(26);
-
-            CREATE TABLE installation_owner(
-              id TEXT PRIMARY KEY,
-              telegram_user_id INTEGER UNIQUE,
-              created_at TEXT NOT NULL
-            );
-            INSERT INTO installation_owner VALUES('owner-1', 12345678, '2026-08-20T00:00:00Z');
-
-            CREATE TABLE sessions(
-              id TEXT PRIMARY KEY,
-              owner_principal TEXT NOT NULL,
-              name TEXT NOT NULL,
-              provider TEXT NOT NULL,
-              account_id TEXT,
-              model TEXT NOT NULL,
-              yolo_mode INTEGER NOT NULL DEFAULT 0,
-              agent_profile TEXT,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              context_summary TEXT,
-              summary_updated_at TEXT
-            );
-            INSERT INTO sessions VALUES('sess-1', 'owner-1', 'Legacy Session', 'custom', NULL, 'model-v26', 0, NULL, '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z', NULL, NULL);
-
-            CREATE TABLE messages(
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              owner_principal TEXT NOT NULL,
-              session_id TEXT NOT NULL,
-              role TEXT NOT NULL,
-              content TEXT NOT NULL,
-              created_at TEXT NOT NULL
-            );
-            INSERT INTO messages(owner_principal, session_id, role, content, created_at)
-            VALUES('owner-1', 'sess-1', 'user', 'legacy question', '2026-08-20T00:00:00Z');
-
-            CREATE TABLE memories(
-              id TEXT PRIMARY KEY,
-              owner_principal TEXT NOT NULL,
-              kind TEXT NOT NULL,
-              key TEXT NOT NULL,
-              content TEXT NOT NULL,
-              tags_csv TEXT NOT NULL DEFAULT '',
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              UNIQUE(owner_principal, kind, key)
-            );
-            INSERT INTO memories VALUES('mem-1', 'owner-1', 'fact', 'user_lang', 'en', 'pref,lang', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
-
-            CREATE TABLE skills(
-              id TEXT PRIMARY KEY,
-              owner_id TEXT NOT NULL,
-              name TEXT NOT NULL,
-              version TEXT NOT NULL,
-              description TEXT NOT NULL,
-              definition_yaml TEXT NOT NULL,
-              entrypoint TEXT NOT NULL,
-              status TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-            INSERT INTO skills VALUES('sk-1', 'owner-1', 'custom_tool', '1.0.0', 'skill desc', 'steps: []', 'main.sh', 'enabled', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
-
-            CREATE TABLE provider_profiles(
-              profile_id TEXT PRIMARY KEY,
-              owner_id TEXT NOT NULL,
-              alias TEXT NOT NULL,
-              endpoint TEXT NOT NULL,
-              protocol TEXT NOT NULL,
-              credential_ref TEXT,
-              api_key_ref TEXT,
-              safe_headers_json TEXT NOT NULL DEFAULT '{}',
-              secret_headers_ref TEXT,
-              enabled INTEGER NOT NULL DEFAULT 1,
-              reachability TEXT NOT NULL DEFAULT 'unknown',
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              last_probe_at TEXT
-            );
-            INSERT INTO provider_profiles VALUES('prof-1', 'owner-1', 'Custom Provider', 'https://api.example.com/v1', 'openai_chat_completions', NULL, NULL, '{}', NULL, 1, 'reachable', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z', NULL);
-
-            CREATE TABLE provider_profile_models(
-              profile_id TEXT NOT NULL,
-              model_id TEXT NOT NULL,
-              text_capable INTEGER NOT NULL DEFAULT 1,
-              vision_capable INTEGER NOT NULL DEFAULT 0,
-              file_input_capable INTEGER NOT NULL DEFAULT 0,
-              native_tools INTEGER NOT NULL DEFAULT 1,
-              structured_output INTEGER NOT NULL DEFAULT 1,
-              continuation INTEGER NOT NULL DEFAULT 1,
-              native_tools_state TEXT NOT NULL DEFAULT 'supported',
-              structured_output_state TEXT NOT NULL DEFAULT 'supported',
-              continuation_state TEXT NOT NULL DEFAULT 'supported',
-              vision_state TEXT NOT NULL DEFAULT 'unknown',
-              file_input_state TEXT NOT NULL DEFAULT 'unknown',
-              model_discovery INTEGER NOT NULL DEFAULT 0,
-              tool_protocol TEXT NOT NULL DEFAULT 'native',
-              evidence TEXT NOT NULL DEFAULT '',
-              probe_status TEXT NOT NULL DEFAULT 'completed',
-              probe_version INTEGER NOT NULL DEFAULT 1,
-              probed_at TEXT NOT NULL DEFAULT '',
-              PRIMARY KEY(profile_id, model_id)
-            );
-            INSERT INTO provider_profile_models VALUES('prof-1', 'model-v26', 1, 0, 0, 1, 1, 1, 'supported', 'supported', 'supported', 'unknown', 'unknown', 0, 'native', 'probed v26', 'completed', 1, '2026-08-20T00:00:00Z');
-
-            CREATE TABLE agent_runs(
-              id TEXT PRIMARY KEY,
-              owner_principal TEXT NOT NULL,
-              session_id TEXT NOT NULL,
-              provider TEXT NOT NULL,
-              model TEXT NOT NULL,
-              goal TEXT,
-              status TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              completed_at TEXT,
-              error TEXT
-            );
-
-            CREATE TABLE tool_runs(
-              id TEXT PRIMARY KEY,
-              agent_run_id TEXT NOT NULL,
-              call_id TEXT NOT NULL,
-              tool_name TEXT NOT NULL,
-              arguments_json TEXT NOT NULL,
-              risk TEXT NOT NULL,
-              status TEXT NOT NULL,
-              output TEXT,
-              error TEXT,
-              started_at TEXT NOT NULL,
-              completed_at TEXT
-            );
+            DELETE FROM schema_migrations WHERE version >= 27;
+            DROP TABLE IF EXISTS provider_capability_evidence;
+            DROP TABLE IF EXISTS learning_jobs;
+            DROP TABLE IF EXISTS tool_run_steps;
+            DROP TABLE IF EXISTS agent_run_events;
             "#,
         )
         .unwrap();
@@ -156,11 +97,13 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
     assert_eq!(storage.schema_version().unwrap(), 27);
 
     // 3. Verify all legacy data is preserved intact
-    let sess = storage.session("owner-1", "sess-1").unwrap().unwrap();
+    let sess_list = storage.list_main_sessions("owner-1", 10, 0, true).unwrap();
+    assert_eq!(sess_list.len(), 1);
+    let sess = &sess_list[0];
     assert_eq!(sess.name, "Legacy Session");
     assert_eq!(sess.model, "model-v26");
 
-    let msgs = storage.stored_messages("owner-1", "sess-1").unwrap();
+    let msgs = storage.stored_messages("owner-1", &sess.id).unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].content, "legacy question");
 
@@ -169,19 +112,19 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
         .unwrap();
     assert_eq!(mems.len(), 1);
     assert_eq!(mems[0].key, "user_lang");
-    assert_eq!(mems[0].content, "en");
+    assert_eq!(mems[0].value, "en");
 
     let skills = xiao::skills::SkillStore::new(storage.clone())
         .list("owner-1", 10)
         .unwrap();
     assert_eq!(skills.len(), 1);
-    assert_eq!(skills[0].name, "custom_tool");
+    assert_eq!(skills[0].name, "custom-tool");
 
     let profiles = xiao::providers::ProviderProfileStore::new(storage.clone())
         .list("owner-1")
         .unwrap();
     assert_eq!(profiles.len(), 1);
-    assert_eq!(profiles[0].alias, "Custom Provider");
+    assert_eq!(profiles[0].alias, "custom-provider");
 }
 
 #[test]
