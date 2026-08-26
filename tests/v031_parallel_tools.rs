@@ -14,11 +14,11 @@ use xiao::{
     config::AgentConfig,
     providers::{
         AgentEvent, Provider, ProviderCapabilities, ProviderRegistry, ProviderRequest,
-        ProviderResponse, ProviderStep, ProviderTurn, ToolCall, ToolProtocol,
+        ProviderResponse, ProviderStep, ProviderTurn, ToolProtocol,
     },
     session::SessionManager,
     storage::Storage,
-    tools::{Tool, ToolContext, ToolOrigin, ToolResult, ToolRisk, ToolSpec},
+    tools::{Tool, ToolCall, ToolContext, ToolOrigin, ToolResult, ToolRisk, ToolSpec},
 };
 
 struct ParallelTwoReadToolsProvider {
@@ -182,16 +182,16 @@ async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
         16384,
     ));
     tools
-        .register(Arc::new(SlowReadToolA {
+        .register(SlowReadToolA {
             active_concurrent: active_concurrent.clone(),
             max_concurrent_seen: max_concurrent_seen.clone(),
-        }))
+        })
         .unwrap();
     tools
-        .register(Arc::new(SlowReadToolB {
+        .register(SlowReadToolB {
             active_concurrent: active_concurrent.clone(),
             max_concurrent_seen: max_concurrent_seen.clone(),
-        }))
+        })
         .unwrap();
 
     let mut config = AgentConfig::default();

@@ -11,11 +11,11 @@ use xiao::{
     config::{AgentConfig, AppConfig},
     providers::{
         AgentEvent, Provider, ProviderCapabilities, ProviderRegistry, ProviderRequest,
-        ProviderResponse, ProviderStep, ProviderTurn, ToolCall, ToolProtocol,
+        ProviderResponse, ProviderStep, ProviderTurn, ToolProtocol,
     },
     session::SessionManager,
     storage::Storage,
-    tools::{Tool, ToolContext, ToolOrigin, ToolResult, ToolRisk, ToolSpec},
+    tools::{Tool, ToolCall, ToolContext, ToolOrigin, ToolResult, ToolRisk, ToolSpec},
 };
 
 struct MultiTurnScriptedProvider {
@@ -259,7 +259,7 @@ async fn scripted_provider_exceeds_eight_turns_without_premature_failure() {
         xiao::tools::ToolPolicy::default(),
         16384,
     ));
-    tools.register(Arc::new(StepTool)).unwrap();
+    tools.register(StepTool).unwrap();
 
     let engine =
         AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
@@ -303,7 +303,7 @@ async fn no_progress_guard_stops_repeated_loop_at_threshold() {
         xiao::tools::ToolPolicy::default(),
         16384,
     ));
-    tools.register(Arc::new(FailingActionTool)).unwrap();
+    tools.register(FailingActionTool).unwrap();
 
     let engine =
         AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);

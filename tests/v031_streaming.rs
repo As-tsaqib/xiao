@@ -8,11 +8,11 @@ use xiao::{
     config::AgentConfig,
     providers::{
         AgentEvent, Provider, ProviderCapabilities, ProviderRegistry, ProviderRequest,
-        ProviderResponse, ProviderStep, ProviderTurn, ToolCall, ToolProtocol,
+        ProviderResponse, ProviderStep, ProviderTurn, ToolProtocol,
     },
     session::SessionManager,
     storage::Storage,
-    tools::{ToolRegistry, ToolResult},
+    tools::{ToolCall, ToolRegistry, ToolResult},
 };
 
 struct StreamingMockProvider {

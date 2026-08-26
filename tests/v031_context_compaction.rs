@@ -11,11 +11,11 @@ use xiao::{
     config::AgentConfig,
     providers::{
         AgentEvent, Provider, ProviderCapabilities, ProviderRegistry, ProviderRequest,
-        ProviderResponse, ProviderStep, ProviderTurn, ToolCall, ToolProtocol,
+        ProviderResponse, ProviderStep, ProviderTurn, ToolProtocol,
     },
     session::SessionManager,
     storage::Storage,
-    tools::{Tool, ToolContext, ToolOrigin, ToolResult, ToolRisk, ToolSpec},
+    tools::{Tool, ToolCall, ToolContext, ToolOrigin, ToolResult, ToolRisk, ToolSpec},
 };
 
 struct PingPongLoopProvider {
@@ -149,8 +149,8 @@ async fn ping_pong_repeating_tool_sequence_is_detected_and_blocked() {
         xiao::tools::ToolPolicy::default(),
         16384,
     ));
-    tools.register(Arc::new(PingTool)).unwrap();
-    tools.register(Arc::new(PongTool)).unwrap();
+    tools.register(PingTool).unwrap();
+    tools.register(PongTool).unwrap();
 
     let engine = AgentEngine::with_registry(
         sessions.clone(),
