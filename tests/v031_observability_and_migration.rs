@@ -13,18 +13,35 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
     {
         let storage = Storage::open(&db_path).unwrap();
         let session = storage
-            .create_session("owner-1", "Legacy Session", "custom", None, "model-v26", false, None)
+            .create_session(
+                "owner-1",
+                "Legacy Session",
+                "custom",
+                None,
+                "model-v26",
+                false,
+                None,
+            )
             .unwrap();
         storage
             .append_message("owner-1", &session.id, "user", "legacy question")
             .unwrap();
 
-        let memory_store = xiao::memory::MemoryStore::new(Arc::new(Storage::open(&db_path).unwrap()));
+        let memory_store =
+            xiao::memory::MemoryStore::new(Arc::new(Storage::open(&db_path).unwrap()));
         memory_store
-            .put("owner-1", "preference", "user_lang", "en", "user_statement", Some(&session.id))
+            .put(
+                "owner-1",
+                "preference",
+                "user_lang",
+                "en",
+                "user_statement",
+                Some(&session.id),
+            )
             .unwrap();
 
-        let skill_store = xiao::skills::SkillStore::new(Arc::new(Storage::open(&db_path).unwrap()));
+        let skill_store =
+            xiao::skills::SkillStore::new(Arc::new(Storage::open(&db_path).unwrap()));
         skill_store
             .save(
                 "owner-1",
@@ -38,7 +55,8 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
             )
             .unwrap();
 
-        let profile_store = xiao::providers::ProviderProfileStore::new(Arc::new(Storage::open(&db_path).unwrap()));
+        let profile_store =
+            xiao::providers::ProviderProfileStore::new(Arc::new(Storage::open(&db_path).unwrap()));
         profile_store
             .create(xiao::storage::ProviderProfileInput {
                 profile_id: Some("prof-1".into()),
