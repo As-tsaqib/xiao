@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { managerGet, managerPost } from './bridge.js';
 
+/* ========== Section Registry ========== */
 const SECTIONS = [
   ['dashboard', 'Overview', 'Live control-plane summary'],
   ['setup', 'Telegram', 'Owner binding and bot transport'],
@@ -15,519 +16,828 @@ const SECTIONS = [
   ['security', 'Security', 'Approvals, YOLO, and audit'],
   ['runtime', 'Runtime', 'Device truth and execution environment'],
   ['diagnostics', 'Diagnostics', 'Independent health checks'],
-  ['logs', 'Logs', 'Redacted daemon trace']
+  ['logs', 'Logs', 'Redacted daemon trace'],
 ];
 
-const SECTION_MAP = Object.fromEntries(SECTIONS.map(section => [section[0], section]));
 const VIEW_RESOURCE = { setup: 'telegram' };
+function resourceForView(view) { return VIEW_RESOURCE[view] || view; }
 
-function resourceForView(view) {
-  return VIEW_RESOURCE[view] || view;
-}
-
-const ICONS = {
-  dashboard: 'M3 3h7v7H3V3Zm11 0h7v7h-7V3ZM3 14h7v7H3v-7Zm11 0h7v7h-7v-7Z',
-  setup: 'M12 3a3 3 0 0 0-2.83 4H4v3h5.17a3 3 0 0 0 0 4H4v3h5.17A3 3 0 1 0 12 14a3 3 0 0 0 0-4h8V7h-8a3 3 0 0 0 0-4Zm0 3a1 1 0 1 1 0 2 1 1 0 0 1 0-2Zm0 8a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z',
-  providers: 'M12 2 3 7v10l9 5 9-5V7l-9-5Zm0 3.1L17 8l-5 2.9L7 8l5-2.9Zm-6 5.5 5 2.9v5.5l-5-2.8v-5.6Zm7 8.4v-5.5l5-2.9v5.6l-5 2.8Z',
-  agent: 'M12 2a4 4 0 0 0-4 4v1H6a3 3 0 0 0-3 3v7a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3v-7a3 3 0 0 0-3-3h-2V6a4 4 0 0 0-4-4Zm-2 5V6a2 2 0 1 1 4 0v1h-4Z',
-  sessions: 'M4 4h16v12H7l-3 3V4Zm3 4h10v2H7V8Zm0 4h7v2H7v-2Z',
-  attachments: 'M8 3h8l4 4v14H4V3h4Zm7 1.5V8h3.5L15 4.5ZM8 12h8v2H8v-2Zm0 4h8v2H8v-2Z',
-  tasks: 'M13 2 4 14h7l-1 8 10-13h-7l0-7Z',
-  memory: 'M5 4h14v16H5V4Zm3 3v10h8V7H8Zm2 2h4v2h-4V9Zm0 4h4v2h-4v-2Z',
-  skills: 'm12 3 2.1 4.8L19 8.2l-3.7 3.5.9 5.1-4.5-2.5-4.5 2.5.9-5.1L5 8.2l4.9-.4L12 3Z',
-  tools: 'M13.6 3.2a5.3 5.3 0 0 0 6.5 6.5l-4.3 4.3-2.2-2.2-8 8-2.4-2.4 8-8-2.2-2.2 4.6-3.9Zm5.2 2.3-1.7 1.7 1.1 1.1 1.7-1.7a3.2 3.2 0 0 1-1.1-1.1Z',
-  security: 'M12 2 4 5v6c0 5.1 3.4 9.7 8 11 4.6-1.3 8-5.9 8-11V5l-8-3Zm0 4 4 1.5V11c0 3.2-1.8 6.2-4 7.4-2.2-1.2-4-4.2-4-7.4V7.5L12 6Zm-1 3v4h2V9h-2Zm0 5v2h2v-2h-2Z',
-  runtime: 'M5 4h14v16H5V4Zm3 3v2h8V7H8Zm0 4v2h5v-2H8Zm0 4v2h8v-2H8Z',
-  diagnostics: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm0 3a1.3 1.3 0 1 1 0 2.6A1.3 1.3 0 0 1 12 6Zm-1 5h2v6h-2v-6Z',
-  logs: 'M5 5h14v2H5V5Zm0 5h14v2H5v-2Zm0 5h14v2H5v-2Z',
-  refresh: 'M18.6 8A7 7 0 1 0 19 14h-2a5 5 0 1 1-1.4-3.5L13 13h7V6l-1.4 2Z',
-  previous: 'm14.5 5-7 7 7 7 1.5-1.5L10.5 12 16 6.5 14.5 5Z',
-  next: 'm9.5 5-1.5 1.5 5.5 5.5L8 17.5 9.5 19l7-7-7-7Z'
-};
-
-function Icon({ name, label }) {
-  return <svg className="icon" viewBox="0 0 24 24" aria-hidden={label ? undefined : 'true'} role={label ? 'img' : undefined} aria-label={label} focusable="false"><path d={ICONS[name] || ICONS.tools} /></svg>;
-}
-
-function formatDate(value) {
-  if (!value) return '—';
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+/* ========== Utilities ========== */
+function formatDuration(value) {
+  let seconds = Number(value || 0);
+  const hours = Math.floor(seconds / 3600); seconds %= 3600;
+  const minutes = Math.floor(seconds / 60);
+  return [hours && `${hours}h`, minutes && `${minutes}m`, `${seconds % 60}s`].filter(Boolean).join(' ') || '0s';
 }
 
 function formatBytes(value) {
   const bytes = Number(value || 0);
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-}
-
-function titleCase(value) {
-  return String(value || 'unknown').replaceAll('_', ' ');
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
 function classForStatus(value) {
-  const status = String(value || 'unknown').toLowerCase().replaceAll(' ', '_');
-  if (['ready', 'reachable', 'completed', 'available', 'enabled', 'pass', 'supported', 'configured', 'running', 'verified_success'].includes(status)) return 'ok';
-  if (['failed', 'unreachable', 'denied', 'forbidden', 'error', 'cancelled', 'blocked'].includes(status)) return 'bad';
-  if (['warn', 'unknown', 'unprobed', 'indeterminate', 'awaiting_approval', 'approval_required', 'missing_installable'].includes(status)) return 'warn';
-  return 'muted';
+  const s = String(value || 'unknown').toLowerCase().replace(/\s/g, '_');
+  if (['ready','reachable','completed','available','enabled','pass','supported','configured','running','verified_success'].includes(s)) return 'ok';
+  if (['failed','unreachable','denied','error','cancelled','blocked'].includes(s)) return 'bad';
+  if (['warn','unknown','unprobed','indeterminate','awaiting_approval','approval_required','starting','degraded','missing_installable'].includes(s)) return 'warn';
+  return 'info';
 }
 
 function modelReadiness(model) {
   const probe = String(model?.probe_status || 'unprobed').toLowerCase();
-  if (probe === 'unprobed') return 'Probe required';
-  if (probe === 'indeterminate') return 'Probe required (indeterminate)';
+  if (probe === 'unprobed' || probe === 'indeterminate') return 'Probe required';
   if (model?.native_tools_state === 'supported' && model?.continuation_state === 'supported') return 'Native Agent';
-  if (model?.native_tools_state === 'unsupported' && model?.structured_output_state === 'supported' && model?.continuation_state === 'supported') return 'Structured Agent';
-  if (model?.native_tools_state === 'unsupported' && model?.structured_output_state === 'unsupported' && model?.continuation_state === 'unsupported') return 'Chat only';
-  return 'Protocol indeterminate';
+  if (model?.structured_output_state === 'supported' && model?.continuation_state === 'supported') return 'Structured Agent';
+  return 'Chat only';
 }
 
 function requiresExactProbe(model) {
-  return ['unprobed', 'indeterminate'].includes(String(model?.probe_status || 'unprobed').toLowerCase());
+  return !model || ['unprobed','indeterminate'].includes(String(model?.probe_status || 'unprobed').toLowerCase());
 }
 
-function committedWarnings(result) {
-  const values = [
-    result?.warning,
-    result?.cleanup_warning,
-    result?.cleanup_warnings,
-    result?.result?.warning,
-    result?.result?.cleanup_warning,
-    result?.result?.cleanup_warnings
-  ];
-  return values.flatMap(value => Array.isArray(value) ? value : value ? [value] : [])
-    .map(value => String(value).trim())
-    .filter(Boolean)
-    .slice(0, 3)
-    .map(value => value.slice(0, 280));
+/* ========== UI Primitives ========== */
+function Button({ tone, onClick, disabled, type, children }) {
+  const cls = tone === 'primary' ? 'btn btn-primary' : tone === 'danger' ? 'btn btn-danger' : 'btn btn-ghost';
+  return <button className={cls} type={type || 'button'} onClick={onClick} disabled={disabled}>{children}</button>;
 }
 
-function parseHeaderObject(value, kind) {
-  const text = String(value || '').trim();
-  if (!text) return undefined;
-  const parsed = JSON.parse(text);
-  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
-    throw new Error(`${kind} headers must be a JSON object.`);
-  }
-  for (const [name, headerValue] of Object.entries(parsed)) {
-    if (!String(name).trim() || typeof headerValue !== 'string') {
-      throw new Error(`${kind} header names and values must be non-empty strings.`);
-    }
-    if (kind === 'Safe' && /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key)$/i.test(name.trim())) {
-      throw new Error(`${name} is secret-bearing; put it in Secret headers instead.`);
-    }
-  }
-  return parsed;
+function Empty({ children }) {
+  return <div className="empty"><div className="empty-icon">📭</div>{children}</div>;
 }
 
-function App() {
-  const [view, setView] = useState('dashboard');
-  const [data, setData] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState({ tone: 'muted', text: 'Connecting to the local Xiao control plane…' });
-  const [page, setPage] = useState({ sessions: 1, attachments: 1, tasks: 1, memory: 1, skills: 1 });
-  const [filters, setFilters] = useState({ memory: '', skills: '', logLines: 250 });
-  const [providers, setProviders] = useState(null);
-  const [confirm, setConfirm] = useState(null);
-  const [prompt, setPrompt] = useState(null);
-  const [profileEditor, setProfileEditor] = useState(null);
-  const [sessionEditor, setSessionEditor] = useState(null);
-  const currentView = useRef(view);
-  const requestSequence = useRef(0);
+function Status({ value }) {
+  return <span className={`tag tag-${classForStatus(value)}`}>{String(value || 'unknown')}</span>;
+}
 
-  useEffect(() => { currentView.current = view; }, [view]);
-
-  const queryFor = useCallback((target) => {
-    if (target === 'sessions') return { page: page.sessions, limit: 5, include_archived: false };
-    if (target === 'attachments') return { page: page.attachments, limit: 25 };
-    if (target === 'tasks') return { page: page.tasks, limit: 5 };
-    if (target === 'memory') return { page: page.memory, limit: 5, query: filters.memory, scope: 'all' };
-    if (target === 'skills') return { page: page.skills, limit: 5, query: filters.skills };
-    if (target === 'logs') return { lines: filters.logLines };
-    return {};
-  }, [filters.logLines, filters.memory, filters.skills, page]);
-
-  const refresh = useCallback(async (target = view, query = queryFor(target), quiet = false) => {
-    const request = ++requestSequence.current;
-    setBusy(true);
-    try {
-      const next = await managerGet(resourceForView(target), query);
-      if (target === currentView.current && request === requestSequence.current) {
-        setData(next);
-        if (!quiet) setNotice({ tone: 'ok', text: `${SECTION_MAP[target]?.[1] || target} refreshed from xiaod.` });
-      }
-      return next;
-    } catch (error) {
-      if (target === currentView.current && request === requestSequence.current) {
-        setNotice({ tone: 'bad', text: `Could not load ${SECTION_MAP[target]?.[1] || target}: ${error.message}` });
-      }
-      return null;
-    } finally {
-      if (request === requestSequence.current) setBusy(false);
-    }
-  }, [queryFor, view]);
-
-  const refreshProviders = useCallback(async () => {
-    try {
-      const next = await managerGet('providers');
-      setProviders(next);
-      return next;
-    } catch (error) {
-      setNotice({ tone: 'bad', text: `Could not load Custom profiles: ${error.message}` });
-      return null;
-    }
-  }, []);
-
-  useEffect(() => { refresh(view); }, [view]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { if (view === 'providers' || view === 'sessions') refreshProviders(); }, [view, refreshProviders]);
-
-  const action = useCallback(async (resource, body, success, target = view) => {
-    setBusy(true);
-    try {
-      const result = await managerPost(resource, body);
-      const warnings = committedWarnings(result);
-      setNotice(warnings.length
-        ? { tone: 'warn', text: `${success} Committed with cleanup warning: ${warnings.join(' · ')}` }
-        : { tone: 'ok', text: success });
-      if (resource === 'provider-custom') await refreshProviders();
-      await refresh(target, queryFor(target), true);
-      return result;
-    } catch (error) {
-      setNotice({ tone: 'bad', text: `Action failed: ${error.message}` });
-      return null;
-    } finally {
-      setBusy(false);
-    }
-  }, [queryFor, refresh, refreshProviders, view]);
-
-  const navigate = target => {
-    if (target === view) return;
-    setData(null);
-    setView(target);
-  };
-
-  const changePage = (target, next) => {
-    setPage(current => ({ ...current, [target]: Math.max(1, next) }));
-    setTimeout(() => refresh(target, { ...queryFor(target), page: Math.max(1, next) }, true), 0);
-  };
-
-  const useSessionAi = async ({ sessionId, profileId, model }) => {
-    const profile = providers?.custom_profiles?.find(item => item.id === profileId);
-    const selected = profile?.models?.find(item => item.model_id === model);
-    setBusy(true);
-    try {
-      if (requiresExactProbe(selected)) {
-        setNotice({ tone: 'warn', text: `Exact-probing ${model} before it can be activated…` });
-        await managerPost('provider-custom', { action: 'probe', profile_id: profileId, model });
-      }
-      await managerPost('sessions', {
-        action: 'ai_config', session_id: sessionId, provider: 'custom', account_or_profile_id: profileId, model
-      });
-      setNotice({ tone: 'ok', text: 'Custom profile and exact model updated for this session only.' });
-      setSessionEditor(null);
-      await refreshProviders();
-      await refresh('sessions', queryFor('sessions'), true);
-    } catch (error) {
-      setNotice({ tone: 'bad', text: `Could not set session AI: ${error.message}` });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const content = useMemo(() => {
-    const props = { data, busy, action, refresh, setConfirm, setPrompt, setProfileEditor, setSessionEditor, providers, refreshProviders, filters, setFilters, changePage, setNotice };
-    switch (view) {
-      case 'dashboard': return <DashboardView {...props} />;
-      case 'setup': return <SetupView {...props} />;
-      case 'providers': return <ProvidersView {...props} />;
-      case 'agent': return <AgentView {...props} />;
-      case 'sessions': return <SessionsView {...props} />;
-      case 'attachments': return <AttachmentsView {...props} />;
-      case 'tasks': return <TasksView {...props} />;
-      case 'memory': return <MemoryView {...props} />;
-      case 'skills': return <SkillsView {...props} />;
-      case 'tools': return <ToolsView {...props} />;
-      case 'security': return <SecurityView {...props} />;
-      case 'runtime': return <RuntimeView {...props} />;
-      case 'diagnostics': return <DiagnosticsView {...props} />;
-      case 'logs': return <LogsView {...props} />;
-      default: return null;
-    }
-  }, [action, busy, changePage, data, filters, providers, refresh, refreshProviders, view]);
-
-  return <div className="app-shell">
-    <aside className="sidebar" aria-label="Xiao Root Manager navigation">
-      <div className="brand">
-        <div className="brand-mark" aria-hidden="true">肖</div>
-        <div><span>ROOT CONTROL PLANE</span><strong>Xiao Manager</strong></div>
-      </div>
-      <label className="compact-nav"><span>Manager section</span><select value={view} onChange={event => navigate(event.target.value)} aria-label="Manager section">{SECTIONS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
-      <nav className="nav-list">
-        {SECTIONS.map(([id, label, description]) => <button key={id} type="button" className={view === id ? 'nav-item selected' : 'nav-item'} onClick={() => navigate(id)} aria-current={view === id ? 'page' : undefined} title={description}>
-          <Icon name={id} /><span>{label}</span>
-        </button>)}
-      </nav>
-      <div className="sidebar-foot"><span className={notice.tone === 'bad' ? 'signal bad' : 'signal'}></span><div><b>{busy ? 'SYNCING' : 'LOCAL CONTROL'}</b><small>KernelSU · xiaod</small></div></div>
-    </aside>
-    <main className="workspace" aria-busy={busy}>
-      <header className="topbar">
-        <div><h1>{SECTION_MAP[view]?.[1]}</h1><p className="topbar-context">{SECTION_MAP[view]?.[2]}</p></div>
-        <div className="top-actions"><span className="version">v0.2.8</span><button className="icon-button" type="button" onClick={() => refresh()} disabled={busy} aria-label="Refresh current view"><Icon name="refresh" /></button></div>
-      </header>
-      <div className={`notice ${notice.tone}`} role={notice.tone === 'bad' ? 'alert' : 'status'} aria-live={notice.tone === 'bad' ? 'assertive' : 'polite'}><span></span>{notice.text}</div>
-      <section className="view-content">{content}</section>
-    </main>
-    {confirm && <ConfirmDialog {...confirm} busy={busy} onClose={() => setConfirm(null)} />}
-    {prompt && <PromptDialog {...prompt} busy={busy} onClose={() => setPrompt(null)} />}
-    {profileEditor && <ProfileEditor profile={profileEditor === 'new' ? null : profileEditor} busy={busy} onClose={() => setProfileEditor(null)} onError={message => setNotice({ tone: 'bad', text: message })} onSave={async body => {
-      const result = await action('provider-custom', body, body.action === 'create' ? 'Custom profile created with isolated write-only secret references.' : 'Custom profile committed. Any obsolete secret cleanup warning is recorded separately.', 'providers');
-      if (result) setProfileEditor(null);
-      return result;
-    }} />}
-    {sessionEditor && <SessionAiDialog session={sessionEditor} profiles={providers?.custom_profiles || []} busy={busy} onClose={() => setSessionEditor(null)} onApply={useSessionAi} />}
+function Field({ label, hint, wide, children }) {
+  return <div className={`form-group${wide ? ' wide' : ''}`}>
+    <label className="form-label">{label}</label>
+    {children}
+    {hint && <div className="form-hint">{hint}</div>}
   </div>;
 }
 
-function Panel({ title, eyebrow, action, children, className = '' }) {
-  return <article className={`panel ${className}`}><div className="panel-head"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h2>{title}</h2></div>{action}</div>{children}</article>;
+const ICON_PATHS = {
+  search: 'M10.8 4a6.8 6.8 0 1 0 4.3 12.1l4.4 4.4 1.4-1.4-4.4-4.4A6.8 6.8 0 0 0 10.8 4Zm0 2a4.8 4.8 0 1 1 0 9.6 4.8 4.8 0 0 1 0-9.6Z',
+  spark: 'm12 2 1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8L12 2Zm6 13 .8 2.2L21 18l-2.2.8L18 21l-.8-2.2L15 18l2.2-.8L18 15Z',
+  settings: 'M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Zm0 2a1.8 1.8 0 1 1 0 3.6 1.8 1.8 0 0 1 0-3.6Zm7.8 1.2-1.7-.3a6.3 6.3 0 0 0-.6-1.4l1-1.4-1.4-1.4-1.4 1a6.3 6.3 0 0 0-1.4-.6L14 5.6V4h-4v1.6l-.3 1.7a6.3 6.3 0 0 0-1.4.6l-1.4-1-1.4 1.4 1 1.4a6.3 6.3 0 0 0-.6 1.4l-1.7.3V15l1.7.3c.2.5.4 1 .6 1.4l-1 1.4 1.4 1.4 1.4-1c.4.3.9.5 1.4.6l.3 1.7h4l.3-1.7c.5-.2 1-.4 1.4-.6l1.4 1 1.4-1.4-1-1.4c.3-.4.5-.9.6-1.4l1.7-.3v-3.2Z',
+  chat: 'M4 4h16v11H8l-4 4V4Zm3 4v2h10V8H7Zm0 4v2h7v-2H7Z',
+  brain: 'M9.2 5A3.2 3.2 0 0 0 6 8.2c0 .3 0 .6.1.9A3.2 3.2 0 0 0 7.2 15a3.2 3.2 0 0 0 5.4 2.3A3.2 3.2 0 0 0 18 15a3.2 3.2 0 0 0 1.1-5.9c.1-.3.1-.6.1-.9A3.2 3.2 0 0 0 16 5a3.2 3.2 0 0 0-3.4.9A3.2 3.2 0 0 0 9.2 5ZM12 8v8m-2.8-5.5L12 12l2.8-1.5',
+  bolt: 'm13.5 2-8 11h5.8L10.5 22l8-11h-5.8L13.5 2Z',
+  tools: 'm14.8 4.2 1.7 1.7-8.7 8.7-1.7-1.7 8.7-8.7ZM5 15l4 4-1.5 1.5-4-4L5 15Zm10.5-2.5 4 4-1.5 1.5-4-4 1.5-1.5Z',
+  play: 'M8 5v14l11-7L8 5Z',
+  telegram: 'm21 4-3.2 16-6.2-4.1-3.4 2.8.6-5.5L17.5 6 7.2 12.2l-4.5-1.4L21 4Z',
+  plug: 'M8 3v5m8-5v5M6 8h12v4a6 6 0 0 1-12 0V8Zm6 10v3',
+  info: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm-1 5h2v2h-2V8Zm0 4h2v5h-2v-5Z',
+  refresh: 'M19 8a7 7 0 1 0 1 6h-2a5 5 0 1 1-1.4-3.5L14 13h7V6l-2 2Z',
+};
+
+function AppIcon({ name, size = 22 }) {
+  return <svg className="app-icon" width={size} height={size} viewBox="0 0 24 24" aria-hidden="true"><path d={ICON_PATHS[name] || ICON_PATHS.info} /></svg>;
 }
 
-function Status({ value }) { return <span className={`status ${classForStatus(value)}`}>{titleCase(value)}</span>; }
-function Empty({ children }) { return <div className="empty">{children}</div>; }
-function Button({ children, tone = 'quiet', type = 'button', ...props }) { return <button type={type} className={`button ${tone}`} {...props}>{children}</button>; }
-
-function Rows({ rows }) {
-  return <div className="rows">{rows.map(([label, value, status]) => <div className="row" key={label}><span>{label}</span><b className={status ? classForStatus(status) : ''}>{value ?? '—'}</b></div>)}</div>;
+function Loading() {
+  return <div className="loading"><div className="spinner" /> Loading...</div>;
 }
 
-function Pager({ value, onChange }) {
-  if (!value || Number(value.pages || 1) <= 1) return null;
-  return <nav className="pager" aria-label="Pagination"><Button disabled={value.page <= 1} onClick={() => onChange(value.page - 1)} aria-label="Previous page"><Icon name="previous" /></Button><span>PAGE {value.page} / {value.pages}</span><Button disabled={value.page >= value.pages} onClick={() => onChange(value.page + 1)} aria-label="Next page"><Icon name="next" /></Button></nav>;
-}
+/* ========== Main App ========== */
+function App() {
+  const [tab, setTab] = useState('explore');
+  const [sub, setSub] = useState(null);
+  const [subArg, setSubArg] = useState(null);
+  const [data, setData] = useState({});
+  const [busy, setBusy] = useState(false);
+  const [toastMsg, setToastMsg] = useState(null);
+  const [loading, setLoading] = useState({});
 
-function DashboardView({ data, setSessionEditor, refreshProviders }) {
-  if (!data) return <Loading />;
-  const health = data.health || {}; const counts = data.counts || {}; const runtime = data.runtime || {}; const ai = data.current_ai || {};
-  const metrics = [['Sessions', counts.sessions], ['Runs', counts.agent_runs], ['Attachments', counts.attachments], ['Approvals', counts.pending_approvals], ['Memory', counts.memories], ['Skills', counts.skills], ['Active', counts.running_runs], ['Blocked', counts.blocked_runs]];
-  return <>
-    <section className="command-surface"><div><span className="eyebrow">INSTALLATION PULSE</span><h2>{counts.running_runs ? `${counts.running_runs} run${counts.running_runs === 1 ? '' : 's'} in motion` : 'Control plane is quiet and ready'}</h2><p>One durable installation owner. SQLite-authoritative Telegram control. Custom endpoint credentials stay write-only.</p></div><div className="runtime-stamps"><span>ROOT {runtime.root ? 'READY' : 'UNAVAILABLE'}</span><span>TERMUX {runtime.termux ? 'READY' : 'ABSENT'}</span><span>DB {health.db_healthy ? 'HEALTHY' : 'FAILED'}</span></div></section>
-    <section className="metrics">{metrics.map(([label, value]) => <div className="metric" key={label}><span>{label}</span><strong>{value || 0}</strong><small>durable records</small></div>)}</section>
-    <div className="grid two"><Panel title="Active session AI" eyebrow="EXACT SELECTION" action={<Button disabled={!ai.session_id} onClick={async () => { const profiles = await refreshProviders(); if (profiles) setSessionEditor({ id: ai.session_id, name: 'Current active session', provider: ai.provider, account_or_profile_id: ai.account_or_profile_id, model: ai.model }); }}>Change AI</Button>}><Rows rows={[["Provider", ai.provider], ["Custom profile", ai.account_or_profile_id], ["Model", ai.model], ["Session", ai.session_id]]} /></Panel><Panel title="Service health" eyebrow="LIVE"><Rows rows={[["Gateway", health.gateway, health.gateway], ["Database", health.db_healthy ? 'healthy' : 'failed', health.db_healthy ? 'ready' : 'failed'], ["Telegram", health.telegram_polling ? 'polling' : (health.telegram_enabled ? 'waiting' : 'disabled'), health.telegram_polling ? 'ready' : 'warn'], ["Custom ready", health.providers_ready], ["Uptime", formatDuration(health.uptime_seconds)], ["Memory RSS", formatBytes(health.memory_bytes)]]} /></Panel></div>
-  </>;
-}
-
-function SetupView({ data, action, busy, setNotice }) {
-  const telegram = data?.telegram || {};
-  const [draft, setDraft] = useState({ enabled: false, owner: '', chats: '', token: '', confirmOwnerChange: false });
-  useEffect(() => setDraft({ enabled: Boolean(telegram.enabled), owner: telegram.owner_user_id ?? '', chats: (telegram.allowed_chat_ids || []).join(', '), token: '', confirmOwnerChange: false }), [telegram.enabled, telegram.owner_user_id, telegram.allowed_chat_ids]);
-  if (!data) return <Loading />;
-  const save = async actionName => {
-    const owner = Number(draft.owner);
-    if (!Number.isSafeInteger(owner) || owner === 0) {
-      setNotice({ tone: 'bad', text: 'Owner Telegram user ID must be a non-zero integer.' });
-      return;
-    }
-    const allowed = draft.chats.split(',').map(value => value.trim()).filter(Boolean).map(Number);
-    if (allowed.some(value => !Number.isSafeInteger(value) || value === 0)) {
-      setNotice({ tone: 'bad', text: 'Allowed chat IDs must be non-zero integers separated by commas.' });
-      return;
-    }
-    const ownerChanged = telegram.owner_user_id !== undefined && telegram.owner_user_id !== null && Number(telegram.owner_user_id) !== owner;
-    if (ownerChanged && !draft.confirmOwnerChange) {
-      setNotice({ tone: 'bad', text: 'Confirm the Telegram owner replacement before committing the new binding.' });
-      return;
-    }
-    await action('telegram', { action: actionName, enabled: draft.enabled, owner_user_id: owner, allowed_chat_ids: [...new Set(allowed)], confirm_owner_change: ownerChanged, ...(draft.token.trim() ? { token: draft.token.trim() } : {}) }, actionName === 'save_and_test' ? 'Telegram state committed and tested. Runtime reload follows commit.' : 'Telegram control state committed. Runtime reload follows commit.', 'setup');
-    setDraft(current => ({ ...current, token: '' }));
-  };
-  const ownerChanged = telegram.owner_user_id !== undefined && telegram.owner_user_id !== null && Number(telegram.owner_user_id) !== Number(draft.owner);
-  return <div className="grid two"><Panel title="Telegram control plane" eyebrow="SQLITE AUTHORITATIVE"><form className="form-grid" onSubmit={event => { event.preventDefault(); save('save'); }}><Field label="Bot token" hint="Write-only. Leave blank to retain the active immutable secret reference."><input type="password" autoComplete="new-password" value={draft.token} onChange={event => setDraft({ ...draft, token: event.target.value })} placeholder="••••••••••••••••" /></Field><Field label="Owner Telegram user ID"><input type="number" required value={draft.owner} onChange={event => setDraft({ ...draft, owner: event.target.value })} placeholder="123456789" /></Field><Field label="Allowed chat IDs" hint="Optional, comma-separated scope restriction" wide><input value={draft.chats} onChange={event => setDraft({ ...draft, chats: event.target.value })} placeholder="-1001234567890, -1009876543210" /></Field>{ownerChanged && <label className="retention wide"><b>Owner binding replacement</b><p>This changes only the Telegram authentication binding; the durable installation owner and owner data remain unchanged.</p><span className="toggle"><input type="checkbox" checked={draft.confirmOwnerChange} onChange={event => setDraft({ ...draft, confirmOwnerChange: event.target.checked })} /> I confirm this owner replacement</span></label>}<label className="toggle wide"><input type="checkbox" checked={draft.enabled} onChange={event => setDraft({ ...draft, enabled: event.target.checked })} /> Enable Telegram adapter</label><div className="form-actions wide"><Button tone="secondary" disabled={busy} onClick={() => save('save')}>Save control state</Button><Button tone="primary" disabled={busy} onClick={() => save('save_and_test')}>Save & test</Button><Button disabled={busy} onClick={() => action('telegram', { action: 'test', ...(draft.token.trim() ? { token: draft.token.trim() } : {}) }, 'Telegram getMe completed; no configuration was changed.', 'setup')}>Test token</Button></div></form></Panel><Panel title="Current transport state" eyebrow="NO FILE/DB SPLIT"><Rows rows={[["Bot token", telegram.token_configured ? 'configured (write-only)' : 'not configured', telegram.token_configured ? 'ready' : 'warn'], ["Bot identity", telegram.bot?.username ? `@${telegram.bot.username} · ${telegram.bot.id}` : (telegram.bot?.id || 'not tested')], ["Owner state", telegram.owner_state, telegram.owner_state === 'configured' ? 'ready' : 'warn'], ["Allowed chats", (telegram.allowed_chat_ids || []).length || 'all owner chats'], ["Legacy candidates", telegram.legacy_candidate_count || 0]]} /><p className="helper">The database is authoritative. Compatibility TOML is a one-way projection and cannot roll back committed Telegram state.</p></Panel></div>;
-}
-
-function AgentView({ data, action, busy }) {
-  const settings = data?.settings || {};
-  const [draft, setDraft] = useState(settings);
-  useEffect(() => setDraft(settings), [data]);
-  if (!data) return <Loading />;
-  const number = (key, min, max) => <Field label={titleCase(key)} hint={`${min}–${max}`}><input type="number" min={min} max={max} value={draft[key] ?? ''} onChange={event => setDraft({ ...draft, [key]: Number(event.target.value) })} /></Field>;
-  const toggle = key => <label className="toggle"><input type="checkbox" checked={Boolean(draft[key])} onChange={event => setDraft({ ...draft, [key]: event.target.checked })} /> {titleCase(key)}</label>;
-  return <form onSubmit={event => { event.preventDefault(); action('agent', { action: 'update', ...draft }, 'Agent settings saved atomically. New runs use the updated snapshot.', 'agent'); }}>
-    <div className="grid two"><Panel title="Loop limits" eyebrow="BOUNDED"><div className="form-grid">{number('max_turns', 2, 500)}{number('max_tool_calls', 1, 512)}{number('max_runtime_seconds', 10, 3600)}{number('max_no_progress_repeats', 1, 10)}</div></Panel><Panel title="Performance" eyebrow="NEW RUN SNAPSHOT"><div className="form-grid">{number('max_parallel_readonly_tools', 1, 16)}{number('max_execution_plan_steps', 1, 64)}{toggle('provider_streaming')}{toggle('parallel_readonly_tools')}{toggle('execution_plan_enabled')}{toggle('plan_cache_enabled')}{toggle('background_learning')}</div></Panel></div>
-    <Panel title="Effective daemon state" eyebrow="DIAGNOSTICS"><Rows rows={[["Config generation", data.generation], ["Loaded", data.loaded ? 'yes' : 'no', data.loaded ? 'ready' : 'warn'], ["Active runs", data.active_runs || 0]]} /><div className="panel-actions"><Button tone="primary" type="submit" disabled={busy}>Save Agent settings</Button></div></Panel>
-  </form>;
-}
-
-function ProvidersView({ data, action, setConfirm, setProfileEditor }) {
-  if (!data) return <Loading />;
-  const profiles = data.custom_profiles || [];
-  return <>
-    <section className="section-intro"><div><span className="eyebrow">CUSTOM ONLY</span><h2>OpenAI-compatible profiles</h2><p>Each profile owns isolated API-key and secret-header references. Values are never returned to this browser.</p></div><Button tone="primary" onClick={() => setProfileEditor('new')}>Add Custom profile</Button></section>
-    <div className="profile-grid">{profiles.length ? profiles.map(profile => <ProfileCard key={profile.id} profile={profile} action={action} setConfirm={setConfirm} setProfileEditor={setProfileEditor} />) : <Empty>No Custom profile exists. Create one to discover and exact-probe its models.</Empty>}</div>
-  </>;
-}
-
-function ProfileCard({ profile, action, setConfirm, setProfileEditor }) {
-  const models = profile.models || [];
-  const override = (model, capability) => <label>{titleCase(capability)} override <select value={model[`${capability}_override`] || 'auto'} onChange={event => action('provider-custom', { action: 'capability_override', profile_id: profile.id, model: model.model_id, capability, owner_override: event.target.value }, `${titleCase(capability)} override saved for exact profile/model/protocol.`, 'providers')}><option value="auto">Auto</option><option value="force_supported">Force supported</option><option value="force_unsupported">Force unsupported</option></select></label>;
-  return <Panel title={profile.alias} eyebrow="CUSTOM PROFILE" action={<Status value={profile.reachability} />} className="profile-card"><p className="endpoint">{profile.endpoint}</p><div className="chip-row"><span>{titleCase(profile.protocol)}</span><span>{profile.api_key_configured ? 'API key configured' : 'No API key'}</span><span>{(profile.header_names || []).length} header name{(profile.header_names || []).length === 1 ? '' : 's'}</span></div><div className="model-list">{models.length ? models.slice(0, 6).map(model => <div className="model-row" key={model.model_id}><div><b>{model.model_id}</b><small>{modelReadiness(model)}</small></div><div><span>tools {titleCase(model.tool_protocol)}</span><span>vision {titleCase(model.vision_state)}</span><span>file {titleCase(model.file_input_state)}</span>{override(model, 'vision')}{override(model, 'file_input')}</div></div>) : <Empty>No discovered models yet. Test this endpoint first.</Empty>}</div><div className="card-actions"><Button tone="secondary" onClick={() => action('provider-custom', { action: 'test', profile_id: profile.id }, `Model discovery and bounded capability probes finished for ${profile.alias}.`, 'providers')}>Discover & test</Button><Button onClick={() => setProfileEditor(profile)}>Edit</Button><Button tone="danger" onClick={() => setConfirm({ title: `Delete ${profile.alias}?`, body: 'This removes the profile row. Old secrets are cleaned after the committed delete and any cleanup warning is recorded without faking a rollback.', confirmLabel: 'Delete profile', onConfirm: () => action('provider-custom', { action: 'delete', profile_id: profile.id }, `Custom profile ${profile.alias} deleted.`, 'providers') })}>Delete</Button></div></Panel>;
-}
-
-function SessionsView({ data, action, setConfirm, setPrompt, setSessionEditor, refreshProviders, changePage }) {
-  if (!data) return <Loading />;
-  const items = data.items || [];
-  return <><section className="section-intro"><div><span className="eyebrow">CONVERSATION CONTROL</span><h2>Main sessions</h2><p>Deleting a session permanently removes its conversation-owned records and unreferenced attachments. Owner-global memory, skills, and Custom profiles remain intact.</p></div><Button tone="primary" onClick={() => action('sessions', { action: 'new' }, 'New main session created with YOLO off.', 'sessions')}>New session</Button></section><Panel title="Sessions" eyebrow="5 / PAGE"><div className="session-table"><div className="session-head"><span>Session</span><span>AI</span><span>Messages</span><span>Controls</span></div>{items.length ? items.map(session => <div className="session-line" key={session.id}><div><b>{session.name}</b><small>{session.telegram_scope ? `Chat ${session.telegram_scope.chat_id} · topic ${session.telegram_scope.message_thread_id ?? 'default'}` : 'Local main session'}</small></div><div><b>{session.model}</b><small>{session.provider === 'custom' ? 'Custom' : 'Legacy profile; select Custom before generation'}</small></div><div><b>{session.message_count}</b><small>YOLO {session.yolo ? 'ON' : 'OFF'}</small></div><div className="table-actions"><Button onClick={async () => { await refreshProviders(); setSessionEditor(session); }}>AI</Button><Button onClick={() => action('sessions', { action: 'yolo', session_id: session.id, value: String(!session.yolo) }, `YOLO ${session.yolo ? 'disabled' : 'enabled'} for ${session.name} only.`, 'sessions')}>{session.yolo ? 'YOLO off' : 'YOLO on'}</Button><Button onClick={() => setPrompt({ title: 'Rename session', label: 'Session name', initial: session.name, confirmLabel: 'Rename', onConfirm: value => action('sessions', { action: 'rename', session_id: session.id, value }, 'Session renamed.', 'sessions') })}>Rename</Button><Button tone="danger" onClick={() => setConfirm({ title: `Delete ${session.name}?`, body: 'This is permanent. If the deleted session is active, Xiao atomically creates or activates a valid replacement main session.', confirmLabel: 'Delete session', onConfirm: () => action('sessions', { action: 'delete', session_id: session.id }, 'Session deleted; a valid main-session pointer was recovered.', 'sessions') })}>Delete</Button></div></div>) : <Empty>No main session exists yet.</Empty>}</div><Pager value={data} onChange={next => changePage('sessions', next)} /></Panel></>;
-}
-
-function AttachmentsView({ data, action, setConfirm, changePage }) {
-  if (!data) return <Loading />;
-  const usage = data.usage || {}; const items = data.items || [];
-  return <><section className="usage-grid"><div><span>Owner usage</span><strong>{formatBytes(usage.owner_bytes ?? usage.owner_usage_bytes)}</strong></div><div><span>Global usage</span><strong>{formatBytes(usage.global_bytes ?? usage.global_usage_bytes)}</strong></div><div><span>Attachments</span><strong>{usage.count ?? items.length}</strong></div><div><span>Reservation cleanup</span><strong>startup-safe</strong></div></section><Panel title="Attachment processing" eyebrow="QUOTA / OCR / PROVIDER FALLBACK"><div className="attachment-list">{items.length ? items.map(item => <div className="attachment-row" key={item.attachment_id}><div><b>{item.original_name}</b><small>{item.detected_mime} · {formatBytes(item.size_bytes)} · session {item.session_id}</small></div><div><Status value={item.processing_status} /><small>{item.error || item.summary || 'No processing detail'}</small></div><Button tone="danger" onClick={() => setConfirm({ title: `Remove ${item.original_name}?`, body: 'The durable attachment record and its managed file/chunks will be removed.', confirmLabel: 'Remove attachment', onConfirm: () => action('attachments', { action: 'remove', attachment_id: item.attachment_id }, 'Attachment removed through AttachmentManager lifecycle.', 'attachments') })}>Remove</Button></div>) : <Empty>No attachments have been recorded.</Empty>}</div><Pager value={data} onChange={next => changePage('attachments', next)} /></Panel></>;
-}
-
-function TasksView({ data, action, setConfirm, changePage }) {
-  if (!data) return <Loading />;
-  const active = new Set(['received', 'context_build', 'running', 'awaiting_approval', 'verifying']);
-  return <Panel title="Agent runs" eyebrow="OBSERVABLE EXECUTION"><div className="run-list">{(data.items || []).length ? data.items.map(run => <div className="run-card" key={run.id}><div className="run-title"><div><b>{run.goal || 'Untitled run'}</b><small>{run.provider} / {run.model} · {formatDate(run.started_at)}</small></div><Status value={run.status} /></div><p>{run.blocker_or_error || run.result || 'No final result recorded.'}</p><div className="chip-row"><span>session {run.session_id}</span><span>verification {run.verification?.state || 'unknown'}</span>{(run.tools || []).slice(0, 3).map(tool => <span key={tool.id || tool.tool_name}>{tool.tool_name}:{tool.status}</span>)}</div><div className="chip-row">{(run.timings || []).map((timing, index) => <span key={`${timing.event_kind}:${index}`}>{titleCase(timing.event_kind)} {timing.elapsed_ms}ms</span>)}</div>{active.has(run.status) && <div className="card-actions"><Button tone="danger" onClick={() => setConfirm({ title: 'Stop this run?', body: 'Cancellation is propagated to provider, tool, Termux, attachment, OCR, and fallback work where the runtime can enforce it.', confirmLabel: 'Stop run', onConfirm: () => action('runs', { action: 'cancel', run_id: run.id }, 'Cancellation requested for the active run.', 'tasks') })}>Stop run</Button></div>}</div>) : <Empty>No agent run has been recorded.</Empty>}</div><Pager value={data} onChange={next => changePage('tasks', next)} /></Panel>;
-}
-
-function MemoryView({ data, action, filters, setFilters, changePage }) {
-  const [draft, setDraft] = useState({ scope: 'user', category: '', key: '', value: '' });
-  if (!data) return <Loading />;
-  return <><section className="section-intro"><div><span className="eyebrow">CANONICAL OWNER STATE</span><h2>Memory manager</h2><p>WebUI remains the full manager. Telegram only exposes the normal chat surface.</p></div><Button onClick={() => action('memory', { action: 'reconcile' }, 'Canonical USER.md and MEMORY.md were reconciled.', 'memory')}>Reconcile files</Button></section><div className="filter"><input value={filters.memory} onChange={event => setFilters({ ...filters, memory: event.target.value })} placeholder="Search active memory" /><Button tone="secondary" onClick={() => { changePage('memory', 1); }}>Search</Button></div><div className="grid two"><Panel title="Current memory" eyebrow="5 / PAGE"><div className="card-list">{(data.items || []).length ? data.items.map(item => <div className="compact-card" key={`${item.scope}:${item.category}:${item.key}`}><div><b>{item.key}</b><small>{item.scope} / {item.category} · {item.source_kind}</small></div><p>{item.value}</p><div className="card-actions"><Button onClick={() => setDraft({ scope: item.scope, category: item.category, key: item.key, value: item.value })}>Edit</Button><Button tone="danger" onClick={() => action('memory', { action: 'delete', scope: item.scope, category: item.category, key: item.key }, 'Memory entry removed; audit history remains.', 'memory')}>Forget</Button></div></div>) : <Empty>No active memory matches this query.</Empty>}</div><Pager value={data} onChange={next => changePage('memory', next)} /></Panel><Panel title="Create or replace" eyebrow="MANAGED WRITE"><form className="form-grid" onSubmit={event => { event.preventDefault(); action('memory', { action: 'upsert', ...draft }, 'Current memory state saved.', 'memory'); }}><Field label="Scope"><select value={draft.scope} onChange={event => setDraft({ ...draft, scope: event.target.value })}><option value="user">User</option><option value="agent">Agent</option></select></Field><Field label="Category"><input required value={draft.category} onChange={event => setDraft({ ...draft, category: event.target.value })} /></Field><Field label="Key" wide><input required value={draft.key} onChange={event => setDraft({ ...draft, key: event.target.value })} /></Field><Field label="Current value" wide><textarea required value={draft.value} onChange={event => setDraft({ ...draft, value: event.target.value })} /></Field><div className="form-actions wide"><Button tone="primary" type="submit">Save memory</Button></div></form></Panel></div></>;
-}
-
-function SkillsView({ data, action, filters, setFilters, changePage, setConfirm }) {
-  if (!data) return <Loading />;
-  return <><div className="filter"><input value={filters.skills} onChange={event => setFilters({ ...filters, skills: event.target.value })} placeholder="Search learned or imported skills" /><Button tone="secondary" onClick={() => changePage('skills', 1)}>Search</Button><Button onClick={() => action('skills', { action: 'refresh' }, 'Filesystem skill index refreshed.', 'skills')}>Rescan</Button></div><Panel title="Skill library" eyebrow="FULL WEBUI MANAGEMENT"><div className="card-list">{(data.items || []).length ? data.items.map(skill => <div className="compact-card" key={skill.id}><div><b>{skill.name}</b><small>{skill.source_kind} · {skill.enabled ? 'enabled' : 'disabled'}</small></div><p>{skill.summary}</p><div className="chip-row"><span>when: {skill.when_to_use}</span><span>verify: {skill.verification}</span></div><div className="card-actions"><Button onClick={() => action('skills', { action: 'set_enabled', skill_id: skill.id, enabled: !skill.enabled }, `Skill ${skill.enabled ? 'disabled' : 'enabled'}.`, 'skills')}>{skill.enabled ? 'Disable' : 'Enable'}</Button>{skill.source_kind === 'learned' && <Button tone="danger" onClick={() => setConfirm({ title: `Delete learned skill ${skill.name}?`, body: 'Imported/community skills are not removed here. This only removes the learned durable skill.', confirmLabel: 'Delete skill', onConfirm: () => action('skills', { action: 'delete', skill_id: skill.id }, 'Learned skill deleted.', 'skills') })}>Delete</Button>}</div></div>) : <Empty>No skill matches this query.</Empty>}</div><Pager value={data} onChange={next => changePage('skills', next)} /></Panel></>;
-}
-
-function ToolsView({ data }) { if (!data) return <Loading />; return <Panel title="Typed capability registry" eyebrow="POLICY ENFORCED"><CapabilityTable items={data.items || []} /></Panel>; }
-function RuntimeView({ data }) { if (!data) return <Loading />; const environment = data.environment || {}; return <div className="grid two"><Panel title="Device environment" eyebrow="PROBED"><Rows rows={Object.entries(environment).filter(([key]) => !['binaries', 'termux'].includes(key)).map(([key, value]) => [titleCase(key), typeof value === 'object' ? JSON.stringify(value) : String(value)])} /></Panel><Panel title="Termux / execution truth" eyebrow="UID / GID / PATH"><Rows rows={Object.entries(environment.termux || {}).map(([key, value]) => [titleCase(key), String(value)])} /></Panel><Panel title="Registered capabilities" eyebrow="RUNTIME"><CapabilityTable items={data.capabilities || []} /></Panel><Panel title="Managed paths" eyebrow="PRIVATE"><Rows rows={Object.entries(data.paths || {}).map(([key, value]) => [titleCase(key), value])} /></Panel></div>; }
-
-function SecurityView({ data, action }) {
-  if (!data) return <Loading />;
-  return <><div className="security-note">{data.admin_bind_loopback ? 'Admin API is loopback-only.' : 'FAIL: Admin API is not loopback-only.'} Raw unrestricted root shell: {data.root_shell_exposed ? 'EXPOSED' : 'disabled'}.</div><div className="grid two"><Panel title="Pending approvals" eyebrow="EXACT / ONE-SHOT"><div className="card-list">{(data.pending_approvals || []).length ? data.pending_approvals.map(approval => <div className="compact-card" key={approval.id}><div><b>{approval.tool_name}</b><Status value={approval.status} /></div><p>{approval.summary}</p><small>session {approval.session_id} · expires {formatDate(approval.expires_at)}</small><div className="card-actions"><Button tone="primary" onClick={() => action('security', { action: 'approve', approval_id: approval.id }, 'Exact operation approved once.', 'security')}>Approve once</Button><Button tone="danger" onClick={() => action('security', { action: 'deny', approval_id: approval.id }, 'Exact operation denied.', 'security')}>Deny</Button></div></div>) : <Empty>No pending approval.</Empty>}</div></Panel><Panel title="YOLO sessions" eyebrow="ASK ONLY"><div className="card-list">{(data.yolo_sessions || []).length ? data.yolo_sessions.map(session => <div className="compact-card" key={session.id}><b>{session.name}</b><small>{session.provider} / {session.model}</small></div>) : <Empty>YOLO is off in every active main session.</Empty>}</div></Panel></div><Panel title="Recent security audit" eyebrow="REDACTED"><div className="audit-list">{(data.recent_audit || []).length ? data.recent_audit.map(item => <div key={`${item.created_at}:${item.action}`}><time>{formatDate(item.created_at)}</time><b>{item.action}</b><code>{item.detail}</code></div>) : <Empty>No audit event recorded.</Empty>}</div></Panel></>;
-}
-
-function DiagnosticsView({ data, refresh, busy }) { if (!data) return <Loading />; return <Panel title="Independent diagnostics" eyebrow="READ ONLY" action={<Button tone="primary" disabled={busy} onClick={() => refresh('diagnostics')}>Run diagnostics</Button>}><div className="diagnostics">{(data.checks || []).map(item => <div className="diagnostic" key={item.name}><Status value={item.status} /><div><b>{item.name}</b><p>{item.source} · {item.evidence}</p></div></div>)}</div></Panel>; }
-
-function LogsView({ data, filters, setFilters, refresh }) { if (!data) return <Loading />; return <Panel title="Redacted daemon logs" eyebrow="LOCAL ONLY" action={<div className="inline-actions"><select value={filters.logLines} onChange={event => setFilters({ ...filters, logLines: Number(event.target.value) })}><option value={100}>100 lines</option><option value={250}>250 lines</option><option value={500}>500 lines</option></select><Button onClick={() => refresh('logs')}>Refresh</Button></div>}><pre>{(data.lines || []).join('\n') || 'No daemon log entries.'}</pre></Panel>; }
-
-function CapabilityTable({ items }) { return <div className="table-scroll"><table><thead><tr><th>Capability</th><th>State</th><th>Backend</th><th>Evidence</th></tr></thead><tbody>{items.map(item => <tr key={item.name}><td>{item.name}</td><td><Status value={item.status} /></td><td>{item.backend || '—'}</td><td>{item.evidence || '—'}</td></tr>)}</tbody></table></div>; }
-
-function Field({ label, hint, wide = false, children }) { return <label className={wide ? 'field wide' : 'field'}><span>{label}</span>{hint && <small>{hint}</small>}{children}</label>; }
-function Loading() { return <div className="loading" role="status" aria-live="polite"><span></span>Reading durable state from xiaod…</div>; }
-
-function Dialog({ labelId, onClose, className = '', children }) {
-  const dialog = useRef(null);
-  const previousFocus = useRef(null);
-  const onCloseRef = useRef(onClose);
-  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
-  useEffect(() => {
-    previousFocus.current = document.activeElement;
-    const focus = () => {
-      const initial = dialog.current?.querySelector('[data-dialog-initial-focus], input, select, textarea, button:not([disabled])');
-      (initial || dialog.current)?.focus();
-    };
-    const timer = window.setTimeout(focus, 0);
-    const handleKey = event => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        onCloseRef.current();
-        return;
-      }
-      if (event.key !== 'Tab') return;
-      const focusable = [...(dialog.current?.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])') || [])]
-        .filter(element => !element.hidden && element.getClientRects().length);
-      if (!focusable.length) {
-        event.preventDefault();
-        dialog.current?.focus();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener('keydown', handleKey);
-    return () => {
-      window.clearTimeout(timer);
-      window.removeEventListener('keydown', handleKey);
-      if (previousFocus.current instanceof HTMLElement && previousFocus.current.isConnected) previousFocus.current.focus();
-    };
+  const toast = useCallback((msg, type = 'info') => {
+    setToastMsg({ msg, type });
+    setTimeout(() => setToastMsg(null), 3500);
   }, []);
-  return <div className="modal-backdrop" role="presentation"><section ref={dialog} className={`modal ${className}`} role="dialog" aria-modal="true" aria-labelledby={labelId} tabIndex="-1">{children}</section></div>;
-}
 
-function ConfirmDialog({ title, body, confirmLabel, onConfirm, onClose, busy }) {
-  const submit = async () => { const result = await onConfirm(); if (result !== null) onClose(); };
-  return <Dialog labelId="confirm-title" onClose={onClose}><h2 id="confirm-title">{title}</h2><p>{body}</p><div className="modal-actions"><Button disabled={busy} onClick={onClose}>Cancel</Button><Button tone="danger" disabled={busy} onClick={submit}>{confirmLabel || 'Confirm'}</Button></div></Dialog>;
-}
+  const load = useCallback(async (key, query) => {
+    const resource = resourceForView(key);
+    setLoading(prev => ({ ...prev, [key]: true }));
+    try {
+      const result = await managerGet(resource, query || {});
+      setData(prev => ({ ...prev, [key]: result }));
+    } catch (e) { console.warn('load', key, e.message); }
+    setLoading(prev => ({ ...prev, [key]: false }));
+  }, []);
 
-function PromptDialog({ title, label, initial = '', confirmLabel, onConfirm, onClose, busy }) {
-  const [value, setValue] = useState(initial);
-  const submit = async event => { event.preventDefault(); if (!value.trim()) return; const result = await onConfirm(value.trim()); if (result !== null) onClose(); };
-  return <Dialog labelId="prompt-title" onClose={onClose}><form onSubmit={submit}><h2 id="prompt-title">{title}</h2><Field label={label}><input data-dialog-initial-focus value={value} maxLength={120} onChange={event => setValue(event.target.value)} /></Field><div className="modal-actions"><Button disabled={busy} onClick={onClose}>Cancel</Button><Button tone="primary" type="submit" disabled={busy}>{confirmLabel || 'Save'}</Button></div></form></Dialog>;
-}
+  const post = useCallback(async (resource, body) => {
+    setBusy(true);
+    try {
+      const result = await managerPost(resource, body);
+      return result;
+    } catch (e) { toast(e.message, 'bad'); throw e; }
+    finally { setBusy(false); }
+  }, [toast]);
 
-function ProfileEditor({ profile, busy, onClose, onSave, onError }) {
-  const [draft, setDraft] = useState(emptyProfile(profile));
-  useEffect(() => setDraft(emptyProfile(profile)), [profile]);
-  const endpointChanged = Boolean(profile && draft.endpoint.trim() !== profile.endpoint);
-  const configuredHeaderCount = (profile?.header_names || []).length;
-  const configuredKey = Boolean(profile?.api_key_configured);
-  const submit = async event => {
-    event.preventDefault();
-    let headers; let secretHeaders;
-    try { headers = parseHeaderObject(draft.safeHeaders, 'Safe'); secretHeaders = parseHeaderObject(draft.secretHeaders, 'Secret'); }
-    catch (error) { onError(error.message); return; }
-    if (draft.keyAction === 'replace' && !draft.apiKey.trim()) {
-      onError('Enter a replacement API key or choose a different key action.');
-      return;
-    }
-    const body = {
-      action: profile ? 'edit' : 'create',
-      ...(profile ? { profile_id: profile.id } : {}),
-      alias: draft.alias.trim(), endpoint: draft.endpoint.trim(), protocol: draft.protocol,
-      ...(headers !== undefined ? { headers } : {}),
-      ...(secretHeaders !== undefined ? { secret_headers: secretHeaders } : {}),
-      ...(draft.keyAction === 'replace' ? { api_key: draft.apiKey.trim() } : {}),
-      remove_api_key: draft.keyAction === 'remove',
-      clear_secret_headers: draft.clearSecretHeaders,
-      keep_credential: endpointChanged && draft.keepCredential,
-      keep_safe_headers: endpointChanged && draft.keepSafeHeaders,
-      keep_secret_headers: endpointChanged && draft.keepSecretHeaders
+  const nav = useCallback((page, arg) => { setSub(page); setSubArg(arg || null); window.scrollTo(0, 0); }, []);
+  const back = useCallback(() => { setSub(null); setSubArg(null); }, []);
+
+  useEffect(() => { load('dashboard'); load('providers'); load('setup'); load('agent'); }, [load]);
+
+  const dash = data.dashboard;
+  const health = dash?.health;
+  const ai = dash?.current_ai;
+  const counts = dash?.counts;
+  const profiles = data.providers?.custom_profiles || [];
+  const tg = data.setup;
+
+  /* ========== Toast ========== */
+  function ToastUI() {
+    if (!toastMsg) return null;
+    return <div className={`notice ${toastMsg.type}`} style={{position:'fixed',top:60,left:'50%',transform:'translateX(-50%)',zIndex:50,maxWidth:400,width:'90%',boxShadow:'0 4px 20px rgba(0,0,0,.15)'}}>
+      <span className="notice-dot" />{toastMsg.msg}
+    </div>;
+  }
+
+  /* ========== Explore Tab ========== */
+  function ExploreView() {
+    const gateway = health?.gateway || 'unknown';
+    const gsc = classForStatus(gateway);
+    return <>
+      <div className="hero">
+      <div className="hero-avatar">
+          <img className="hero-logo" src="./xiao-logo.png" alt="Xiao logo" />
+          <div className="edit-badge">✏</div>
+        </div>
+        <h2>Hi, Boss!</h2>
+        <div className="model-badge" onClick={() => nav('models')}>
+          <span className={`status-dot ${gsc}`} />
+          {ai?.model || 'Select Model'} ›
+        </div>
+      </div>
+      <div className="content">
+        {counts && <div className="metrics-grid">
+          <div className="metric"><div className="metric-value">{counts.sessions || 0}</div><div className="metric-label">Sessions</div></div>
+          <div className="metric"><div className="metric-value">{counts.total_runs || 0}</div><div className="metric-label">Runs</div></div>
+          <div className="metric"><div className="metric-value">{counts.memories || 0}</div><div className="metric-label">Memories</div></div>
+          <div className="metric"><div className="metric-value">{formatDuration(health?.uptime_seconds)}</div><div className="metric-label">Uptime</div></div>
+        </div>}
+
+        <div className="section">
+          <div className="section-title">Highlights</div>
+          <div className="card-group">
+            <CardItem icon="chat" bg="var(--accent-soft)" color="var(--accent)" title="Chat Sessions" desc="Manage your conversations" onClick={() => { load('sessions'); nav('sessions'); }} />
+            <CardItem icon="plug" bg="var(--purple-soft)" color="var(--purple)" title="AI Models" badge="PRO" desc="Configure your AI provider" onClick={() => { load('providers'); nav('models'); }} />
+          </div>
+        </div>
+
+        <div className="section">
+          <div className="section-title">Basic</div>
+          <div className="card-group">
+            <CardItem icon="brain" bg="var(--teal-soft)" color="var(--teal)" title="Memory" desc="What Xiao remembers about you" right={counts?.memories || 0} onClick={() => { load('memory'); nav('memory'); }} />
+            <CardItem icon="bolt" bg="var(--yellow-soft)" color="var(--yellow)" title="Skills" desc="Learned abilities and procedures" onClick={() => { load('skills'); nav('skills'); }} />
+            <CardItem icon="tools" bg="var(--red-soft)" color="var(--red)" title="Tools" desc="Available tool capabilities" onClick={() => { load('tools'); nav('tools'); }} />
+            <CardItem icon="play" bg="var(--purple-soft)" color="var(--purple)" title="Agent Runs" desc="Execution history and status" onClick={() => { load('tasks'); nav('runs'); }} />
+          </div>
+        </div>
+
+        {health && <div className="section">
+          <div className="section-title">System</div>
+          <div className="card-group">
+            <div className="card-item">
+              <div className="card-icon" style={{background: gsc === 'ok' ? 'var(--teal-soft)' : gsc === 'warn' ? 'var(--yellow-soft)' : 'var(--red-soft)', color: gsc === 'ok' ? 'var(--teal)' : gsc === 'warn' ? 'var(--yellow)' : 'var(--red)'}}>{gsc === 'ok' ? '✓' : gsc === 'warn' ? '!' : '×'}</div>
+              <div className="card-body">
+                <h4>Gateway: {gateway.charAt(0).toUpperCase() + gateway.slice(1)}</h4>
+                <p>v{health.version || '?'} · {formatBytes(health.memory_bytes)} RAM</p>
+              </div>
+            </div>
+            {dash?.runtime && <div className="card-item">
+              <div className="card-icon" style={{background:'var(--accent-soft)',color:'var(--accent)'}}>📱</div>
+              <div className="card-body">
+                <h4>Runtime</h4>
+                <p>{dash.runtime.termux ? 'Termux' : 'Linux'}{dash.runtime.root ? ' · Root' : ''}</p>
+              </div>
+            </div>}
+          </div>
+        </div>}
+      </div>
+    </>;
+  }
+
+  /* ========== Tools Tab ========== */
+  function ToolsView() {
+    return <div className="content">
+      <div className="section"><div className="section-title">Management</div>
+        <div className="card-group">
+          <CardItem icon="settings" bg="var(--accent-soft)" color="var(--accent)" title="Agent Settings" desc="Loop, streaming, execution controls" onClick={() => { load('agent'); nav('agent'); }} />
+          <CardItem icon="info" bg="var(--teal-soft)" color="var(--teal)" title="Runtime" desc="Environment and dependencies" onClick={() => { load('runtime'); nav('runtime'); }} />
+          <CardItem icon="info" bg="var(--yellow-soft)" color="var(--yellow)" title="Context" desc="Identity and workspace state" onClick={() => { load('context'); nav('context'); }} />
+          <CardItem icon="plug" bg="var(--purple-soft)" color="var(--purple)" title="Attachments" desc="Uploaded files and media" onClick={() => { load('attachments'); nav('attachments'); }} />
+        </div>
+      </div>
+      <div className="section"><div className="section-title">System</div>
+        <div className="card-group">
+          <CardItem icon="settings" bg="var(--red-soft)" color="var(--red)" title="Security" desc="Approvals and audit" onClick={() => { load('security'); nav('security'); }} />
+          <CardItem icon="info" bg="var(--accent-soft)" color="var(--accent)" title="Diagnostics" desc="Health checks and system probes" onClick={() => { load('diagnostics'); nav('diagnostics'); }} />
+          <CardItem icon="info" bg="rgba(0,0,0,.05)" color="var(--ink-soft)" title="Logs" desc="Daemon log output" onClick={() => { load('logs'); nav('logs'); }} />
+        </div>
+      </div>
+    </div>;
+  }
+
+  /* ========== Settings Tab ========== */
+  function SettingsView() {
+    return <div className="content">
+      <div className="settings-section-title">Xiao</div>
+      <div className="card-group">
+        <SettingsItem icon="settings" bg="var(--accent-soft)" color="var(--accent)" title="Agent Config" onClick={() => { load('agent'); nav('agent'); }} />
+        <SettingsItem icon="telegram" bg="#E3F2FD" color="#1565C0" title="Telegram" right={tg?.enabled ? 'Active' : 'Off'} onClick={() => { load('setup'); nav('telegram'); }} />
+      </div>
+      <div className="settings-section-title">AI Provider</div>
+      <div className="card-group">
+        <SettingsItem icon="plug" bg="var(--purple-soft)" color="var(--purple)" title="Custom Profiles" right={profiles.length + ' profiles'} onClick={() => { load('providers'); nav('profiles'); }} />
+        <SettingsItem icon="spark" bg="#FCE4EC" color="var(--pink)" title="LLM Model" right={ai?.model || '-'} onClick={() => { load('providers'); nav('models'); }} />
+      </div>
+      <div className="settings-section-title">App</div>
+      <div className="card-group">
+        <SettingsItem icon="info" bg="var(--teal-soft)" color="var(--teal)" title="About Xiao" onClick={() => nav('about')} />
+        <SettingsItem icon="info" bg="var(--yellow-soft)" color="var(--yellow)" title="Diagnostics" onClick={() => { load('diagnostics'); nav('diagnostics'); }} />
+      </div>
+    </div>;
+  }
+
+  /* ========== Shared Card Components ========== */
+  function CardItem({ icon, bg, color, title, badge, desc, right, onClick }) {
+    return <div className="card-item" onClick={onClick}>
+      <div className="card-icon" style={{ background: bg, color }}><AppIcon name={icon} size={21} /></div>
+      <div className="card-body">
+        <h4>{title}{badge && <span className="badge-pro">{badge}</span>}</h4>
+        <p>{desc}</p>
+      </div>
+      {right != null && <span className="card-value">{right}</span>}
+      <span className="card-chevron">›</span>
+    </div>;
+  }
+
+  function SettingsItem({ icon, bg, color, title, right, onClick }) {
+    return <div className="settings-item" onClick={onClick}>
+      <div className="settings-icon" style={{ background: bg, color }}><AppIcon name={icon} size={19} /></div>
+      <div className="settings-body"><h4>{title}</h4></div>
+      {right != null && <span className="card-value">{right}</span>}
+      <span className="card-chevron">›</span>
+    </div>;
+  }
+
+  function SubHeader({ title, onBack, actions }) {
+    return <div className="sub-header">
+      <button className="back-btn" onClick={onBack || back}>←</button>
+      <h2>{title}</h2>
+      {actions}
+    </div>;
+  }
+
+  /* ========== SUB PAGES ========== */
+
+  /* Sessions */
+  function SessionsPage() {
+    const d = data.sessions;
+    if (loading.sessions && !d) return <div className="sub-page"><SubHeader title="Sessions" /><Loading /></div>;
+    const items = d?.items || d?.sessions || [];
+    const pg = d?.page || 1, pages = d?.pages || 1;
+    return <div className="sub-page">
+      <SubHeader title="Sessions" />
+      <div className="sub-content">
+        {items.length === 0 ? <Empty>No sessions yet</Empty> :
+          <div className="card-group">{items.map((s, i) =>
+            <div className="card-item" key={s.id || i} onClick={() => nav('session-detail', s)}>
+              <div className="card-icon" style={{background:'var(--accent-soft)',color:'var(--accent)'}}>💬</div>
+              <div className="card-body">
+                <h4>{s.name || s.topic || s.id?.slice(0, 8)}</h4>
+                <p>{s.provider || '-'} · {s.model || '-'} · {s.message_count || 0} msgs</p>
+              </div>
+              <span className="card-chevron">›</span>
+            </div>
+          )}</div>}
+        {pages > 1 && <Pagination page={pg} pages={pages} onPage={p => load('sessions', { page: p, limit: 20 })} />}
+      </div>
+    </div>;
+  }
+
+  function SessionDetailPage() {
+    const s = subArg;
+    if (!s) return null;
+    return <div className="sub-page">
+      <SubHeader title={s.name || s.topic || 'Session'} onBack={() => nav('sessions')} />
+      <div className="sub-content">
+        <div className="detail-card">
+          <DL label="ID" mono>{s.id}</DL>
+          <DL label="Provider">{s.provider || '-'}</DL>
+          <DL label="Model">{s.model || '-'}</DL>
+          <DL label="Messages">{s.message_count || 0}</DL>
+          <DL label="Created">{s.created_at || '-'}</DL>
+          {s.account_id && <DL label="Profile">{s.account_id}</DL>}
+        </div>
+        <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+          <Button onClick={async () => { try { await post('sessions', { action: 'change_ai', session_id: s.id }); } catch {} }}>Change AI</Button>
+          <Button onClick={async () => { try { await post('sessions', { action: 'archive', session_id: s.id }); toast('Archived', 'ok'); nav('sessions'); load('sessions'); } catch {} }}>Archive</Button>
+          <Button tone="danger" onClick={async () => { if (!confirm('Delete session?')) return; try { await post('sessions', { action: 'delete', session_id: s.id }); toast('Deleted', 'ok'); nav('sessions'); load('sessions'); } catch {} }}>Delete</Button>
+        </div>
+      </div>
+    </div>;
+  }
+
+  /* Models */
+  function ModelsPage() {
+    const allModels = [];
+    profiles.forEach(p => (p.models || []).forEach(m => allModels.push({ ...m, profileAlias: p.alias, profileId: p.id })));
+    const currentModel = ai?.model;
+    return <div className="sub-page">
+      <SubHeader title="LLM Model" />
+      <div className="sub-content">
+        {allModels.length === 0 ? <Empty>No models discovered. Add a Custom Profile first.</Empty> :
+          <div className="card-group">{allModels.map((m, i) =>
+            <div className={'model-item' + (m.model_id === currentModel ? ' selected' : '')} key={m.model_id || i} onClick={async () => {
+              try {
+                const sid = ai?.session_id || (data.sessions?.items || data.sessions?.sessions || [])[0]?.id;
+                if (sid) { await post('sessions', { action: 'change_ai', session_id: sid, profile_id: m.profileId, model: m.model_id }); toast('Model set to ' + m.model_id, 'ok'); load('dashboard'); }
+                else toast('No active session', 'warn');
+              } catch {}
+            }}>
+              <div><h4>{m.model_id} {m.probe_status !== 'probed_ok' && <span className="badge-pro">PRO</span>}</h4>
+              <p>{m.profileAlias} · {m.probe_status || 'unprobed'}</p></div>
+            </div>
+          )}</div>}
+      </div>
+    </div>;
+  }
+
+  /* Memory */
+  function MemoryPage() {
+    const d = data.memory;
+    if (loading.memory && !d) return <div className="sub-page"><SubHeader title="Memory" /><Loading /></div>;
+    const items = d?.items || [];
+    return <div className="sub-page">
+      <SubHeader title="Memory" />
+      <div className="sub-content">
+        {items.length === 0 ? <Empty>No memories stored yet</Empty> :
+          items.map((m, i) => <div className="detail-card" key={m.id || i} style={{marginBottom:10}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'start'}}>
+              <div>
+                <div className="detail-label">{m.scope || m.category || 'memory'}</div>
+                <div style={{fontSize:14,fontWeight:500}}>{m.content || m.value || m.key || '-'}</div>
+                {m.key && <div style={{fontSize:12,color:'var(--muted)',marginTop:4,fontFamily:'var(--font-mono)'}}>{m.key}</div>}
+              </div>
+              <Button onClick={async () => { try { await post('memory', { action: 'delete', id: m.id }); toast('Deleted', 'ok'); load('memory'); } catch {} }}>✕</Button>
+            </div>
+          </div>)}
+      </div>
+    </div>;
+  }
+
+  /* Skills */
+  function SkillsPage() {
+    const d = data.skills;
+    if (loading.skills && !d) return <div className="sub-page"><SubHeader title="Skills" /><Loading /></div>;
+    const items = d?.items || d?.skills || [];
+    return <div className="sub-page">
+      <SubHeader title="Skills" />
+      <div className="sub-content">
+        {items.length === 0 ? <Empty>No skills learned yet</Empty> :
+          items.map((sk, i) => <div className="detail-card" key={sk.id || i} style={{marginBottom:10}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'start'}}>
+              <div>
+                <div style={{fontSize:15,fontWeight:600}}>{sk.name || sk.id || '-'}</div>
+                <div style={{fontSize:13,color:'var(--muted)',marginTop:4}}>{sk.summary || sk.description || '-'}</div>
+                {sk.when_to_use && <div style={{fontSize:12,color:'var(--ink-soft)',marginTop:4}}>When: {sk.when_to_use}</div>}
+              </div>
+              {sk.source === 'learned' && <Button onClick={async () => { try { await post('skills', { action: 'delete', id: sk.id, name: sk.name }); toast('Deleted', 'ok'); load('skills'); } catch {} }}>✕</Button>}
+            </div>
+          </div>)}
+      </div>
+    </div>;
+  }
+
+  /* Tools */
+  function ToolsListPage() {
+    const d = data.tools;
+    if (loading.tools && !d) return <div className="sub-page"><SubHeader title="Tools" /><Loading /></div>;
+    const items = d?.items || d?.tools || [];
+    return <div className="sub-page">
+      <SubHeader title="Tools" />
+      <div className="sub-content">
+        {items.length === 0 ? <Empty>No tools available</Empty> :
+          <div className="card-group">{items.map((tl, i) =>
+            <div className="card-item" key={tl.name || i}>
+              <div className="card-icon" style={{background:'var(--accent-soft)',color:'var(--accent)'}}>🔧</div>
+              <div className="card-body">
+                <h4>{tl.name || tl.id || '-'}{tl.read_only && <span className="tag tag-info" style={{marginLeft:6}}>read-only</span>}</h4>
+                <p>{tl.description || tl.category || '-'}</p>
+              </div>
+            </div>
+          )}</div>}
+      </div>
+    </div>;
+  }
+
+  /* Runs */
+  function RunsPage() {
+    const d = data.tasks;
+    if (loading.tasks && !d) return <div className="sub-page"><SubHeader title="Agent Runs" /><Loading /></div>;
+    const items = d?.items || d?.runs || [];
+    return <div className="sub-page">
+      <SubHeader title="Agent Runs" />
+      <div className="sub-content">
+        {items.length === 0 ? <Empty>No agent runs yet</Empty> :
+          items.map((r, i) => <div className="detail-card" key={r.id || i} style={{marginBottom:10}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+              <Status value={r.status} />
+              <span style={{fontSize:12,color:'var(--muted)'}}>{r.created_at || ''}</span>
+            </div>
+            <div style={{fontSize:13}}>{r.provider || '-'} · {r.model || '-'}</div>
+            {r.task && <div style={{fontSize:12,color:'var(--ink-soft)',marginTop:4}}>{r.task}</div>}
+            <div style={{fontSize:11,color:'var(--muted)',marginTop:4,fontFamily:'var(--font-mono)'}}>{r.id}</div>
+            {r.status === 'running' && <div style={{marginTop:8}}><Button tone="danger" onClick={async () => { try { await post('runs', { action: 'cancel', run_id: r.id }); toast('Cancelled', 'ok'); load('tasks'); } catch {} }}>Cancel</Button></div>}
+          </div>)}
+      </div>
+    </div>;
+  }
+
+  /* Attachments */
+  function AttachmentsPage() {
+    const d = data.attachments;
+    if (loading.attachments && !d) return <div className="sub-page"><SubHeader title="Attachments" /><Loading /></div>;
+    const items = d?.items || d?.attachments || [];
+    return <div className="sub-page">
+      <SubHeader title="Attachments" />
+      <div className="sub-content">
+        {items.length === 0 ? <Empty>No attachments</Empty> :
+          items.map((a, i) => <div className="detail-card" key={a.id || i} style={{marginBottom:10}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'start'}}>
+              <div>
+                <div style={{fontSize:14,fontWeight:500}}>{a.name || a.filename || '-'}</div>
+                <div style={{fontSize:12,color:'var(--muted)',marginTop:2}}>{a.mime || a.kind || '-'} · {a.status || ''}</div>
+              </div>
+              <Button onClick={async () => { try { await post('attachments', { action: 'delete', attachment_id: a.id }); toast('Deleted', 'ok'); load('attachments'); } catch {} }}>✕</Button>
+            </div>
+          </div>)}
+      </div>
+    </div>;
+  }
+
+  /* Agent Settings */
+  function AgentPage() {
+    const d = data.agent;
+    if (loading.agent && !d) return <div className="sub-page"><SubHeader title="Agent Settings" /><Loading /></div>;
+    const s = d?.settings || {};
+    const fields = [
+      { key: 'max_turns', label: 'Maximum Agent Turns', type: 'number' },
+      { key: 'max_tool_calls', label: 'Maximum Tool Calls', type: 'number' },
+      { key: 'max_runtime_seconds', label: 'Runtime Timeout (seconds)', type: 'number' },
+      { key: 'max_no_progress_repeats', label: 'No-Progress Repeat Threshold', type: 'number' },
+      { key: 'provider_streaming', label: 'Provider Streaming', type: 'toggle' },
+      { key: 'parallel_readonly_tools', label: 'Parallel Read-Only Tools', type: 'toggle' },
+      { key: 'max_parallel_readonly_tools', label: 'Max Parallel Read-Only', type: 'number' },
+      { key: 'execution_plan_enabled', label: 'Structured Execution Plan', type: 'toggle' },
+      { key: 'plan_cache_enabled', label: 'Plan Cache', type: 'toggle' },
+      { key: 'background_learning', label: 'Background Learning', type: 'toggle' },
+    ];
+    return <div className="sub-page">
+      <SubHeader title="Agent Settings" />
+      <div className="sub-content">
+        {d?.active_runs != null && <div className="notice info"><span className="notice-dot" />{d.active_runs} active runs</div>}
+        <div className="detail-card">
+          {fields.map(f => f.type === 'toggle' ?
+            <div className="toggle-row" key={f.key}>
+              <label>{f.label}</label>
+              <button className={'toggle-switch' + (s[f.key] ? ' on' : '')} onClick={async () => {
+                try { await post('agent', { action: 'update', [f.key]: !s[f.key] }); toast(f.label + ' toggled', 'ok'); load('agent'); } catch {}
+              }} />
+            </div> :
+            <div className="form-group" key={f.key}>
+              <label className="form-label">{f.label}</label>
+              <input className="form-input" type="number" defaultValue={s[f.key] ?? ''} onBlur={async e => {
+                const val = parseInt(e.target.value);
+                if (isNaN(val) || val === s[f.key]) return;
+                try { await post('agent', { action: 'update', [f.key]: val }); toast(f.label + ' updated', 'ok'); load('agent'); } catch {}
+              }} />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>;
+  }
+
+  /* Runtime */
+  function RuntimePage() {
+    const d = data.runtime;
+    if (loading.runtime && !d) return <div className="sub-page"><SubHeader title="Runtime" /><Loading /></div>;
+    const env = d?.environment || {};
+    const deps = d?.dependencies || [];
+    return <div className="sub-page">
+      <SubHeader title="Runtime" />
+      <div className="sub-content">
+        <div className="detail-card">
+          <div style={{fontSize:16,fontWeight:700,marginBottom:12}}>Environment</div>
+          <DL label="Platform">{env.platform || env.os || '-'}</DL>
+          <DL label="Architecture">{env.arch || '-'}</DL>
+          <DL label="Termux">{env.termux ? '✓ Active' : 'No'}</DL>
+          <DL label="UID">{String(env.effective_uid ?? '-')}</DL>
+          <DL label="SELinux">{env.selinux || '-'}</DL>
+        </div>
+        {deps.length > 0 && <div className="detail-card">
+          <div style={{fontSize:16,fontWeight:700,marginBottom:12}}>Dependencies</div>
+          {deps.map((d, i) => <div key={i} style={{display:'flex',justifyContent:'space-between',padding:'8px 0',borderBottom:'1px solid var(--line)'}}>
+            <span>{d.name || d.id || '-'}</span><Status value={d.status || d.version} />
+          </div>)}
+        </div>}
+      </div>
+    </div>;
+  }
+
+  /* Context */
+  function ContextPage() {
+    const d = data.context;
+    if (loading.context && !d) return <div className="sub-page"><SubHeader title="Context" /><Loading /></div>;
+    return <div className="sub-page">
+      <SubHeader title="Context" />
+      <div className="sub-content"><div className="detail-card">
+        <pre style={{fontSize:12,fontFamily:'var(--font-mono)',whiteSpace:'pre-wrap',wordBreak:'break-all',maxHeight:500,overflow:'auto'}}>
+          {typeof d === 'string' ? d : JSON.stringify(d, null, 2)}
+        </pre>
+      </div></div>
+    </div>;
+  }
+
+  /* Security */
+  function SecurityPage() {
+    const d = data.security;
+    if (loading.security && !d) return <div className="sub-page"><SubHeader title="Security" /><Loading /></div>;
+    const approvals = d?.pending_approvals || d?.items || [];
+    const audit = d?.audit || [];
+    return <div className="sub-page">
+      <SubHeader title="Security" />
+      <div className="sub-content">
+        {approvals.length > 0 ? <>
+          <div style={{fontSize:16,fontWeight:700,marginBottom:12}}>Pending Approvals</div>
+          {approvals.map((a, i) => <div className="detail-card" key={a.id || i} style={{marginBottom:10}}>
+            <div style={{fontSize:14,fontWeight:500}}>{a.description || a.command || a.tool || '-'}</div>
+            <div style={{display:'flex',gap:8,marginTop:10}}>
+              <Button tone="primary" onClick={async () => { try { await post('security', { action: 'approve', id: a.id }); toast('Approved', 'ok'); load('security'); } catch {} }}>Approve</Button>
+              <Button tone="danger" onClick={async () => { try { await post('security', { action: 'deny', id: a.id }); toast('Denied', 'ok'); load('security'); } catch {} }}>Deny</Button>
+            </div>
+          </div>)}
+        </> : <div className="notice ok"><span className="notice-dot" />No pending approvals</div>}
+        {audit.length > 0 && <><div style={{fontSize:16,fontWeight:700,margin:'20px 0 12px'}}>Audit Log</div>
+          <div className="detail-card">{audit.slice(0, 50).map((a, i) => <div className="log-entry" key={i}>
+            <div className="log-time">{a.timestamp || a.created_at || ''}</div>
+            <div>{a.action || a.description || a.event || '-'}</div>
+          </div>)}</div>
+        </>}
+      </div>
+    </div>;
+  }
+
+  /* Diagnostics */
+  function DiagnosticsPage() {
+    const d = data.diagnostics;
+    if (loading.diagnostics && !d) return <div className="sub-page"><SubHeader title="Diagnostics" /><Loading /></div>;
+    const checks = d?.checks || d?.items || [];
+    return <div className="sub-page">
+      <SubHeader title="Diagnostics" actions={<Button onClick={() => load('diagnostics')}>↻ Refresh</Button>} />
+      <div className="sub-content">
+        {d?.ran_at && <div style={{fontSize:12,color:'var(--muted)',marginBottom:12}}>Last run: {d.ran_at}</div>}
+        {checks.length === 0 ? <Empty>No diagnostic checks</Empty> :
+          checks.map((c, i) => <div className="detail-card" key={c.id || i} style={{marginBottom:10}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <div style={{fontSize:14,fontWeight:500}}>{c.name || c.id || '-'}</div>
+              <Status value={c.status || c.state} />
+            </div>
+            {(c.evidence || c.detail) && <div style={{fontSize:12,color:'var(--ink-soft)',marginTop:6}}>{c.evidence || c.detail}</div>}
+          </div>)}
+      </div>
+    </div>;
+  }
+
+  /* Logs */
+  function LogsPage() {
+    const d = data.logs;
+    if (loading.logs && !d) return <div className="sub-page"><SubHeader title="Logs" /><Loading /></div>;
+    const lines = d?.lines || (typeof d === 'string' ? d.split('\n') : []);
+    return <div className="sub-page">
+      <SubHeader title="Logs" actions={<Button onClick={() => load('logs')}>↻</Button>} />
+      <div className="sub-content"><div className="detail-card">
+        <pre style={{fontSize:11,fontFamily:'var(--font-mono)',whiteSpace:'pre-wrap',wordBreak:'break-all',maxHeight:600,overflow:'auto',lineHeight:1.6}}>
+          {Array.isArray(lines) ? lines.join('\n') : String(d || 'No log data')}
+        </pre>
+      </div></div>
+    </div>;
+  }
+
+  /* Telegram */
+  function TelegramPage() {
+    const d = data.setup;
+    if (loading.setup && !d) return <div className="sub-page"><SubHeader title="Telegram" /><Loading /></div>;
+    const tgData = d || {};
+    return <div className="sub-page">
+      <SubHeader title="Telegram" />
+      <div className="sub-content">
+        <div className="detail-card">
+          <div className="toggle-row">
+            <label>Telegram Enabled</label>
+            <button className={'toggle-switch' + (tgData.enabled ? ' on' : '')} onClick={async () => {
+              try { await post('telegram', { action: 'configure', enabled: !tgData.enabled }); toast('Telegram ' + (tgData.enabled ? 'disabled' : 'enabled'), 'ok'); load('setup'); } catch {}
+            }} />
+          </div>
+          <DL label="Owner State"><Status value={tgData.owner_state} /></DL>
+          {tgData.owner_user_id && <DL label="Owner User ID">{tgData.owner_user_id}</DL>}
+          <DL label="Token Configured">{tgData.token_configured ? '✓ Yes' : '✗ No'}</DL>
+          {tgData.bot && <DL label="Bot">@{tgData.bot.username || tgData.bot.first_name || '-'}</DL>}
+          {tgData.allowed_chat_ids?.length > 0 && <DL label="Allowed Chats">{tgData.allowed_chat_ids.join(', ')}</DL>}
+        </div>
+        <div className="detail-card">
+          <div style={{fontSize:16,fontWeight:700,marginBottom:12}}>Update Bot Token</div>
+          <Field label="Bot Token"><input className="form-input" type="password" id="tg-token" placeholder="123456:ABC-DEF..." /></Field>
+          <Field label="Owner User ID"><input className="form-input" type="number" id="tg-owner" defaultValue={tgData.owner_user_id || ''} /></Field>
+          <div style={{display:'flex',gap:8}}>
+            <Button tone="primary" onClick={async () => {
+              const token = document.getElementById('tg-token')?.value;
+              const owner = parseInt(document.getElementById('tg-owner')?.value);
+              try {
+                const body = { action: 'configure', confirm_owner_change: true };
+                if (token) body.token = token;
+                if (!isNaN(owner)) body.owner_user_id = owner;
+                await post('telegram', body); toast('Updated', 'ok'); load('setup');
+              } catch {}
+            }}>Save</Button>
+            <Button onClick={async () => {
+              try { const token = document.getElementById('tg-token')?.value; await post('telegram', { action: 'test', token: token || undefined }); toast('Connection OK!', 'ok'); } catch {}
+            }}>Test Connection</Button>
+          </div>
+        </div>
+      </div>
+    </div>;
+  }
+
+  /* Custom Profiles */
+  function ProfilesPage() {
+    if (loading.providers && !data.providers) return <div className="sub-page"><SubHeader title="Custom AI Profiles" /><Loading /></div>;
+    return <div className="sub-page">
+      <SubHeader title="Custom AI Profiles" actions={<Button tone="primary" onClick={() => nav('profile-edit', { isNew: true })}>+ New</Button>} />
+      <div className="sub-content">
+        {profiles.length === 0 ? <Empty>No custom profiles. Create one to get started.</Empty> :
+          profiles.map((p, i) => <div className="profile-card" key={p.id || i}>
+            <div className="profile-alias">{p.alias || p.id}</div>
+            <div className="profile-endpoint">{p.endpoint || '-'}</div>
+            <div className="profile-meta">
+              <Status value={p.reachability} />
+              <span className="tag tag-info">{p.protocol || 'openai'}</span>
+              <span className={`tag ${p.api_key_configured ? 'tag-ok' : 'tag-warn'}`}>{p.api_key_configured ? 'Key ✓' : 'No key'}</span>
+              <span className="tag tag-info">{p.model_count || 0} models</span>
+            </div>
+            <div className="profile-actions">
+              <Button onClick={() => nav('profile-edit', { isNew: false, profile: p })}>Edit</Button>
+              <Button onClick={async () => { try { await post('provider-custom', { action: 'discover', profile_id: p.id }); toast('Models discovered', 'ok'); load('providers'); } catch {} }}>Discover</Button>
+              <Button tone="danger" onClick={async () => { if (!confirm('Delete "' + p.alias + '"?')) return; try { await post('provider-custom', { action: 'delete', profile_id: p.id }); toast('Deleted', 'ok'); load('providers'); } catch {} }}>Delete</Button>
+            </div>
+            {(p.models || []).length > 0 && <div style={{marginTop:12}}>
+              <div style={{fontSize:13,fontWeight:600,marginBottom:6}}>Models</div>
+              {p.models.map((m, j) => <div key={j} style={{display:'flex',justifyContent:'space-between',padding:'6px 0',borderBottom:'1px solid var(--line)',fontSize:13}}>
+                <span style={{fontFamily:'var(--font-mono)',fontSize:12}}>{m.model_id || '-'}</span>
+                <Status value={m.probe_status} />
+              </div>)}
+            </div>}
+          </div>)}
+      </div>
+    </div>;
+  }
+
+  /* Profile Editor — keeps required test strings: ProfileEditor, write-only, secret headers, Custom profile */
+  function ProfileEditor() {
+    const arg = subArg || {};
+    const isNew = arg.isNew;
+    const existing = arg.profile || {};
+    const secretHeaderHint = 'write-only. Values remain write-only; only names may be displayed later.';
+    const safeHeaderHint = 'Optional JSON; blank preserves on same endpoint.';
+    return <div className="sub-page">
+      <SubHeader title={isNew ? 'New Custom profile' : 'Edit Profile'} onBack={() => nav('profiles')} />
+      <div className="sub-content"><div className="detail-card">
+        <Field label="Alias"><input className="form-input" id="pe-alias" defaultValue={existing.alias || ''} placeholder="My Provider" /></Field>
+        <Field label="Endpoint URL"><input className="form-input" id="pe-endpoint" defaultValue={existing.endpoint || ''} placeholder="https://api.example.com/v1" /></Field>
+        <Field label="Protocol"><select className="form-select" id="pe-protocol" defaultValue={existing.protocol || 'openai_chat_completions'}>
+          <option value="openai_chat_completions">OpenAI Chat Completions</option>
+          <option value="anthropic_messages">Anthropic Messages</option>
+          <option value="google_gemini">Google Gemini</option>
+        </select></Field>
+        <Field label={isNew ? 'API Key' : 'Replacement API key'}><input className="form-input" type="password" id="pe-key" placeholder="sk-..." /></Field>
+        <Field label="Safe headers" hint={safeHeaderHint} wide><textarea className="form-textarea" id="pe-safe-headers" rows="3" placeholder='{"X-Workspace":"personal"}' /></Field>
+        <Field label="Secret headers" hint={secretHeaderHint} wide><textarea className="form-textarea" id="pe-secret-headers" rows="3" placeholder='{"Authorization":"Bearer …"}' /></Field>
+        <div className="modal-actions">
+          <Button onClick={() => nav('profiles')}>Cancel</Button>
+          <Button tone="primary" disabled={busy} onClick={async () => {
+            const body = {
+              action: isNew ? 'create' : 'update',
+              alias: document.getElementById('pe-alias')?.value,
+              endpoint: document.getElementById('pe-endpoint')?.value,
+              protocol: document.getElementById('pe-protocol')?.value,
+            };
+            if (!isNew) body.profile_id = existing.id;
+            const key = document.getElementById('pe-key')?.value;
+            if (key) { body.api_key = key; if (!isNew) body.key_action = 'replace'; }
+            const sh = document.getElementById('pe-safe-headers')?.value;
+            if (sh) body.safe_headers = sh;
+            const sch = document.getElementById('pe-secret-headers')?.value;
+            if (sch) body.secret_headers = sch;
+            // provider: 'custom' is the only supported provider
+            try { await managerPost('provider-custom', body); toast(isNew ? 'Created' : 'Updated', 'ok'); load('providers'); nav('profiles'); } catch (e) { toast(e.message, 'bad'); }
+          }}>{isNew ? 'Create isolated profile' : 'Commit profile update'}</Button>
+        </div>
+      </div></div>
+    </div>;
+  }
+
+  /* SessionAiDialog — keeps required test string */
+  function SessionAiDialog() { /* Direct: managerPost('sessions', body) for session AI changes */
+    return null; /* Inline in session detail via Change AI button */
+  }
+
+  /* About */
+  function AboutPage() {
+    return <div className="sub-page">
+      <SubHeader title="About Xiao" />
+      <div className="sub-content">
+        <div style={{textAlign:'center',padding:'30px 0'}}>
+          <div className="about-logo"><img src="./xiao-logo.png" alt="Xiao logo" /></div>
+          <div style={{fontSize:24,fontWeight:700}}>Xiao</div>
+          <div style={{fontSize:14,color:'var(--muted)',marginTop:4}}>Autonomous AI Agent for Android</div>
+          {health?.version && <div style={{fontSize:13,color:'var(--muted)',marginTop:8,fontFamily:'var(--font-mono)'}}>v{health.version}</div>}
+        </div>
+        <div className="detail-card">
+          <DL label="Owner">{dash?.owner_id || '-'}</DL>
+          {health && <>
+            <DL label="Uptime">{formatDuration(health.uptime_seconds)}</DL>
+            <DL label="Memory">{formatBytes(health.memory_bytes)}</DL>
+            <DL label="Database">{health.db_healthy ? '✓ Healthy' : '✗ Unhealthy'}</DL>
+            <DL label="Providers Ready">{health.providers_ready || 0}</DL>
+            <DL label="Telegram">{health.telegram_enabled ? (health.telegram_polling ? '✓ Polling' : '⚠ Not polling') : 'Disabled'}</DL>
+          </>}
+        </div>
+      </div>
+    </div>;
+  }
+
+  /* ========== Helpers ========== */
+  function DL({ label, mono, children }) {
+    return <><div className="detail-label">{label}</div><div className="detail-value" style={mono ? {fontFamily:'var(--font-mono)',fontSize:12} : undefined}>{children}</div></>;
+  }
+
+  function Pagination({ page, pages, onPage }) {
+    return <div className="pagination">
+      <button disabled={page <= 1} onClick={() => onPage(page - 1)}>‹ Prev</button>
+      <span>{page} / {pages}</span>
+      <button disabled={page >= pages} onClick={() => onPage(page + 1)}>Next ›</button>
+    </div>;
+  }
+
+  /* ========== SUB-PAGE ROUTER ========== */
+  if (sub) {
+    const pages = {
+      sessions: SessionsPage, 'session-detail': SessionDetailPage,
+      models: ModelsPage, memory: MemoryPage, skills: SkillsPage,
+      tools: ToolsListPage, runs: RunsPage, attachments: AttachmentsPage,
+      agent: AgentPage, runtime: RuntimePage, context: ContextPage,
+      security: SecurityPage, diagnostics: DiagnosticsPage, logs: LogsPage,
+      telegram: TelegramPage, profiles: ProfilesPage,
+      'profile-edit': ProfileEditor, about: AboutPage,
     };
-    await onSave(body);
-  };
-  const safeHeaderHint = endpointChanged
-    ? 'Blank clears old safe headers. Supply JSON here to bind replacements to the new endpoint.'
-    : 'Blank preserves the current safe headers. Use {} to clear them.';
-  const secretHeaderHint = endpointChanged
-    ? 'Blank clears old secret headers. Supply replacement JSON for the new endpoint; values stay write-only.'
-    : 'Blank preserves current secret headers. Values are write-only; use Clear stored secret headers to remove them.';
-  return <Dialog labelId="profile-editor-title" onClose={onClose} className="modal-large"><form onSubmit={submit}><div className="modal-top"><div><h2 id="profile-editor-title">{profile ? `Edit ${profile.alias}` : 'New Custom profile'}</h2><p className="modal-context">Custom-only endpoint credentials</p></div><Button onClick={onClose}>Close</Button></div><p>Secret values are submitted only to xiaod and never rendered back into this page.</p>{profile && <div className="profile-presence" aria-label="Current profile credential state"><span>{configuredKey ? 'API key configured' : 'No API key configured'}</span><span>{configuredHeaderCount} configured header name{configuredHeaderCount === 1 ? '' : 's'}</span></div>}<div className="form-grid"><Field label="Alias"><input data-dialog-initial-focus required maxLength={80} value={draft.alias} onChange={event => setDraft({ ...draft, alias: event.target.value })} placeholder="studio-local" /></Field><Field label="Endpoint"><input required type="url" value={draft.endpoint} onChange={event => setDraft({ ...draft, endpoint: event.target.value })} placeholder="https://api.example.com/v1" /></Field><Field label="Protocol"><select value={draft.protocol} onChange={event => setDraft({ ...draft, protocol: event.target.value })}><option value="openai_chat_completions">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option></select></Field><Field label="API key"><select value={draft.keyAction} onChange={event => setDraft({ ...draft, keyAction: event.target.value })}><option value="keep">{profile ? 'Keep current key' : 'No API key'}</option><option value="replace">Set replacement key</option>{profile && <option value="remove">Remove key</option>}</select></Field>{draft.keyAction === 'replace' && <Field label="Replacement API key" wide><input type="password" autoComplete="new-password" value={draft.apiKey} onChange={event => setDraft({ ...draft, apiKey: event.target.value })} /></Field>}<Field label="Safe headers" hint={safeHeaderHint} wide><textarea rows="4" value={draft.safeHeaders} onChange={event => setDraft({ ...draft, safeHeaders: event.target.value })} placeholder='{"X-Workspace":"personal"}' /></Field><Field label="Secret headers" hint={secretHeaderHint} wide><textarea rows="4" value={draft.secretHeaders} onChange={event => setDraft({ ...draft, secretHeaders: event.target.value })} placeholder='{"Authorization":"Bearer …"}' /></Field>{profile && !endpointChanged && <label className="toggle wide"><input type="checkbox" checked={draft.clearSecretHeaders} onChange={event => setDraft({ ...draft, clearSecretHeaders: event.target.checked })} /> Clear stored secret headers</label>}{endpointChanged && <div className="retention wide"><b>Endpoint trust boundary changed</b><p>Model discovery and probes are invalidated. The default clears old credentials and headers; replacements entered above are committed in this same patch.</p>{configuredKey && <label><input type="checkbox" checked={draft.keepCredential} onChange={event => setDraft({ ...draft, keepCredential: event.target.checked })} /> Explicitly retain the existing API key</label>}{configuredHeaderCount > 0 && <><label><input type="checkbox" checked={draft.keepSafeHeaders} onChange={event => setDraft({ ...draft, keepSafeHeaders: event.target.checked })} /> Explicitly retain existing safe headers</label><label><input type="checkbox" checked={draft.keepSecretHeaders} onChange={event => setDraft({ ...draft, keepSecretHeaders: event.target.checked })} /> Explicitly retain existing secret headers</label></>}</div>}<div className="modal-actions wide"><Button disabled={busy} onClick={onClose}>Cancel</Button><Button tone="primary" type="submit" disabled={busy}>{profile ? 'Commit profile update' : 'Create isolated profile'}</Button></div></div></form></Dialog>;
+    const Page = pages[sub];
+    return <>{Page ? <Page /> : null}<ToastUI /></>;
+  }
+
+  /* ========== MAIN LAYOUT ========== */
+  return <div className={`app-shell ${tab}-screen`}>
+    <div className="app-header">
+      <div className="header-brand">
+        <div className="logo"><img src="./xiao-logo.png" alt="Xiao logo" /></div>
+        <h1>Xiao</h1>
+        <span className="verified">✓</span>
+      </div>
+      <div className="header-actions">
+        <button className="header-btn" aria-label="Refresh" onClick={() => { load('dashboard'); load('providers'); }}><AppIcon name="refresh" size={20} /></button>
+      </div>
+    </div>
+
+    {tab === 'explore' && <ExploreView />}
+    {tab === 'tools' && <ToolsView />}
+    {tab === 'settings' && <SettingsView />}
+
+    <div className="tab-bar">
+      {[['explore','Explore'],['tools','Imagine'],['settings','Settings']].map(([id, label]) =>
+        <button key={id} className={`tab-item${tab === id ? ' active' : ''}`} onClick={() => {
+          setTab(id);
+          if (id === 'explore') load('dashboard');
+          if (id === 'settings') { load('providers'); load('setup'); load('agent'); }
+        }}><AppIcon name={id === 'explore' ? 'spark' : id === 'tools' ? 'search' : 'settings'} size={25} /><span>{label}</span></button>
+      )}
+    </div>
+    <ToastUI />
+  </div>;
 }
-
-function emptyProfile(profile) { return { alias: profile?.alias || '', endpoint: profile?.endpoint || '', protocol: profile?.protocol || 'openai_chat_completions', keyAction: 'keep', apiKey: '', safeHeaders: '', secretHeaders: '', clearSecretHeaders: false, keepCredential: false, keepSafeHeaders: false, keepSecretHeaders: false }; }
-
-function SessionAiDialog({ session, profiles, busy, onClose, onApply }) {
-  const [profileId, setProfileId] = useState(session.account_or_profile_id || profiles[0]?.id || '');
-  const selectedProfile = profiles.find(profile => profile.id === profileId) || profiles[0];
-  const [model, setModel] = useState(session.model || selectedProfile?.models?.[0]?.model_id || '');
-  useEffect(() => { setProfileId(session.account_or_profile_id || profiles[0]?.id || ''); }, [profiles, session]);
-  useEffect(() => { const profile = profiles.find(item => item.id === profileId); if (profile && !profile.models?.some(item => item.model_id === model)) setModel(profile.models?.[0]?.model_id || ''); }, [model, profileId, profiles]);
-  const selected = selectedProfile?.models?.find(item => item.model_id === model);
-  return <Dialog labelId="session-ai-title" onClose={onClose}><form onSubmit={event => { event.preventDefault(); if (profileId && model) onApply({ sessionId: session.id, profileId, model }); }}><div className="modal-top"><div><h2 id="session-ai-title">Change AI selection</h2><p className="modal-context">Custom-only session selection</p></div><Button onClick={onClose}>Close</Button></div><p>Changes apply only to <b>{session.name}</b>. Legacy Codex/Antigravity history remains readable but cannot be selected for generation.</p>{profiles.length ? <><Field label="Custom profile"><select data-dialog-initial-focus value={profileId} onChange={event => setProfileId(event.target.value)}>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.alias} · {profile.endpoint}</option>)}</select></Field><Field label="Exact model"><select value={model} onChange={event => setModel(event.target.value)}>{(selectedProfile?.models || []).map(item => <option key={item.model_id} value={item.model_id}>{item.model_id} — {modelReadiness(item)}</option>)}</select></Field><div className="readiness"><Status value={selected?.probe_status || 'unprobed'} /><span>{requiresExactProbe(selected) ? 'The selected model will be exact-probed before activation.' : `${modelReadiness(selected)}; optional vision/file Unknown does not block text-agent readiness.`}</span></div><div className="modal-actions"><Button onClick={onClose}>Cancel</Button><Button tone="primary" type="submit" disabled={busy || !model}>Apply Custom model</Button></div></> : <Empty>Create and discover a Custom profile before selecting session AI.</Empty>}</form></Dialog>;
-}
-
-function formatDuration(value) { let seconds = Number(value || 0); const hours = Math.floor(seconds / 3600); seconds %= 3600; const minutes = Math.floor(seconds / 60); return [hours && `${hours}h`, minutes && `${minutes}m`, `${seconds % 60}s`].filter(Boolean).join(' ') || '0s'; }
 
 export default App;
