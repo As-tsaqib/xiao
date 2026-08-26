@@ -1703,7 +1703,9 @@ impl Provider for CustomProvider {
                         );
                     }
                 }
-                return Err(anyhow!("Custom provider request failed with HTTP {status}: {summary}"));
+                return Err(anyhow!(
+                    "Custom provider request failed with HTTP {status}: {summary}"
+                ));
             }
         }
         let response = match ensure_success(response, "Custom provider").await {
