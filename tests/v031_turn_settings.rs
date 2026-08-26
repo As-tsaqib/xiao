@@ -252,9 +252,11 @@ async fn scripted_provider_exceeds_eight_turns_without_premature_failure() {
         auth,
     ));
 
-    let mut config = AgentConfig::default();
-    config.max_turns = 150;
-    config.max_tool_calls = 150;
+    let config = AgentConfig {
+        max_turns: 150,
+        max_tool_calls: 150,
+        ..Default::default()
+    };
 
     let tools = Arc::new(xiao::tools::ToolRegistry::new(
         xiao::tools::ToolPolicy::default(),
@@ -296,9 +298,11 @@ async fn no_progress_guard_stops_repeated_loop_at_threshold() {
         auth,
     ));
 
-    let mut config = AgentConfig::default();
-    config.max_no_progress_repeats = 3;
-    config.max_turns = 150;
+    let config = AgentConfig {
+        max_no_progress_repeats: 3,
+        max_turns: 150,
+        ..Default::default()
+    };
 
     let tools = Arc::new(xiao::tools::ToolRegistry::new(
         xiao::tools::ToolPolicy::default(),

@@ -194,9 +194,11 @@ async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
         })
         .unwrap();
 
-    let mut config = AgentConfig::default();
-    config.parallel_readonly_tools = true;
-    config.max_parallel_readonly_tools = 8;
+    let config = AgentConfig {
+        parallel_readonly_tools: true,
+        max_parallel_readonly_tools: 8,
+        ..Default::default()
+    };
 
     let engine =
         AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
