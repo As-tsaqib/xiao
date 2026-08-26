@@ -4352,15 +4352,46 @@ mod tests {
 
         let (auth, _directory) = test_auth();
         let storage = auth.storage();
-        let config = CustomProviderConfig {
-            enabled: true,
-            base_url: Some(format!("http://{address}/v1")),
-            protocol: "openai_chat_completions".into(),
-            profile_id: Some("prof-stream-test".into()),
-            ..Default::default()
-        };
-        let provider = CustomProvider::new(config, auth);
-        let req = request(vec![message("user", "hello streaming capability test")]);
+        let profiles = ProviderProfileStore::new(storage.clone());
+        let owner = "owner:stream";
+        let profile = profiles
+            .create(ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner.into(),
+                alias: "streamer".into(),
+                endpoint: format!("http://{address}/v1"),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: None,
+                api_key_ref: None,
+                safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
+            })
+            .unwrap();
+        profiles
+            .replace_models(
+                owner,
+                &profile.profile_id,
+                &[profile_model(
+                    &profile.profile_id,
+                    "stream-model",
+                    ToolProtocol::Native,
+                )],
+            )
+            .unwrap();
+
+        let provider = CustomProvider::new(
+            CustomProviderConfig {
+                enabled: true,
+                base_url: Some(format!("http://{address}/v1")),
+                protocol: "openai_chat_completions".into(),
+                models: vec!["stream-model".into()],
+                ..Default::default()
+            },
+            auth,
+        );
+        let mut req = request(vec![message("user", "hello streaming capability test")]);
+        req.model = "stream-model".into();
+        req.account_id = Some(profile.profile_id.clone());
 
         let turn = provider.run_turn(req, None, vec![], None).await.unwrap();
         match turn.step {
@@ -4370,8 +4401,8 @@ mod tests {
 
         let evidence = storage
             .get_capability_evidence(
-                "prof-stream-test",
-                "model-a",
+                &profile.profile_id,
+                "stream-model",
                 "openai_chat_completions",
                 "streaming",
             )
