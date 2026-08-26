@@ -6,7 +6,7 @@ This record captures automated CI verification status and documents device limit
 
 - Branch: `main`
 - Schema migration: 26 → 27
-- Verified CI Run: 33020411289 (Commit `8e33b09b5585eeeb1ef5347b4d13e3db856cfc2c`)
+- Verified CI Run: 33022754295 (Commit `30d2e45da7ea30811e5a55ae5c25608b68832a89`)
 - `rust` job: PASS (cargo check, cargo test with 312 unit/integration tests passing, strict clippy, release build, WebUI build, static acceptance).
 - `android-arm64` job: PASS (cargo-ndk build, WebUI embed, deterministic module ZIP build and sha256 checksum verification).
 - Local Rust, WebUI, and Android builds/tests: not run (repository policy; all validation via GitHub Actions CI).
@@ -43,6 +43,13 @@ This record captures automated CI verification status and documents device limit
 11. **WebUI Redesign & Daemon IPC Alignment**:
     - Functional `SessionAiDialog` and `ProfileEditor` with complete Custom profile lifecycle and write-only secret security.
     - Fully typed daemon IPC action routing for session AI (`ai_config`), custom profile discovery/probe (`test`/`probe`), attachment removal (`remove`), memory forget/reconcile, and approval decisions.
+
+12. **CLI Hardening & End-to-End Contract Assurance**:
+    - Universal pre-daemon syntax validation across all 22 command families and leaf subcommands.
+    - Terminal-native subcommand help and `--help` resolution without requiring active daemon IPC.
+    - Strict arity, option parsing, and exit code contract enforcement (0 ok, 1 error, 2 usage, 3 daemon unavailable, 4 rejected, 5 not found, 6 local io).
+    - Global flags (`--json`, `--quiet`, `--session`, `--timeout`, `--no-color`) validated with stable structured JSON error envelopes.
+    - Strict security contract: zero secret leakage in argv, stdin/file-based secret ingestion, and sanitization of tokens/keys in CLI JSON responses.
 
 ## Device Limitations & Edge Behaviors
 
