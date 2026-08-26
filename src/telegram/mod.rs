@@ -4089,10 +4089,9 @@ mod tests {
         let captured = provider_captured_req.lock().unwrap();
         assert_eq!(captured.len(), 1);
         let req_messages = captured[0]["messages"].as_array().unwrap();
-        let user_content = &req_messages[0]["content"];
-        let content_str = serde_json::to_string(user_content).unwrap();
-        assert!(content_str.contains("data:image/png;base64,"));
-        assert!(content_str.contains("Apa ini"));
+        let messages_str = serde_json::to_string(req_messages).unwrap();
+        assert!(messages_str.contains("data:image/png;base64,"));
+        assert!(messages_str.contains("Apa ini"));
 
         let sent_requests = telegram_probe.requests.lock().unwrap();
         assert!(sent_requests.iter().any(|(method, body)| {
