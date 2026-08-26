@@ -68,3 +68,7 @@ Turn exhaustion at 150 should be rare. If reached, return a bounded useful Block
 - foreground semantic verification.
 
 It does not need to cancel already post-delivery background learning for a completed earlier run.
+
+## Android Composer Icon Limitation
+
+Telegram Android client does not permit external bot control over composer action icons or composer styling via draft payload attributes. Xiao only renders draft progress and rich view blocks in the message stream; it does not claim or attempt composer icon control on Android.

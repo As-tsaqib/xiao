@@ -462,13 +462,15 @@ impl TelegramAdapter {
                 // exact ASK decision can surface as a scoped inline card. Private
                 // chats retain the existing draft transport; topics intentionally
                 // receive no draft updates but do receive the same approval card.
+                let draft_id = (message.chat.kind == "private")
+                    .then_some(if update_id <= 0 { 1 } else { update_id });
                 self.execute_with_live_events(
                     &principal,
                     scope,
                     update_id,
                     user.id,
                     text,
-                    (message.chat.kind == "private").then_some(update_id),
+                    draft_id,
                     work.child_token(),
                 )
                 .await
@@ -661,18 +663,30 @@ impl TelegramAdapter {
             .storage
             .setting(&format!("telegram.progress_detail:{principal}"))?
             .unwrap_or(configured_detail);
-        let mut aggregator = ProgressAggregator::new(detail);
+        let configured_direct_final = self
+            .app
+            .config
+            .read()
+            .await
+            .telegram
+            .ui
+            .direct_final;
+        let direct_final = self
+            .app
+            .storage
+            .setting(&format!("telegram.direct_final:{principal}"))?
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(configured_direct_final);
+        let mut aggregator = ProgressAggregator::with_direct_final(detail, direct_final);
         let mut dirty = true;
         let mut last_sent = std::time::Instant::now() - Duration::from_secs(30);
         const HEARTBEAT: Duration = Duration::from_secs(20);
         loop {
             tokio::select! {
                 result = &mut future => {
-                    if dirty {
-                        if let Some(draft_id) = draft_id {
-                            let view = aggregator.view();
-                            let _ = self.client.draft_rich_scoped(scope, draft_id, rich::render(&view, true)).await;
-                        }
+                    // Finalize / clear draft exactly once before delivering the single permanent final.
+                    if let Some(draft_id) = draft_id {
+                        let _ = self.client.clear_draft_scoped(scope, draft_id).await;
                     }
                     return result;
                 }
@@ -1775,6 +1789,7 @@ struct ProgressAggregator {
     items: Vec<ProgressItem>,
     next_id: u64,
     detail: String,
+    direct_final: bool,
     stream_chunks: usize,
     visible_text: String,
 }
@@ -1791,10 +1806,15 @@ const PROGRESS_CHAR_BUDGET: usize = 3_500;
 
 impl ProgressAggregator {
     fn new(detail: String) -> Self {
+        Self::with_direct_final(detail, true)
+    }
+
+    fn with_direct_final(detail: String, direct_final: bool) -> Self {
         Self {
             items: vec![],
             next_id: 1,
             detail,
+            direct_final,
             stream_chunks: 0,
             visible_text: String::new(),
         }
@@ -1836,17 +1856,6 @@ impl ProgressAggregator {
             AgentEvent::StreamChunk { .. } => self.stream_chunk(),
             AgentEvent::TextDelta(delta) => {
                 self.visible_text.push_str(&delta);
-                if self.visible_text.chars().count() > 3_000 {
-                    self.visible_text = self
-                        .visible_text
-                        .chars()
-                        .rev()
-                        .take(3_000)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect();
-                }
                 self.stream_chunk();
             }
             AgentEvent::GenerationCompleted => {
@@ -2147,9 +2156,14 @@ impl ProgressAggregator {
             }
         }
         let mut blocks = vec![Block::Progress { items }];
-        if !self.visible_text.is_empty() {
+        if self.direct_final && !self.visible_text.is_empty() {
+            let display_text = if self.visible_text.chars().count() > 3_000 {
+                self.visible_text.chars().take(3_000).collect::<String>()
+            } else {
+                self.visible_text.clone()
+            };
             blocks.push(Block::Paragraph {
-                text: self.visible_text.clone(),
+                text: display_text,
             });
         }
         View {
@@ -4100,5 +4114,219 @@ mod tests {
                     .unwrap()
                     .contains("Ini adalah gambar merah.")
         }));
+    }
+    #[test]
+    fn monotonic_accumulated_draft_content_does_not_shrink_or_reset() {
+        let mut progress = ProgressAggregator::new("normal".into());
+        progress.push(AgentEvent::GenerationStarted);
+        progress.push(AgentEvent::TextDelta("Hello ".into()));
+        assert_eq!(progress.visible_text, "Hello ");
+        let view = progress.view();
+        assert_eq!(view.blocks.len(), 2);
+        if let Block::Paragraph { text } = &view.blocks[1] {
+            assert_eq!(text, "Hello ");
+        } else {
+            panic!("expected paragraph block");
+        }
+
+        progress.push(AgentEvent::TextDelta("world!".into()));
+        assert_eq!(progress.visible_text, "Hello world!");
+        let view = progress.view();
+        if let Block::Paragraph { text } = &view.blocks[1] {
+            assert_eq!(text, "Hello world!");
+        } else {
+            panic!("expected paragraph block");
+        }
+
+        progress.push(AgentEvent::ToolStarted("terminal".into()));
+        assert_eq!(progress.visible_text, "Hello world!");
+
+        progress.push(AgentEvent::TextDelta(" Extra".into()));
+        assert_eq!(progress.visible_text, "Hello world! Extra");
+    }
+
+    #[test]
+    fn direct_final_false_avoids_answer_draft_entirely() {
+        let mut progress = ProgressAggregator::with_direct_final("normal".into(), false);
+        progress.push(AgentEvent::GenerationStarted);
+        progress.push(AgentEvent::TextDelta("streaming answer token".into()));
+        let view = progress.view();
+        assert_eq!(view.blocks.len(), 1);
+        assert!(matches!(view.blocks[0], Block::Progress { .. }));
+    }
+
+    #[tokio::test]
+    async fn telegram_rich_draft_lifecycle_sequence_clears_draft_before_single_permanent_final() {
+        let telegram_probe = Arc::new(TelegramRequestProbe::default());
+        let telegram_base = serve(
+            Router::new()
+                .fallback(post(scoped_telegram_stub))
+                .with_state(telegram_probe.clone()),
+        )
+        .await;
+
+        let provider_captured = Arc::new(Mutex::new(Vec::new()));
+        let provider_captured_clone = provider_captured.clone();
+        let provider_base = serve(
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = provider_captured_clone.clone();
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world!\"}}]}\n\ndata: [DONE]\n\n";
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(sse_body))
+                            .unwrap()
+                    }
+                }),
+            ),
+        )
+        .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.storage.database = temp.path().join("xiao.db");
+        cfg.paths.data_dir = temp.path().join("data");
+        cfg.paths.logs_dir = temp.path().join("logs");
+        cfg.paths.secrets_dir = temp.path().join("secrets");
+        cfg.telegram.enabled = true;
+        cfg.telegram.access.owner_user_id = Some(10);
+        cfg.telegram.access.allowed_chat_ids = vec![100];
+        cfg.telegram.ui.direct_final = true;
+        cfg.providers.custom.enabled = true;
+        cfg.providers.custom.base_url = Some(provider_base.clone());
+        cfg.providers.custom.models = vec!["m-stream".into()];
+        cfg.providers.custom.default_model = Some("m-stream".into());
+
+        let app = AppState::build(cfg).await.unwrap();
+        let owner = app.resolve_telegram_owner(10).unwrap().owner_id;
+
+        let profile_store = crate::providers::ProviderProfileStore::new(app.storage.clone());
+        let profile = profile_store
+            .create(crate::storage::ProviderProfileInput {
+                profile_id: None,
+                owner_id: owner.clone(),
+                alias: "stream-profile".into(),
+                endpoint: provider_base.clone(),
+                protocol: "openai_chat_completions".into(),
+                credential_ref: None,
+                api_key_ref: None,
+                safe_headers_json: "{}".into(),
+                secret_headers_ref: None,
+            })
+            .unwrap();
+        let stream_model = crate::storage::ProviderProfileModelRecord {
+            profile_id: profile.profile_id.clone(),
+            model_id: "m-stream".into(),
+            text_capable: true,
+            vision_capable: false,
+            file_input_capable: false,
+            native_tools: false,
+            structured_output: false,
+            continuation: false,
+            native_tools_state: "unsupported".into(),
+            structured_output_state: "unsupported".into(),
+            continuation_state: "unsupported".into(),
+            vision_state: "unsupported".into(),
+            file_input_state: "unsupported".into(),
+            model_discovery: false,
+            tool_protocol: "chat_only".into(),
+            evidence: "streaming fixture".into(),
+            probe_status: "completed".into(),
+            probe_version: 1,
+            probed_at: "now".into(),
+        };
+        profile_store
+            .replace_models(&owner, &profile.profile_id, &[stream_model])
+            .unwrap();
+
+        let session = app
+            .sessions
+            .context_for_telegram(&owner, TelegramScope::new(100, None))
+            .unwrap()
+            .active;
+        app.storage
+            .set_session_provider(
+                &owner,
+                &session.id,
+                "custom",
+                Some(&profile.profile_id),
+                "m-stream",
+            )
+            .unwrap();
+
+        let adapter = TelegramAdapter {
+            app: app.clone(),
+            client: TelegramClient::with_base("test-token".into(), telegram_base).unwrap(),
+            menus: Arc::new(MenuStore::new(Duration::from_secs(60))),
+            custom_logins: Arc::new(CustomLoginStore::new(Duration::from_secs(60))),
+            principal_locks: Arc::new(Mutex::new(HashMap::new())),
+            active_work: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let mut msg = message(55, 100, 10, "Hello streaming");
+        msg.message.as_mut().unwrap().chat.kind = "private".into();
+        adapter.handle_update(msg).await.unwrap();
+
+        let reqs = telegram_probe.requests.lock().unwrap().clone();
+        let draft_calls: Vec<_> = reqs
+            .iter()
+            .filter(|(m, _)| m == "sendRichMessageDraft")
+            .collect();
+        let final_calls: Vec<_> = reqs
+            .iter()
+            .filter(|(m, _)| m == "sendRichMessage" || m == "sendMessage")
+            .collect();
+
+        // 1. Exactly one permanent final message
+        assert_eq!(
+            final_calls.len(),
+            1,
+            "exactly one permanent final message must be sent"
+        );
+        let final_json = serde_json::to_string(&final_calls[0].1).unwrap();
+        assert!(final_json.contains("Hello world!"));
+
+        // 2. All draft calls use stable draft_id 55
+        for (_, body) in &draft_calls {
+            assert_eq!(body.get("draft_id").and_then(Value::as_i64), Some(55));
+        }
+
+        // 3. Draft clear occurs
+        let clear_calls: Vec<_> = draft_calls
+            .iter()
+            .filter(|(_, body)| {
+                body.pointer("/rich_message/blocks")
+                    .and_then(Value::as_array)
+                    .map_or(false, |b| b.is_empty())
+            })
+            .collect();
+        assert_eq!(
+            clear_calls.len(),
+            1,
+            "draft must be cleared exactly once before final delivery"
+        );
+
+        // 4. Draft clear precedes final send
+        let last_clear_pos = reqs
+            .iter()
+            .rposition(|(m, body)| {
+                m == "sendRichMessageDraft"
+                    && body
+                        .pointer("/rich_message/blocks")
+                        .and_then(Value::as_array)
+                        .map_or(false, |b| b.is_empty())
+            })
+            .unwrap();
+        let first_final_pos = reqs
+            .iter()
+            .position(|(m, _)| m == "sendRichMessage" || m == "sendMessage")
+            .unwrap();
+        assert!(
+            last_clear_pos < first_final_pos,
+            "draft clear must precede permanent final delivery"
+        );
     }
 }

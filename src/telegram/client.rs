@@ -330,6 +330,14 @@ impl TelegramClient {
         );
         self.call("sendRichMessageDraft", body).await
     }
+    pub async fn clear_draft(&self, chat_id: i64, draft_id: i64) -> Result<bool> {
+        self.clear_draft_scoped(TelegramScope::new(chat_id, None), draft_id)
+            .await
+    }
+    pub async fn clear_draft_scoped(&self, scope: TelegramScope, draft_id: i64) -> Result<bool> {
+        self.draft_rich_scoped(scope, draft_id, json!({"blocks":[]}))
+            .await
+    }
     pub async fn edit_rich(
         &self,
         chat_id: i64,
@@ -533,6 +541,28 @@ mod tests {
             "ok":true,
             "result":{"message_id":91,"chat":{"id":4242,"type":"private"}}
         }))
+    }
+
+    #[tokio::test]
+    async fn clear_draft_sends_empty_rich_blocks_with_stable_draft_id() {
+        let probe = Arc::new(RequestProbe::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .fallback(post(request_stub))
+            .with_state(probe.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            TelegramClient::with_base("test-token".into(), format!("http://{address}")).unwrap();
+        let scope = TelegramScope::new(4242, None);
+        assert!(client.clear_draft_scoped(scope, 42).await.unwrap());
+        let requests = probe.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "sendRichMessageDraft");
+        let body: Value = serde_json::from_slice(&requests[0].2).unwrap();
+        assert_eq!(body["draft_id"], 42);
+        assert_eq!(body["rich_message"]["blocks"], json!([]));
+        server.abort();
     }
 
     #[test]

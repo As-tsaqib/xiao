@@ -472,6 +472,8 @@ pub struct TelegramUi {
     pub progress_detail: String,
     #[serde(default = "default_close_behavior")]
     pub menu_close_behavior: String,
+    #[serde(default = "default_direct_final")]
+    pub direct_final: bool,
 }
 impl Default for TelegramUi {
     fn default() -> Self {
@@ -479,6 +481,7 @@ impl Default for TelegramUi {
             menu_ttl_seconds: default_menu_ttl(),
             progress_detail: default_progress_detail(),
             menu_close_behavior: default_close_behavior(),
+            direct_final: default_direct_final(),
         }
     }
 }
@@ -684,6 +687,9 @@ fn default_progress_detail() -> String {
 }
 fn default_close_behavior() -> String {
     "keep_summary".into()
+}
+fn default_direct_final() -> bool {
+    true
 }
 fn default_bind() -> String {
     "127.0.0.1:37921".into()

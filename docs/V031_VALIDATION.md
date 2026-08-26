@@ -7,7 +7,7 @@ This record is intentionally incomplete until the exact-head CI and rooted Andro
 - Branch: `v0.3.1-audit`
 - Schema migration: 26 → 27
 - Exact SHA/run: 28b60f6b942afa07077f79e58cdc1887af006054 (Run 32923200795)
-- Device comparison shows Telegram Android clips multiple custom emoji inside `RichBlockThinking`, while iOS renders them fully. Draft progress now uses Unicode fallbacks for cross-client consistency; completed `✓`/`✗` markers are unchanged.
+- Device comparison shows Telegram Android clips multiple custom emoji inside `RichBlockThinking`, while iOS renders them fully. Draft progress now uses Unicode fallbacks for cross-client consistency; completed `✓`/`✗` markers are unchanged. Composer icon styling and input controls are subject to Telegram Android client limitations and cannot be controlled via bot server draft payloads.
 - Local Rust, WebUI, and Android builds/tests: not run (repository policy).
 
 ## Rooted Android manual gates

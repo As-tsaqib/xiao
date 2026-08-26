@@ -102,6 +102,7 @@ pub struct ApplyRequest {
     pub log_level: Option<String>,
     pub progress_detail: Option<String>,
     pub menu_close_behavior: Option<String>,
+    pub direct_final: Option<bool>,
     /// Deprecated v0.2.8 compatibility fields. Legacy credentials remain
     /// stored for history isolation, but this endpoint never enables or
     /// mutates an inactive provider.
@@ -621,6 +622,9 @@ async fn admin_apply(
     }
     if let Some(v) = req.menu_close_behavior {
         next.telegram.ui.menu_close_behavior = v;
+    }
+    if let Some(v) = req.direct_final {
+        next.telegram.ui.direct_final = v;
     }
     if let Some(v) = req.custom_enabled {
         next.providers.custom.enabled = v;
