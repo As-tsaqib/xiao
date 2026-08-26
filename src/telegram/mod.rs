@@ -1796,6 +1796,7 @@ struct ToolProgress {
 const PROGRESS_CHAR_BUDGET: usize = 3_500;
 
 impl ProgressAggregator {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(detail: String) -> Self {
         Self::with_direct_final(detail, true)
     }
@@ -2589,6 +2590,7 @@ mod tests {
 
     use super::*;
     use crate::tools::{ToolContext, ToolEffect, ToolOrigin, ToolPolicy, ToolRisk, ToolSpec};
+    use serde_json::Value;
     use axum::{
         body::Bytes,
         extract::State,
