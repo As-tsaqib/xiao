@@ -88,7 +88,7 @@ impl TelegramEmojiRegistry {
         );
     }
 
-    fn get(&self, icon: ProgressIcon) -> TelegramEmoji {
+    pub fn get(&self, icon: ProgressIcon) -> TelegramEmoji {
         self.entries.get(&icon).cloned().unwrap_or(TelegramEmoji {
             custom_emoji_id: None,
             fallback: "•",
