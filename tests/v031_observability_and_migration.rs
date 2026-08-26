@@ -11,7 +11,7 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
 
     // 1. Populate database with pre-migration v0.3.0 data, then reset schema state to 26
     {
-        let storage = Storage::open(&db_path).unwrap();
+        let storage = Arc::new(Storage::open(&db_path).unwrap());
         let session = storage
             .create_session(
                 "owner-1",
@@ -27,35 +27,38 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
             .append_message("owner-1", &session.id, "user", "legacy question")
             .unwrap();
 
-        let memory_store =
-            xiao::memory::MemoryStore::new(Arc::new(Storage::open(&db_path).unwrap()));
+        let memory_store = xiao::memory::MemoryStore::new(storage.clone());
         memory_store
-            .put(
+            .upsert(
                 "owner-1",
+                xiao::memory::MemoryScope::User,
                 "preference",
                 "user_lang",
                 "en",
+                1.0,
                 "user_statement",
                 Some(&session.id),
             )
             .unwrap();
 
-        let skill_store = xiao::skills::SkillStore::new(Arc::new(Storage::open(&db_path).unwrap()));
+        let skill_store = xiao::skills::SkillStore::new(storage.clone());
         skill_store
-            .save(
+            .create_or_update(
                 "owner-1",
-                "custom_tool",
-                "skill desc",
-                "when to use",
-                "main.sh",
-                "",
-                "",
-                "",
+                xiao::skills::SkillCandidate {
+                    name: "custom_tool".into(),
+                    summary: "skill desc".into(),
+                    when_to_use: "when to use".into(),
+                    prerequisites: String::new(),
+                    procedure: "main.sh".into(),
+                    pitfalls: String::new(),
+                    verification: String::new(),
+                },
+                None,
             )
             .unwrap();
 
-        let profile_store =
-            xiao::providers::ProviderProfileStore::new(Arc::new(Storage::open(&db_path).unwrap()));
+        let profile_store = xiao::providers::ProviderProfileStore::new(storage.clone());
         profile_store
             .create(xiao::storage::ProviderProfileInput {
                 profile_id: Some("prof-1".into()),
@@ -69,6 +72,11 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
                 secret_headers_ref: None,
             })
             .unwrap();
+
+        drop(profile_store);
+        drop(skill_store);
+        drop(memory_store);
+        drop(storage);
 
         // Roll back schema state to 26 (drop migration 27 tables & migration 27 record)
         let conn = Connection::open(&db_path).unwrap();
