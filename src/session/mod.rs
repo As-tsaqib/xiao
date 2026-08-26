@@ -808,7 +808,10 @@ mod tests {
             .append_message(owner_a, &first_a1.id, "user", "hello in first")
             .unwrap();
         assert_eq!(
-            storage.session_messages(owner_a, &first_a1.id).unwrap().len(),
+            storage
+                .session_messages(owner_a, &first_a1.id)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -824,7 +827,9 @@ mod tests {
             .unwrap();
 
         // 2. /new (create_and_switch_telegram) inherits provider/account/model from active main in same scope
-        let second_a1 = manager.create_and_switch_telegram(owner_a, scope_1).unwrap();
+        let second_a1 = manager
+            .create_and_switch_telegram(owner_a, scope_1)
+            .unwrap();
         assert_eq!(second_a1.provider, "custom");
         assert_eq!(second_a1.account_id.as_deref(), Some("profile_123"));
         assert_eq!(second_a1.model, "gpt-5-turbo");
