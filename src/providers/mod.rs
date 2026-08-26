@@ -129,7 +129,6 @@ impl CapabilityEvidenceSource {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomCapabilityProbe {
     pub capabilities: ProviderCapabilities,
@@ -626,11 +625,7 @@ impl ProviderRegistry {
         self.auth.clone()
     }
 
-    pub fn from_single(
-        id: &str,
-        provider: Arc<dyn Provider>,
-        auth: Arc<AuthManager>,
-    ) -> Self {
+    pub fn from_single(id: &str, provider: Arc<dyn Provider>, auth: Arc<AuthManager>) -> Self {
         let mut providers = HashMap::new();
         providers.insert(id.to_owned(), provider);
         Self {
@@ -639,10 +634,7 @@ impl ProviderRegistry {
         }
     }
 
-    pub fn from_test(
-        providers: Vec<(&str, Arc<dyn Provider>)>,
-        auth: Arc<AuthManager>,
-    ) -> Self {
+    pub fn from_test(providers: Vec<(&str, Arc<dyn Provider>)>, auth: Arc<AuthManager>) -> Self {
         let providers = providers
             .into_iter()
             .map(|(id, provider)| (id.to_owned(), provider))

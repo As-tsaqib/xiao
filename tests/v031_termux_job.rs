@@ -1,11 +1,7 @@
-use std::sync::Arc;
-
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use xiao::tools::{
-    builtin::terminal::TermuxTerminalTool,
-    builtin::TermuxJobTool,
-    Tool, ToolContext,
+    builtin::terminal::TermuxTerminalTool, builtin::TermuxJobTool, Tool, ToolContext,
 };
 
 #[test]

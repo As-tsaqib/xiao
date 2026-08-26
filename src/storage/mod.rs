@@ -4365,7 +4365,12 @@ impl Storage {
         })
     }
 
-    pub fn enqueue_learning_job(&self, owner_id: &str, run_id: &str, not_before: Option<&str>) -> Result<String> {
+    pub fn enqueue_learning_job(
+        &self,
+        owner_id: &str,
+        run_id: &str,
+        not_before: Option<&str>,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let nb = not_before.unwrap_or(&now);
@@ -4379,7 +4384,10 @@ impl Storage {
         Ok(id)
     }
 
-    pub fn claim_pending_learning_job(&self, max_attempts: u32) -> Result<Option<LearningJobRecord>> {
+    pub fn claim_pending_learning_job(
+        &self,
+        max_attempts: u32,
+    ) -> Result<Option<LearningJobRecord>> {
         let now = Utc::now().to_rfc3339();
         self.with_conn(|conn| {
             let candidate: Option<(String, u32)> = conn

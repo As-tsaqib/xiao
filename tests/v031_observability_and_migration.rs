@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use xiao::storage::Storage;
 
 #[test]
@@ -186,7 +185,12 @@ fn tool_run_steps_and_agent_run_events_stored_and_retrieved() {
         .record_run_event(&run_id, "run_started", 0, None)
         .unwrap();
     storage
-        .record_run_event(&run_id, "provider_first_text_delta", 320, Some(r#"{"tokens":1}"#))
+        .record_run_event(
+            &run_id,
+            "provider_first_text_delta",
+            320,
+            Some(r#"{"tokens":1}"#),
+        )
         .unwrap();
     storage
         .record_run_event(&run_id, "final_answer_ready", 1200, None)

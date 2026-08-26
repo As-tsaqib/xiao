@@ -102,7 +102,11 @@ impl Tool for SlowReadToolA {
         }
     }
 
-    async fn execute(&self, _ctx: &ToolContext, _args: serde_json::Value) -> anyhow::Result<String> {
+    async fn execute(
+        &self,
+        _ctx: &ToolContext,
+        _args: serde_json::Value,
+    ) -> anyhow::Result<String> {
         let current = self.active_concurrent.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_concurrent_seen.fetch_max(current, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -131,7 +135,11 @@ impl Tool for SlowReadToolB {
         }
     }
 
-    async fn execute(&self, _ctx: &ToolContext, _args: serde_json::Value) -> anyhow::Result<String> {
+    async fn execute(
+        &self,
+        _ctx: &ToolContext,
+        _args: serde_json::Value,
+    ) -> anyhow::Result<String> {
         let current = self.active_concurrent.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_concurrent_seen.fetch_max(current, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -153,20 +161,31 @@ async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
         storage.clone(),
         xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider, auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider,
+        auth,
+    ));
 
     let active_concurrent = Arc::new(AtomicUsize::new(0));
     let max_concurrent_seen = Arc::new(AtomicUsize::new(0));
 
-    let tools = Arc::new(xiao::tools::ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
-    tools.register(Arc::new(SlowReadToolA {
-        active_concurrent: active_concurrent.clone(),
-        max_concurrent_seen: max_concurrent_seen.clone(),
-    })).unwrap();
-    tools.register(Arc::new(SlowReadToolB {
-        active_concurrent: active_concurrent.clone(),
-        max_concurrent_seen: max_concurrent_seen.clone(),
-    })).unwrap();
+    let tools = Arc::new(xiao::tools::ToolRegistry::new(
+        xiao::tools::ToolPolicy::default(),
+        16384,
+    ));
+    tools
+        .register(Arc::new(SlowReadToolA {
+            active_concurrent: active_concurrent.clone(),
+            max_concurrent_seen: max_concurrent_seen.clone(),
+        }))
+        .unwrap();
+    tools
+        .register(Arc::new(SlowReadToolB {
+            active_concurrent: active_concurrent.clone(),
+            max_concurrent_seen: max_concurrent_seen.clone(),
+        }))
+        .unwrap();
 
     let mut config = AgentConfig::default();
     config.parallel_readonly_tools = true;
@@ -181,7 +200,15 @@ async fn read_only_tools_execute_concurrently_and_preserve_stable_order() {
     );
 
     let session = sessions
-        .create_session("owner-1", "Parallel Test", "custom", None, "parallel-model", false, None)
+        .create_session(
+            "owner-1",
+            "Parallel Test",
+            "custom",
+            None,
+            "parallel-model",
+            false,
+            None,
+        )
         .unwrap();
 
     let answer = engine

@@ -105,7 +105,11 @@ impl Tool for StepTool {
         }
     }
 
-    async fn execute(&self, _context: &ToolContext, arguments: serde_json::Value) -> anyhow::Result<String> {
+    async fn execute(
+        &self,
+        _context: &ToolContext,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<String> {
         let step = arguments.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
         Ok(json!({ "status": "ok", "step": step, "verification_evidence": true }).to_string())
     }
@@ -179,7 +183,11 @@ impl Tool for FailingActionTool {
         }
     }
 
-    async fn execute(&self, _context: &ToolContext, _arguments: serde_json::Value) -> anyhow::Result<String> {
+    async fn execute(
+        &self,
+        _context: &ToolContext,
+        _arguments: serde_json::Value,
+    ) -> anyhow::Result<String> {
         Err(anyhow::anyhow!("device network interface down"))
     }
 }
@@ -220,24 +228,31 @@ async fn scripted_provider_exceeds_eight_turns_without_premature_failure() {
         storage.clone(),
         xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider.clone(), auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider.clone(),
+        auth,
+    ));
 
     let mut config = AgentConfig::default();
     config.max_turns = 150;
 
-    let tools = Arc::new(xiao::tools::ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
+    let tools = Arc::new(xiao::tools::ToolRegistry::new(
+        xiao::tools::ToolPolicy::default(),
+        16384,
+    ));
     tools.register(Arc::new(StepTool)).unwrap();
 
-    let engine = AgentEngine::with_registry(
-        sessions.clone(),
-        storage.clone(),
-        providers,
-        config,
-        tools,
-    );
+    let engine =
+        AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
 
-    let session = sessions.create_session("owner-1", "Test", "custom", None, "test-model", false, None).unwrap();
-    let answer = engine.submit_to_session_with_progress("owner-1", &session.id, "run 12 turns", None).await.unwrap();
+    let session = sessions
+        .create_session("owner-1", "Test", "custom", None, "test-model", false, None)
+        .unwrap();
+    let answer = engine
+        .submit_to_session_with_progress("owner-1", &session.id, "run 12 turns", None)
+        .await
+        .unwrap();
 
     assert!(answer.answer.contains("completed after 12 turns"));
     assert_eq!(provider.turns_requested.load(Ordering::SeqCst), 13);
@@ -256,25 +271,32 @@ async fn no_progress_guard_stops_repeated_loop_at_threshold() {
         storage.clone(),
         xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider.clone(), auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider.clone(),
+        auth,
+    ));
 
     let mut config = AgentConfig::default();
     config.max_no_progress_repeats = 3;
     config.max_turns = 150;
 
-    let tools = Arc::new(xiao::tools::ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
+    let tools = Arc::new(xiao::tools::ToolRegistry::new(
+        xiao::tools::ToolPolicy::default(),
+        16384,
+    ));
     tools.register(Arc::new(FailingActionTool)).unwrap();
 
-    let engine = AgentEngine::with_registry(
-        sessions.clone(),
-        storage.clone(),
-        providers,
-        config,
-        tools,
-    );
+    let engine =
+        AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
 
-    let session = sessions.create_session("owner-1", "Test", "custom", None, "fail-model", false, None).unwrap();
-    let answer = engine.submit_to_session_with_progress("owner-1", &session.id, "trigger fail loop", None).await.unwrap();
+    let session = sessions
+        .create_session("owner-1", "Test", "custom", None, "fail-model", false, None)
+        .unwrap();
+    let answer = engine
+        .submit_to_session_with_progress("owner-1", &session.id, "trigger fail loop", None)
+        .await
+        .unwrap();
 
     assert!(answer.answer.to_lowercase().contains("blocked"));
     assert!(answer.answer.contains("no-progress limit reached"));

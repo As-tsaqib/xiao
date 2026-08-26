@@ -74,9 +74,16 @@ async fn informational_answer_completes_deterministically_without_semantic_overh
         storage.clone(),
         xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider.clone(), auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider.clone(),
+        auth,
+    ));
 
-    let tools = Arc::new(ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
+    let tools = Arc::new(ToolRegistry::new(
+        xiao::tools::ToolPolicy::default(),
+        16384,
+    ));
     let engine = AgentEngine::with_registry(
         sessions.clone(),
         storage.clone(),
@@ -86,11 +93,24 @@ async fn informational_answer_completes_deterministically_without_semantic_overh
     );
 
     let session = sessions
-        .create_session("owner-1", "Latency Test", "custom", None, "test-model", false, None)
+        .create_session(
+            "owner-1",
+            "Latency Test",
+            "custom",
+            None,
+            "test-model",
+            false,
+            None,
+        )
         .unwrap();
 
     let answer = engine
-        .submit_to_session_with_progress("owner-1", &session.id, "What is the capital of France?", None)
+        .submit_to_session_with_progress(
+            "owner-1",
+            &session.id,
+            "What is the capital of France?",
+            None,
+        )
         .await
         .unwrap();
 

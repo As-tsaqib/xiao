@@ -82,7 +82,11 @@ impl Tool for PingTool {
         }
     }
 
-    async fn execute(&self, _ctx: &ToolContext, _args: serde_json::Value) -> anyhow::Result<String> {
+    async fn execute(
+        &self,
+        _ctx: &ToolContext,
+        _args: serde_json::Value,
+    ) -> anyhow::Result<String> {
         Ok(json!({ "status": "ping_ok", "verification_evidence": true }).to_string())
     }
 }
@@ -104,7 +108,11 @@ impl Tool for PongTool {
         }
     }
 
-    async fn execute(&self, _ctx: &ToolContext, _args: serde_json::Value) -> anyhow::Result<String> {
+    async fn execute(
+        &self,
+        _ctx: &ToolContext,
+        _args: serde_json::Value,
+    ) -> anyhow::Result<String> {
         Ok(json!({ "status": "pong_ok", "verification_evidence": true }).to_string())
     }
 }
@@ -122,9 +130,16 @@ async fn ping_pong_repeating_tool_sequence_is_detected_and_blocked() {
         storage.clone(),
         xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider.clone(), auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider.clone(),
+        auth,
+    ));
 
-    let tools = Arc::new(xiao::tools::ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
+    let tools = Arc::new(xiao::tools::ToolRegistry::new(
+        xiao::tools::ToolPolicy::default(),
+        16384,
+    ));
     tools.register(Arc::new(PingTool)).unwrap();
     tools.register(Arc::new(PongTool)).unwrap();
 
@@ -137,7 +152,15 @@ async fn ping_pong_repeating_tool_sequence_is_detected_and_blocked() {
     );
 
     let session = sessions
-        .create_session("owner-1", "PingPong Test", "custom", None, "pingpong-model", false, None)
+        .create_session(
+            "owner-1",
+            "PingPong Test",
+            "custom",
+            None,
+            "pingpong-model",
+            false,
+            None,
+        )
         .unwrap();
 
     let answer = engine

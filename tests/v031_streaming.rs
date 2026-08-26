@@ -90,9 +90,16 @@ async fn streamed_text_deltas_reach_progress_channel_before_completion() {
         storage.clone(),
         xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider, auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider,
+        auth,
+    ));
 
-    let tools = Arc::new(ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
+    let tools = Arc::new(ToolRegistry::new(
+        xiao::tools::ToolPolicy::default(),
+        16384,
+    ));
     let engine = AgentEngine::with_registry(
         sessions.clone(),
         storage.clone(),
@@ -102,12 +109,25 @@ async fn streamed_text_deltas_reach_progress_channel_before_completion() {
     );
 
     let session = sessions
-        .create_session("owner-1", "Stream Test", "custom", None, "stream-model", false, None)
+        .create_session(
+            "owner-1",
+            "Stream Test",
+            "custom",
+            None,
+            "stream-model",
+            false,
+            None,
+        )
         .unwrap();
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let answer = engine
-        .submit_to_session_with_progress("owner-1", &session.id, "say hello", Some(progress_tx))
+        .submit_to_session_with_progress(
+            "owner-1",
+            &session.id,
+            "say hello",
+            Some(progress_tx),
+        )
         .await
         .unwrap();
 
@@ -137,9 +157,16 @@ async fn raw_tool_json_never_appears_in_text_deltas() {
         storage.clone(),
         xiao::security::secrets::SecretStore::new(dir.path().join("secrets")),
     ));
-    let providers = Arc::new(ProviderRegistry::from_single("custom", provider, auth));
+    let providers = Arc::new(ProviderRegistry::from_single(
+        "custom",
+        provider,
+        auth,
+    ));
 
-    let tools = Arc::new(ToolRegistry::new(xiao::tools::ToolPolicy::default(), 16384));
+    let tools = Arc::new(ToolRegistry::new(
+        xiao::tools::ToolPolicy::default(),
+        16384,
+    ));
     let engine = AgentEngine::with_registry(
         sessions.clone(),
         storage.clone(),
@@ -149,7 +176,15 @@ async fn raw_tool_json_never_appears_in_text_deltas() {
     );
 
     let session = sessions
-        .create_session("owner-1", "Stream Test", "custom", None, "stream-model", false, None)
+        .create_session(
+            "owner-1",
+            "Stream Test",
+            "custom",
+            None,
+            "stream-model",
+            false,
+            None,
+        )
         .unwrap();
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<AgentEvent>();
