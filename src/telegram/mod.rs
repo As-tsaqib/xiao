@@ -3943,23 +3943,42 @@ mod tests {
 
         let provider_captured_req = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let provider_captured_clone = provider_captured_req.clone();
-        let provider_base = serve(Router::new().route(
-            "/v1/chat/completions",
-            post(move |Json(body): Json<serde_json::Value>| {
-                let captured = provider_captured_clone.clone();
-                async move {
-                    captured.lock().unwrap().push(body);
-                    Json(json!({
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "Ini adalah gambar merah."
-                            }
-                        }]
-                    }))
-                }
-            }),
-        ))
+        let captured_for_route = provider_captured_clone.clone();
+        let provider_base = serve(Router::new()
+            .route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = captured_for_route.clone();
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Ini adalah gambar merah."
+                                }
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = provider_captured_clone.clone();
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Ini adalah gambar merah."
+                                }
+                            }]
+                        }))
+                    }
+                }),
+            ))
         .await;
 
         let temp = tempfile::tempdir().unwrap();

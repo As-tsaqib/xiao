@@ -622,10 +622,9 @@ mod tests {
                     }]
                 }),
             )
-            .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("denied") || err.contains("policy") || err.contains("su"));
+            .await
+            .unwrap();
+        assert!(result.contains(""status":"denied""));
     }
 
     #[tokio::test]
