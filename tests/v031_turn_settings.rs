@@ -254,6 +254,7 @@ async fn scripted_provider_exceeds_eight_turns_without_premature_failure() {
 
     let mut config = AgentConfig::default();
     config.max_turns = 150;
+    config.max_tool_calls = 150;
 
     let tools = Arc::new(xiao::tools::ToolRegistry::new(
         xiao::tools::ToolPolicy::default(),
