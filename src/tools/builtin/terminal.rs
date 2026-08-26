@@ -44,14 +44,16 @@ impl TermuxTerminalTool {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Arguments {
+    #[serde(alias = "cmd", alias = "command", alias = "executable", alias = "binary")]
     program: String,
-    #[serde(default)]
+    #[serde(default, alias = "argv", alias = "arguments", alias = "params")]
     args: Vec<String>,
+    #[serde(default, alias = "workdir", alias = "dir", alias = "working_directory")]
     cwd: Option<PathBuf>,
-    #[serde(default)]
+    #[serde(default, alias = "env", alias = "vars")]
     environment: BTreeMap<String, String>,
+    #[serde(default, alias = "timeout")]
     timeout_ms: Option<u64>,
     #[serde(default)]
     purpose: Option<ExecutionPurpose>,
@@ -980,5 +982,43 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires 1..=2 steps"));
+    }
+
+    #[tokio::test]
+    async fn terminal_accepts_common_field_aliases() {
+        let executor = Arc::new(MockExecutor::new());
+        executor.register(
+            "git",
+            &["status"],
+            outcome("git", "On branch main\nnothing to commit"),
+        );
+        let dependencies = Arc::new(DependencyResolver::new(
+            executor.clone(),
+            capabilities(),
+            Arc::new(PackagePolicy::permissive()),
+        ));
+        let tool = TermuxTerminalTool::new(executor, dependencies, "/tmp");
+        let context = ToolContext {
+            principal: "p".into(),
+            session_id: "test-aliases".into(),
+            agent_run_id: "run-aliases".into(),
+            yolo_mode: false,
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+            progress: None,
+        };
+
+        let result = tool
+            .execute(
+                &context,
+                json!({
+                    "command": "git",
+                    "argv": ["status"]
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("On branch main"));
     }
 }

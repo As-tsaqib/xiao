@@ -21,10 +21,12 @@ impl PdfCreateTool {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Arguments {
+    #[serde(alias = "file_path", alias = "filename", alias = "output_path", alias = "target")]
     path: String,
+    #[serde(alias = "text", alias = "body", alias = "data", alias = "markdown")]
     content: String,
+    #[serde(default, alias = "heading", alias = "header", alias = "subject")]
     title: Option<String>,
 }
 
@@ -478,5 +480,40 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("symlink"));
+    }
+
+    #[tokio::test]
+    async fn pdf_create_accepts_common_field_aliases() {
+        let temp = tempdir().unwrap();
+        let tool = PdfCreateTool::new(temp.path());
+        let context = ToolContext {
+            principal: "p".into(),
+            session_id: "test-aliases".into(),
+            agent_run_id: "run-aliases".into(),
+            yolo_mode: false,
+            messages: Vec::new(),
+            cancellation: CancellationToken::new(),
+            progress: None,
+        };
+
+        let result = tool
+            .execute(
+                &context,
+                json!({
+                    "filename": "aliased.pdf",
+                    "text": "Document content via aliases",
+                    "heading": "Aliased Document"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("created successfully"));
+        let pdf_path = temp
+            .path()
+            .join(".xiao/workspaces/test-aliases/aliased.pdf");
+        assert!(pdf_path.exists());
+        let bytes = std::fs::read(&pdf_path).unwrap();
+        assert!(bytes.starts_with(b"%PDF-1.4"));
     }
 }

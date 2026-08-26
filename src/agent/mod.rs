@@ -1282,6 +1282,8 @@ impl AgentEngine {
                             if result.is_error {
                                 failed_actions.insert(action_signature);
                             } else {
+                                failed_actions.clear();
+                                identical_failure_repeats = 0;
                                 for artifact in artifacts_from_tool_output(&result.output) {
                                     artifacts.insert(artifact.path.clone(), artifact);
                                 }
@@ -1294,7 +1296,10 @@ impl AgentEngine {
                         }
                         let signature = next.iter().map(|result| format!("{}:{}:{}", result.name, result.is_error, short_hash(&result.output))).collect::<Vec<_>>().join("|");
                         observation_signatures.push_back(signature);
-                        while observation_signatures.len() > 6 { observation_signatures.pop_front(); }
+                        let max_signatures = (config.max_no_progress_repeats.max(2) * 2).max(6);
+                        while observation_signatures.len() > max_signatures {
+                            observation_signatures.pop_front();
+                        }
                         if result_aware_ping_pong(&observation_signatures, config.max_no_progress_repeats) {
                             let audit=self.storage.tool_runs(principal,&agent_run_id)?;
                             let mut blocked=completion.verify_for_task_async(prompt,"repeated equivalent observations",&audit).await;
@@ -2802,6 +2807,109 @@ mod tests {
             learned.is_empty(),
             "post-delivery learning must not block AgentAnswer"
         );
+    }
+
+    #[tokio::test]
+    async fn successful_intermediate_action_resets_failed_actions_and_recovers() {
+        struct RepairThenVerifyProvider {
+            turns: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Provider for RepairThenVerifyProvider {
+            fn id(&self) -> &'static str {
+                "repair-verify"
+            }
+            fn models(&self) -> Vec<String> {
+                vec!["m".into()]
+            }
+            fn ready(&self) -> bool {
+                true
+            }
+            fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+                ProviderCapabilities::native("deterministic native fixture")
+            }
+            async fn run(&self, _: ProviderRequest, _: Option<mpsc::UnboundedSender<AgentEvent>>) -> Result<ProviderResponse> {
+                Err(anyhow!("run_turn must be used"))
+            }
+            async fn run_turn(
+                &self,
+                _: ProviderRequest,
+                _: Option<serde_json::Value>,
+                _: Vec<ToolResult>,
+                _: Option<mpsc::UnboundedSender<AgentEvent>>,
+            ) -> Result<ProviderTurn> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                match turn {
+                    0 => Ok(ProviderTurn {
+                        step: ProviderStep::ToolCalls(vec![ToolCall {
+                            call_id: "call-0".into(),
+                            name: "adaptive_action".into(),
+                            arguments: serde_json::json!({"strategy":"bad"}),
+                        }]),
+                        continuation: None,
+                        events: Vec::new(),
+                    }),
+                    1 => Ok(ProviderTurn {
+                        step: ProviderStep::ToolCalls(vec![ToolCall {
+                            call_id: "call-1".into(),
+                            name: "adaptive_action".into(),
+                            arguments: serde_json::json!({"strategy":"repair"}),
+                        }]),
+                        continuation: None,
+                        events: Vec::new(),
+                    }),
+                    2 => Ok(ProviderTurn {
+                        step: ProviderStep::ToolCalls(vec![ToolCall {
+                            call_id: "call-2".into(),
+                            name: "adaptive_action".into(),
+                            arguments: serde_json::json!({"strategy":"verify"}),
+                        }]),
+                        continuation: None,
+                        events: Vec::new(),
+                    }),
+                    _ => Ok(ProviderTurn {
+                        step: ProviderStep::Final("Repaired and verified".into()),
+                        continuation: None,
+                        events: Vec::new(),
+                    }),
+                }
+            }
+        }
+
+        let provider = Arc::new(RepairThenVerifyProvider {
+            turns: AtomicUsize::new(0),
+        });
+        let (base, db, _, _tmp) = engine("repair-verify", provider.clone());
+        let registry = Arc::new(ToolRegistry::new(
+            ToolPolicy::default().allow_side_effect("adaptive_action"),
+            4_096,
+        ));
+        registry.register(AdaptiveActionTool).unwrap();
+        let engine = AgentEngine::with_registry(
+            base.sessions.clone(),
+            db.clone(),
+            base.providers.clone(),
+            AgentConfig {
+                max_turns: 6,
+                max_no_progress_repeats: 2,
+                ..AgentConfig::default()
+            },
+            registry,
+        );
+        let answer = engine
+            .submit_with_progress("u", "Repair and verify the pipeline", None)
+            .await
+            .unwrap();
+        assert_eq!(answer.final_answer, "Repaired and verified");
+        assert_eq!(answer.verification.state, VerificationState::VerifiedSuccess);
+        let run = &db.agent_runs("u", 1).unwrap()[0];
+        assert_eq!(run.status, "completed");
+        let audit = db.tool_runs("u", &run.id).unwrap();
+        assert_eq!(audit.len(), 3);
+        assert_eq!(audit[0].status, "failed");
+        assert_eq!(audit[1].status, "completed");
+        assert_eq!(audit[2].status, "completed");
     }
 
     #[tokio::test]

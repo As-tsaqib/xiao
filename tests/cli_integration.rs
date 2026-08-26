@@ -337,6 +337,20 @@ fn subcommand_syntax_and_arity_errors_are_usage_errors() {
             "usage: xiao daemon <start|foreground|stop|restart|status|logs>",
         ),
         (&["logs", "10", "extra"], "usage: xiao logs [N]"),
+        (&["setup", "extra"], "usage: xiao setup"),
+        (
+            &["quickstart", "--invalid"],
+            "usage: xiao quickstart [--no-start]",
+        ),
+        (&["logs", "invalid"], "line count must be an integer"),
+        (
+            &["daemon", "logs", "invalid"],
+            "line count must be an integer",
+        ),
+        (
+            &["daemon", "logs", "10", "extra"],
+            "usage: xiao daemon logs [N]",
+        ),
     ];
 
     for (args, expected_error) in cases {

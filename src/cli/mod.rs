@@ -389,6 +389,7 @@ async fn run(options: GlobalOptions, args: Vec<String>, presenter: &CliPresenter
     if command.starts_with('/') || !TOP_LEVEL.contains(&command) {
         return Err(unknown_command(command));
     }
+    validate_command_syntax(&args)?;
     let paths = CliPaths::from_env()?;
     match command {
         "setup" => setup(&paths, &options, presenter).await,
@@ -537,6 +538,11 @@ fn validate_command_syntax(args: &[String]) -> CliResult<()> {
         Some("approvals") => validate_approvals_syntax(&args[1..]),
         Some("attachments") => validate_attachments_syntax(&args[1..]),
         Some("runs") => validate_runs_syntax(&args[1..]),
+        Some("setup") => exact_arity(args, 1, "usage: xiao setup"),
+        Some("quickstart") => validate_quickstart_syntax(&args[1..]),
+        Some("daemon") => validate_daemon_syntax(&args[1..]),
+        Some("config") => validate_config_syntax(&args[1..]),
+        Some("logs") => validate_logs_syntax(&args[1..]),
         _ => Ok(()),
     }
 }
@@ -756,6 +762,44 @@ fn validate_runs_syntax(args: &[String]) -> CliResult<()> {
             "usage: xiao runs <list|show ID|cancel ID>",
         )),
     }
+}
+
+fn validate_quickstart_syntax(args: &[String]) -> CliResult<()> {
+    match args {
+        [] | [arg] if arg == "--no-start" => Ok(()),
+        _ => Err(CliFailure::usage("usage: xiao quickstart [--no-start]")),
+    }
+}
+
+fn validate_daemon_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("start" | "foreground" | "status" | "stop" | "restart") if args.len() == 1 => Ok(()),
+        Some("logs") => {
+            if args.len() > 2 {
+                return Err(CliFailure::usage("usage: xiao daemon logs [N]"));
+            }
+            parse_lines(args.get(1))?;
+            Ok(())
+        }
+        _ => Err(CliFailure::usage(
+            "usage: xiao daemon <start|foreground|stop|restart|status|logs>",
+        )),
+    }
+}
+
+fn validate_config_syntax(args: &[String]) -> CliResult<()> {
+    match args.first().map(String::as_str) {
+        Some("path" | "check" | "show") if args.len() == 1 => Ok(()),
+        _ => Err(CliFailure::usage("usage: xiao config <path|check|show>")),
+    }
+}
+
+fn validate_logs_syntax(args: &[String]) -> CliResult<()> {
+    if args.len() > 1 {
+        return Err(CliFailure::usage("usage: xiao logs [N]"));
+    }
+    parse_lines(args.first())?;
+    Ok(())
 }
 
 async fn chat(
