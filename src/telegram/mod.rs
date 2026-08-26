@@ -455,8 +455,7 @@ impl TelegramAdapter {
                 None => return Ok(()),
             };
 
-            let is_agent_request =
-                !text.trim_start().starts_with('/') || is_retry_command(text);
+            let is_agent_request = !text.trim_start().starts_with('/') || is_retry_command(text);
             let result = if is_agent_request {
                 // Every Telegram generation receives observable live events so an
                 // exact ASK decision can surface as a scoped inline card. Private
@@ -1545,10 +1544,12 @@ impl TelegramAdapter {
                     self.advance_menu_prompt(&mut guard).await?;
                     return Ok(());
                 }
-                let fast = command
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(|x| matches!(x.split('@').next(), Some("/stop") | Some("/retry") | Some("/r")));
+                let fast = command.split_whitespace().next().is_some_and(|x| {
+                    matches!(
+                        x.split('@').next(),
+                        Some("/stop") | Some("/retry") | Some("/r")
+                    )
+                });
                 let result = if fast {
                     self.app
                         .commands
