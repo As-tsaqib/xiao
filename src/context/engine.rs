@@ -707,7 +707,11 @@ mod tests {
                 .append_message(
                     "p",
                     &context.active.id,
-                    if index.is_multiple_of(2) { "user" } else { "assistant" },
+                    if index.is_multiple_of(2) {
+                        "user"
+                    } else {
+                        "assistant"
+                    },
                     &format!("message-{index} {}", "z".repeat(500)),
                 )
                 .unwrap();

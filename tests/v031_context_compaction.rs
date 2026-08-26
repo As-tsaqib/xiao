@@ -61,7 +61,11 @@ impl Provider for PingPongLoopProvider {
         _progress: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> anyhow::Result<ProviderTurn> {
         let t = self.turns.fetch_add(1, Ordering::SeqCst);
-        let tool_name = if t.is_multiple_of(2) { "tool_ping" } else { "tool_pong" };
+        let tool_name = if t.is_multiple_of(2) {
+            "tool_ping"
+        } else {
+            "tool_pong"
+        };
         Ok(ProviderTurn {
             step: ProviderStep::ToolCalls(vec![ToolCall {
                 call_id: format!("call-{t}"),
