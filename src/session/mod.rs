@@ -52,7 +52,7 @@ impl SessionManager {
         let mut provider = "custom".to_string();
         let mut account_id = None;
         let mut model = "default".to_string();
-        
+
         if let Ok(Some((main_id, _, _))) = self.storage.frontend_state(principal) {
             if let Ok(Some(s)) = self.storage.session(principal, &main_id) {
                 provider = s.provider;
@@ -60,9 +60,16 @@ impl SessionManager {
                 model = s.model;
             }
         }
-        
-        self.storage
-            .create_session(principal, &name, &provider, account_id.as_deref(), &model, false, None)
+
+        self.storage.create_session(
+            principal,
+            &name,
+            &provider,
+            account_id.as_deref(),
+            &model,
+            false,
+            None,
+        )
     }
 
     pub fn context_for(&self, principal: &str) -> Result<SessionContext> {
@@ -291,7 +298,7 @@ impl SessionManager {
         let mut provider = "custom".to_string();
         let mut account_id = None;
         let mut model = "default".to_string();
-        
+
         if let Ok(Some((main_id, _, _))) = self.storage.telegram_frontend_state(principal, scope) {
             if let Ok(Some(s)) = self.storage.session(principal, &main_id) {
                 provider = s.provider;
@@ -299,10 +306,16 @@ impl SessionManager {
                 model = s.model;
             }
         }
-        
-        let session = self
-            .storage
-            .create_session(principal, &name, &provider, account_id.as_deref(), &model, false, None)?;
+
+        let session = self.storage.create_session(
+            principal,
+            &name,
+            &provider,
+            account_id.as_deref(),
+            &model,
+            false,
+            None,
+        )?;
         self.storage
             .bind_session_to_telegram_scope(principal, &session.id, scope)?;
         Ok(session)

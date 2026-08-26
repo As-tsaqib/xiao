@@ -2385,60 +2385,69 @@ mod tests {
         ));
         let custom_logins = Arc::new(CustomLoginStore::new(std::time::Duration::from_secs(60)));
         let tg = super::TelegramManager::new(app.clone(), None, custom_logins);
-        
+
         let owner = "owner1";
         let scope = TelegramScope::new(100, None);
         let session = app.sessions.ensure_telegram_session(owner, scope).unwrap();
-        
+
         let profiles = crate::providers::ProviderProfileStore::new(db.clone());
-        profiles.create_with_models_and_activate_session(
-            crate::providers::ProviderProfileInput {
-                profile_id: None,
-                owner_id: owner.into(),
-                alias: "custom".into(),
-                endpoint: "https://test".into(),
-                protocol: "openai".into(),
-                credential_ref: None,
-                api_key_ref: None,
-                safe_headers_json: "{}".into(),
-                secret_headers_ref: None,
-            },
-            &[crate::storage::ProviderProfileModelRecord {
-                profile_id: "test".into(),
-                model_id: "slow_model".into(),
-                text_capable: true,
-                vision_capable: false,
-                file_input_capable: false,
-                native_tools: false,
-                structured_output: false,
-                continuation: false,
-                native_tools_state: "unknown".into(),
-                structured_output_state: "unknown".into(),
-                continuation_state: "unknown".into(),
-                vision_state: "unknown".into(),
-                file_input_state: "unknown".into(),
-                model_discovery: false,
-                tool_protocol: "chat_only".into(),
-                evidence: "test".into(),
-                probe_status: "unprobed".into(),
-                probe_version: 1,
-                probed_at: chrono::Utc::now().to_rfc3339(),
-            }],
-            &session.id,
-            "test_model",
-        ).unwrap();
-        
+        profiles
+            .create_with_models_and_activate_session(
+                crate::providers::ProviderProfileInput {
+                    profile_id: None,
+                    owner_id: owner.into(),
+                    alias: "custom".into(),
+                    endpoint: "https://test".into(),
+                    protocol: "openai".into(),
+                    credential_ref: None,
+                    api_key_ref: None,
+                    safe_headers_json: "{}".into(),
+                    secret_headers_ref: None,
+                },
+                &[crate::storage::ProviderProfileModelRecord {
+                    profile_id: "test".into(),
+                    model_id: "slow_model".into(),
+                    text_capable: true,
+                    vision_capable: false,
+                    file_input_capable: false,
+                    native_tools: false,
+                    structured_output: false,
+                    continuation: false,
+                    native_tools_state: "unknown".into(),
+                    structured_output_state: "unknown".into(),
+                    continuation_state: "unknown".into(),
+                    vision_state: "unknown".into(),
+                    file_input_state: "unknown".into(),
+                    model_discovery: false,
+                    tool_protocol: "chat_only".into(),
+                    evidence: "test".into(),
+                    probe_status: "unprobed".into(),
+                    probe_version: 1,
+                    probed_at: chrono::Utc::now().to_rfc3339(),
+                }],
+                &session.id,
+                "test_model",
+            )
+            .unwrap();
+
         // Emulate SetModel callback
         let start = std::time::Instant::now();
         let cmd = crate::command::Command::SetModel { model: "slow_model".into() };
-        let _ = app.execute(owner, Some(scope), cmd).await.unwrap();
+        let _ = app
+            .execute(owner, Some(scope), cmd)
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
-        
+
         // Ensure it doesn't wait (should be very fast, well under 100ms)
         assert!(elapsed.as_millis() < 500, "SetModel should not wait for slow probe");
-        
+
         // Ensure the model was persisted
-        let active = app.sessions.context_for_telegram(owner, scope).unwrap().active;
+        let active = app
+            .sessions
+            .context_for_telegram(owner, scope)
+            .unwrap()
+            .active;
         assert_eq!(active.model, "slow_model");
     }
 
@@ -2455,56 +2464,60 @@ mod tests {
         ));
         let custom_logins = Arc::new(CustomLoginStore::new(std::time::Duration::from_secs(60)));
         let tg = super::TelegramManager::new(app, None, custom_logins);
-        
+
         let owner1 = "owner1";
         let owner2 = "owner2";
-        
+
         let p1 = tg.resolve_custom_alias(owner1, "custom").unwrap();
         assert_eq!(p1, "custom");
-        
+
         let profiles = crate::providers::ProviderProfileStore::new(db.clone());
-        profiles.create_with_models_and_activate_session(
-            crate::providers::ProviderProfileInput {
-                profile_id: None,
-                owner_id: owner1.into(),
-                alias: "custom".into(),
-                endpoint: "https://test".into(),
-                protocol: "openai".into(),
-                credential_ref: None,
-                api_key_ref: None,
-                safe_headers_json: "{}".into(),
-                secret_headers_ref: None,
-            },
-            &[],
-            "test_session",
-            "test_model",
-        ).unwrap();
-        
+        profiles
+            .create_with_models_and_activate_session(
+                crate::providers::ProviderProfileInput {
+                    profile_id: None,
+                    owner_id: owner1.into(),
+                    alias: "custom".into(),
+                    endpoint: "https://test".into(),
+                    protocol: "openai".into(),
+                    credential_ref: None,
+                    api_key_ref: None,
+                    safe_headers_json: "{}".into(),
+                    secret_headers_ref: None,
+                },
+                &[],
+                "test_session",
+                "test_model",
+            )
+            .unwrap();
+
         let p2 = tg.resolve_custom_alias(owner1, "custom").unwrap();
         assert_eq!(p2, "custom_1");
-        
+
         // Add custom_2 to create a gap
-        profiles.create_with_models_and_activate_session(
-            crate::providers::ProviderProfileInput {
-                profile_id: None,
-                owner_id: owner1.into(),
-                alias: "custom_2".into(),
-                endpoint: "https://test".into(),
-                protocol: "openai".into(),
-                credential_ref: None,
-                api_key_ref: None,
-                safe_headers_json: "{}".into(),
-                secret_headers_ref: None,
-            },
-            &[],
-            "test_session",
-            "test_model",
-        ).unwrap();
-        
+        profiles
+            .create_with_models_and_activate_session(
+                crate::providers::ProviderProfileInput {
+                    profile_id: None,
+                    owner_id: owner1.into(),
+                    alias: "custom_2".into(),
+                    endpoint: "https://test".into(),
+                    protocol: "openai".into(),
+                    credential_ref: None,
+                    api_key_ref: None,
+                    safe_headers_json: "{}".into(),
+                    secret_headers_ref: None,
+                },
+                &[],
+                "test_session",
+                "test_model",
+            )
+            .unwrap();
+
         // Should fill the gap and return custom_1
         let p3 = tg.resolve_custom_alias(owner1, "custom").unwrap();
         assert_eq!(p3, "custom_1");
-        
+
         // Other owner should still get "custom"
         let p4 = tg.resolve_custom_alias(owner2, "custom").unwrap();
         assert_eq!(p4, "custom");

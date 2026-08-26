@@ -1121,7 +1121,6 @@ impl CommandCore {
         }
     }
 
-
     fn session_context(
         &self,
         principal: &str,
