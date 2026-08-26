@@ -46,7 +46,7 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
             .create_or_update(
                 "owner-1",
                 xiao::skills::SkillCandidate {
-                    name: "custom_tool".into(),
+                    name: "custom-tool".into(),
                     summary: "skill desc".into(),
                     when_to_use: "when to use".into(),
                     prerequisites: String::new(),
@@ -118,7 +118,7 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
         .list("owner-1", 10)
         .unwrap();
     assert_eq!(skills.len(), 1);
-    assert_eq!(skills[0].name, "custom_tool");
+    assert_eq!(skills[0].name, "custom-tool");
 
     let profiles = xiao::providers::ProviderProfileStore::new(storage.clone())
         .list("owner-1")
