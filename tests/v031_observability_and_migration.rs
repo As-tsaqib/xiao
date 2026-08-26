@@ -40,8 +40,7 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
             )
             .unwrap();
 
-        let skill_store =
-            xiao::skills::SkillStore::new(Arc::new(Storage::open(&db_path).unwrap()));
+        let skill_store = xiao::skills::SkillStore::new(Arc::new(Storage::open(&db_path).unwrap()));
         skill_store
             .save(
                 "owner-1",
