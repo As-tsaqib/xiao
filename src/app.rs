@@ -367,10 +367,9 @@ fn spawn_learning_worker(storage: Arc<Storage>, identity: Arc<IdentityWorkspace>
                         .ok_or_else(|| anyhow::anyhow!("learning trace missing"))
                         .and_then(|value| serde_json::from_value(value).map_err(Into::into))
                         .and_then(|trace| evaluator.evaluate(&owner, &trace).map(|_| ()));
-                    let _ = if let Err(error) = &result {
-                        storage.finish_learning_job(&id, Err(&error.to_string()))
-                    } else {
-                        storage.finish_learning_job(&id, Ok(()))
+                    let _ = match &result {
+                        Err(error) => storage.finish_learning_job(&id, "failed", Some(&error.to_string())),
+                        Ok(()) => storage.finish_learning_job(&id, "succeeded", None),
                     };
                     let _ = storage.record_agent_run_event(
                         &run,

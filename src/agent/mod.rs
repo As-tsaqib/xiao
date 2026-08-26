@@ -1366,7 +1366,7 @@ impl AgentEngine {
                 // Persist before returning, but keep the job unreleased until
                 // the frontend records final delivery acknowledgement.
                 if config.background_learning {
-                    self.storage.enqueue_learning_job(principal,&agent_run_id,&serde_json::json!({"trace":trace,"explicit_prompt":append_user.then_some(bound_text(redact_text(prompt),2_000))}))?;
+                    self.storage.enqueue_learning_payload(principal,&agent_run_id,&serde_json::json!({"trace":trace,"explicit_prompt":append_user.then_some(bound_text(redact_text(prompt),2_000))}))?;
                 }
             } else {
                 let status = match verification.state {

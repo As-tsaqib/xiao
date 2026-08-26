@@ -702,7 +702,7 @@ mod tests {
             ..AgentConfig::default()
         };
         let (storage, context, engine) = setup(config);
-        for index in 0..16 {
+        for index in 0_usize..16 {
             storage
                 .append_message(
                     "p",

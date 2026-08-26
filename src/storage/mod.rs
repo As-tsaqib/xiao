@@ -96,13 +96,6 @@ pub struct AgentRunRecord {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AgentRunEventRecord {
-    pub event_kind: String,
-    pub elapsed_ms: u64,
-    pub metadata: serde_json::Value,
-    pub created_at: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolRunRecord {
@@ -1949,7 +1942,7 @@ impl Storage {
         })
     }
 
-    pub fn enqueue_learning_job(
+    pub fn enqueue_learning_payload(
         &self,
         owner_id: &str,
         run_id: &str,
@@ -1975,20 +1968,6 @@ impl Storage {
             let job=transaction.query_row("SELECT id,owner_id,run_id,payload_json FROM learning_jobs WHERE status='pending' AND delivered_at IS NOT NULL AND not_before<=? AND attempts<3 ORDER BY created_at LIMIT 1",params![now.to_rfc3339()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))).optional()?;
             if let Some((id,owner,run,payload))=job { transaction.execute("UPDATE learning_jobs SET status='running',attempts=attempts+1,updated_at=? WHERE id=?",params![now.to_rfc3339(),id])?; transaction.commit()?; return Ok(Some((id,owner,run,serde_json::from_str(&payload)?))); }
             transaction.commit()?; Ok(None)
-        })
-    }
-
-    pub fn finish_learning_job(&self, id: &str, result: Result<(), &str>) -> Result<()> {
-        let (status, error) = match result {
-            Ok(()) => ("succeeded", None),
-            Err(error) => ("failed", Some(crate::security::redact::redact_text(error))),
-        };
-        self.with_conn(|connection| {
-            connection.execute(
-                "UPDATE learning_jobs SET status=?,last_error_redacted=?,updated_at=? WHERE id=?",
-                params![status, error, Utc::now().to_rfc3339(), id],
-            )?;
-            Ok(())
         })
     }
 
@@ -2474,14 +2453,6 @@ impl Storage {
             connection.execute("INSERT INTO agent_run_events(agent_run_id,event_kind,elapsed_ms,metadata_json,created_at) VALUES(?,?,?,?,?)", params![run_id,event_kind,elapsed_ms.min(86_400_000) as i64,metadata,Utc::now().to_rfc3339()])?;
             connection.execute("DELETE FROM agent_run_events WHERE agent_run_id=? AND id NOT IN (SELECT id FROM agent_run_events WHERE agent_run_id=? ORDER BY id DESC LIMIT 128)", params![run_id,run_id])?;
             Ok(())
-        })
-    }
-
-    pub fn agent_run_events(&self, run_id: &str) -> Result<Vec<AgentRunEventRecord>> {
-        self.with_conn(|connection| {
-            let mut statement=connection.prepare("SELECT event_kind,elapsed_ms,metadata_json,created_at FROM agent_run_events WHERE agent_run_id=? ORDER BY id")?;
-            let rows=statement.query_map(params![run_id], |row| Ok(AgentRunEventRecord { event_kind:row.get(0)?, elapsed_ms:row.get::<_,i64>(1)?.max(0) as u64, metadata:serde_json::from_str(&row.get::<_,String>(2)?).unwrap_or_default(), created_at:row.get(3)? }))?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
     }
 
