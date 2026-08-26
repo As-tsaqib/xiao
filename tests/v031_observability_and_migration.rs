@@ -24,63 +24,81 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
             );
             INSERT INTO installation_owner VALUES('owner-1', 12345678, '2026-08-20T00:00:00Z');
 
+            CREATE TABLE owners(
+              owner_id TEXT PRIMARY KEY,
+              telegram_user_id INTEGER UNIQUE,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            INSERT INTO owners VALUES('owner-1', 12345678, '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
+
             CREATE TABLE sessions(
               id TEXT PRIMARY KEY,
               owner_principal TEXT NOT NULL,
               name TEXT NOT NULL,
-              provider TEXT NOT NULL,
+              provider TEXT NOT NULL DEFAULT 'custom',
               account_id TEXT,
-              model TEXT NOT NULL,
+              model TEXT NOT NULL DEFAULT 'default',
+              archived INTEGER NOT NULL DEFAULT 0,
+              is_side INTEGER NOT NULL DEFAULT 0,
+              parent_id TEXT,
+              created_at TEXT NOT NULL,
+              last_active_at TEXT NOT NULL,
               yolo_mode INTEGER NOT NULL DEFAULT 0,
               agent_profile TEXT,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
               context_summary TEXT,
               summary_updated_at TEXT
             );
-            INSERT INTO sessions VALUES('sess-1', 'owner-1', 'Legacy Session', 'custom', NULL, 'model-v26', 0, NULL, '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z', NULL, NULL);
+            INSERT INTO sessions VALUES('sess-1', 'owner-1', 'Legacy Session', 'custom', NULL, 'model-v26', 0, 0, NULL, '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z', 0, NULL, NULL, NULL);
 
             CREATE TABLE messages(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
-              owner_principal TEXT NOT NULL,
               session_id TEXT NOT NULL,
               role TEXT NOT NULL,
               content TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
-            INSERT INTO messages(owner_principal, session_id, role, content, created_at)
-            VALUES('owner-1', 'sess-1', 'user', 'legacy question', '2026-08-20T00:00:00Z');
+            INSERT INTO messages(session_id, role, content, created_at)
+            VALUES('sess-1', 'user', 'legacy question', '2026-08-20T00:00:00Z');
 
             CREATE TABLE memories(
               id TEXT PRIMARY KEY,
               owner_principal TEXT NOT NULL,
-              kind TEXT NOT NULL,
+              scope TEXT NOT NULL CHECK(scope IN ('user','agent')),
+              category TEXT NOT NULL,
               key TEXT NOT NULL,
-              content TEXT NOT NULL,
-              tags_csv TEXT NOT NULL DEFAULT '',
+              value TEXT NOT NULL,
+              confidence REAL NOT NULL DEFAULT 1.0,
+              source_kind TEXT NOT NULL,
+              source_session_id TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
-              UNIQUE(owner_principal, kind, key)
+              UNIQUE(owner_principal, scope, category, key)
             );
-            INSERT INTO memories VALUES('mem-1', 'owner-1', 'fact', 'user_lang', 'en', 'pref,lang', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
+            INSERT INTO memories VALUES('mem-1', 'owner-1', 'user', 'preference', 'user_lang', 'en', 1.0, 'user_statement', 'sess-1', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
 
             CREATE TABLE skills(
               id TEXT PRIMARY KEY,
-              owner_id TEXT NOT NULL,
+              owner_principal TEXT NOT NULL,
               name TEXT NOT NULL,
-              version TEXT NOT NULL,
-              description TEXT NOT NULL,
-              definition_yaml TEXT NOT NULL,
-              entrypoint TEXT NOT NULL,
-              status TEXT NOT NULL,
+              summary TEXT NOT NULL,
+              when_to_use TEXT NOT NULL,
+              procedure TEXT NOT NULL,
+              pitfalls TEXT NOT NULL DEFAULT '',
+              verification TEXT NOT NULL DEFAULT '',
+              prerequisites TEXT NOT NULL DEFAULT '',
+              source_kind TEXT NOT NULL DEFAULT 'local',
+              enabled INTEGER NOT NULL DEFAULT 1,
               created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
+              updated_at TEXT NOT NULL,
+              UNIQUE(owner_principal, name)
             );
-            INSERT INTO skills VALUES('sk-1', 'owner-1', 'custom_tool', '1.0.0', 'skill desc', 'steps: []', 'main.sh', 'enabled', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
+            INSERT INTO skills VALUES('sk-1', 'owner-1', 'custom_tool', 'skill desc', 'when to use', 'procedure', '', '', '', 'local', 1, '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z');
 
             CREATE TABLE provider_profiles(
               profile_id TEXT PRIMARY KEY,
               owner_id TEXT NOT NULL,
+              provider_kind TEXT NOT NULL DEFAULT 'custom',
               alias TEXT NOT NULL,
               endpoint TEXT NOT NULL,
               protocol TEXT NOT NULL,
@@ -94,7 +112,7 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
               updated_at TEXT NOT NULL,
               last_probe_at TEXT
             );
-            INSERT INTO provider_profiles VALUES('prof-1', 'owner-1', 'Custom Provider', 'https://api.example.com/v1', 'openai_chat_completions', NULL, NULL, '{}', NULL, 1, 'reachable', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z', NULL);
+            INSERT INTO provider_profiles VALUES('prof-1', 'owner-1', 'custom', 'Custom Provider', 'https://api.example.com/v1', 'openai_chat_completions', NULL, NULL, '{}', NULL, 1, 'reachable', '2026-08-20T00:00:00Z', '2026-08-20T00:00:00Z', NULL);
 
             CREATE TABLE provider_profile_models(
               profile_id TEXT NOT NULL,
@@ -144,7 +162,8 @@ fn matrix_i1_migration_26_to_27_preserves_sessions_memory_skills_profiles() {
               output TEXT,
               error TEXT,
               started_at TEXT NOT NULL,
-              completed_at TEXT
+              finished_at TEXT,
+              UNIQUE(agent_run_id, call_id)
             );
             "#,
         )
