@@ -835,10 +835,7 @@ pub fn human_context(value: &Value) -> String {
         .get("session_id")
         .and_then(Value::as_str)
         .unwrap_or("-");
-    let prov = value
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
+    let prov = value.get("provider").and_then(Value::as_str).unwrap_or("-");
     let model = value.get("model").and_then(Value::as_str).unwrap_or("-");
     let mode = value.get("mode").and_then(Value::as_str).unwrap_or("chat");
     let eff_msgs = value
@@ -875,7 +872,9 @@ pub fn human_context(value: &Value) -> String {
     lines.push(format!("Session:    {sess}"));
     lines.push(format!("Model:      {prov}/{model}"));
     lines.push(format!("Mode:       {mode}"));
-    lines.push(format!("Messages:   {eff_msgs} effective ({main_msgs} main)"));
+    lines.push(format!(
+        "Messages:   {eff_msgs} effective ({main_msgs} main)"
+    ));
     lines.push(format!("Characters: {chars} / {budget} budget"));
     lines.push(format!("Summary:    {summary}"));
     lines.push(format!("Memory:     {mems} active entries"));
@@ -966,7 +965,9 @@ pub fn human_tools(value: &Value) -> String {
             if desc.is_empty() {
                 lines.push(format!("  - {name:<14} risk: {risk:<6} mode: {mode}"));
             } else {
-                lines.push(format!("  - {name:<14} risk: {risk:<6} mode: {mode:<6} {desc}"));
+                lines.push(format!(
+                    "  - {name:<14} risk: {risk:<6} mode: {mode:<6} {desc}"
+                ));
             }
         }
         lines.join("\n")
@@ -1083,14 +1084,10 @@ pub fn human_telegram(value: &Value) -> String {
     lines.push(format!("  Enabled:       {enabled}"));
     lines.push(format!("  Token:         {token}"));
     if let Some(bot) = t.get("bot").and_then(Value::as_object) {
-        let username = bot
-            .get("username")
-            .and_then(Value::as_str)
-            .unwrap_or("-");
-        let bot_id = bot.get("id").and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_u64().map(|u| u as i64))
-        });
+        let username = bot.get("username").and_then(Value::as_str).unwrap_or("-");
+        let bot_id = bot
+            .get("id")
+            .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
         if let Some(bid) = bot_id {
             lines.push(format!("  Bot:           @{username} (id: {bid})"));
         } else {
@@ -1098,7 +1095,10 @@ pub fn human_telegram(value: &Value) -> String {
         }
     }
     if let Some(owner) = t.get("owner_user_id").and_then(Value::as_i64) {
-        let state = t.get("owner_state").and_then(Value::as_str).unwrap_or("active");
+        let state = t
+            .get("owner_state")
+            .and_then(Value::as_str)
+            .unwrap_or("active");
         lines.push(format!("  Owner:         {owner} ({state})"));
     }
     if let Some(chats) = t.get("allowed_chat_ids").and_then(Value::as_array) {
@@ -1264,7 +1264,11 @@ pub fn human_custom_profile(value: &Value) -> String {
             })
             .collect();
         if !m_strs.is_empty() {
-            lines.push(format!("Models ({}):     {}", m_strs.len(), m_strs.join(", ")));
+            lines.push(format!(
+                "Models ({}):     {}",
+                m_strs.len(),
+                m_strs.join(", ")
+            ));
         }
     }
     lines.join("\n")
@@ -1491,7 +1495,10 @@ pub fn human_memory_item(value: &Value) -> String {
     let cat = value.get("category").and_then(Value::as_str).unwrap_or("-");
     let key = value.get("key").and_then(Value::as_str).unwrap_or("-");
     let val = value.get("value").and_then(Value::as_str).unwrap_or("-");
-    let src = value.get("source_kind").and_then(Value::as_str).unwrap_or("-");
+    let src = value
+        .get("source_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
 
     let mut lines = Vec::new();
     lines.push(format!("Memory:   {id}"));
@@ -1540,14 +1547,23 @@ pub fn human_skills(value: &Value) -> String {
 pub fn human_skill_item(value: &Value) -> String {
     let id = value.get("id").and_then(Value::as_str).unwrap_or("-");
     let name = value.get("name").and_then(Value::as_str).unwrap_or("-");
-    let ver = value.get("version").and_then(Value::as_str).unwrap_or("1.0.0");
+    let ver = value
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("1.0.0");
     let en = value
         .get("enabled")
         .and_then(Value::as_bool)
         .map(|b| if b { "yes" } else { "no" })
         .unwrap_or("-");
-    let src = value.get("source_kind").and_then(Value::as_str).unwrap_or("-");
-    let desc = value.get("description").and_then(Value::as_str).unwrap_or("");
+    let src = value
+        .get("source_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let desc = value
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
 
     let mut lines = Vec::new();
     lines.push(format!("Skill:        {name} (id: {id})"));
