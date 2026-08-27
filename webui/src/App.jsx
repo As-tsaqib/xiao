@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { managerGet, managerPost } from './bridge.js';
 
 /* ========== Section Registry ========== */
@@ -92,6 +92,8 @@ const ICON_PATHS = {
   plug: 'M8 3v5m8-5v5M6 8h12v4a6 6 0 0 1-12 0V8Zm6 10v3',
   info: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm-1 5h2v2h-2V8Zm0 4h2v5h-2v-5Z',
   refresh: 'M19 8a7 7 0 1 0 1 6h-2a5 5 0 1 1-1.4-3.5L14 13h7V6l-2 2Z',
+  sun: 'M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10Zm0-5a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0V3a1 1 0 0 1 1-1Zm0 17a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0v-2a1 1 0 0 1 1-1ZM4.22 4.22a1 1 0 0 1 1.42 0l1.42 1.42a1 1 0 0 1-1.42 1.42L4.22 5.64a1 1 0 0 1 0-1.42Zm12.72 12.72a1 1 0 0 1 1.42 0l1.42 1.42a1 1 0 0 1-1.42 1.42l-1.42-1.42a1 1 0 0 1 0-1.42ZM2 12a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2H3a1 1 0 0 1-1-1Zm17 0a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2h-2a1 1 0 0 1-1-1ZM5.64 18.36a1 1 0 0 1 0-1.42l1.42-1.42a1 1 0 0 1 1.42 1.42l-1.42 1.42a1 1 0 0 1-1.42 0Zm12.72-12.72a1 1 0 0 1 0-1.42l1.42-1.42a1 1 0 1 1 1.42 1.42l-1.42 1.42a1 1 0 0 1-1.42 0Z',
+  moon: 'M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z',
 };
 
 function AppIcon({ name, size = 22 }) {
@@ -111,6 +113,28 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [toastMsg, setToastMsg] = useState(null);
   const [loading, setLoading] = useState({});
+  const [theme, setTheme] = useState(() => {
+    try {
+      const saved = localStorage.getItem('xiao-theme');
+      if (saved) return saved;
+      return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    } catch {
+      return 'light';
+    }
+  });
+
+  useEffect(() => {
+    try {
+      document.documentElement.setAttribute('data-theme', theme);
+      localStorage.setItem('xiao-theme', theme);
+    } catch {}
+  }, [theme]);
+
+  const toggleTheme = useCallback(() => {
+    setTheme(prev => prev === 'dark' ? 'light' : 'dark');
+  }, []);
+
+  const [refreshing, setRefreshing] = useState(false);
 
   const toast = useCallback((msg, type = 'info') => {
     setToastMsg({ msg, type });
@@ -127,6 +151,33 @@ function App() {
     setLoading(prev => ({ ...prev, [key]: false }));
   }, []);
 
+  const handleManualRefresh = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    const startTime = Date.now();
+    try {
+      if (sub) {
+        await load(sub);
+      } else {
+        await Promise.all([
+          load('dashboard'),
+          load('providers'),
+          load('setup'),
+          load('agent'),
+        ]);
+      }
+      const elapsed = Date.now() - startTime;
+      if (elapsed < 650) {
+        await new Promise(r => setTimeout(r, 650 - elapsed));
+      }
+      toast('Data berhasil diperbarui', 'ok');
+    } catch {
+      toast('Gagal memperbarui data', 'bad');
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refreshing, sub, load, toast]);
+
   const post = useCallback(async (resource, body) => {
     setBusy(true);
     try {
@@ -136,10 +187,73 @@ function App() {
     finally { setBusy(false); }
   }, [toast]);
 
-  const nav = useCallback((page, arg) => { setSub(page); setSubArg(arg || null); window.scrollTo(0, 0); }, []);
-  const back = useCallback(() => { setSub(null); setSubArg(null); }, []);
+  const lastBackPressRef = useRef(0);
 
-  useEffect(() => { load('dashboard'); load('providers'); load('setup'); load('agent'); }, [load]);
+  const nav = useCallback((page, arg) => {
+    setSub(page);
+    setSubArg(arg || null);
+    window.scrollTo(0, 0);
+    try {
+      window.history.pushState({ tab, sub: page, subArg: arg || null }, '', '#' + page);
+    } catch {}
+  }, [tab]);
+
+  const selectTab = useCallback((newTab) => {
+    setTab(newTab);
+    setSub(null);
+    setSubArg(null);
+    window.scrollTo(0, 0);
+    try {
+      window.history.pushState({ tab: newTab, sub: null, subArg: null }, '', '#' + newTab);
+    } catch {}
+  }, []);
+
+  const back = useCallback(() => {
+    try {
+      window.history.back();
+    } catch {
+      setSub(null);
+      setSubArg(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.history.replaceState({ tab: 'explore', sub: null, subArg: null, isRoot: true }, '', '#explore');
+      window.history.pushState({ tab: 'explore', sub: null, subArg: null, isMain: true }, '', '#explore');
+    } catch {}
+
+    const handlePopState = (event) => {
+      const state = event.state;
+      if (!state || state.isRoot) {
+        const now = Date.now();
+        if (now - lastBackPressRef.current < 2000) {
+          // Double press -> let Android exit
+          window.history.back();
+          return;
+        }
+        lastBackPressRef.current = now;
+        toast('Tekan kembali sekali lagi untuk keluar', 'info');
+        try {
+          window.history.pushState({ tab: 'explore', sub: null, subArg: null, isMain: true }, '', '#explore');
+        } catch {}
+        setTab('explore');
+        setSub(null);
+        setSubArg(null);
+        return;
+      }
+
+      if (state.tab) setTab(state.tab);
+      setSub(state.sub || null);
+      setSubArg(state.subArg || null);
+      window.scrollTo(0, 0);
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [toast]);
+
+  useEffect(() => { load('dashboard'); load('providers'); load('setup'); }, [load]);
 
   const dash = data.dashboard;
   const health = dash?.health;
@@ -151,7 +265,16 @@ function App() {
   /* ========== Toast ========== */
   function ToastUI() {
     if (!toastMsg) return null;
-    return <div className={`notice ${toastMsg.type}`} style={{position:'fixed',top:60,left:'50%',transform:'translateX(-50%)',zIndex:50,maxWidth:400,width:'90%',boxShadow:'0 4px 20px rgba(0,0,0,.15)'}}>
+    return <div className={`notice ${toastMsg.type}`} style={{
+      position: 'fixed',
+      top: 'calc(56px + var(--status-bar-inset, 38px) + 14px)',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      zIndex: 100,
+      maxWidth: 400,
+      width: '90%',
+      boxShadow: '0 8px 24px rgba(0,0,0,.25)'
+    }}>
       <span className="notice-dot" />{toastMsg.msg}
     </div>;
   }
@@ -161,17 +284,6 @@ function App() {
     const gateway = health?.gateway || 'unknown';
     const gsc = classForStatus(gateway);
     return <>
-      <div className="hero">
-      <div className="hero-avatar">
-          <img className="hero-logo" src="./xiao-logo.png" alt="Xiao logo" />
-          <div className="edit-badge">✏</div>
-        </div>
-        <h2>Hi, Boss!</h2>
-        <div className="model-badge" onClick={() => nav('models')}>
-          <span className={`status-dot ${gsc}`} />
-          {ai?.model || 'Select Model'} ›
-        </div>
-      </div>
       <div className="content">
         {counts && <div className="metrics-grid">
           <div className="metric"><div className="metric-value">{counts.sessions || 0}</div><div className="metric-label">Sessions</div></div>
@@ -248,12 +360,25 @@ function App() {
       <div className="settings-section-title">Xiao</div>
       <div className="card-group">
         <SettingsItem icon="settings" bg="var(--accent-soft)" color="var(--accent)" title="Agent Config" onClick={() => { load('agent'); nav('agent'); }} />
-        <SettingsItem icon="telegram" bg="#E3F2FD" color="#1565C0" title="Telegram" right={tg?.enabled ? 'Active' : 'Off'} onClick={() => { load('setup'); nav('telegram'); }} />
+        <SettingsItem icon="telegram" bg="#E3F2FD" color="#1565C0" title="Telegram" right={(tg?.telegram?.enabled ?? tg?.enabled) ? 'Active' : 'Off'} onClick={() => { load('setup'); nav('telegram'); }} />
       </div>
       <div className="settings-section-title">AI Provider</div>
       <div className="card-group">
         <SettingsItem icon="plug" bg="var(--purple-soft)" color="var(--purple)" title="Custom Profiles" right={profiles.length + ' profiles'} onClick={() => { load('providers'); nav('profiles'); }} />
         <SettingsItem icon="spark" bg="#FCE4EC" color="var(--pink)" title="LLM Model" right={ai?.model || '-'} onClick={() => { load('providers'); nav('models'); }} />
+      </div>
+      <div className="settings-section-title">Appearance</div>
+      <div className="card-group">
+        <div className="settings-item" onClick={toggleTheme} style={{ cursor: 'pointer' }}>
+          <div className="settings-icon" style={{ background: theme === 'dark' ? 'var(--purple-soft)' : 'var(--yellow-soft)', color: theme === 'dark' ? 'var(--purple)' : 'var(--yellow)' }}>
+            <AppIcon name={theme === 'dark' ? 'moon' : 'sun'} size={19} />
+          </div>
+          <div className="settings-body">
+            <h4>Dark Mode</h4>
+            <p>{theme === 'dark' ? 'Dark theme active' : 'Light theme active'}</p>
+          </div>
+          <button className={`toggle-switch${theme === 'dark' ? ' on' : ''}`} type="button" aria-label="Toggle dark mode" onClick={(e) => { e.stopPropagation(); toggleTheme(); }} />
+        </div>
       </div>
       <div className="settings-section-title">App</div>
       <div className="card-group">
@@ -498,17 +623,45 @@ function App() {
       { key: 'plan_cache_enabled', label: 'Plan Cache', type: 'toggle' },
       { key: 'background_learning', label: 'Background Learning', type: 'toggle' },
     ];
+
+    const toggleField = async (key, label, currentVal) => {
+      const newVal = !currentVal;
+      setData(prev => ({
+        ...prev,
+        agent: {
+          ...prev.agent,
+          settings: { ...(prev.agent?.settings || {}), [key]: newVal }
+        }
+      }));
+      try {
+        await post('agent', { action: 'update', [key]: newVal });
+        toast(label + ' ' + (newVal ? 'enabled' : 'disabled'), 'ok');
+        load('agent');
+      } catch {
+        setData(prev => ({
+          ...prev,
+          agent: {
+            ...prev.agent,
+            settings: { ...(prev.agent?.settings || {}), [key]: currentVal }
+          }
+        }));
+      }
+    };
+
     return <div className="sub-page">
       <SubHeader title="Agent Settings" />
       <div className="sub-content">
         {d?.active_runs != null && <div className="notice info"><span className="notice-dot" />{d.active_runs} active runs</div>}
         <div className="detail-card">
           {fields.map(f => f.type === 'toggle' ?
-            <div className="toggle-row" key={f.key}>
+            <div className="toggle-row" key={f.key} onClick={() => toggleField(f.key, f.label, s[f.key])}>
               <label>{f.label}</label>
-              <button className={'toggle-switch' + (s[f.key] ? ' on' : '')} onClick={async () => {
-                try { await post('agent', { action: 'update', [f.key]: !s[f.key] }); toast(f.label + ' toggled', 'ok'); load('agent'); } catch {}
-              }} />
+              <button
+                type="button"
+                className={'toggle-switch' + (s[f.key] ? ' on' : '')}
+                onClick={(e) => { e.stopPropagation(); toggleField(f.key, f.label, s[f.key]); }}
+                aria-label={f.label}
+              />
             </div> :
             <div className="form-group" key={f.key}>
               <label className="form-label">{f.label}</label>
@@ -634,16 +787,62 @@ function App() {
   function TelegramPage() {
     const d = data.setup;
     if (loading.setup && !d) return <div className="sub-page"><SubHeader title="Telegram" /><Loading /></div>;
-    const tgData = d || {};
+    const tgData = d?.telegram || d || {};
+
+    const toggleTelegram = async () => {
+      const currentVal = !!tgData.enabled;
+      const newVal = !currentVal;
+      setData(prev => {
+        const prevSetup = prev.setup || {};
+        const prevTg = prevSetup.telegram || prevSetup;
+        return {
+          ...prev,
+          setup: {
+            ...prevSetup,
+            telegram: {
+              ...prevTg,
+              enabled: newVal
+            },
+            enabled: newVal
+          }
+        };
+      });
+      try {
+        await post('telegram', { action: 'configure', enabled: newVal });
+        toast('Telegram ' + (newVal ? 'enabled' : 'disabled'), 'ok');
+        load('setup');
+      } catch {
+        setData(prev => {
+          const prevSetup = prev.setup || {};
+          const prevTg = prevSetup.telegram || prevSetup;
+          return {
+            ...prev,
+            setup: {
+              ...prevSetup,
+              telegram: {
+                ...prevTg,
+                enabled: currentVal
+              },
+              enabled: currentVal
+            }
+          };
+        });
+        toast('Gagal mengubah status Telegram', 'bad');
+      }
+    };
+
     return <div className="sub-page">
       <SubHeader title="Telegram" />
       <div className="sub-content">
         <div className="detail-card">
-          <div className="toggle-row">
+          <div className="toggle-row" onClick={toggleTelegram}>
             <label>Telegram Enabled</label>
-            <button className={'toggle-switch' + (tgData.enabled ? ' on' : '')} onClick={async () => {
-              try { await post('telegram', { action: 'configure', enabled: !tgData.enabled }); toast('Telegram ' + (tgData.enabled ? 'disabled' : 'enabled'), 'ok'); load('setup'); } catch {}
-            }} />
+            <button
+              type="button"
+              className={'toggle-switch' + (tgData.enabled ? ' on' : '')}
+              onClick={(e) => { e.stopPropagation(); toggleTelegram(); }}
+              aria-label="Toggle Telegram"
+            />
           </div>
           <DL label="Owner State"><Status value={tgData.owner_state} /></DL>
           {tgData.owner_user_id && <DL label="Owner User ID">{tgData.owner_user_id}</DL>}
@@ -819,9 +1018,21 @@ function App() {
         <span className="verified">✓</span>
       </div>
       <div className="header-actions">
-        <button className="header-btn" aria-label="Refresh" onClick={() => { load('dashboard'); load('providers'); }}><AppIcon name="refresh" size={20} /></button>
+        <button className="header-btn" aria-label="Toggle theme" title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} onClick={toggleTheme}>
+          <AppIcon name={theme === 'dark' ? 'sun' : 'moon'} size={20} />
+        </button>
+        <button
+          className={`header-btn${refreshing ? ' refreshing' : ''}`}
+          aria-label="Refresh"
+          title={refreshing ? 'Memperbarui...' : 'Perbarui data'}
+          disabled={refreshing}
+          onClick={handleManualRefresh}
+        >
+          <AppIcon name="refresh" size={20} />
+        </button>
       </div>
     </div>
+    {refreshing && <div className="refresh-bar" />}
 
     {tab === 'explore' && <ExploreView />}
     {tab === 'tools' && <ToolsView />}
@@ -829,11 +1040,9 @@ function App() {
 
     <div className="tab-bar">
       {[['explore','Explore'],['tools','Imagine'],['settings','Settings']].map(([id, label]) =>
-        <button key={id} className={`tab-item${tab === id ? ' active' : ''}`} onClick={() => {
-          setTab(id);
-          if (id === 'explore') load('dashboard');
-          if (id === 'settings') { load('providers'); load('setup'); load('agent'); }
-        }}><AppIcon name={id === 'explore' ? 'spark' : id === 'tools' ? 'search' : 'settings'} size={25} /><span>{label}</span></button>
+        <button key={id} className={`tab-item${tab === id ? ' active' : ''}`} onClick={() => selectTab(id)}>
+          <AppIcon name={id === 'explore' ? 'spark' : id === 'tools' ? 'search' : 'settings'} size={25} />
+        </button>
       )}
     </div>
     <ToastUI />
