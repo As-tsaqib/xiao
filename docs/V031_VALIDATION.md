@@ -6,7 +6,7 @@ This record captures automated CI verification status and documents device limit
 
 - Branch: `main`
 - Schema migration: 26 → 27
-- Verified CI Run: 33025145426 (Commit `e5f4f7831d17d091e921d7237077977eb7efb51e`)
+- Verified CI Run: 33027762084 (Commit `1fc4a45749f7e53f1f7e02b4d9fa2461099684bc`)
 - `rust` job: PASS (cargo check, cargo test with 316 unit/integration tests passing, strict clippy, release build, WebUI build, static acceptance).
 - `android-arm64` job: PASS (cargo-ndk build, WebUI embed, deterministic module ZIP build and sha256 checksum verification).
 - Local Rust, WebUI, and Android builds/tests: not run (repository policy; all validation via GitHub Actions CI).
@@ -55,6 +55,15 @@ This record captures automated CI verification status and documents device limit
     - Resets consecutive identical failure counts and cleared failed action history on successful tool execution, preventing false-positive blocks when repairing intermediate failures.
     - Dynamic observation signature history buffer matching configured `max_no_progress_repeats`.
     - Parameter aliases for `pdf_create` (`file_path`, `filename`, `output_path`, `target`, `text`, `body`, `data`, `heading`, `header`) and `termux_terminal` (`command`, `cmd`, `argv`, `workdir`, `env`, `timeout`) ensuring first-attempt reliability across diverse LLM prompt patterns.
+
+14. **Human-Readable CLI Output & Contract Hardening**:
+    - Consistent, concise human-readable output by default with labeled sections, key-value rows, and bounded tables across all CLI commands (`status`, `context`, `doctor`, `tools`, `sessions`, `telegram`, `model`, `runs`, `attachments`, `memory`, `skills`, `approvals`, `config`, `daemon`, `logs`, `chat`).
+    - Raw JSON, Telegram View blocks/actions, secrets, auth tokens, internal envelopes, and prompt/reasoning data strictly stripped from human output and CLI DTO projections.
+    - Identifiers displayed only when necessary for follow-up operations.
+    - `--json` guarantees stable `{"status":"ok", "data": ...}` machine envelope.
+    - `--quiet` strictly suppresses stdout on success while preserving actionable stderr errors.
+    - Decorative `--no-color` removed; `xiao help advanced` added for hidden plumbing/admin commands with prioritized help listing common commands first.
+    - Comprehensive snapshot and contract tests enforcing zero secret leakage and absence of raw JSON blocks in human rendering.
 
 ## Device Limitations & Edge Behaviors
 
