@@ -1603,7 +1603,9 @@ pub fn human_approvals(value: &Value) -> String {
             } else {
                 format!("  (session: {sess})")
             };
-            lines.push(format!("  - {id}  tool: {tool}  risk: {risk}  \"{sum}\"{sess_str}"));
+            lines.push(format!(
+                "  - {id}  tool: {tool}  risk: {risk}  \"{sum}\"{sess_str}"
+            ));
         }
         lines.join("\n")
     } else {
