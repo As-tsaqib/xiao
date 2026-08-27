@@ -2469,6 +2469,14 @@ impl Storage {
                 | "final_answer_ready"
                 | "final_frontend_delivery"
                 | "background_learning"
+                | "plan_cache_hit"
+                | "plan_cache_miss"
+                | "plan_cache_rejected"
+                | "plan_cache_invalidated"
+                | "script_cache_hit"
+                | "script_cache_miss"
+                | "script_cache_hash_mismatch"
+                | "script_cache_policy_reject"
         ) {
             return Err(anyhow::anyhow!("invalid agent timing event"));
         }
