@@ -927,17 +927,62 @@ impl AgentEngine {
                 )?;
                 let remaining = std::time::Duration::from_secs(config.max_runtime_seconds)
                     .saturating_sub(run_started.elapsed());
+                let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<AgentEvent>();
+                let progress_sink = progress.clone();
+                let storage_timing = self.storage.clone();
+                let run_id_timing = agent_run_id.clone();
+                let timing_ref = timing_started;
+                let turn_idx = turns;
+                let timing_task = tokio::spawn(async move {
+                    let mut first_byte_recorded = false;
+                    let mut first_text_recorded = false;
+                    while let Some(event) = turn_rx.recv().await {
+                        match &event {
+                            AgentEvent::StreamChunk { .. } if !first_byte_recorded => {
+                                first_byte_recorded = true;
+                                let _ = storage_timing.record_agent_run_event(
+                                    &run_id_timing,
+                                    "provider_first_byte",
+                                    timing_ref.elapsed().as_millis() as u64,
+                                    &serde_json::json!({ "turn": turn_idx }),
+                                );
+                            }
+                            AgentEvent::TextDelta(t)
+                                if !first_text_recorded && !t.trim().is_empty() =>
+                            {
+                                first_text_recorded = true;
+                                let _ = storage_timing.record_agent_run_event(
+                                    &run_id_timing,
+                                    "first_visible_text_delta",
+                                    timing_ref.elapsed().as_millis() as u64,
+                                    &serde_json::json!({ "turn": turn_idx }),
+                                );
+                            }
+                            _ => {}
+                        }
+                        if let Some(sink) = &progress_sink {
+                            let _ = sink.send(event);
+                        }
+                    }
+                });
                 let turn = tokio::select! {
-                    _ = token.cancelled() => return Err(anyhow!("generation cancelled")),
+                    _ = token.cancelled() => {
+                        drop(turn_tx);
+                        let _ = timing_task.await;
+                        return Err(anyhow!("generation cancelled"));
+                    }
                     response = tokio::time::timeout(
                         remaining,
                         provider.run_turn(
                             request.clone(),
                             continuation.take(),
                             tool_results,
-                            progress.clone(),
+                            Some(turn_tx),
                         ),
-                    ) => response.map_err(|_| anyhow!("agent runtime limit reached during provider turn"))??,
+                    ) => {
+                        let _ = timing_task.await;
+                        response.map_err(|_| anyhow!("agent runtime limit reached during provider turn"))??
+                    }
                 };
                 self.storage.record_agent_run_event(
                     &agent_run_id,
@@ -945,27 +990,6 @@ impl AgentEngine {
                     timing_started.elapsed().as_millis() as u64,
                     &serde_json::json!({ "turn": turns }),
                 )?;
-                for ev in &turn.events {
-                    match ev {
-                        AgentEvent::StreamChunk { .. } => {
-                            let _ = self.storage.record_agent_run_event(
-                                &agent_run_id,
-                                "first_byte",
-                                timing_started.elapsed().as_millis() as u64,
-                                &serde_json::json!({ "turn": turns }),
-                            );
-                        }
-                        AgentEvent::TextDelta(_) => {
-                            let _ = self.storage.record_agent_run_event(
-                                &agent_run_id,
-                                "first_visible_text_delta",
-                                timing_started.elapsed().as_millis() as u64,
-                                &serde_json::json!({ "turn": turns }),
-                            );
-                        }
-                        _ => {}
-                    }
-                }
                 provider_events.extend(turn.events);
                 match turn.step {
                     ProviderStep::Final(answer)=>{

@@ -650,7 +650,7 @@ function App() {
               <div className="card-body"><h4>Sessions</h4><p>{counts?.sessions || 0} total sessions</p></div>
               <span className="card-chevron">›</span>
             </div>
-            <div className="card-item" onClick={() => { load('tasks'); nav('runs'); }}>
+            <div className="card-item" onClick={() => { load('runs'); nav('runs'); }}>
               <div className="card-icon" style={{ background: 'var(--yellow-soft)', color: 'var(--yellow)' }}><AppIcon name="play" size={22} /></div>
               <div className="card-body"><h4>Agent Runs</h4><p>{counts?.runs || 0} active / historical runs</p></div>
               <span className="card-chevron">›</span>
@@ -771,12 +771,12 @@ function App() {
     const d = data.sessions;
     if (loading.sessions && !d) return <div className="sub-page"><SubHeader title="Sessions" /><Loading /></div>;
     const items = d?.items || d?.sessions || [];
-    const totalPages = d?.total_pages || 1;
+    const totalPages = d?.pages || d?.total_pages || 1;
     const curPage = d?.page || 1;
     return <div className="sub-page">
       <SubHeader title="Sessions" actions={<Button tone="primary" onClick={async () => {
         try {
-          const s = await post('sessions', { action: 'create', name: 'New Session' });
+          const s = await post('sessions', { action: 'new', name: 'New Session' });
           toast('Session created', 'ok');
           load('sessions');
           load('dashboard');
@@ -840,7 +840,7 @@ function App() {
 
     const handleOverride = async (profileId, modelId, capability, override) => {
       try {
-        await post('providers/custom', {
+        await post('provider-custom', {
           action: 'capability_override',
           profile_id: profileId,
           model: modelId,
@@ -856,7 +856,7 @@ function App() {
 
     const handleProbe = async (profileId, modelId) => {
       try {
-        await post('providers/custom', { action: 'probe', profile_id: profileId, model: modelId });
+        await post('provider-custom', { action: 'probe', profile_id: profileId, model: modelId });
         toast('Model probe completed', 'ok');
         load('providers');
       } catch (e) {
@@ -1020,8 +1020,8 @@ function App() {
 
   /* Runs */
   function RunsPage() {
-    const d = data.tasks;
-    if (loading.tasks && !d) return <div className="sub-page"><SubHeader title="Agent Runs" /><Loading /></div>;
+    const d = data.runs;
+    if (loading.runs && !d) return <div className="sub-page"><SubHeader title="Agent Runs" /><Loading /></div>;
     const items = d?.items || d?.runs || [];
     return <div className="sub-page">
       <SubHeader title="Agent Runs" />
@@ -1046,7 +1046,7 @@ function App() {
               try {
                 await post('runs', { action: 'cancel', run_id: r.id });
                 toast('Cancelled', 'ok');
-                load('tasks');
+                load('runs');
               } catch {}
             }}>Cancel Run</Button></div>}
           </div>)}

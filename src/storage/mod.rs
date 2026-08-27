@@ -2461,6 +2461,7 @@ impl Storage {
             event_kind,
             "pre_provider_overhead"
                 | "provider_request_start"
+                | "provider_first_byte"
                 | "first_byte"
                 | "first_visible_text_delta"
                 | "provider_completion"
