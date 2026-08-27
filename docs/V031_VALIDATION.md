@@ -6,8 +6,8 @@ This record captures automated CI verification status and documents device limit
 
 - Branch: `main`
 - Schema migration: 26 → 27
-- Verified CI Run: 33022754295 (Commit `30d2e45da7ea30811e5a55ae5c25608b68832a89`)
-- `rust` job: PASS (cargo check, cargo test with 312 unit/integration tests passing, strict clippy, release build, WebUI build, static acceptance).
+- Verified CI Run: 33025145426 (Commit `e5f4f7831d17d091e921d7237077977eb7efb51e`)
+- `rust` job: PASS (cargo check, cargo test with 316 unit/integration tests passing, strict clippy, release build, WebUI build, static acceptance).
 - `android-arm64` job: PASS (cargo-ndk build, WebUI embed, deterministic module ZIP build and sha256 checksum verification).
 - Local Rust, WebUI, and Android builds/tests: not run (repository policy; all validation via GitHub Actions CI).
 
@@ -50,6 +50,11 @@ This record captures automated CI verification status and documents device limit
     - Strict arity, option parsing, and exit code contract enforcement (0 ok, 1 error, 2 usage, 3 daemon unavailable, 4 rejected, 5 not found, 6 local io).
     - Global flags (`--json`, `--quiet`, `--session`, `--timeout`, `--no-color`) validated with stable structured JSON error envelopes.
     - Strict security contract: zero secret leakage in argv, stdin/file-based secret ingestion, and sanitization of tokens/keys in CLI JSON responses.
+
+13. **Tool Execution Reliability & False-Positive Loop Elimination**:
+    - Resets consecutive identical failure counts and cleared failed action history on successful tool execution, preventing false-positive blocks when repairing intermediate failures.
+    - Dynamic observation signature history buffer matching configured `max_no_progress_repeats`.
+    - Parameter aliases for `pdf_create` (`file_path`, `filename`, `output_path`, `target`, `text`, `body`, `data`, `heading`, `header`) and `termux_terminal` (`command`, `cmd`, `argv`, `workdir`, `env`, `timeout`) ensuring first-attempt reliability across diverse LLM prompt patterns.
 
 ## Device Limitations & Edge Behaviors
 
