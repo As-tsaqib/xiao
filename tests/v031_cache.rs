@@ -290,10 +290,30 @@ async fn matrix_g7_termux_job_execution_registers_and_hits_cache() {
     let events1 = storage.agent_run_events(&run_id).unwrap();
     assert!(events1.iter().any(|e| e.event_kind == "plan_cache_miss"));
 
-    // Second execution: cache hit
-    let res2 = job.execute(&ctx, args).await.unwrap();
+    // Second execution in a new agent run: cache hit!
+    let run_id_2 = storage
+        .create_agent_run("owner-1", &session.id, "custom", "m", Some("cache test 2"))
+        .unwrap();
+    let tool_run_id_2 = storage
+        .create_tool_run(&run_id_2, "call-job-2", "termux_job", "{}", "side_effect")
+        .unwrap();
+    storage
+        .set_tool_run_status(&tool_run_id_2, "running", None, None)
+        .unwrap();
+
+    let ctx_2 = xiao::tools::ToolContext {
+        principal: "owner-1".into(),
+        session_id: session.id.clone(),
+        agent_run_id: run_id_2.clone(),
+        yolo_mode: false,
+        messages: vec![],
+        cancellation: CancellationToken::new(),
+        progress: None,
+    };
+
+    let res2 = job.execute(&ctx_2, args).await.unwrap();
     assert!(res2.contains("succeeded"));
 
-    let events2 = storage.agent_run_events(&run_id).unwrap();
+    let events2 = storage.agent_run_events(&run_id_2).unwrap();
     assert!(events2.iter().any(|e| e.event_kind == "plan_cache_hit"));
 }
