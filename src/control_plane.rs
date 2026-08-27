@@ -454,7 +454,7 @@ impl SessionAiService {
             let profile = profiles
                 .get(owner, binding)?
                 .ok_or_else(|| anyhow!("Custom profile not found for owner"))?;
-            let record = profiles
+            let _record = profiles
                 .model(&profile.profile_id, model)?
                 .ok_or_else(|| anyhow!("model has not been discovered for this Custom profile"))?;
             // P0-1 / P0-4: enforce readiness semantics.
