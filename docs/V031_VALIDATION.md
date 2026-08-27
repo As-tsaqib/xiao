@@ -6,7 +6,7 @@ This record captures automated CI verification status and documents device limit
 
 - Branch: `main`
 - Schema migration: 26 → 27
-- Verified CI Run: 33068967406 (Commit `b4f95dcb2a382103f901170669aafe24beafc0c2`)
+- Verified CI Run: 33070970357 (Commit `2dc5e4922184d0092f69e6b36ca8974a6381e4b8`)
 - `rust` job: PASS (cargo check, cargo test with 321 unit/integration tests passing, strict clippy, release build, WebUI build, static acceptance).
 - `android-arm64` job: PASS (cargo-ndk build, WebUI embed, deterministic module ZIP build and sha256 checksum verification).
 - Local Rust, WebUI, and Android builds/tests: not run (repository policy; all validation via GitHub Actions CI).
