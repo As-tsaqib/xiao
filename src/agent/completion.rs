@@ -837,10 +837,7 @@ mod tests {
             TaskKind::Informational
         );
         let verifier = CompletionVerifier::default();
-        assert_eq!(
-            verifier.classify(goal, &[]),
-            TaskKind::Informational
-        );
+        assert_eq!(verifier.classify(goal, &[]), TaskKind::Informational);
     }
 
     #[test]

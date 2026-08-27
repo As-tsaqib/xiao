@@ -279,7 +279,8 @@ endstream",
     );
     let font_obj = (
         font_obj_id,
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_owned(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_owned(),
     );
 
     let mut all_objects = vec![catalog_obj, pages_obj, font_obj];

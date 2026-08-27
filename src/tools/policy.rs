@@ -191,11 +191,13 @@ pub(crate) fn termux_call_policy(arguments: &Value) -> PolicyDecision {
         }
     }
 
-    let is_workspace_relative_file_op = matches!(
-        program.as_str(),
-        "rm" | "rmdir" | "unlink" | "truncate"
-    );
-    let non_flag_args: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+    let is_workspace_relative_file_op =
+        matches!(program.as_str(), "rm" | "rmdir" | "unlink" | "truncate");
+    let non_flag_args: Vec<&str> = args
+        .iter()
+        .copied()
+        .filter(|a| !a.starts_with('-'))
+        .collect();
     let all_targets_in_workspace = !non_flag_args.is_empty()
         && non_flag_args.iter().all(|target| {
             let p = std::path::Path::new(target);

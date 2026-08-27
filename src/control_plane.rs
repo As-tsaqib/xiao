@@ -473,7 +473,10 @@ impl SessionAiService {
     }
 
     /// Explicit/optional probe if requested.
-    pub fn capability_probe_required(&self, record: &crate::storage::ProviderProfileModelRecord) -> bool {
+    pub fn capability_probe_required(
+        &self,
+        record: &crate::storage::ProviderProfileModelRecord,
+    ) -> bool {
         matches!(
             Self::model_readiness(record),
             CustomModelReadiness::Unprobed | CustomModelReadiness::Indeterminate
@@ -541,8 +544,12 @@ impl FrontendDeliveryService {
             "frontend": frontend,
             "metadata": metadata.cloned().unwrap_or(serde_json::Value::Null),
         });
-        self.storage
-            .record_agent_run_event(run_id, "final_frontend_delivery", elapsed_ms, &meta)?;
+        self.storage.record_agent_run_event(
+            run_id,
+            "final_frontend_delivery",
+            elapsed_ms,
+            &meta,
+        )?;
         self.storage.release_learning_job_after_delivery(run_id)?;
         Ok(())
     }
