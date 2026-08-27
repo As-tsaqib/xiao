@@ -897,7 +897,10 @@ async fn ingest_cli_attachment(
         ));
     }
     let bytes = fs::read(effective_path).map_err(|error| {
-        CliFailure::local(format!("read attachment {}: {error}", effective_path.display()))
+        CliFailure::local(format!(
+            "read attachment {}: {error}",
+            effective_path.display()
+        ))
     })?;
     let name = effective_path
         .file_name()

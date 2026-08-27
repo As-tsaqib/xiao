@@ -2338,7 +2338,10 @@ mod tests {
         assert!(projected.get("telegram").is_some());
         let t = projected.get("telegram").unwrap();
         assert_eq!(t.get("enabled").and_then(Value::as_bool), Some(true));
-        assert_eq!(t.get("token_configured").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            t.get("token_configured").and_then(Value::as_bool),
+            Some(true)
+        );
         assert_eq!(t.get("owner_user_id").and_then(Value::as_i64), Some(999888));
 
         let human = human_telegram(&projected);
