@@ -69,9 +69,9 @@ async fn webui_all_manager_get_and_post_contracts_execute_successfully() {
     // 3. Capability override
     profile_store
         .set_capability_override(
+            &owner,
             &profile.profile_id,
             "model-1",
-            "openai_chat_completions",
             "vision",
             "force_supported",
         )
