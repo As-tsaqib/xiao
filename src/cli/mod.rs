@@ -1736,7 +1736,10 @@ async fn attachments_command(
                 ))
                 .await?;
             let item = find_item(&data, &args[1], &["attachment_id"])?;
-            presenter.success("attachments show", crate::cli_contract::project_attachment_item(item))
+            presenter.success(
+                "attachments show",
+                crate::cli_contract::project_attachment_item(item),
+            )
         }
         Some("remove") if args.len() == 2 => presenter.success(
             "attachments remove",
@@ -1765,7 +1768,10 @@ async fn runs_command(
         ),
         Some("show") if args.len() == 2 => {
             let data = client.get_admin("/v1/admin/runs?limit=50").await?;
-            presenter.success("runs show", crate::cli_contract::project_run_item(find_item(&data, &args[1], &["id"])?))
+            presenter.success(
+                "runs show",
+                crate::cli_contract::project_run_item(find_item(&data, &args[1], &["id"])?),
+            )
         }
         Some("cancel") if args.len() == 2 => presenter.success(
             "runs cancel",

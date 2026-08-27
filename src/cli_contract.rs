@@ -831,17 +831,45 @@ pub fn human_status(value: &Value) -> String {
 }
 
 pub fn human_context(value: &Value) -> String {
-    let sess = value.get("session_id").and_then(Value::as_str).unwrap_or("-");
-    let prov = value.get("provider").and_then(Value::as_str).unwrap_or("-");
+    let sess = value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let prov = value
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
     let model = value.get("model").and_then(Value::as_str).unwrap_or("-");
     let mode = value.get("mode").and_then(Value::as_str).unwrap_or("chat");
-    let eff_msgs = value.get("effective_messages").and_then(Value::as_u64).unwrap_or(0);
-    let main_msgs = value.get("main_messages").and_then(Value::as_u64).unwrap_or(0);
-    let chars = value.get("stored_characters").and_then(Value::as_u64).unwrap_or(0);
-    let budget = value.get("context_budget_characters").and_then(Value::as_u64).unwrap_or(0);
-    let summary = value.get("summary_available").and_then(Value::as_bool).map(|b| if b { "available" } else { "none" }).unwrap_or("none");
-    let mems = value.get("active_memory_entries").and_then(Value::as_u64).unwrap_or(0);
-    let skills = value.get("skills_available").and_then(Value::as_u64).unwrap_or(0);
+    let eff_msgs = value
+        .get("effective_messages")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let main_msgs = value
+        .get("main_messages")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let chars = value
+        .get("stored_characters")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let budget = value
+        .get("context_budget_characters")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let summary = value
+        .get("summary_available")
+        .and_then(Value::as_bool)
+        .map(|b| if b { "available" } else { "none" })
+        .unwrap_or("none");
+    let mems = value
+        .get("active_memory_entries")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let skills = value
+        .get("skills_available")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
 
     let mut lines = Vec::new();
     lines.push(format!("Session:    {sess}"));
@@ -930,7 +958,10 @@ pub fn human_tools(value: &Value) -> String {
         for t in items {
             let name = t.get("name").and_then(Value::as_str).unwrap_or("-");
             let risk = t.get("risk").and_then(Value::as_str).unwrap_or("low");
-            let mode = t.get("approval_mode").and_then(Value::as_str).unwrap_or("auto");
+            let mode = t
+                .get("approval_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("auto");
             let desc = t.get("description").and_then(Value::as_str).unwrap_or("");
             if desc.is_empty() {
                 lines.push(format!("  - {name:<14} risk: {risk:<6} mode: {mode}"));
@@ -945,7 +976,10 @@ pub fn human_tools(value: &Value) -> String {
 }
 
 pub fn human_sessions(value: &Value) -> String {
-    let active_id = value.get("active_cli_session_id").and_then(Value::as_str).unwrap_or("");
+    let active_id = value
+        .get("active_cli_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if let Some(items) = value.get("items").and_then(Value::as_array) {
         if items.is_empty() {
             return "No active sessions.".into();
@@ -958,11 +992,17 @@ pub fn human_sessions(value: &Value) -> String {
             let prov = s.get("provider").and_then(Value::as_str).unwrap_or("-");
             let model = s.get("model").and_then(Value::as_str).unwrap_or("-");
             let msgs = s.get("message_count").and_then(Value::as_u64).unwrap_or(0);
-            let yolo = s.get("yolo").and_then(Value::as_bool).map(|b| if b { "on" } else { "off" }).unwrap_or("off");
+            let yolo = s
+                .get("yolo")
+                .and_then(Value::as_bool)
+                .map(|b| if b { "on" } else { "off" })
+                .unwrap_or("off");
             let is_active = id == active_id;
             let marker = if is_active { "*" } else { " " };
             let active_tag = if is_active { " (active)" } else { "" };
-            lines.push(format!("  {marker} {id:<10} \"{name}\"  {prov}/{model}  msgs: {msgs}  yolo: {yolo}{active_tag}"));
+            lines.push(format!(
+                "  {marker} {id:<10} \"{name}\"  {prov}/{model}  msgs: {msgs}  yolo: {yolo}{active_tag}"
+            ));
         }
         lines.join("\n")
     } else {
@@ -971,14 +1011,45 @@ pub fn human_sessions(value: &Value) -> String {
 }
 
 pub fn human_session_item(value: &Value) -> String {
-    let id = value.get("id").or_else(|| value.pointer("/session/id")).and_then(Value::as_str).unwrap_or("-");
-    let name = value.get("name").or_else(|| value.pointer("/session/name")).and_then(Value::as_str).unwrap_or("Untitled");
-    let prov = value.get("provider").or_else(|| value.pointer("/session/provider")).and_then(Value::as_str).unwrap_or("-");
-    let model = value.get("model").or_else(|| value.pointer("/session/model")).and_then(Value::as_str).unwrap_or("-");
-    let msgs = value.get("message_count").or_else(|| value.pointer("/session/message_count")).and_then(Value::as_u64).unwrap_or(0);
-    let yolo = value.get("yolo").or_else(|| value.pointer("/session/yolo")).and_then(Value::as_bool).map(|b| if b { "on" } else { "off" }).unwrap_or("off");
-    let created = value.get("created_at").or_else(|| value.pointer("/session/created_at")).and_then(Value::as_str);
-    let active = value.get("last_active_at").or_else(|| value.pointer("/session/last_active_at")).and_then(Value::as_str);
+    let id = value
+        .get("id")
+        .or_else(|| value.pointer("/session/id"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let name = value
+        .get("name")
+        .or_else(|| value.pointer("/session/name"))
+        .and_then(Value::as_str)
+        .unwrap_or("Untitled");
+    let prov = value
+        .get("provider")
+        .or_else(|| value.pointer("/session/provider"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let model = value
+        .get("model")
+        .or_else(|| value.pointer("/session/model"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let msgs = value
+        .get("message_count")
+        .or_else(|| value.pointer("/session/message_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let yolo = value
+        .get("yolo")
+        .or_else(|| value.pointer("/session/yolo"))
+        .and_then(Value::as_bool)
+        .map(|b| if b { "on" } else { "off" })
+        .unwrap_or("off");
+    let created = value
+        .get("created_at")
+        .or_else(|| value.pointer("/session/created_at"))
+        .and_then(Value::as_str);
+    let active = value
+        .get("last_active_at")
+        .or_else(|| value.pointer("/session/last_active_at"))
+        .and_then(Value::as_str);
 
     let mut lines = Vec::new();
     lines.push(format!("Session:     {id}"));
@@ -999,13 +1070,27 @@ pub fn human_telegram(value: &Value) -> String {
     let t = value.get("telegram").unwrap_or(value);
     let mut lines = Vec::new();
     lines.push("Telegram:".into());
-    let enabled = t.get("enabled").and_then(Value::as_bool).map(|b| if b { "yes" } else { "no" }).unwrap_or("no");
-    let token = t.get("token_configured").and_then(Value::as_bool).map(|b| if b { "configured" } else { "not configured" }).unwrap_or("not configured");
+    let enabled = t
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .map(|b| if b { "yes" } else { "no" })
+        .unwrap_or("no");
+    let token = t
+        .get("token_configured")
+        .and_then(Value::as_bool)
+        .map(|b| if b { "configured" } else { "not configured" })
+        .unwrap_or("not configured");
     lines.push(format!("  Enabled:       {enabled}"));
     lines.push(format!("  Token:         {token}"));
     if let Some(bot) = t.get("bot").and_then(Value::as_object) {
-        let username = bot.get("username").and_then(Value::as_str).unwrap_or("-");
-        let bot_id = bot.get("id").and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
+        let username = bot
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or("-");
+        let bot_id = bot.get("id").and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().map(|u| u as i64))
+        });
         if let Some(bid) = bot_id {
             lines.push(format!("  Bot:           @{username} (id: {bid})"));
         } else {
@@ -1136,8 +1221,16 @@ pub fn human_custom_profile(value: &Value) -> String {
     let alias = p.get("alias").and_then(Value::as_str).unwrap_or("-");
     let endpoint = p.get("endpoint").and_then(Value::as_str).unwrap_or("-");
     let protocol = p.get("protocol").and_then(Value::as_str).unwrap_or("-");
-    let enabled = p.get("enabled").and_then(Value::as_bool).map(|b| if b { "yes" } else { "no" }).unwrap_or("-");
-    let key = p.get("api_key_configured").and_then(Value::as_bool).map(|b| if b { "configured" } else { "not configured" }).unwrap_or("not configured");
+    let enabled = p
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .map(|b| if b { "yes" } else { "no" })
+        .unwrap_or("-");
+    let key = p
+        .get("api_key_configured")
+        .and_then(Value::as_bool)
+        .map(|b| if b { "configured" } else { "not configured" })
+        .unwrap_or("not configured");
 
     let mut lines = Vec::new();
     lines.push(format!("Custom Profile: {alias} (id: {id})"));
@@ -1146,7 +1239,10 @@ pub fn human_custom_profile(value: &Value) -> String {
     lines.push(format!("Enabled:        {enabled}"));
     lines.push(format!("API Key:        {key}"));
     if let Some(headers) = p.get("header_names").and_then(Value::as_array) {
-        let h_strs: Vec<String> = headers.iter().filter_map(|h| h.as_str().map(str::to_owned)).collect();
+        let h_strs: Vec<String> = headers
+            .iter()
+            .filter_map(|h| h.as_str().map(str::to_owned))
+            .collect();
         if !h_strs.is_empty() {
             lines.push(format!("Headers:        {}", h_strs.join(", ")));
         }
@@ -1158,7 +1254,10 @@ pub fn human_custom_profile(value: &Value) -> String {
                 if let Some(s) = m.as_str() {
                     Some(s.to_string())
                 } else if let Some(obj) = m.as_object() {
-                    obj.get("model_id").or_else(|| obj.get("id")).and_then(Value::as_str).map(str::to_owned)
+                    obj.get("model_id")
+                        .or_else(|| obj.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
                 } else {
                     None
                 }
@@ -1186,9 +1285,13 @@ pub fn human_runs(value: &Value) -> String {
             let status = r.get("status").and_then(Value::as_str).unwrap_or("-");
             let goal = r.get("goal").and_then(Value::as_str).unwrap_or("");
             if goal.is_empty() {
-                lines.push(format!("  - {id}  sess: {sess}  {prov}/{model}  status: {status}"));
+                lines.push(format!(
+                    "  - {id}  sess: {sess}  {prov}/{model}  status: {status}"
+                ));
             } else {
-                lines.push(format!("  - {id}  sess: {sess}  {prov}/{model}  status: {status}  goal: \"{goal}\""));
+                lines.push(format!(
+                    "  - {id}  sess: {sess}  {prov}/{model}  status: {status}  goal: \"{goal}\""
+                ));
             }
         }
         lines.join("\n")
@@ -1198,16 +1301,52 @@ pub fn human_runs(value: &Value) -> String {
 }
 
 pub fn human_run_item(value: &Value) -> String {
-    let id = value.get("id").or_else(|| value.pointer("/run/id")).and_then(Value::as_str).unwrap_or("-");
-    let sess = value.get("session_id").or_else(|| value.pointer("/run/session_id")).and_then(Value::as_str).unwrap_or("-");
-    let status = value.get("status").or_else(|| value.pointer("/run/status")).and_then(Value::as_str).unwrap_or("-");
-    let prov = value.get("provider").or_else(|| value.pointer("/run/provider")).and_then(Value::as_str).unwrap_or("-");
-    let model = value.get("model").or_else(|| value.pointer("/run/model")).and_then(Value::as_str).unwrap_or("-");
-    let goal = value.get("goal").or_else(|| value.pointer("/run/goal")).and_then(Value::as_str).unwrap_or("-");
-    let started = value.get("started_at").or_else(|| value.pointer("/run/started_at")).and_then(Value::as_str);
-    let finished = value.get("finished_at").or_else(|| value.pointer("/run/finished_at")).and_then(Value::as_str);
-    let result = value.get("result").or_else(|| value.pointer("/run/result")).and_then(Value::as_str);
-    let blocker = value.get("blocker_or_error").or_else(|| value.pointer("/run/blocker_or_error")).and_then(Value::as_str);
+    let id = value
+        .get("id")
+        .or_else(|| value.pointer("/run/id"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let sess = value
+        .get("session_id")
+        .or_else(|| value.pointer("/run/session_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let status = value
+        .get("status")
+        .or_else(|| value.pointer("/run/status"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let prov = value
+        .get("provider")
+        .or_else(|| value.pointer("/run/provider"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let model = value
+        .get("model")
+        .or_else(|| value.pointer("/run/model"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let goal = value
+        .get("goal")
+        .or_else(|| value.pointer("/run/goal"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let started = value
+        .get("started_at")
+        .or_else(|| value.pointer("/run/started_at"))
+        .and_then(Value::as_str);
+    let finished = value
+        .get("finished_at")
+        .or_else(|| value.pointer("/run/finished_at"))
+        .and_then(Value::as_str);
+    let result = value
+        .get("result")
+        .or_else(|| value.pointer("/run/result"))
+        .and_then(Value::as_str);
+    let blocker = value
+        .get("blocker_or_error")
+        .or_else(|| value.pointer("/run/blocker_or_error"))
+        .and_then(Value::as_str);
 
     let mut lines = Vec::new();
     lines.push(format!("Run:          {id}"));
@@ -1227,7 +1366,10 @@ pub fn human_run_item(value: &Value) -> String {
     if let Some(b) = blocker {
         lines.push(format!("Error:        {b}"));
     }
-    if let Some(v) = value.get("verification").or_else(|| value.pointer("/run/verification")) {
+    if let Some(v) = value
+        .get("verification")
+        .or_else(|| value.pointer("/run/verification"))
+    {
         if let Some(state) = v.get("state").and_then(Value::as_str) {
             lines.push(format!("Verification: {state}"));
         }
@@ -1251,12 +1393,27 @@ pub fn human_attachments(value: &Value) -> String {
         let mut lines = Vec::new();
         lines.push(header);
         for att in items {
-            let id = att.get("attachment_id").and_then(Value::as_str).unwrap_or("-");
-            let name = att.get("original_name").and_then(Value::as_str).unwrap_or("-");
+            let id = att
+                .get("attachment_id")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let name = att
+                .get("original_name")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
             let kind = att.get("kind").and_then(Value::as_str).unwrap_or("-");
-            let size = att.get("size_bytes").and_then(Value::as_u64).map(format_bytes).unwrap_or_else(|| "-".into());
-            let status = att.get("processing_status").and_then(Value::as_str).unwrap_or("-");
-            lines.push(format!("  - {id}  {name}  kind: {kind}  size: {size}  status: {status}"));
+            let size = att
+                .get("size_bytes")
+                .and_then(Value::as_u64)
+                .map(format_bytes)
+                .unwrap_or_else(|| "-".into());
+            let status = att
+                .get("processing_status")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            lines.push(format!(
+                "  - {id}  {name}  kind: {kind}  size: {size}  status: {status}"
+            ));
         }
         lines.join("\n")
     } else {
@@ -1265,12 +1422,31 @@ pub fn human_attachments(value: &Value) -> String {
 }
 
 pub fn human_attachment_item(value: &Value) -> String {
-    let id = value.get("attachment_id").or_else(|| value.get("id")).and_then(Value::as_str).unwrap_or("-");
-    let name = value.get("original_name").or_else(|| value.get("name")).and_then(Value::as_str).unwrap_or("-");
+    let id = value
+        .get("attachment_id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let name = value
+        .get("original_name")
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
     let kind = value.get("kind").and_then(Value::as_str).unwrap_or("-");
-    let size = value.get("size_bytes").and_then(Value::as_u64).map(format_bytes).unwrap_or_else(|| "-".into());
-    let status = value.get("processing_status").or_else(|| value.get("status")).and_then(Value::as_str).unwrap_or("-");
-    let mime = value.get("detected_mime").or_else(|| value.get("declared_mime")).and_then(Value::as_str);
+    let size = value
+        .get("size_bytes")
+        .and_then(Value::as_u64)
+        .map(format_bytes)
+        .unwrap_or_else(|| "-".into());
+    let status = value
+        .get("processing_status")
+        .or_else(|| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let mime = value
+        .get("detected_mime")
+        .or_else(|| value.get("declared_mime"))
+        .and_then(Value::as_str);
     let sha = value.get("sha256").and_then(Value::as_str);
 
     let mut lines = Vec::new();
@@ -1338,13 +1514,21 @@ pub fn human_skills(value: &Value) -> String {
             let id = s.get("id").and_then(Value::as_str).unwrap_or("-");
             let name = s.get("name").and_then(Value::as_str).unwrap_or("-");
             let ver = s.get("version").and_then(Value::as_str).unwrap_or("1.0.0");
-            let en = s.get("enabled").and_then(Value::as_bool).map(|b| if b { "yes" } else { "no" }).unwrap_or("-");
+            let en = s
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .map(|b| if b { "yes" } else { "no" })
+                .unwrap_or("-");
             let src = s.get("source_kind").and_then(Value::as_str).unwrap_or("-");
             let desc = s.get("description").and_then(Value::as_str).unwrap_or("");
             if desc.is_empty() {
-                lines.push(format!("  - {name}  v{ver}  enabled: {en}  source: {src}  (id: {id})"));
+                lines.push(format!(
+                    "  - {name}  v{ver}  enabled: {en}  source: {src}  (id: {id})"
+                ));
             } else {
-                lines.push(format!("  - {name}  v{ver}  enabled: {en}  source: {src}  \"{desc}\"  (id: {id})"));
+                lines.push(format!(
+                    "  - {name}  v{ver}  enabled: {en}  source: {src}  \"{desc}\"  (id: {id})"
+                ));
             }
         }
         lines.join("\n")
@@ -1357,7 +1541,11 @@ pub fn human_skill_item(value: &Value) -> String {
     let id = value.get("id").and_then(Value::as_str).unwrap_or("-");
     let name = value.get("name").and_then(Value::as_str).unwrap_or("-");
     let ver = value.get("version").and_then(Value::as_str).unwrap_or("1.0.0");
-    let en = value.get("enabled").and_then(Value::as_bool).map(|b| if b { "yes" } else { "no" }).unwrap_or("-");
+    let en = value
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .map(|b| if b { "yes" } else { "no" })
+        .unwrap_or("-");
     let src = value.get("source_kind").and_then(Value::as_str).unwrap_or("-");
     let desc = value.get("description").and_then(Value::as_str).unwrap_or("");
 
@@ -1370,7 +1558,10 @@ pub fn human_skill_item(value: &Value) -> String {
         lines.push(format!("Description:  {desc}"));
     }
     if let Some(caps) = value.get("capabilities").and_then(Value::as_array) {
-        let cap_strs: Vec<String> = caps.iter().filter_map(|c| c.as_str().map(str::to_owned)).collect();
+        let cap_strs: Vec<String> = caps
+            .iter()
+            .filter_map(|c| c.as_str().map(str::to_owned))
+            .collect();
         if !cap_strs.is_empty() {
             lines.push(format!("Capabilities: {}", cap_strs.join(", ")));
         }
@@ -1391,7 +1582,11 @@ pub fn human_approvals(value: &Value) -> String {
             let risk = a.get("risk").and_then(Value::as_str).unwrap_or("-");
             let sum = a.get("summary").and_then(Value::as_str).unwrap_or("");
             let sess = a.get("session_id").and_then(Value::as_str).unwrap_or("");
-            let sess_str = if sess.is_empty() { String::new() } else { format!("  (session: {sess})") };
+            let sess_str = if sess.is_empty() {
+                String::new()
+            } else {
+                format!("  (session: {sess})")
+            };
             lines.push(format!("  - {id}  tool: {tool}  risk: {risk}  \"{sum}\"{sess_str}"));
         }
         lines.join("\n")
@@ -1432,11 +1627,22 @@ pub fn human_daemon(value: &Value) -> String {
         return format!("Daemon exited: {status}");
     }
     if let Some(lines_arr) = value.get("lines").and_then(Value::as_array) {
-        return lines_arr.iter().map(|l| l.as_str().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        return lines_arr
+            .iter()
+            .map(|l| l.as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
     }
     if value.get("already_running").is_some() {
-        let pid = value.get("pid").and_then(Value::as_u64).map(|p| format!(" (PID: {p})")).unwrap_or_default();
-        let already = value.get("already_running").and_then(Value::as_bool).unwrap_or(false);
+        let pid = value
+            .get("pid")
+            .and_then(Value::as_u64)
+            .map(|p| format!(" (PID: {p})"))
+            .unwrap_or_default();
+        let already = value
+            .get("already_running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if already {
             return format!("Daemon is already running{pid}");
         } else {
@@ -1444,13 +1650,24 @@ pub fn human_daemon(value: &Value) -> String {
         }
     }
     if let Some(state) = value.get("state").and_then(Value::as_str) {
-        let pid = value.get("pid").and_then(Value::as_u64).map(|p| format!(" (PID: {p})")).unwrap_or_default();
+        let pid = value
+            .get("pid")
+            .and_then(Value::as_u64)
+            .map(|p| format!(" (PID: {p})"))
+            .unwrap_or_default();
         return format!("Daemon: {state}{pid}");
     }
     if value.get("reachable").is_some() || value.get("managed_pid").is_some() {
-        let reachable = value.get("reachable").and_then(Value::as_bool).unwrap_or(false);
+        let reachable = value
+            .get("reachable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let state = if reachable { "running" } else { "stopped" };
-        let pid = value.get("managed_pid").and_then(Value::as_u64).map(|p| format!(" (PID: {p})")).unwrap_or_default();
+        let pid = value
+            .get("managed_pid")
+            .and_then(Value::as_u64)
+            .map(|p| format!(" (PID: {p})"))
+            .unwrap_or_default();
         let mut lines = Vec::new();
         lines.push(format!("Daemon Status: {state}{pid}"));
         if let Some(endpoint) = value.get("endpoint").and_then(Value::as_str) {
@@ -1507,7 +1724,9 @@ pub fn human_chat(value: &Value) -> String {
 }
 
 fn format_inline_map(map: &Map<String, Value>) -> String {
-    let preferred = ["id", "name", "alias", "key", "status", "value", "enabled", "provider", "model"];
+    let preferred = [
+        "id", "name", "alias", "key", "status", "value", "enabled", "provider", "model",
+    ];
     let mut parts = Vec::new();
     for k in &preferred {
         if let Some(v) = map.get(*k) {
@@ -1757,7 +1976,7 @@ mod tests {
         let h = human_status(&out);
         assert!(h.contains("Owner:      owner-1"));
         assert!(h.contains("Daemon:     running"));
-        assert!(!h.contains("{"));
+        assert!(!h.contains('{'));
     }
 
     #[test]
@@ -1790,7 +2009,7 @@ mod tests {
         assert!(h.contains("Enabled:       yes"));
         assert!(h.contains("Token:         configured"));
         assert!(h.contains("@MyXiaoBot"));
-        assert!(!h.contains("{"));
+        assert!(!h.contains('{'));
     }
 
     #[test]
@@ -1822,7 +2041,7 @@ mod tests {
         assert!(h.contains("Sessions (1)"));
         assert!(h.contains("* s1"));
         assert!(h.contains("(active)"));
-        assert!(!h.contains("{"));
+        assert!(!h.contains('{'));
     }
 
     #[test]
@@ -1849,7 +2068,7 @@ mod tests {
         assert!(h.contains("Session:    s1"));
         assert!(h.contains("Model:      codex/gpt-5"));
         assert!(h.contains("Messages:   8 effective (10 main)"));
-        assert!(!h.contains("{"));
+        assert!(!h.contains('{'));
     }
 
     #[test]
@@ -1864,7 +2083,7 @@ mod tests {
         let hm = human_memory(&out);
         assert!(hm.contains("Memory Entries (1)"));
         assert!(hm.contains("[user/bio] name = \"Ada\""));
-        assert!(!hm.contains("{"));
+        assert!(!hm.contains('{'));
 
         let raw_skill = json!({"items": [{"id":"sk1","name":"my-skill","source_kind":"learned","enabled":true,"version":"1.0.0","description":"test skill"}],"page":1,"pages":1,"page_size":10});
         let out2 = project_skills(raw_skill);
@@ -1876,7 +2095,7 @@ mod tests {
         let hs = human_skills(&out2);
         assert!(hs.contains("Skills (1)"));
         assert!(hs.contains("my-skill"));
-        assert!(!hs.contains("{"));
+        assert!(!hs.contains('{'));
     }
 
     #[test]
@@ -1888,7 +2107,7 @@ mod tests {
         let ha = human_attachments(&out);
         assert!(ha.contains("Attachments (1"));
         assert!(ha.contains("file.pdf"));
-        assert!(!ha.contains("{"));
+        assert!(!ha.contains('{'));
 
         let raw_runs = json!({"items": [{"id":"r1","session_id":"s1","provider":"codex","model":"gpt-5","status":"completed","goal":"do thing","started_at":"2025-01-01T00:00:00Z","verification":{"state":"verified_success","evidence":[]}}],"page":1,"pages":1,"page_size":10});
         let out2 = project_runs(raw_runs);
@@ -1901,7 +2120,7 @@ mod tests {
         assert!(hr.contains("Runs (1)"));
         assert!(hr.contains("r1"));
         assert!(hr.contains("status: completed"));
-        assert!(!hr.contains("{"));
+        assert!(!hr.contains('{'));
     }
 
     #[test]
@@ -1914,7 +2133,7 @@ mod tests {
         assert!(h.contains("Doctor: 2 checks"));
         assert!(h.contains("✓ disk: OK"));
         assert!(h.contains("✗ net: FAIL"));
-        assert!(!h.contains("{"));
+        assert!(!h.contains('{'));
 
         let raw_tools = json!({"items":[{"name":"terminal","risk":"high","approval_mode":"ask","description":"run shell"}]});
         let out2 = project_tools(raw_tools);
@@ -1923,7 +2142,7 @@ mod tests {
         let ht = human_tools(&out2);
         assert!(ht.contains("Tools (1)"));
         assert!(ht.contains("terminal"));
-        assert!(!ht.contains("{"));
+        assert!(!ht.contains('{'));
     }
 
     #[test]
@@ -1935,7 +2154,7 @@ mod tests {
         assert!(ha.contains("Pending Approvals (1)"));
         assert!(ha.contains("apr1"));
         assert!(ha.contains("rm -rf /tmp"));
-        assert!(!ha.contains("{"));
+        assert!(!ha.contains('{'));
     }
 
     #[test]
@@ -1993,27 +2212,85 @@ mod tests {
     #[test]
     fn human_output_never_contains_raw_json_blocks() {
         let test_cases: &[(&str, Value)] = &[
-            ("status", project_status(json!({"owner_id":"1","health":{"daemon_running":true},"counts":{"sessions":0},"current_ai":null,"runtime":{}}))),
-            ("context", project_context(json!({"session_id":"s1","provider":"codex","model":"m","mode":"chat","effective_messages":0,"main_messages":0,"stored_characters":0,"context_budget_characters":1000}))),
-            ("doctor", project_doctor(json!({"checks":[{"name":"disk","status":"OK","evidence":"ok"}]}))),
-            ("tools", project_tools(json!({"items":[{"name":"terminal","risk":"high","approval_mode":"ask","description":"sh"}]}))),
-            ("sessions list", project_sessions(json!({"items":[],"active_cli_session_id":""}))),
-            ("runs list", project_runs(json!({"items":[]}))),
-            ("attachments list", project_attachments(json!({"items":[]}))),
-            ("memory list", project_memory(json!({"items":[]}))),
-            ("skills list", project_skills(json!({"items":[]}))),
-            ("approvals list", project_approvals(json!({"items":[]}))),
-            ("config show", json!({"server":{"control_socket":"/tmp/xiao.sock"}})),
-            ("daemon status", json!({"reachable":true,"managed_pid":123,"endpoint":"http://localhost"})),
-            ("logs", json!({"lines":["first log line","second log line"]})),
-            ("chat", json!({"answer":"Hello human!","artifacts":[{"path":"file.txt"}]})),
+            (
+                "status",
+                project_status(json!({
+                    "owner_id": "1",
+                    "health": {"daemon_running": true},
+                    "counts": {"sessions": 0},
+                    "current_ai": null,
+                    "runtime": {}
+                })),
+            ),
+            (
+                "context",
+                project_context(json!({
+                    "session_id": "s1",
+                    "provider": "codex",
+                    "model": "m",
+                    "mode": "chat",
+                    "effective_messages": 0,
+                    "main_messages": 0,
+                    "stored_characters": 0,
+                    "context_budget_characters": 1000
+                })),
+            ),
+            (
+                "doctor",
+                project_doctor(json!({
+                    "checks": [{"name": "disk", "status": "OK", "evidence": "ok"}]
+                })),
+            ),
+            (
+                "tools",
+                project_tools(json!({
+                    "items": [{"name": "terminal", "risk": "high", "approval_mode": "ask", "description": "sh"}]
+                })),
+            ),
+            (
+                "sessions list",
+                project_sessions(json!({"items": [], "active_cli_session_id": ""})),
+            ),
+            ("runs list", project_runs(json!({"items": []}))),
+            (
+                "attachments list",
+                project_attachments(json!({"items": []})),
+            ),
+            ("memory list", project_memory(json!({"items": []}))),
+            ("skills list", project_skills(json!({"items": []}))),
+            ("approvals list", project_approvals(json!({"items": []}))),
+            (
+                "config show",
+                json!({"server": {"control_socket": "/tmp/xiao.sock"}}),
+            ),
+            (
+                "daemon status",
+                json!({"reachable": true, "managed_pid": 123, "endpoint": "http://localhost"}),
+            ),
+            (
+                "logs",
+                json!({"lines": ["first log line", "second log line"]}),
+            ),
+            (
+                "chat",
+                json!({"answer": "Hello human!", "artifacts": [{"path": "file.txt"}]}),
+            ),
         ];
 
         for (cmd, val) in test_cases {
             let rendered = render_human_for_command(cmd, val);
-            assert!(!rendered.contains("{\n"), "{cmd} rendered raw JSON opening: {rendered}");
-            assert!(!rendered.contains("}\n"), "{cmd} rendered raw JSON closing: {rendered}");
-            assert!(!rendered.contains("\": \""), "{cmd} rendered raw JSON key-value: {rendered}");
+            assert!(
+                !rendered.contains("{\n"),
+                "{cmd} rendered raw JSON opening: {rendered}"
+            );
+            assert!(
+                !rendered.contains("}\n"),
+                "{cmd} rendered raw JSON closing: {rendered}"
+            );
+            assert!(
+                !rendered.contains("\": \""),
+                "{cmd} rendered raw JSON key-value: {rendered}"
+            );
         }
     }
 }
