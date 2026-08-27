@@ -977,9 +977,10 @@ impl AgentEngine {
                             request.clone(),
                             continuation.take(),
                             tool_results,
-                            Some(turn_tx),
+                            Some(turn_tx.clone()),
                         ),
                     ) => {
+                        drop(turn_tx);
                         let _ = timing_task.await;
                         response.map_err(|_| anyhow!("agent runtime limit reached during provider turn"))??
                     }
