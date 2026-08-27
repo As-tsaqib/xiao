@@ -36,15 +36,7 @@ async fn webui_all_manager_get_and_post_contracts_execute_successfully() {
 
     // 1. Session new
     let s_new = storage
-        .create_session(
-            &owner,
-            "New Session",
-            "custom",
-            None,
-            "m",
-            false,
-            None,
-        )
+        .create_session(&owner, "New Session", "custom", None, "m", false, None)
         .unwrap();
     assert!(!s_new.id.is_empty());
 
