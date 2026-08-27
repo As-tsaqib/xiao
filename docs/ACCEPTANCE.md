@@ -1,7 +1,7 @@
-# Xiao v0.2.7 Control-Plane Unification, Reliability, Multimodal, and Management Acceptance Coverage
+# Xiao v0.3.1 Control-Plane Unification, Reliability, Multimodal, and Management Acceptance Coverage
 
-This maps retained v0.2.6 regressions plus final v0.2.7 acceptance criteria to implementation and
-deterministic tests. The current schema head is migration 24. Xiao is a private single-owner agent; stable
+This maps retained regressions plus v0.3.1 acceptance criteria to implementation and
+deterministic tests. The current schema head is migration 27. Xiao is a private single-owner agent; stable
 `OwnerIdentity` owns global durable state while `TelegramScope` and
 `XiaoSession` isolate conversation state. Legacy principal values remain only
 as migration compatibility keys. Host tests use fake runtime, transport,
@@ -31,11 +31,11 @@ rooted-Android validation.
 | 17 | Skills pagination | `skills_manager_paginates_thirteen_entries_as_five_five_three` | Thirteen skills render 5/5/3 with bounded selection |
 | 18 | Doctor truthfulness | `doctor_reports_memory_failure_independently_from_healthy_database` | DB can PASS while Memory independently WARN/FAIL |
 | 19 | Semantic runtime | `provider_evaluations_use_one_reusable_runtime_with_bounded_concurrency`; cancellation test | No per-call runtime/thread; concurrency, timeout, and cancellation are bounded |
-| 20 | Command registry | `public_registry_is_exact_and_hidden_commands_are_not_advertised`; help/setMyCommands equality tests | Exactly 17 public commands; `/about` and `/logout` absent |
+| 20 | Command registry | `public_registry_is_exact_and_hidden_commands_are_not_advertised`; help/setMyCommands equality tests | Exactly 15 public commands; `/about` and `/logout` absent |
 | 21 | Model disconnect isolation | `model_disconnect_removes_only_selected_account_and_detaches_its_sessions` | Selected account/profile is removed without damaging unrelated state |
 | 22 | WebUI single writer | `webui_uses_only_typed_xiaod_manager_actions`; `manager_memory_write_flows_through_living_memory_manager` | Browser mutates state only through authenticated typed xiaod actions/managers |
 | 23 | WebUI secret masking | `manager_provider_json_masks_write_only_secrets_and_header_values` | Admin responses never return raw credential/header values |
-| 24 | v0.2.5–v0.2.7 migration | `representative_v025_state_migrates_transactionally_and_idempotently`; WebUI-first owner test; `v020_migration_is_fresh_and_idempotent_with_consistent_fts` | Sessions/history/runs/profiles/attachments/approvals/indexes survive migrations 18–24; stable-owner rekey is transactional/idempotent |
+| 24 | Schema migrations | `representative_v025_state_migrates_transactionally_and_idempotently`; WebUI-first owner test; `v020_migration_is_fresh_and_idempotent_with_consistent_fts` | Sessions/history/runs/profiles/attachments/approvals/indexes survive migrations 18–27; stable-owner rekey is transactional/idempotent |
 | 25 | Telegram setup atomicity | `telegram_setup_config_snapshot_failure_commits_authoritative_state_with_warning`; `telegram_probe_failure_keeps_old_token_binding_and_control_state_active`; `telegram_late_db_failure_rolls_back_binding_and_staged_token_as_one_transaction`; `telegram_post_commit_secret_cleanup_failure_is_success_with_warning` | Probe/stage precede one SQLite control-plane commit; late DB failure leaves old binding; post-commit cleanup is a warning, never a fake rollback |
 | 26 | Concurrent attachment admission | `concurrent_quota_reservations_cannot_exceed_session_quota`; `concurrent_quota_reservations_cannot_exceed_owner_or_global_quota`; `quota_reservation_release_and_orphan_cleanup_are_durable` | Session, owner, and global quotas are reserved atomically; release/finalize/startup cleanup are durable |
 | 27 | Scanned-PDF provider fallback | `scanned_pdf_provider_file_input_path_is_durable_and_real`; `scanned_pdf_provider_vision_renders_pages_before_calling_provider`; `agent_engine_runs_scanned_pdf_provider_file_fallback_before_final_answer` | Deterministic provider file/vision transports are exercised through the planner and AgentEngine; extracted text is indexed before final generation |

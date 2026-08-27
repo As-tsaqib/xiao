@@ -31,7 +31,7 @@ wrappers together. Mutable state stays outside the replaceable module payload.
 ```sh
 xiao status
 xiao doctor
-xiao login codex
+xiao login
 ```
 
 The archive has `module.prop`, lifecycle scripts, binaries, configuration, and
@@ -57,9 +57,8 @@ xiao-ctl status
 xiao status
 xiao doctor
 xiao sessions
-xiao model
-xiao login codex
-xiao login antigravity
+xiao model show
+xiao login
 xiao chat "hello"
 ```
 
@@ -132,7 +131,7 @@ The public Telegram command registry is exactly `/start`, `/help`, `/login`,
 and exact `/approve`/`/deny` actions remain internal menu syntax. `/provider`,
 `/settings`, `/usage`, `/env`, `/about`, and `/logout` are intentionally absent.
 Termux aliases preserve all arguments, so
-`xiao sessions rename ID New Name` and `xiao model MODEL_ID` reach the same
+`xiao sessions rename ID New Name` and `xiao model use MODEL_ID` reach the same
 Command Core variants.
 
 The living workspace is under `[paths].data_dir` (normally

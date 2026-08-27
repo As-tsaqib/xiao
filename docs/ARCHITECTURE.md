@@ -1,6 +1,6 @@
-# Xiao v0.2.7 Architecture
+# Xiao v0.3.1 Architecture
 
-## v0.2.7 control-plane unification
+## v0.3.1 control-plane unification
 
 Telegram, CLI, and KernelSU WebUI are adapters over the same `xiaod` application services. One stable `owner_user_id` is the authorization identity; chat allowlists restrict location only. CLI sessions remain independent unless explicitly targeted; provider/session, memory, skills, approvals, attachments, Custom capability probing/editing, scanned-PDF processing, and Doctor diagnostics share the same control-plane semantics. Secrets remain write-only/masked.
 
@@ -87,13 +87,15 @@ output bound. Providers only translate those canonical definitions to wire
 schemas. Runtime `ToolPolicy` evaluates risk and call arguments; a skill is
 guidance and cannot grant a tool or bypass policy.
 
-The v0.2.7 built-ins are:
+The v0.3.1 built-ins are:
 
 - `context_stats`
 - `memory_search`, `memory_set`, `memory_delete`
 - `session_search`
 - `skill_search`, `skill_view`
 - `termux_terminal` (`terminal`/`exec` compatibility aliases)
+- `termux_job`
+- `pdf_create`
 - `android_xiao_status`, `android_xiao_restart`
 
 The terminal accepts structured program/argv only, runs as the detected Termux

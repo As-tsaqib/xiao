@@ -879,10 +879,15 @@ async fn ingest_cli_attachment(
     kind: &str,
     path: &Path,
 ) -> CliResult<()> {
-    let metadata = fs::metadata(path).map_err(|error| {
+    let effective_path = path
+        .to_str()
+        .and_then(|s| s.strip_prefix("file://"))
+        .map(Path::new)
+        .unwrap_or(path);
+    let metadata = fs::metadata(effective_path).map_err(|error| {
         CliFailure::local(format!(
             "read attachment metadata {}: {error}",
-            path.display()
+            effective_path.display()
         ))
     })?;
     // Client-side bound avoids accidentally constructing enormous base64 argv/JSON.
@@ -891,10 +896,10 @@ async fn ingest_cli_attachment(
             "attachment exceeds the client safety bound",
         ));
     }
-    let bytes = fs::read(path).map_err(|error| {
-        CliFailure::local(format!("read attachment {}: {error}", path.display()))
+    let bytes = fs::read(effective_path).map_err(|error| {
+        CliFailure::local(format!("read attachment {}: {error}", effective_path.display()))
     })?;
-    let name = path
+    let name = effective_path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("attachment")
@@ -937,12 +942,14 @@ async fn telegram_command(
             let token = read_secret_file(Path::new(&args[1]), "Telegram Bot Token")?;
             presenter.success(
                 "telegram set-token-file",
-                client
-                    .post_admin(
-                        "/v1/admin/telegram",
-                        &json!({"action":"configure","token":token}),
-                    )
-                    .await?,
+                dto_telegram(
+                    client
+                        .post_admin(
+                            "/v1/admin/telegram",
+                            &json!({"action":"configure","token":token}),
+                        )
+                        .await?,
+                ),
             )
         }
         Some("set-owner") => {
@@ -971,16 +978,18 @@ async fn telegram_command(
             };
             presenter.success(
                 "telegram set-owner",
-                client
-                    .post_admin(
-                        "/v1/admin/telegram",
-                        &json!({
-                            "action":"configure",
-                            "owner_user_id":owner,
-                            "confirm_owner_change":confirmed,
-                        }),
-                    )
-                    .await?,
+                dto_telegram(
+                    client
+                        .post_admin(
+                            "/v1/admin/telegram",
+                            &json!({
+                                "action":"configure",
+                                "owner_user_id":owner,
+                                "confirm_owner_change":confirmed,
+                            }),
+                        )
+                        .await?,
+                ),
             )
         }
         Some("configure") => telegram_configure(client, &args[1..], presenter).await,
@@ -1054,19 +1063,21 @@ async fn telegram_configure(
     let action = if test { "save_and_test" } else { "configure" };
     presenter.success(
         "telegram configure",
-        client
-            .post_admin(
-                "/v1/admin/telegram",
-                &json!({
-                    "action":action,
-                    "token":token,
-                    "owner_user_id":owner,
-                    "confirm_owner_change":confirm,
-                    "allowed_chat_ids": if allowed.is_empty() { None::<Vec<i64>> } else { Some(allowed) },
-                    "enabled":enabled,
-                }),
-            )
-            .await?,
+        dto_telegram(
+            client
+                .post_admin(
+                    "/v1/admin/telegram",
+                    &json!({
+                        "action":action,
+                        "token":token,
+                        "owner_user_id":owner,
+                        "confirm_owner_change":confirm,
+                        "allowed_chat_ids": if allowed.is_empty() { None::<Vec<i64>> } else { Some(allowed) },
+                        "enabled":enabled,
+                    }),
+                )
+                .await?,
+        ),
     )
 }
 

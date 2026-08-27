@@ -18,9 +18,8 @@ Examples:
 ```sh
 xiao status
 xiao doctor
-xiao session
-xiao login codex
-xiao login antigravity
+xiao sessions
+xiao login
 xiao chat "Explain the current session"
 xiao daemon status
 xiao daemon restart
@@ -42,8 +41,7 @@ its role-limited IPC credential. That file remains root-owned under
 `/data/adb/xiao`; it is never copied into a normal Termux home or printed by the
 wrapper.
 
-Codex and Antigravity login URLs should be opened on the same Android device so
-their browser redirects can reach xiao's temporary localhost callback listener.
+Custom provider endpoints and credentials are configured via `xiao login` or the WebUI/Telegram setup.
 
 ## Agent execution backend
 
@@ -64,7 +62,7 @@ redaction.
 Runtime policy rejects privilege-escalation/system commands, `sh -c`, direct
 package mutations, and automatic installer pipelines. Clearly destructive
 argv, an opaque shell script, or credential-sensitive paths require an exact
-owner approval (`/approvals`, `/approve <id>`, `/deny <id>`). Approval is
+owner approval (via Telegram inline callback buttons or `xiao approvals approve <id>`). Approval is
 argument-bound, expires, and is consumed once. This terminal is user-space
 general execution, not an unrestricted root shell.
 

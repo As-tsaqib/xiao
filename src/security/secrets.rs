@@ -14,7 +14,17 @@ impl SecretStore {
         Self { root: root.into() }
     }
     fn path(&self, key: &str) -> PathBuf {
-        self.root.join(format!("{key}.secret"))
+        let sanitized: String = key
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        self.root.join(format!("{sanitized}.secret"))
     }
     pub fn put(&self, key: &str, value: &str) -> Result<()> {
         fs::create_dir_all(&self.root)?;
@@ -90,4 +100,37 @@ fn set_0600(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_0600(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_secret_store_put_get_remove() {
+        let dir = tempdir().unwrap();
+        let store = SecretStore::new(dir.path());
+        assert!(!store.exists("test_key").unwrap());
+        store.put("test_key", "super_secret").unwrap();
+        assert!(store.exists("test_key").unwrap());
+        assert_eq!(
+            store.get("test_key").unwrap(),
+            Some("super_secret".to_string())
+        );
+        store.remove("test_key").unwrap();
+        assert!(!store.exists("test_key").unwrap());
+    }
+
+    #[test]
+    fn test_secret_store_path_sanitization() {
+        let dir = tempdir().unwrap();
+        let store = SecretStore::new(dir.path());
+        store.put("../traversal/key", "val").unwrap();
+        assert!(dir.path().join("___traversal_key.secret").exists());
+        assert_eq!(
+            store.get("../traversal/key").unwrap(),
+            Some("val".to_string())
+        );
+    }
 }

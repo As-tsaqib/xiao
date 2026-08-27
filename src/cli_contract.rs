@@ -153,40 +153,47 @@ pub fn project_status(raw: Value) -> Value {
 
 pub fn project_telegram(raw: Value) -> Value {
     let raw = sanitize(raw);
-    if let Some(obj) = raw.as_object() {
-        if let Some(t) = obj.get("telegram") {
-            let t = sanitize(t.clone());
-            let allowed = [
-                "enabled",
-                "owner_user_id",
-                "owner_state",
-                "legacy_candidate_count",
-                "allowed_chat_ids",
-                "token_configured",
-                "bot",
-            ];
-            let mut bot_filtered = Map::new();
-            if let Some(bot) = t.as_object().and_then(|m| m.get("bot")) {
-                if let Some(bobj) = bot.as_object() {
-                    for k in ["id", "username", "first_name"] {
-                        if let Some(v) = bobj.get(k) {
-                            bot_filtered.insert(k.to_string(), v.clone());
-                        }
+    let target = if let Some(t) = raw.get("telegram") {
+        Some(t)
+    } else if let Some(t) = raw.get("result").and_then(|r| r.get("status")) {
+        Some(t)
+    } else if let Some(t) = raw.get("status").filter(|s| s.is_object()) {
+        Some(t)
+    } else {
+        None
+    };
+    if let Some(t) = target {
+        let t = sanitize(t.clone());
+        let allowed = [
+            "enabled",
+            "owner_user_id",
+            "owner_state",
+            "legacy_candidate_count",
+            "allowed_chat_ids",
+            "token_configured",
+            "bot",
+        ];
+        let mut bot_filtered = Map::new();
+        if let Some(bot) = t.as_object().and_then(|m| m.get("bot")) {
+            if let Some(bobj) = bot.as_object() {
+                for k in ["id", "username", "first_name"] {
+                    if let Some(v) = bobj.get(k) {
+                        bot_filtered.insert(k.to_string(), v.clone());
                     }
-                } else if !bot.is_null() {
-                    bot_filtered.insert("value".to_string(), bot.clone());
                 }
+            } else if !bot.is_null() {
+                bot_filtered.insert("value".to_string(), bot.clone());
             }
-            let mut telegram_out = pick_object(&t, &allowed);
-            if !bot_filtered.is_empty() {
-                if t.get("bot").is_some() {
-                    telegram_out.insert("bot".to_string(), Value::Object(bot_filtered));
-                }
-            } else if t.get("bot").is_some() && t.get("bot").unwrap().is_null() {
-                telegram_out.insert("bot".to_string(), Value::Null);
-            }
-            return json!({ "telegram": Value::Object(telegram_out) });
         }
+        let mut telegram_out = pick_object(&t, &allowed);
+        if !bot_filtered.is_empty() {
+            if t.get("bot").is_some() {
+                telegram_out.insert("bot".to_string(), Value::Object(bot_filtered));
+            }
+        } else if t.get("bot").is_some() && t.get("bot").unwrap().is_null() {
+            telegram_out.insert("bot".to_string(), Value::Null);
+        }
+        return json!({ "telegram": Value::Object(telegram_out) });
     }
     let allowed = [
         "enabled",
@@ -1068,7 +1075,11 @@ pub fn human_session_item(value: &Value) -> String {
 }
 
 pub fn human_telegram(value: &Value) -> String {
-    let t = value.get("telegram").unwrap_or(value);
+    let t = value
+        .get("telegram")
+        .or_else(|| value.get("result").and_then(|r| r.get("status")))
+        .or_else(|| value.get("status").filter(|s| s.is_object()))
+        .unwrap_or(value);
     let mut lines = Vec::new();
     lines.push("Telegram:".into());
     let enabled = t
@@ -2306,5 +2317,34 @@ mod tests {
                 "{cmd} rendered raw JSON key-value: {rendered}"
             );
         }
+    }
+    #[test]
+    fn telegram_mutation_result_projection_and_human() {
+        let raw = json!({
+            "ok": true,
+            "result": {
+                "applied": true,
+                "tested": false,
+                "status": {
+                    "enabled": true,
+                    "token_configured": true,
+                    "owner_user_id": 999888,
+                    "owner_state": "active",
+                    "allowed_chat_ids": [111, 222]
+                }
+            }
+        });
+        let projected = project_telegram(raw);
+        assert!(projected.get("telegram").is_some());
+        let t = projected.get("telegram").unwrap();
+        assert_eq!(t.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(t.get("token_configured").and_then(Value::as_bool), Some(true));
+        assert_eq!(t.get("owner_user_id").and_then(Value::as_i64), Some(999888));
+
+        let human = human_telegram(&projected);
+        assert!(human.contains("Enabled:       yes"));
+        assert!(human.contains("Token:         configured"));
+        assert!(human.contains("Owner:         999888 (active)"));
+        assert!(human.contains("Allowed Chats: 111, 222"));
     }
 }

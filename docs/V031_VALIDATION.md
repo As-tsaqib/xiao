@@ -48,7 +48,7 @@ This record captures automated CI verification status and documents device limit
     - Universal pre-daemon syntax validation across all 22 command families and leaf subcommands.
     - Terminal-native subcommand help and `--help` resolution without requiring active daemon IPC.
     - Strict arity, option parsing, and exit code contract enforcement (0 ok, 1 error, 2 usage, 3 daemon unavailable, 4 rejected, 5 not found, 6 local io).
-    - Global flags (`--json`, `--quiet`, `--session`, `--timeout`, `--no-color`) validated with stable structured JSON error envelopes.
+    - Global flags (`--json`, `--quiet`, `--session`, `--timeout`) validated with stable structured JSON error envelopes.
     - Strict security contract: zero secret leakage in argv, stdin/file-based secret ingestion, and sanitization of tokens/keys in CLI JSON responses.
 
 13. **Tool Execution Reliability & False-Positive Loop Elimination**:
