@@ -430,8 +430,7 @@ async fn matrix_e7_mixed_batch_parallelizes_reads_and_keeps_write_barrier_end_to
                     events: vec![],
                 })
             } else {
-                let call_ids: Vec<String> =
-                    tool_results.into_iter().map(|r| r.call_id).collect();
+                let call_ids: Vec<String> = tool_results.into_iter().map(|r| r.call_id).collect();
                 Ok(ProviderTurn {
                     step: ProviderStep::Final(format!("done:{}", call_ids.join(","))),
                     continuation: None,
@@ -500,13 +499,8 @@ async fn matrix_e7_mixed_batch_parallelizes_reads_and_keeps_write_barrier_end_to
         ..Default::default()
     };
 
-    let engine = AgentEngine::with_registry(
-        sessions.clone(),
-        storage.clone(),
-        providers,
-        config,
-        tools,
-    );
+    let engine =
+        AgentEngine::with_registry(sessions.clone(), storage.clone(), providers, config, tools);
     let session = storage
         .create_session(
             "owner-1",
