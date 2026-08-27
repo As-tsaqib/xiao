@@ -519,31 +519,36 @@ impl CompletionVerifier {
             .iter()
             .map(|run| observation(run))
             .collect::<Vec<_>>();
-        if let SemanticResult::Valid(semantic) =
-            self.semantic_completion(goal, task_kind, final_answer, &observations)
-        {
-            if !semantic.satisfied {
-                let missing = semantic
-                    .missing_evidence
-                    .into_iter()
-                    .take(8)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return evidence(
-                    VerificationState::NotYetVerified,
-                    task_kind,
-                    if missing.is_empty() {
-                        format!(
-                            "semantic completion check needs more evidence: {}",
-                            semantic.reason
-                        )
-                    } else {
-                        format!("missing semantic completion evidence: {missing}")
-                    },
-                    succeeded_tools,
-                    0,
-                    observations,
-                );
+        let deterministic_verified = verification_runs
+            .iter()
+            .any(|r| self_verified_operation(r) || declared_verification(r));
+        if !deterministic_verified {
+            if let SemanticResult::Valid(semantic) =
+                self.semantic_completion(goal, task_kind, final_answer, &observations)
+            {
+                if !semantic.satisfied {
+                    let missing = semantic
+                        .missing_evidence
+                        .into_iter()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return evidence(
+                        VerificationState::NotYetVerified,
+                        task_kind,
+                        if missing.is_empty() {
+                            format!(
+                                "semantic completion check needs more evidence: {}",
+                                semantic.reason
+                            )
+                        } else {
+                            format!("missing semantic completion evidence: {missing}")
+                        },
+                        succeeded_tools,
+                        0,
+                        observations,
+                    );
+                }
             }
         }
         evidence(
