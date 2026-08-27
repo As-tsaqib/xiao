@@ -150,9 +150,9 @@ async fn matrix_g7_termux_job_execution_registers_and_hits_cache() {
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
     use xiao::runtime::{
-        CapabilityRegistry, CommandOutcome, DependencyResolver, ExecutionBackend,
-        PackageBackend, PackageCandidate, ProcessExecutor, RuntimeEnvironment, SelinuxState,
-        TermuxCommand, TrustedPackageRepository,
+        CapabilityRegistry, CommandOutcome, DependencyResolver, ExecutionBackend, PackageBackend,
+        PackageCandidate, ProcessExecutor, RuntimeEnvironment, SelinuxState, TermuxCommand,
+        TrustedPackageRepository,
     };
     use xiao::storage::Storage;
     use xiao::tools::Tool;
