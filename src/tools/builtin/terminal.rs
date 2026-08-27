@@ -435,7 +435,7 @@ impl Tool for TermuxJobTool {
         }
         let all_succeeded = results.iter().all(|item| item["status"] == "succeeded");
         if all_succeeded && !is_hit {
-            if let Some(key) = cache_key {
+            if let Some(_key) = cache_key {
                 let _ = self.plan_cache.insert(plan_candidate);
             }
         }

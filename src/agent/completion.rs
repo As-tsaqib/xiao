@@ -60,6 +60,7 @@ impl Default for CompletionVerifier {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskIntentDecision {
@@ -734,6 +735,7 @@ mod tests {
     use super::*;
     use crate::semantic::{SemanticBackend, SemanticRequest};
 
+    #[allow(dead_code)]
     struct FixedSemantic(&'static str);
 
     impl SemanticBackend for FixedSemantic {

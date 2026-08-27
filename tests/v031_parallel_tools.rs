@@ -21,7 +21,8 @@ use xiao::{
     storage::Storage,
     tools::{
         scheduler::{schedule, ToolExecutionClass},
-        Tool, ToolCall, ToolContext, ToolOrigin, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
+        Tool, ToolCall, ToolContext, ToolOrigin, ToolPolicy, ToolRegistry, ToolResult, ToolRisk,
+        ToolSpec,
     },
 };
 

@@ -145,10 +145,17 @@ fn matrix_g6_script_cannot_become_root_escalation_path() {
 
 #[tokio::test]
 async fn matrix_g7_termux_job_execution_registers_and_hits_cache() {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+    use xiao::runtime::{
+        CapabilityRegistry, CommandOutcome, DependencyResolver, ExecutionBackend,
+        PackageBackend, PackageCandidate, ProcessExecutor, RuntimeEnvironment, SelinuxState,
+        TermuxCommand, TrustedPackageRepository,
+    };
     use xiao::storage::Storage;
+    use xiao::tools::Tool;
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("xiao.db");
@@ -156,13 +163,13 @@ async fn matrix_g7_termux_job_execution_registers_and_hits_cache() {
 
     struct SimpleExecutor;
     #[async_trait::async_trait]
-    impl xiao::runtime::ProcessExecutor for SimpleExecutor {
+    impl ProcessExecutor for SimpleExecutor {
         async fn execute(
             &self,
-            command: xiao::runtime::TermuxCommand,
+            command: TermuxCommand,
             _cancellation: CancellationToken,
-        ) -> anyhow::Result<xiao::runtime::CommandOutcome> {
-            Ok(xiao::runtime::CommandOutcome {
+        ) -> anyhow::Result<CommandOutcome> {
+            Ok(CommandOutcome {
                 program: command.program,
                 args: command.args,
                 cwd: command.cwd,
@@ -177,34 +184,60 @@ async fn matrix_g7_termux_job_execution_registers_and_hits_cache() {
         }
     }
 
-    struct SimpleBackend;
+    struct DummyBackend;
     #[async_trait::async_trait]
-    impl xiao::runtime::PackageBackend for SimpleBackend {
-        async fn is_available(&self, _pkg: &str) -> anyhow::Result<bool> {
+    impl PackageBackend for DummyBackend {
+        fn package_manager_name(&self) -> &str {
+            "dummy"
+        }
+        async fn binary_available(&self, _binary: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
-        async fn is_installed(&self, _pkg: &str) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn install(&self, _pkg: &str, _c: CancellationToken) -> anyhow::Result<()> {
-            Ok(())
+        async fn install(
+            &self,
+            _pkg: &str,
+            _cancellation: CancellationToken,
+        ) -> anyhow::Result<CommandOutcome> {
+            anyhow::bail!("disabled in test")
         }
     }
 
-    let caps = Arc::new(xiao::runtime::CapabilityRegistry::empty());
-    caps.register_runtime(
-        "execution.termux",
-        xiao::runtime::CapabilityStatus::Available {
-            backend: xiao::runtime::ExecutionBackend::Termux,
-            path: PathBuf::from("/data/data/com.termux/files/usr/bin"),
-        },
-    );
+    struct DummyPackageRepo;
+    #[async_trait::async_trait]
+    impl TrustedPackageRepository for DummyPackageRepo {
+        async fn search(
+            &self,
+            _query: &str,
+            _cancellation: CancellationToken,
+        ) -> anyhow::Result<Vec<PackageCandidate>> {
+            Ok(vec![])
+        }
+    }
 
-    let resolver = Arc::new(xiao::runtime::DependencyResolver::new(
+    let caps = Arc::new(CapabilityRegistry::from_environment(&RuntimeEnvironment {
+        platform: "android".into(),
+        os_version: None,
+        android_version: Some("14".into()),
+        device_model: None,
+        architecture: "aarch64".into(),
+        xiao_version: "0.3.1".into(),
+        effective_uid: 10234,
+        root_available: false,
+        root_evidence: "test".into(),
+        selinux: SelinuxState::Enforcing,
+        data_root: PathBuf::from("/data/adb/xiao"),
+        workspace_writable: true,
+        termux: None,
+        binaries: BTreeMap::new(),
+        execution_backends: vec![ExecutionBackend::Termux],
+        probed_at: "now".into(),
+    }));
+
+    let resolver = Arc::new(DependencyResolver::with_trusted_repository(
         caps,
-        Arc::new(SimpleBackend),
-        Arc::new(xiao::runtime::TrustedPackageRepository::default()),
-        storage.clone(),
+        Arc::new(DummyBackend),
+        None,
+        Arc::new(DummyPackageRepo),
     ));
 
     let terminal = xiao::tools::builtin::TermuxTerminalTool::new(
