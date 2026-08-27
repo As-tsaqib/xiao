@@ -1807,11 +1807,7 @@ pub fn human_generic(value: &Value) -> String {
                 } else if let Some(sub) = v.as_object() {
                     lines.push(format!("{}:", human_key(k)));
                     for (subk, subv) in sub {
-                        if is_scalar(subv) {
-                            lines.push(format!("  {}: {}", human_key(subk), scalar(subv)));
-                        } else {
-                            lines.push(format!("  {}: {}", human_key(subk), scalar(subv)));
-                        }
+                        lines.push(format!("  {}: {}", human_key(subk), scalar(subv)));
                     }
                 } else if let Some(arr) = v.as_array() {
                     if arr.iter().all(is_scalar) {
