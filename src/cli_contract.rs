@@ -153,15 +153,10 @@ pub fn project_status(raw: Value) -> Value {
 
 pub fn project_telegram(raw: Value) -> Value {
     let raw = sanitize(raw);
-    let target = if let Some(t) = raw.get("telegram") {
-        Some(t)
-    } else if let Some(t) = raw.get("result").and_then(|r| r.get("status")) {
-        Some(t)
-    } else if let Some(t) = raw.get("status").filter(|s| s.is_object()) {
-        Some(t)
-    } else {
-        None
-    };
+    let target = raw
+        .get("telegram")
+        .or_else(|| raw.get("result").and_then(|r| r.get("status")))
+        .or_else(|| raw.get("status").filter(|s| s.is_object()));
     if let Some(t) = target {
         let t = sanitize(t.clone());
         let allowed = [
