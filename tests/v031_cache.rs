@@ -260,6 +260,13 @@ async fn matrix_g7_termux_job_execution_registers_and_hits_cache() {
         .create_agent_run("owner-1", &session.id, "custom", "m", Some("cache test"))
         .unwrap();
 
+    let tool_run_id = storage
+        .create_tool_run(&run_id, "call-job-1", "termux_job", "{}", "side_effect")
+        .unwrap();
+    storage
+        .set_tool_run_status(&tool_run_id, "running", None, None)
+        .unwrap();
+
     let ctx = xiao::tools::ToolContext {
         principal: "owner-1".into(),
         session_id: session.id.clone(),
