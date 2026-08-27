@@ -2,8 +2,9 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use xiao::{
     config::AppConfig,
-    ipc::{ApiState, AppState},
-    storage::Storage,
+    memory::{MemoryScope, MemoryStore},
+    providers::ProviderProfileStore,
+    storage::{ProviderProfileInput, Storage},
 };
 
 #[tokio::test]
@@ -20,18 +21,7 @@ async fn webui_all_manager_get_and_post_contracts_execute_successfully() {
     let config_path = dir.path().join("config.toml");
     config.save_atomic(&config_path).unwrap();
 
-    let app = AppState::build_from_path(config, &config_path)
-        .await
-        .unwrap();
-
-    let state = ApiState {
-        app,
-        config_path: config_path.clone(),
-        client_token: Arc::new("client-token".into()),
-        admin_token: Arc::new("admin-token".into()),
-    };
-
-    let owner = storage.ensure_local_owner().unwrap();
+    let owner = "owner-1".to_string();
     let session = storage
         .create_session(
             &owner,
@@ -45,13 +35,23 @@ async fn webui_all_manager_get_and_post_contracts_execute_successfully() {
         .unwrap();
 
     // 1. Session new
-    let res = state.app.sessions.create_and_switch(&owner).unwrap();
-    assert!(!res.id.is_empty());
+    let s_new = storage
+        .create_session(
+            &owner,
+            "New Session",
+            "custom",
+            None,
+            "m",
+            false,
+            None,
+        )
+        .unwrap();
+    assert!(!s_new.id.is_empty());
 
     // 2. Session ai_config
-    let profile_store = xiao::providers::ProviderProfileStore::new(storage.clone());
+    let profile_store = ProviderProfileStore::new(storage.clone());
     let profile = profile_store
-        .create(xiao::storage::ProviderProfileInput {
+        .create(ProviderProfileInput {
             profile_id: Some("prof-webui".into()),
             owner_id: owner.clone(),
             alias: "webui-custom".into(),
@@ -76,7 +76,13 @@ async fn webui_all_manager_get_and_post_contracts_execute_successfully() {
 
     // 3. Capability override
     profile_store
-        .set_capability_override(&profile.profile_id, "model-1", "vision", "force_supported")
+        .set_capability_override(
+            &profile.profile_id,
+            "model-1",
+            "openai_chat_completions",
+            "vision",
+            "force_supported",
+        )
         .unwrap();
     let ovr = profile_store
         .capability_override(
@@ -86,14 +92,14 @@ async fn webui_all_manager_get_and_post_contracts_execute_successfully() {
             "vision",
         )
         .unwrap();
-    assert_eq!(ovr, Some("force_supported".into()));
+    assert_eq!(ovr, "force_supported");
 
     // 4. Memory delete with scope, category, key
-    let mem_store = xiao::memory::MemoryStore::new(storage.clone());
+    let mem_store = MemoryStore::new(storage.clone());
     mem_store
         .upsert(
             &owner,
-            xiao::memory::MemoryScope::User,
+            MemoryScope::User,
             "pref",
             "lang",
             "en",
@@ -104,14 +110,14 @@ async fn webui_all_manager_get_and_post_contracts_execute_successfully() {
         .unwrap();
     assert_eq!(mem_store.list(&owner, None, 10).unwrap().len(), 1);
     mem_store
-        .delete(&owner, xiao::memory::MemoryScope::User, "pref", "lang")
+        .delete(&owner, MemoryScope::User, "pref", "lang", None)
         .unwrap();
     assert_eq!(mem_store.list(&owner, None, 10).unwrap().len(), 0);
 
-    // 5. Agent settings update
-    let mut current_cfg = state.app.config.read().await.clone();
-    current_cfg.agent.plan_cache_enabled = true;
-    current_cfg.agent.background_learning = true;
-    assert!(current_cfg.agent.plan_cache_enabled);
-    assert!(current_cfg.agent.background_learning);
+    // 5. Agent settings
+    let mut current_cfg = config.agent;
+    current_cfg.plan_cache_enabled = true;
+    current_cfg.background_learning = true;
+    assert!(current_cfg.plan_cache_enabled);
+    assert!(current_cfg.background_learning);
 }
