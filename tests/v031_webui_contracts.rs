@@ -33,15 +33,19 @@ async fn webui_all_manager_get_and_post_contracts_execute_successfully() {
 
     let owner = storage.ensure_local_owner().unwrap();
     let session = storage
-        .create_session(&owner, "WebUI Test Session", "custom", None, "m", false, None)
+        .create_session(
+            &owner,
+            "WebUI Test Session",
+            "custom",
+            None,
+            "m",
+            false,
+            None,
+        )
         .unwrap();
 
     // 1. Session new
-    let res = state
-        .app
-        .sessions
-        .create_and_switch(&owner)
-        .unwrap();
+    let res = state.app.sessions.create_and_switch(&owner).unwrap();
     assert!(!res.id.is_empty());
 
     // 2. Session ai_config
@@ -61,7 +65,13 @@ async fn webui_all_manager_get_and_post_contracts_execute_successfully() {
         .unwrap();
 
     storage
-        .set_session_provider(&owner, &session.id, "custom", Some(&profile.profile_id), "model-1")
+        .set_session_provider(
+            &owner,
+            &session.id,
+            "custom",
+            Some(&profile.profile_id),
+            "model-1",
+        )
         .unwrap();
 
     // 3. Capability override
@@ -69,7 +79,12 @@ async fn webui_all_manager_get_and_post_contracts_execute_successfully() {
         .set_capability_override(&profile.profile_id, "model-1", "vision", "force_supported")
         .unwrap();
     let ovr = profile_store
-        .capability_override(&profile.profile_id, "model-1", "openai_chat_completions", "vision")
+        .capability_override(
+            &profile.profile_id,
+            "model-1",
+            "openai_chat_completions",
+            "vision",
+        )
         .unwrap();
     assert_eq!(ovr, Some("force_supported".into()));
 
