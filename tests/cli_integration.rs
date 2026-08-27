@@ -395,3 +395,49 @@ fn deprecated_providers_give_helpful_guidance() {
         );
     }
 }
+
+#[test]
+fn quiet_flag_suppresses_stdout_and_preserves_stderr_errors() {
+    let output = xiao()
+        .args(["stats", "--quiet"])
+        .output()
+        .expect("run stats --quiet");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(stderr.contains("unknown command `stats`"));
+
+    let output_json = xiao()
+        .args(["stats", "--json", "--quiet"])
+        .output()
+        .expect("run stats --json --quiet");
+    assert_eq!(output_json.status.code(), Some(2));
+    assert!(output_json.stdout.is_empty());
+    let stderr_json = String::from_utf8(output_json.stderr).expect("stderr json utf8");
+    assert!(stderr_json.contains("\"status\":\"error\""));
+    assert!(stderr_json.contains("\"unknown_command\""));
+}
+
+#[test]
+fn help_advanced_subcommand_works() {
+    let output = xiao()
+        .args(["help", "advanced"])
+        .output()
+        .expect("run help advanced");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.contains("Usage: xiao <admin|quickstart>"));
+    assert!(stdout.contains("quickstart"));
+    assert!(stdout.contains("admin"));
+}
+
+#[test]
+fn no_color_is_not_a_valid_flag() {
+    let output = xiao()
+        .args(["stats", "--no-color"])
+        .output()
+        .expect("run stats --no-color");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(stderr.contains("unknown command"));
+}

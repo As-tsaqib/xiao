@@ -58,7 +58,6 @@ struct GlobalOptions {
     quiet: bool,
     session: Option<String>,
     timeout_seconds: Option<u64>,
-    no_color: bool,
 }
 
 #[derive(Debug)]
@@ -103,7 +102,7 @@ impl CliPresenter {
         Self { options }
     }
 
-    fn success(&self, _command: &str, data: Value) -> CliResult<()> {
+    fn success(&self, command: &str, data: Value) -> CliResult<()> {
         if self.options.quiet {
             return Ok(());
         }
@@ -118,7 +117,7 @@ impl CliPresenter {
             );
             return Ok(());
         }
-        render_human(&data);
+        render_human(command, &data);
         Ok(())
     }
 
@@ -130,7 +129,7 @@ impl CliPresenter {
 
     fn error(&self, failure: &CliFailure) {
         let message = redact_text(&failure.message);
-        if self.options.json && !self.options.quiet {
+        if self.options.json {
             let code =
                 if failure.code == EXIT_USAGE && failure.message.starts_with("unknown command `") {
                     "unknown_command"
@@ -325,7 +324,6 @@ fn parse_global_options(raw: Vec<String>) -> CliResult<(GlobalOptions, Vec<Strin
         match raw[index].as_str() {
             "--json" => options.json = true,
             "--quiet" => options.quiet = true,
-            "--no-color" => options.no_color = true,
             "--session" => {
                 index += 1;
                 options.session = Some(
@@ -1610,7 +1608,7 @@ async fn memory_command(
                 }))
                 .cloned()
                 .ok_or_else(|| CliFailure { code: EXIT_NOT_FOUND, message: "memory entry not found".into() })?;
-            presenter.success("memory get", item)
+            presenter.success("memory get", crate::cli_contract::project_memory_item(item))
         }
         Some("set") if args.len() >= 5 => presenter.success(
             "memory set",
@@ -1657,7 +1655,7 @@ async fn skills_command(
         Some("show") if args.len() == 2 => {
             let data = client.get_admin("/v1/admin/skills?limit=50").await?;
             let item = find_item(&data, &args[1], &["id", "name"])?;
-            presenter.success("skills show", item)
+            presenter.success("skills show", crate::cli_contract::project_skill_item(item))
         }
         Some("enable" | "disable") if args.len() == 2 => presenter.success(
             &format!("skills {}", args[0]),
@@ -1738,7 +1736,7 @@ async fn attachments_command(
                 ))
                 .await?;
             let item = find_item(&data, &args[1], &["attachment_id"])?;
-            presenter.success("attachments show", item)
+            presenter.success("attachments show", crate::cli_contract::project_attachment_item(item))
         }
         Some("remove") if args.len() == 2 => presenter.success(
             "attachments remove",
@@ -1767,7 +1765,7 @@ async fn runs_command(
         ),
         Some("show") if args.len() == 2 => {
             let data = client.get_admin("/v1/admin/runs?limit=50").await?;
-            presenter.success("runs show", find_item(&data, &args[1], &["id"])?)
+            presenter.success("runs show", crate::cli_contract::project_run_item(find_item(&data, &args[1], &["id"])?))
         }
         Some("cancel") if args.len() == 2 => presenter.success(
             "runs cancel",
@@ -2720,6 +2718,9 @@ fn print_subcommand_help(path: &[String]) {
     let key = path.iter().map(String::as_str).collect::<Vec<_>>();
     let text = match key.as_slice() {
         ["chat"] | ["ask"] => r#"Usage: xiao chat [--file PATH] [--image PATH] [--session ID] [--json] [--quiet] "PROMPT""#,
+        ["advanced"] => "Usage: xiao <admin|quickstart> ...\n\nAdvanced / plumbing commands:\n  xiao quickstart [--no-start]\n  xiao admin ...",
+        ["quickstart"] => "Usage: xiao quickstart [--no-start]",
+        ["admin"] => "Usage: xiao admin ...",
         ["telegram"] => "Usage: xiao telegram <status|configure|set-owner|set-token-file|test>",
         ["telegram", "status"] => "Usage: xiao telegram status",
         ["telegram", "configure"] => "Usage: xiao telegram configure [--owner ID] [--allowed-chat ID] [--token-file PATH] [--enable|--disable] [--test]",
@@ -2812,7 +2813,7 @@ fn help_text() -> String {
         r#"xiao v{version}
 Private single-owner Xiao terminal control plane.
 
-Usage: xiao [--json] [--quiet] [--session ID] [--timeout SEC] [--no-color] COMMAND
+Usage: xiao [--json] [--quiet] [--session ID] [--timeout SEC] COMMAND
 
 Core:
   xiao chat [--file PATH] [--image PATH] "..."
@@ -2877,10 +2878,9 @@ mod cli_tests {
 
     #[test]
     fn global_options_work_after_command_and_session_is_exact() {
-        let (options, args) = parsed(&["status", "--json", "--session", "abc", "--no-color"]);
+        let (options, args) = parsed(&["status", "--json", "--session", "abc"]);
         assert!(options.json);
         assert_eq!(options.session.as_deref(), Some("abc"));
-        assert!(options.no_color);
         assert_eq!(args, vec!["status"]);
     }
 

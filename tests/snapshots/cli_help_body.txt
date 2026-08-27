@@ -1,6 +1,6 @@
 Private single-owner Xiao terminal control plane.
 
-Usage: xiao [--json] [--quiet] [--session ID] [--timeout SEC] [--no-color] COMMAND
+Usage: xiao [--json] [--quiet] [--session ID] [--timeout SEC] COMMAND
 
 Core:
   xiao chat [--file PATH] [--image PATH] "..."
