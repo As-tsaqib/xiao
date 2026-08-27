@@ -6,8 +6,8 @@ This record captures automated CI verification status and documents device limit
 
 - Branch: `main`
 - Schema migration: 26 → 27
-- Verified CI Run: 33027762084 (Commit `1fc4a45749f7e53f1f7e02b4d9fa2461099684bc`)
-- `rust` job: PASS (cargo check, cargo test with 316 unit/integration tests passing, strict clippy, release build, WebUI build, static acceptance).
+- Verified CI Run: 33029821007 (Commit `09b6ace64f06a920671c227af23680bc826fc913`)
+- `rust` job: PASS (cargo check, cargo test with 319 unit/integration tests passing, strict clippy, release build, WebUI build, static acceptance).
 - `android-arm64` job: PASS (cargo-ndk build, WebUI embed, deterministic module ZIP build and sha256 checksum verification).
 - Local Rust, WebUI, and Android builds/tests: not run (repository policy; all validation via GitHub Actions CI).
 
@@ -64,6 +64,11 @@ This record captures automated CI verification status and documents device limit
     - `--quiet` strictly suppresses stdout on success while preserving actionable stderr errors.
     - Decorative `--no-color` removed; `xiao help advanced` added for hidden plumbing/admin commands with prioritized help listing common commands first.
     - Comprehensive snapshot and contract tests enforcing zero secret leakage and absence of raw JSON blocks in human rendering.
+
+15. **Secret Store Path Hardening & Mutation Projection Polish**:
+    - `SecretStore::path` sanitizes keys to prevent path traversal or non-standard filesystem character injection.
+    - CLI `telegram set-token-file`, `set-owner`, and `configure` responses route through `dto_telegram` / `project_telegram`, providing accurate human-readable status rendering after mutations.
+    - Attachment ingestion transparently handles `file://` URI prefixes alongside relative and absolute filesystem paths.
 
 ## Device Limitations & Edge Behaviors
 
