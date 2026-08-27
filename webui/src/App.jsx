@@ -573,7 +573,7 @@ function App() {
 
   const handleApplySessionAi = async ({ sessionId, profileId, model }) => {
     try {
-      await post('sessions', {
+      await managerPost('sessions', {
         action: 'ai_config',
         session_id: sessionId,
         provider: 'custom',

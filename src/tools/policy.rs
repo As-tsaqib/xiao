@@ -191,43 +191,22 @@ pub(crate) fn termux_call_policy(arguments: &Value) -> PolicyDecision {
         }
     }
 
-    let is_workspace_relative_file_op =
-        matches!(program.as_str(), "rm" | "rmdir" | "unlink" | "truncate");
-    let non_flag_args: Vec<&str> = args
-        .iter()
-        .copied()
-        .filter(|a| !a.starts_with('-'))
-        .collect();
-    let all_targets_in_workspace = !non_flag_args.is_empty()
-        && non_flag_args.iter().all(|target| {
-            let p = std::path::Path::new(target);
-            !p.is_absolute()
-                && !p
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-                && !is_sensitive_path_or_value(target)
-        });
-
-    let destructive = if is_workspace_relative_file_op && all_targets_in_workspace {
-        false
-    } else {
-        matches!(
-            program.as_str(),
-            "rm" | "rmdir"
-                | "unlink"
-                | "shred"
-                | "truncate"
-                | "chmod"
-                | "chown"
-                | "chgrp"
-                | "kill"
-                | "pkill"
-                | "killall"
-        ) || program == "find" && args.contains(&"-delete")
-            || program == "git"
-                && (args.contains(&"clean")
-                    || args.windows(2).any(|window| window == ["reset", "--hard"]))
-    };
+    let destructive = matches!(
+        program.as_str(),
+        "rm" | "rmdir"
+            | "unlink"
+            | "shred"
+            | "truncate"
+            | "chmod"
+            | "chown"
+            | "chgrp"
+            | "kill"
+            | "pkill"
+            | "killall"
+    ) || program == "find" && args.contains(&"-delete")
+        || program == "git"
+            && (args.contains(&"clean")
+                || args.windows(2).any(|window| window == ["reset", "--hard"]));
     if destructive {
         return PolicyDecision::RequireApproval(format!(
             "destructive Termux command {program} requires exact owner approval"
