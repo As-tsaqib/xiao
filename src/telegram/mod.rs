@@ -785,16 +785,9 @@ impl TelegramAdapter {
                             .await?;
                     }
                 }
-                let elapsed_ms = self.app.storage.agent_run_elapsed_ms(&run_id);
-                self.app.storage.record_agent_run_event(
-                    &run_id,
-                    "final_frontend_delivery",
-                    elapsed_ms,
-                    &serde_json::json!({"frontend":"telegram"}),
-                )?;
-                self.app
-                    .storage
-                    .release_learning_job_after_delivery(&run_id)?;
+                let delivery_service =
+                    crate::control_plane::FrontendDeliveryService::new(self.app.storage.clone());
+                delivery_service.ack(&run_id, "telegram", None)?;
                 Ok(())
             }
             CommandResult::StartCustomLogin => {
@@ -1853,7 +1846,13 @@ impl ProgressAggregator {
                 self.stream_chunk();
             }
             AgentEvent::GenerationCompleted => {
-                self.set_active("Finishing response".into(), ProgressActivity::Writing)
+                if let Some(index) = self
+                    .items
+                    .iter()
+                    .rposition(|item| item.state == ProgressState::Active)
+                {
+                    self.items[index].state = ProgressState::Done;
+                }
             }
             AgentEvent::GenerationFailed(error) => self.fail(&error),
         }

@@ -458,35 +458,26 @@ impl SessionAiService {
                 .model(&profile.profile_id, model)?
                 .ok_or_else(|| anyhow!("model has not been discovered for this Custom profile"))?;
             // P0-1 / P0-4: enforce readiness semantics.
-            // Vision/file Unknown is NOT a blocker.
-            // Unprobed or Indeterminate requires exact-model probe.
-            match Self::model_readiness(&record) {
-                CustomModelReadiness::AgentNative
-                | CustomModelReadiness::AgentStructured
-                | CustomModelReadiness::ChatOnly => {
-                    self.storage.set_session_provider(
-                        owner,
-                        &input.session_id,
-                        provider,
-                        Some(&profile.profile_id),
-                        model,
-                    )?;
-                }
-                CustomModelReadiness::Unprobed => {
-                    return Err(anyhow!(
-                        "capability_probe_required: model '{model}' has not been probed for this Custom profile; run exact-model probe first"
-                    ));
-                }
-                CustomModelReadiness::Indeterminate => {
-                    return Err(anyhow!(
-                        "capability_probe_required: model '{model}' agent protocol capability is Indeterminate; probe exact model before activation"
-                    ));
-                }
-            }
+            // Model selection is one-tap and activates without requiring an exact probe.
+            self.storage.set_session_provider(
+                owner,
+                &input.session_id,
+                provider,
+                Some(&profile.profile_id),
+                model,
+            )?;
         }
         self.storage
             .session(owner, &input.session_id)?
             .ok_or_else(|| anyhow!("updated session disappeared"))
+    }
+
+    /// Explicit/optional probe if requested.
+    pub fn capability_probe_required(&self, record: &crate::storage::ProviderProfileModelRecord) -> bool {
+        matches!(
+            Self::model_readiness(record),
+            CustomModelReadiness::Unprobed | CustomModelReadiness::Indeterminate
+        )
     }
 
     /// P0-4 / P1-1 bounded exact-model probe: uses selected profile's merged headers and API key.
@@ -527,6 +518,33 @@ impl SessionAiService {
         models[pos] = crate::providers::profile_model_from_probe(profile_id, model, &probe, &now);
         profiles.replace_models(owner, profile_id, &models)?;
         Ok(models[pos].clone())
+    }
+}
+
+pub struct FrontendDeliveryService {
+    storage: Arc<Storage>,
+}
+
+impl FrontendDeliveryService {
+    pub fn new(storage: Arc<Storage>) -> Self {
+        Self { storage }
+    }
+
+    pub fn ack(
+        &self,
+        run_id: &str,
+        frontend: &str,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let elapsed_ms = self.storage.agent_run_elapsed_ms(run_id);
+        let meta = serde_json::json!({
+            "frontend": frontend,
+            "metadata": metadata.cloned().unwrap_or(serde_json::Value::Null),
+        });
+        self.storage
+            .record_agent_run_event(run_id, "final_frontend_delivery", elapsed_ms, &meta)?;
+        self.storage.release_learning_job_after_delivery(run_id)?;
+        Ok(())
     }
 }
 

@@ -870,7 +870,26 @@ async fn chat(
             )
             .await?
     };
-    presenter.success("chat", app_result_schema(value))
+    let run_id = value
+        .pointer("/data/run_id")
+        .or_else(|| value.pointer("/run_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let result = presenter.success("chat", app_result_schema(value));
+    if result.is_ok() {
+        if let Some(run_id) = run_id {
+            let _ = client
+                .post_client(
+                    "/v1/delivery-ack",
+                    &serde_json::json!({
+                        "run_id": run_id,
+                        "frontend": "cli"
+                    }),
+                )
+                .await;
+        }
+    }
+    result
 }
 
 async fn ingest_cli_attachment(

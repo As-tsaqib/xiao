@@ -48,6 +48,9 @@ impl Provider for TrackingMockProvider {
     fn ready(&self) -> bool {
         true
     }
+    fn supports_semantic_evaluation(&self, _model: &str) -> bool {
+        true
+    }
     fn capabilities(&self, _model: &str) -> ProviderCapabilities {
         ProviderCapabilities {
             text: true,

@@ -142,3 +142,118 @@ fn matrix_g6_script_cannot_become_root_escalation_path() {
     };
     assert!(untrusted_interp.verify().is_err());
 }
+
+#[tokio::test]
+async fn matrix_g7_termux_job_execution_registers_and_hits_cache() {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    use xiao::storage::Storage;
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("xiao.db");
+    let storage = Arc::new(Storage::open(&db_path).unwrap());
+
+    struct SimpleExecutor;
+    #[async_trait::async_trait]
+    impl xiao::runtime::ProcessExecutor for SimpleExecutor {
+        async fn execute(
+            &self,
+            command: xiao::runtime::TermuxCommand,
+            _cancellation: CancellationToken,
+        ) -> anyhow::Result<xiao::runtime::CommandOutcome> {
+            Ok(xiao::runtime::CommandOutcome {
+                program: command.program,
+                args: command.args,
+                cwd: command.cwd,
+                exit_code: Some(0),
+                stdout: "ok\n".into(),
+                stderr: String::new(),
+                duration_ms: 5,
+                truncated: false,
+                timed_out: false,
+                cancelled: false,
+            })
+        }
+    }
+
+    struct SimpleBackend;
+    #[async_trait::async_trait]
+    impl xiao::runtime::PackageBackend for SimpleBackend {
+        async fn is_available(&self, _pkg: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn is_installed(&self, _pkg: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn install(&self, _pkg: &str, _c: CancellationToken) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let caps = Arc::new(xiao::runtime::CapabilityRegistry::empty());
+    caps.register_runtime(
+        "execution.termux",
+        xiao::runtime::CapabilityStatus::Available {
+            backend: xiao::runtime::ExecutionBackend::Termux,
+            path: PathBuf::from("/data/data/com.termux/files/usr/bin"),
+        },
+    );
+
+    let resolver = Arc::new(xiao::runtime::DependencyResolver::new(
+        caps,
+        Arc::new(SimpleBackend),
+        Arc::new(xiao::runtime::TrustedPackageRepository::default()),
+        storage.clone(),
+    ));
+
+    let terminal = xiao::tools::builtin::TermuxTerminalTool::new(
+        Arc::new(SimpleExecutor),
+        resolver,
+        dir.path(),
+    );
+    let plan_cache = Arc::new(PlanCache::new());
+    let job = xiao::tools::builtin::TermuxJobTool::with_cache(
+        terminal,
+        16,
+        Some(storage.clone()),
+        plan_cache.clone(),
+    );
+
+    let session = storage
+        .create_session("owner-1", "Cache Test", "custom", None, "m", false, None)
+        .unwrap();
+    let run_id = storage
+        .create_agent_run("owner-1", &session.id, "custom", "m", Some("cache test"))
+        .unwrap();
+
+    let ctx = xiao::tools::ToolContext {
+        principal: "owner-1".into(),
+        session_id: session.id.clone(),
+        agent_run_id: run_id.clone(),
+        yolo_mode: false,
+        messages: vec![],
+        cancellation: CancellationToken::new(),
+        progress: None,
+    };
+
+    let args = json!({
+        "steps": [
+            { "id": "1", "program": "ps", "args": ["-A"] }
+        ]
+    });
+
+    // First execution: cache miss, then inserts
+    let res1 = job.execute(&ctx, args.clone()).await.unwrap();
+    assert!(res1.contains("succeeded"));
+
+    let events1 = storage.agent_run_events(&run_id).unwrap();
+    assert!(events1.iter().any(|e| e.event_kind == "plan_cache_miss"));
+
+    // Second execution: cache hit
+    let res2 = job.execute(&ctx, args).await.unwrap();
+    assert!(res2.contains("succeeded"));
+
+    let events2 = storage.agent_run_events(&run_id).unwrap();
+    assert!(events2.iter().any(|e| e.event_kind == "plan_cache_hit"));
+}

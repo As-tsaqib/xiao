@@ -227,22 +227,23 @@ pub fn generate_valid_pdf(text: &str) -> Vec<u8> {
         let mut stream_ops = Vec::new();
         stream_ops.push("BT\n/F1 12 Tf\n72 750 Td\n16 TL".to_owned());
         for (line_idx, line) in lines_for_page.iter().enumerate() {
-            let sanitized: String = line
-                .chars()
-                .map(|c| {
-                    if c.is_ascii() && !c.is_ascii_control() {
-                        c
-                    } else if c.is_ascii_whitespace() {
-                        ' '
-                    } else {
-                        '?'
-                    }
-                })
-                .collect();
-            let escaped = sanitized
-                .replace('\\', "\\\\")
-                .replace('(', "\\(")
-                .replace(')', "\\)");
+            let mut escaped = String::new();
+            for c in line.chars() {
+                let code = c as u32;
+                if code == 0x5C {
+                    escaped.push_str("\\\\");
+                } else if code == 0x28 {
+                    escaped.push_str("\\(");
+                } else if code == 0x29 {
+                    escaped.push_str("\\)");
+                } else if (0x20..=0x7E).contains(&code) || (0xA0..=0xFF).contains(&code) {
+                    escaped.push(c);
+                } else if c.is_whitespace() {
+                    escaped.push(' ');
+                } else {
+                    escaped.push('?');
+                }
+            }
             if line_idx == 0 {
                 stream_ops.push(format!("({escaped}) Tj"));
             } else {
@@ -278,7 +279,7 @@ endstream",
     );
     let font_obj = (
         font_obj_id,
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_owned(),
     );
 
     let mut all_objects = vec![catalog_obj, pages_obj, font_obj];

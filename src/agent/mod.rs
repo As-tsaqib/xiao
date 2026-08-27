@@ -922,6 +922,41 @@ impl AgentEngine {
                 self.storage.record_agent_run_event(&agent_run_id, "provider_request_start", timing_started.elapsed().as_millis() as u64, &serde_json::json!({"turn":turns}))?;
                 let remaining = std::time::Duration::from_secs(config.max_runtime_seconds)
                     .saturating_sub(run_started.elapsed());
+                let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<AgentEvent>();
+                let progress_sink = progress.clone();
+                let storage_timing = self.storage.clone();
+                let run_id_timing = agent_run_id.clone();
+                let timing_ref = timing_started;
+                let timing_task = tokio::spawn(async move {
+                    let mut first_byte_recorded = false;
+                    let mut first_text_recorded = false;
+                    while let Some(event) = turn_rx.recv().await {
+                        match &event {
+                            AgentEvent::StreamChunk { .. } if !first_byte_recorded => {
+                                first_byte_recorded = true;
+                                let _ = storage_timing.record_agent_run_event(
+                                    &run_id_timing,
+                                    "first_byte",
+                                    timing_ref.elapsed().as_millis() as u64,
+                                    &serde_json::json!({}),
+                                );
+                            }
+                            AgentEvent::TextDelta(_) if !first_text_recorded => {
+                                first_text_recorded = true;
+                                let _ = storage_timing.record_agent_run_event(
+                                    &run_id_timing,
+                                    "first_visible_text_delta",
+                                    timing_ref.elapsed().as_millis() as u64,
+                                    &serde_json::json!({}),
+                                );
+                            }
+                            _ => {}
+                        }
+                        if let Some(sink) = &progress_sink {
+                            let _ = sink.send(event);
+                        }
+                    }
+                });
                 let turn = tokio::select! {
                     _ = token.cancelled() => return Err(anyhow!("generation cancelled")),
                     response = tokio::time::timeout(
@@ -930,10 +965,11 @@ impl AgentEngine {
                             request.clone(),
                             continuation.take(),
                             tool_results,
-                            progress.clone(),
+                            Some(turn_tx),
                         ),
                     ) => response.map_err(|_| anyhow!("agent runtime limit reached during provider turn"))??,
                 };
+                let _ = timing_task.await;
                 self.storage.record_agent_run_event(&agent_run_id, "provider_completion", timing_started.elapsed().as_millis() as u64, &serde_json::json!({"turn":turns}))?;
                 provider_events.extend(turn.events);
                 match turn.step {
@@ -1047,16 +1083,73 @@ impl AgentEngine {
                         }
                         if calls.is_empty(){return Err(anyhow!("provider returned an empty tool-call turn"));}
                         continuation=turn.continuation;
-                        if config.parallel_readonly_tools && calls.len()>1 && calls.iter().all(|call| crate::tools::scheduler::execution_class(self.tools.spec(&call.name).as_ref())==crate::tools::scheduler::ToolExecutionClass::ReadOnlyParallelSafe) {
-                            if tool_calls.saturating_add(calls.len())>config.max_tool_calls { return Err(anyhow!("agent tool-call limit ({}) reached",config.max_tool_calls)); }
-                            tool_calls+=calls.len();
-                            let group_started=timing_started.elapsed().as_millis() as u64;
-                            tool_results=self.execute_readonly_group(calls,&tool_context,&agent_run_id,config.max_parallel_readonly_tools,progress.as_ref()).await?;
-                            self.storage.record_agent_run_event(&agent_run_id,"tool_group",timing_started.elapsed().as_millis() as u64,&serde_json::json!({"started_ms":group_started,"class":"parallel_read_only","count":tool_results.len()}))?;
-                            continue;
-                        }
-                        let mut next=Vec::with_capacity(calls.len());
+                        let mut groups: Vec<(bool, Vec<crate::tools::ToolCall>)> = Vec::new();
                         for call in calls {
+                            let is_parallel_read = config.parallel_readonly_tools
+                                && crate::tools::scheduler::execution_class(
+                                    self.tools.spec(&call.name).as_ref(),
+                                ) == crate::tools::scheduler::ToolExecutionClass::ReadOnlyParallelSafe;
+                            if let Some((current_is_ro, list)) = groups.last_mut() {
+                                if *current_is_ro && is_parallel_read {
+                                    list.push(call);
+                                    continue;
+                                }
+                            }
+                            groups.push((is_parallel_read, vec![call]));
+                        }
+                        let mut next = Vec::new();
+                        for (is_ro, group) in groups {
+                            if is_ro && group.len() > 1 {
+                                if tool_calls.saturating_add(group.len()) > config.max_tool_calls {
+                                    let audit = self.storage.tool_runs(principal, &agent_run_id)?;
+                                    let mut blocked = completion
+                                        .verify_for_task_async(
+                                            prompt,
+                                            "tool-call budget exhausted",
+                                            &audit,
+                                        )
+                                        .await;
+                                    blocked.state = VerificationState::Blocked;
+                                    blocked.verified = false;
+                                    blocked.summary = format!(
+                                        "agent tool-call limit ({}) reached without verified success",
+                                        config.max_tool_calls
+                                    );
+                                    return Ok(LoopOutcome {
+                                        final_answer: format!("Blocked: {}", blocked.summary),
+                                        verification: blocked,
+                                    });
+                                }
+                                tool_calls += group.len();
+                                let group_started = timing_started.elapsed().as_millis() as u64;
+                                let group_results = self
+                                    .execute_readonly_group(
+                                        group,
+                                        &tool_context,
+                                        &agent_run_id,
+                                        config.max_parallel_readonly_tools,
+                                        progress.as_ref(),
+                                    )
+                                    .await?;
+                                self.storage.record_agent_run_event(
+                                    &agent_run_id,
+                                    "tool_group",
+                                    timing_started.elapsed().as_millis() as u64,
+                                    &serde_json::json!({
+                                        "started_ms": group_started,
+                                        "class": "parallel_read_only",
+                                        "count": group_results.len(),
+                                    }),
+                                )?;
+                                for res in &group_results {
+                                    for artifact in artifacts_from_tool_output(&res.output) {
+                                        artifacts.insert(artifact.path.clone(), artifact);
+                                    }
+                                }
+                                next.extend(group_results);
+                                continue;
+                            }
+                            for call in group {
                             tool_calls += 1;
                             if tool_calls > config.max_tool_calls {
                                 let audit = self.storage.tool_runs(principal, &agent_run_id)?;

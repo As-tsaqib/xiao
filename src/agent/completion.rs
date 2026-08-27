@@ -87,47 +87,13 @@ impl CompletionVerifier {
 
     pub fn classify(&self, goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind {
         let clean_goal = strip_attachment_envelope(goal);
-        match self.semantic.evaluate::<TaskIntentDecision>(
-            "task_intent",
-            serde_json::json!({
-                "type":"object",
-                "additionalProperties":false,
-                "required":["task_kind","required_evidence","reason"],
-                "properties":{
-                    "task_kind":{"enum":["informational","inspection","action","modification","installation","verification","mixed"]},
-                    "required_evidence":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":300}},
-                    "reason":{"type":"string","maxLength":500}
-                }
-            }),
-            serde_json::json!({
-                "goal": clean_goal,
-                "observed_tools": tool_runs.iter().take(64).map(|run| serde_json::json!({
-                    "tool":run.tool_name,"risk":run.risk,"status":run.status
-                })).collect::<Vec<_>>()
-            }),
-        ) {
-            SemanticResult::Valid(decision)
-                if decision.required_evidence.len() <= 8
-                    && decision.reason.chars().count() <= 500 =>
-            {
-                return decision.task_kind;
-            }
-            SemanticResult::Malformed | SemanticResult::Unavailable | SemanticResult::Valid(_) => {}
-        }
         deterministic_task_kind(clean_goal, tool_runs)
     }
 
-    /// Provider-backed semantic evaluation bridges an async provider through
-    /// a synchronous, schema-validating boundary. Keep that work off Tokio's
-    /// async workers so a slow evaluator cannot stall Telegram cancellation,
-    /// callbacks, or another owner's request.
+    /// Pre-provider classification must remain local and deterministic to eliminate
+    /// hidden foreground provider latency.
     pub async fn classify_async(&self, goal: &str, tool_runs: &[ToolRunRecord]) -> TaskKind {
-        let evaluator = self.clone();
-        let goal = goal.to_owned();
-        let tool_runs = tool_runs.to_vec();
-        tokio::task::spawn_blocking(move || evaluator.classify(&goal, &tool_runs))
-            .await
-            .unwrap_or(TaskKind::Action)
+        self.classify(goal, tool_runs)
     }
 
     fn semantic_completion(
@@ -870,12 +836,10 @@ mod tests {
             CompletionVerifier::default().deterministic_classify(goal, &[]),
             TaskKind::Informational
         );
-        let semantic = Arc::new(SemanticEvaluator::with_backend(Arc::new(FixedSemantic(
-            r#"{"task_kind":"modification","required_evidence":["manifest exists"],"reason":"the owner requests a new artifact state"}"#,
-        ))));
+        let verifier = CompletionVerifier::default();
         assert_eq!(
-            CompletionVerifier::with_semantic(semantic).classify(goal, &[]),
-            TaskKind::Modification
+            verifier.classify(goal, &[]),
+            TaskKind::Informational
         );
     }
 

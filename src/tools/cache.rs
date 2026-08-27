@@ -110,6 +110,42 @@ impl CachedScript {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ScriptCache {
+    scripts: Arc<RwLock<HashMap<PathBuf, CachedScript>>>,
+}
+
+impl ScriptCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, script: CachedScript) -> Result<()> {
+        script.verify()?;
+        self.scripts
+            .write()
+            .unwrap()
+            .insert(script.path.clone(), script);
+        Ok(())
+    }
+
+    pub fn get(&self, path: &Path) -> Option<CachedScript> {
+        self.scripts.read().unwrap().get(path).cloned()
+    }
+
+    pub fn verify_path(&self, path: &Path) -> Result<CachedScript> {
+        let script = self
+            .get(path)
+            .ok_or_else(|| anyhow!("script not found in cache"))?;
+        script.verify()?;
+        Ok(script)
+    }
+
+    pub fn clear(&self) {
+        self.scripts.write().unwrap().clear();
+    }
+}
+
 pub fn dynamic_observation_is_cacheable(tool: &str) -> bool {
     !matches!(
         tool,

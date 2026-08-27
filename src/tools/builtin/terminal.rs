@@ -202,6 +202,7 @@ pub struct TermuxJobTool {
     terminal: TermuxTerminalTool,
     max_steps: usize,
     storage: Option<Arc<crate::storage::Storage>>,
+    plan_cache: Arc<crate::tools::cache::PlanCache>,
 }
 
 impl TermuxJobTool {
@@ -210,6 +211,7 @@ impl TermuxJobTool {
             terminal,
             max_steps: max_steps.clamp(1, 64),
             storage: None,
+            plan_cache: Arc::new(crate::tools::cache::PlanCache::new()),
         }
     }
 
@@ -222,6 +224,21 @@ impl TermuxJobTool {
             terminal,
             max_steps: max_steps.clamp(1, 64),
             storage: Some(storage),
+            plan_cache: Arc::new(crate::tools::cache::PlanCache::new()),
+        }
+    }
+
+    pub fn with_cache(
+        terminal: TermuxTerminalTool,
+        max_steps: usize,
+        storage: Option<Arc<crate::storage::Storage>>,
+        plan_cache: Arc<crate::tools::cache::PlanCache>,
+    ) -> Self {
+        Self {
+            terminal,
+            max_steps: max_steps.clamp(1, 64),
+            storage,
+            plan_cache,
         }
     }
 }
@@ -286,6 +303,52 @@ impl Tool for TermuxJobTool {
         ) {
             return Err(anyhow!("termux_job mode must be auto or sequential"));
         }
+
+        let plan_candidate = crate::tools::cache::CachedPlan {
+            steps: serde_json::to_value(&job.steps).unwrap_or_default(),
+            schema_version: 1,
+            environment_fingerprint: "termux-android".into(),
+        };
+        let (cache_key, is_hit) = match plan_candidate.key() {
+            Ok(key) => {
+                if self.plan_cache.get(&key).is_some() {
+                    if let Some(storage) = &self.storage {
+                        let elapsed = storage.agent_run_elapsed_ms(&context.agent_run_id);
+                        let _ = storage.record_agent_run_event(
+                            &context.agent_run_id,
+                            "plan_cache_hit",
+                            elapsed,
+                            &serde_json::json!({ "key": &key }),
+                        );
+                    }
+                    (Some(key), true)
+                } else {
+                    if let Some(storage) = &self.storage {
+                        let elapsed = storage.agent_run_elapsed_ms(&context.agent_run_id);
+                        let _ = storage.record_agent_run_event(
+                            &context.agent_run_id,
+                            "plan_cache_miss",
+                            elapsed,
+                            &serde_json::json!({ "key": &key }),
+                        );
+                    }
+                    (Some(key), false)
+                }
+            }
+            Err(_) => {
+                if let Some(storage) = &self.storage {
+                    let elapsed = storage.agent_run_elapsed_ms(&context.agent_run_id);
+                    let _ = storage.record_agent_run_event(
+                        &context.agent_run_id,
+                        "plan_cache_rejected",
+                        elapsed,
+                        &serde_json::json!({ "reason": "secret_material" }),
+                    );
+                }
+                (None, false)
+            }
+        };
+
         let mut results = Vec::with_capacity(job.steps.len());
         for (index, step) in job.steps.into_iter().enumerate() {
             if context.cancellation.is_cancelled() {
@@ -370,8 +433,14 @@ impl Tool for TermuxJobTool {
                 }
             }
         }
+        let all_succeeded = results.iter().all(|item| item["status"] == "succeeded");
+        if all_succeeded && !is_hit {
+            if let Some(key) = cache_key {
+                let _ = self.plan_cache.insert(plan_candidate);
+            }
+        }
         Ok(serde_json::to_string(&json!({
-            "job_status": if results.iter().all(|item| item["status"] == "succeeded") { "succeeded" } else { "failed" },
+            "job_status": if all_succeeded { "succeeded" } else { "failed" },
             "steps": results,
             "verification_evidence": true
         }))?)

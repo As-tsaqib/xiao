@@ -261,6 +261,7 @@ pub async fn serve(app: AppState, config_path: impl AsRef<Path>) -> Result<()> {
         .route("/v1/command", post(execute))
         .route("/v1/chat", post(execute))
         .route("/v1/session-chat", post(execute_session))
+        .route("/v1/delivery-ack", post(delivery_ack))
         .route("/v1/attachments/ingest", post(ingest_attachment))
         .route("/v1/logs", get(logs))
         .route("/v1/admin/snapshot", get(admin_snapshot))
@@ -439,6 +440,31 @@ async fn execute_session(
     }
     .map_err(bad)?;
     Ok(Json(serde_json::to_value(result).map_err(bad)?))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeliveryAckRequest {
+    run_id: String,
+    #[serde(default)]
+    frontend: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+async fn delivery_ack(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<DeliveryAckRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !authorized_client(&headers, &state) {
+        return Err(deny());
+    }
+    let frontend = req.frontend.unwrap_or_else(|| "cli".to_string());
+    let service = crate::control_plane::FrontendDeliveryService::new(state.app.storage.clone());
+    service
+        .ack(&req.run_id, &frontend, req.metadata.as_ref())
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true, "run_id": req.run_id })))
 }
 
 async fn ingest_attachment(

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { managerGet, managerPost } from './bridge.js';
 
 /* ========== Section Registry ========== */
@@ -22,19 +22,33 @@ const SECTIONS = [
 const VIEW_RESOURCE = { setup: 'telegram' };
 function resourceForView(view) { return VIEW_RESOURCE[view] || view; }
 
+const RELOAD_MAP = {
+  models: ['providers'],
+  profiles: ['providers'],
+  'profile-edit': ['providers'],
+  telegram: ['setup'],
+  agent: ['agent'],
+  sessions: ['sessions'],
+  'session-detail': ['sessions'],
+  attachments: ['attachments'],
+  runs: ['tasks'],
+  tasks: ['tasks'],
+  memory: ['memory'],
+  skills: ['skills'],
+  tools: ['tools'],
+  security: ['security'],
+  runtime: ['runtime'],
+  diagnostics: ['diagnostics'],
+  logs: ['logs'],
+  dashboard: ['dashboard'],
+};
+
 /* ========== Utilities ========== */
 function formatDuration(value) {
   let seconds = Number(value || 0);
   const hours = Math.floor(seconds / 3600); seconds %= 3600;
   const minutes = Math.floor(seconds / 60);
   return [hours && `${hours}h`, minutes && `${minutes}m`, `${seconds % 60}s`].filter(Boolean).join(' ') || '0s';
-}
-
-function formatBytes(value) {
-  const bytes = Number(value || 0);
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
 function classForStatus(value) {
@@ -47,16 +61,12 @@ function classForStatus(value) {
 
 function modelReadiness(model) {
   const probe = String(model?.probe_status || 'unprobed').toLowerCase();
-  if (probe === 'unprobed') return 'Probe required';
-  if (probe === 'indeterminate') return 'Probe required (indeterminate)';
+  if (probe === 'unprobed') return 'Unprobed';
+  if (probe === 'indeterminate') return 'Indeterminate';
   if (model?.native_tools_state === 'supported' && model?.continuation_state === 'supported') return 'Native Agent';
   if (model?.native_tools_state === 'unsupported' && model?.structured_output_state === 'supported' && model?.continuation_state === 'supported') return 'Structured Agent';
   if (model?.native_tools_state === 'unsupported' && model?.structured_output_state === 'unsupported' && model?.continuation_state === 'unsupported') return 'Chat only';
   return 'Protocol indeterminate';
-}
-
-function requiresExactProbe(model) {
-  return ['unprobed', 'indeterminate'].includes(String(model?.probe_status || 'unprobed').toLowerCase());
 }
 
 function parseHeaderObject(value, kind) {
@@ -150,6 +160,8 @@ const ICONS = {
   info: 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z',
   telegram: 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 0 0-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .38z',
   refresh: 'M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z',
+  sun: 'M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10Zm0-5a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0V3a1 1 0 0 1 1-1Zm0 17a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0v-2a1 1 0 0 1 1-1ZM4.22 4.22a1 1 0 0 1 1.42 0l1.42 1.42a1 1 0 0 1-1.42 1.42L4.22 5.64a1 1 0 0 1 0-1.42Zm12.72 12.72a1 1 0 0 1 1.42 0l1.42 1.42a1 1 0 0 1-1.42 1.42l-1.42-1.42a1 1 0 0 1 0-1.42ZM2 12a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2H3a1 1 0 0 1-1-1Zm17 0a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2h-2a1 1 0 0 1-1-1ZM5.64 18.36a1 1 0 0 1 0-1.42l1.42-1.42a1 1 0 0 1 1.42 1.42l-1.42 1.42a1 1 0 0 1-1.42 0Zm12.72-12.72a1 1 0 0 1 0-1.42l1.42-1.42a1 1 0 1 1 1.42 1.42l-1.42 1.42a1 1 0 0 1-1.42 0Z',
+  moon: 'M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z',
 };
 
 function AppIcon({ name, size = 22 }) {
@@ -162,7 +174,6 @@ function Loading() {
 }
 
 /* ========== SessionAiDialog Component ========== */
-/* SessionAiDialog — Custom profile model selection for exact session */
 function SessionAiDialog({ session, profiles, busy, onClose, onApply }) {
   const [profileId, setProfileId] = useState(session?.account_or_profile_id || profiles[0]?.id || '');
   const selectedProfile = profiles.find(profile => profile.id === profileId) || profiles[0];
@@ -190,7 +201,7 @@ function SessionAiDialog({ session, profiles, busy, onClose, onApply }) {
     }}>
       <h3 id="session-ai-title">Change AI selection</h3>
       <p style={{fontSize:13,color:'var(--muted)',marginBottom:16}}>
-        Changes apply only to <b>{session?.name || session?.id?.slice(0, 8)}</b>. Legacy Codex/Antigravity history remains readable but cannot be selected for generation.
+        Changes apply only to <b>{session?.name || session?.id?.slice(0, 8)}</b>.
       </p>
       {profiles.length > 0 ? <>
         <Field label="Custom profile">
@@ -208,9 +219,7 @@ function SessionAiDialog({ session, profiles, busy, onClose, onApply }) {
         <div style={{margin:'12px 0',fontSize:12,color:'var(--ink-soft)'}}>
           <Status value={selected?.probe_status || 'unprobed'} />
           <span style={{marginLeft:8}}>
-            {requiresExactProbe(selected)
-              ? 'The selected model will be exact-probed before activation.'
-              : `${modelReadiness(selected)}; optional vision/file Unknown does not block text-agent readiness.`}
+            {modelReadiness(selected)}
           </span>
         </div>
         <div className="modal-actions">
@@ -223,7 +232,6 @@ function SessionAiDialog({ session, profiles, busy, onClose, onApply }) {
 }
 
 /* ========== ProfileEditor Component ========== */
-/* ProfileEditor — Custom-only endpoint credentials, write-only secret headers */
 function ProfileEditor({ profile, isNew, busy, onBack, onSaved, onError }) {
   const [alias, setAlias] = useState(profile?.alias || '');
   const [endpoint, setEndpoint] = useState(profile?.endpoint || '');
@@ -295,9 +303,6 @@ function ProfileEditor({ profile, isNew, busy, onBack, onSaved, onError }) {
       onError('Endpoint URL is required');
       return;
     }
-    if (keyAction === 'replace' && !apiKey.trim() && isNew) {
-      // Optional API key for custom endpoints
-    }
 
     const body = {
       action: isNew ? 'create' : 'edit',
@@ -343,8 +348,6 @@ function ProfileEditor({ profile, isNew, busy, onBack, onSaved, onError }) {
           <Field label="Protocol"><select className="form-select" id="pe-protocol" value={protocol} onChange={e => setProtocol(e.target.value)}>
             <option value="openai_chat_completions">OpenAI Chat Completions</option>
             <option value="openai_responses">OpenAI Responses</option>
-            <option value="anthropic_messages">Anthropic Messages</option>
-            <option value="google_gemini">Google Gemini</option>
           </select></Field>
           <Field label="API key">
             <select className="form-select" value={keyAction} onChange={e => setKeyAction(e.target.value)}>
@@ -406,6 +409,43 @@ function App() {
   const [toastMsg, setToastMsg] = useState(null);
   const [loading, setLoading] = useState({});
   const [sessionAiDialogTarget, setSessionAiDialogTarget] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const [themePreference, setThemePreference] = useState(() => {
+    try {
+      return localStorage.getItem('xiao-theme-pref') || 'system';
+    } catch {
+      return 'system';
+    }
+  });
+
+  const [appliedTheme, setAppliedTheme] = useState('light');
+
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const updateTheme = () => {
+      const resolved = themePreference === 'system'
+        ? (media.matches ? 'dark' : 'light')
+        : themePreference;
+      setAppliedTheme(resolved);
+      document.documentElement.setAttribute('data-theme', resolved);
+      try {
+        localStorage.setItem('xiao-theme-pref', themePreference);
+      } catch {}
+    };
+
+    updateTheme();
+    media.addEventListener('change', updateTheme);
+    return () => media.removeEventListener('change', updateTheme);
+  }, [themePreference]);
+
+  const cycleTheme = useCallback(() => {
+    setThemePreference(prev => {
+      if (prev === 'system') return 'dark';
+      if (prev === 'dark') return 'light';
+      return 'system';
+    });
+  }, []);
 
   const toast = useCallback((msg, type = 'info') => {
     setToastMsg({ msg, type });
@@ -431,8 +471,91 @@ function App() {
     finally { setBusy(false); }
   }, [toast]);
 
-  const nav = useCallback((page, arg) => { setSub(page); setSubArg(arg || null); window.scrollTo(0, 0); }, []);
-  const back = useCallback(() => { setSub(null); setSubArg(null); }, []);
+  const lastBackPressRef = useRef(0);
+
+  const nav = useCallback((page, arg) => {
+    setSub(page);
+    setSubArg(arg || null);
+    window.scrollTo(0, 0);
+    try {
+      window.history.pushState({ tab, sub: page, subArg: arg || null }, '', '#' + page);
+    } catch {}
+  }, [tab]);
+
+  const selectTab = useCallback((newTab) => {
+    setTab(newTab);
+    setSub(null);
+    setSubArg(null);
+    window.scrollTo(0, 0);
+    try {
+      window.history.pushState({ tab: newTab, sub: null, subArg: null }, '', '#' + newTab);
+    } catch {}
+  }, []);
+
+  const back = useCallback(() => {
+    try {
+      window.history.back();
+    } catch {
+      setSub(null);
+      setSubArg(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.history.replaceState({ tab: 'explore', sub: null, subArg: null, isRoot: true }, '', '#explore');
+      window.history.pushState({ tab: 'explore', sub: null, subArg: null, isMain: true }, '', '#explore');
+    } catch {}
+
+    const handlePopState = (event) => {
+      const state = event.state;
+      if (!state || state.isRoot) {
+        const now = Date.now();
+        if (now - lastBackPressRef.current < 2000) {
+          window.history.back();
+          return;
+        }
+        lastBackPressRef.current = now;
+        toast('Tekan kembali sekali lagi untuk keluar', 'info');
+        try {
+          window.history.pushState({ tab: 'explore', sub: null, subArg: null, isMain: true }, '', '#explore');
+        } catch {}
+        setTab('explore');
+        setSub(null);
+        setSubArg(null);
+        return;
+      }
+
+      if (state.tab) setTab(state.tab);
+      setSub(state.sub || null);
+      setSubArg(state.subArg || null);
+      window.scrollTo(0, 0);
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [toast]);
+
+  const handleManualRefresh = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    const startTime = Date.now();
+    try {
+      const resourcesToReload = sub
+        ? (RELOAD_MAP[sub] || [sub])
+        : ['dashboard', 'providers', 'setup', 'agent'];
+      await Promise.all(resourcesToReload.map(r => load(r)));
+      const elapsed = Date.now() - startTime;
+      if (elapsed < 650) {
+        await new Promise(r => setTimeout(r, 650 - elapsed));
+      }
+      toast('Data berhasil diperbarui', 'ok');
+    } catch {
+      toast('Gagal memperbarui data', 'bad');
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refreshing, sub, load, toast]);
 
   useEffect(() => {
     load('dashboard');
@@ -450,32 +573,52 @@ function App() {
 
   const handleApplySessionAi = async ({ sessionId, profileId, model }) => {
     try {
-      // provider: 'custom' is the only supported generation provider
-      await managerPost('sessions', {
+      await post('sessions', {
         action: 'ai_config',
         session_id: sessionId,
         provider: 'custom',
         account_or_profile_id: profileId,
         model,
       });
-      toast('Session AI updated', 'ok');
       setSessionAiDialogTarget(null);
+      toast('AI selection updated', 'ok');
       load('dashboard');
       load('sessions');
-    } catch (err) {
-      toast(err.message, 'bad');
+    } catch (e) {
+      toast(e.message, 'bad');
     }
   };
 
   /* ========== Toast ========== */
   function ToastUI() {
     if (!toastMsg) return null;
-    return <div className={`notice ${toastMsg.type}`} style={{position:'fixed',top:60,left:'50%',transform:'translateX(-50%)',zIndex:50,maxWidth:400,width:'90%',boxShadow:'0 4px 20px rgba(0,0,0,.15)'}}>
+    return <div className={`notice ${toastMsg.type}`} style={{position:'fixed',top:'calc(56px + var(--status-bar-inset) + 14px)',left:'50%',transform:'translateX(-50%)',zIndex:100,maxWidth:400,width:'90%',boxShadow:'0 8px 24px rgba(0,0,0,.25)'}}>
       <span className="notice-dot" />{toastMsg.msg}
     </div>;
   }
 
-  /* ========== Explore Tab ========== */
+  /* ========== Sub Header ========== */
+  function SubHeader({ title, actions }) {
+    return <div className="sub-header">
+      <button className="back-btn" onClick={back} aria-label="Back">←</button>
+      <h2>{title}</h2>
+      {actions}
+    </div>;
+  }
+
+  /* ========== Settings Item Component ========== */
+  function SettingsItem({ icon, bg, color, title, right, onClick }) {
+    return <div className="settings-item" onClick={onClick}>
+      <div className="settings-icon" style={{ background: bg, color }}><AppIcon name={icon} size={20} /></div>
+      <div className="settings-body"><h4>{title}</h4></div>
+      {right && <span className="settings-right">{right}</span>}
+      <span className="card-chevron">›</span>
+    </div>;
+  }
+
+  /* ===================================================
+     VIEW: Explore (Dashboard)
+     =================================================== */
   function ExploreView() {
     const gateway = health?.gateway || 'unknown';
     const gsc = classForStatus(gateway);
@@ -486,7 +629,7 @@ function App() {
           <div className="edit-badge">✏</div>
         </div>
         <h2>Hi, Boss!</h2>
-        <div className="model-badge" onClick={() => { load('providers'); nav('models'); }}>
+        <div className="model-badge" onClick={() => nav('models')}>
           <span className={`status-dot ${gsc}`} />
           {ai?.model || 'Select Model'} ›
         </div>
@@ -494,176 +637,196 @@ function App() {
       <div className="content">
         {counts && <div className="metrics-grid">
           <div className="metric"><div className="metric-value">{counts.sessions || 0}</div><div className="metric-label">Sessions</div></div>
-          <div className="metric"><div className="metric-value">{counts.total_runs || 0}</div><div className="metric-label">Runs</div></div>
-          <div className="metric"><div className="metric-value">{counts.memories || 0}</div><div className="metric-label">Memories</div></div>
-          <div className="metric"><div className="metric-value">{formatDuration(health?.uptime_seconds)}</div><div className="metric-label">Uptime</div></div>
+          <div className="metric"><div className="metric-value">{counts.attachments || 0}</div><div className="metric-label">Attachments</div></div>
+          <div className="metric"><div className="metric-value">{counts.skills || 0}</div><div className="metric-label">Skills</div></div>
         </div>}
-
         <div className="section">
-          <div className="section-title">Highlights</div>
-          <div className="card-group">
-            <CardItem icon="chat" bg="var(--accent-soft)" color="var(--accent)" title="Chat Sessions" desc="Manage your conversations" onClick={() => { load('sessions'); nav('sessions'); }} />
-            <CardItem icon="plug" bg="var(--purple-soft)" color="var(--purple)" title="AI Models" badge="PRO" desc="Configure your AI provider" onClick={() => { load('providers'); nav('models'); }} />
+          <div className="section-header">
+            <span className="section-title">Essential</span>
           </div>
-        </div>
-
-        <div className="section">
-          <div className="section-title">Basic</div>
           <div className="card-group">
-            <CardItem icon="brain" bg="var(--teal-soft)" color="var(--teal)" title="Memory" desc="What Xiao remembers about you" right={counts?.memories || 0} onClick={() => { load('memory'); nav('memory'); }} />
-            <CardItem icon="bolt" bg="var(--yellow-soft)" color="var(--yellow)" title="Skills" desc="Learned abilities and procedures" onClick={() => { load('skills'); nav('skills'); }} />
-            <CardItem icon="tools" bg="var(--red-soft)" color="var(--red)" title="Tools" desc="Available tool capabilities" onClick={() => { load('tools'); nav('tools'); }} />
-            <CardItem icon="play" bg="var(--purple-soft)" color="var(--purple)" title="Agent Runs" desc="Execution history and status" onClick={() => { load('tasks'); nav('runs'); }} />
-          </div>
-        </div>
-
-        {health && <div className="section">
-          <div className="section-title">System</div>
-          <div className="card-group">
-            <div className="card-item">
-              <div className="card-icon" style={{background:'var(--teal-soft)',color:'var(--teal)'}}><AppIcon name="info" size={21} /></div>
-              <div className="card-body">
-                <h4>Gateway: {gateway.charAt(0).toUpperCase() + gateway.slice(1)}</h4>
-                <p>v{health.version || '?'} · {formatBytes(health.memory_bytes)} RAM</p>
-              </div>
+            <div className="card-item" onClick={() => { load('sessions'); nav('sessions'); }}>
+              <div className="card-icon" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}><AppIcon name="chat" size={22} /></div>
+              <div className="card-body"><h4>Sessions</h4><p>{counts?.sessions || 0} total sessions</p></div>
+              <span className="card-chevron">›</span>
             </div>
-            {dash?.runtime && <div className="card-item">
-              <div className="card-icon" style={{background:'var(--accent-soft)',color:'var(--accent)'}}>📱</div>
-              <div className="card-body">
-                <h4>Runtime</h4>
-                <p>{dash.runtime.termux ? 'Termux' : 'Linux'}{dash.runtime.root ? ' · Root' : ''}</p>
-              </div>
-            </div>}
+            <div className="card-item" onClick={() => { load('tasks'); nav('runs'); }}>
+              <div className="card-icon" style={{ background: 'var(--yellow-soft)', color: 'var(--yellow)' }}><AppIcon name="play" size={22} /></div>
+              <div className="card-body"><h4>Agent Runs</h4><p>{counts?.runs || 0} active / historical runs</p></div>
+              <span className="card-chevron">›</span>
+            </div>
+            <div className="card-item" onClick={() => { load('attachments'); nav('attachments'); }}>
+              <div className="card-icon" style={{ background: 'var(--teal-soft)', color: 'var(--teal)' }}><AppIcon name="bolt" size={22} /></div>
+              <div className="card-body"><h4>Attachments</h4><p>{counts?.attachments || 0} files stored</p></div>
+              <span className="card-chevron">›</span>
+            </div>
           </div>
-        </div>}
+        </div>
+        <div className="section">
+          <div className="section-header">
+            <span className="section-title">System & Security</span>
+          </div>
+          <div className="card-group">
+            <div className="card-item" onClick={() => { load('security'); nav('security'); }}>
+              <div className="card-icon" style={{ background: 'var(--red-soft)', color: 'var(--red)' }}><AppIcon name="tools" size={22} /></div>
+              <div className="card-body"><h4>Security</h4><p>Approvals, YOLO, and audit</p></div>
+              <span className="card-chevron">›</span>
+            </div>
+            <div className="card-item" onClick={() => { load('diagnostics'); nav('diagnostics'); }}>
+              <div className="card-icon" style={{ background: 'var(--purple-soft)', color: 'var(--purple)' }}><AppIcon name="spark" size={22} /></div>
+              <div className="card-body"><h4>Diagnostics</h4><p>Independent health checks</p></div>
+              <span className="card-chevron">›</span>
+            </div>
+          </div>
+        </div>
       </div>
     </>;
   }
 
-  /* ========== Tools Tab ========== */
+  /* ===================================================
+     VIEW: Tools (Imagine)
+     =================================================== */
   function ToolsView() {
-    return <div className="content">
-      <div className="section"><div className="section-title">Management</div>
+    return <div className="content" style={{ paddingTop: 20 }}>
+      <div className="section">
+        <div className="section-header"><span className="section-title">Capabilities</span></div>
         <div className="card-group">
-          <CardItem icon="settings" bg="var(--accent-soft)" color="var(--accent)" title="Agent Settings" desc="Loop, streaming, execution controls" onClick={() => { load('agent'); nav('agent'); }} />
-          <CardItem icon="info" bg="var(--teal-soft)" color="var(--teal)" title="Runtime" desc="Environment and dependencies" onClick={() => { load('runtime'); nav('runtime'); }} />
-          <CardItem icon="info" bg="var(--yellow-soft)" color="var(--yellow)" title="Context" desc="Identity and workspace state" onClick={() => { load('context'); nav('context'); }} />
-          <CardItem icon="plug" bg="var(--purple-soft)" color="var(--purple)" title="Attachments" desc="Uploaded files and media" onClick={() => { load('attachments'); nav('attachments'); }} />
+          <div className="card-item" onClick={() => { load('tools'); nav('tools'); }}>
+            <div className="card-icon" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}><AppIcon name="tools" size={22} /></div>
+            <div className="card-body"><h4>Tools Surface</h4><p>Typed built-in and Termux capabilities</p></div>
+            <span className="card-chevron">›</span>
+          </div>
+          <div className="card-item" onClick={() => { load('skills'); nav('skills'); }}>
+            <div className="card-icon" style={{ background: 'var(--purple-soft)', color: 'var(--purple)' }}><AppIcon name="spark" size={22} /></div>
+            <div className="card-body"><h4>Skills</h4><p>Learned workflows and instructions</p></div>
+            <span className="card-chevron">›</span>
+          </div>
+          <div className="card-item" onClick={() => { load('memory'); nav('memory'); }}>
+            <div className="card-icon" style={{ background: 'var(--teal-soft)', color: 'var(--teal)' }}><AppIcon name="brain" size={22} /></div>
+            <div className="card-body"><h4>Memory</h4><p>Owner facts and preferences</p></div>
+            <span className="card-chevron">›</span>
+          </div>
         </div>
       </div>
-      <div className="section"><div className="section-title">System</div>
+      <div className="section">
+        <div className="section-header"><span className="section-title">Environment</span></div>
         <div className="card-group">
-          <CardItem icon="settings" bg="var(--red-soft)" color="var(--red)" title="Security" desc="Approvals and audit" onClick={() => { load('security'); nav('security'); }} />
-          <CardItem icon="info" bg="var(--accent-soft)" color="var(--accent)" title="Diagnostics" desc="Health checks and system probes" onClick={() => { load('diagnostics'); nav('diagnostics'); }} />
-          <CardItem icon="info" bg="rgba(0,0,0,.05)" color="var(--ink-soft)" title="Logs" desc="Daemon log output" onClick={() => { load('logs'); nav('logs'); }} />
+          <div className="card-item" onClick={() => { load('runtime'); nav('runtime'); }}>
+            <div className="card-icon" style={{ background: 'var(--yellow-soft)', color: 'var(--yellow)' }}><AppIcon name="settings" size={22} /></div>
+            <div className="card-body"><h4>Runtime</h4><p>Device truth and execution environment</p></div>
+            <span className="card-chevron">›</span>
+          </div>
+          <div className="card-item" onClick={() => { load('context'); nav('context'); }}>
+            <div className="card-icon" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}><AppIcon name="chat" size={22} /></div>
+            <div className="card-body"><h4>Context</h4><p>Active bounded context engine</p></div>
+            <span className="card-chevron">›</span>
+          </div>
         </div>
       </div>
     </div>;
   }
 
-  /* ========== Settings Tab ========== */
+  /* ===================================================
+     VIEW: Settings
+     =================================================== */
   function SettingsView() {
-    return <div className="content">
+    return <div className="content" style={{ paddingTop: 8 }}>
       <div className="settings-section-title">Xiao</div>
       <div className="card-group">
         <SettingsItem icon="settings" bg="var(--accent-soft)" color="var(--accent)" title="Agent Config" onClick={() => { load('agent'); nav('agent'); }} />
-        <SettingsItem icon="telegram" bg="#E3F2FD" color="#1565C0" title="Telegram" right={tg?.enabled ? 'Active' : 'Off'} onClick={() => { load('setup'); nav('telegram'); }} />
+        <SettingsItem icon="telegram" bg="var(--accent-soft)" color="var(--accent)" title="Telegram" right={(tg?.telegram?.enabled ?? tg?.enabled) ? 'Active' : 'Off'} onClick={() => { load('setup'); nav('telegram'); }} />
       </div>
       <div className="settings-section-title">AI Provider</div>
       <div className="card-group">
         <SettingsItem icon="plug" bg="var(--purple-soft)" color="var(--purple)" title="Custom Profiles" right={profiles.length + ' profiles'} onClick={() => { load('providers'); nav('profiles'); }} />
-        <SettingsItem icon="spark" bg="#FCE4EC" color="var(--pink)" title="LLM Model" right={ai?.model || '-'} onClick={() => { load('providers'); nav('models'); }} />
+        <SettingsItem icon="spark" bg="var(--pink-soft, #fce4ec)" color="var(--pink)" title="LLM Model" right={ai?.model || '-'} onClick={() => { load('providers'); nav('models'); }} />
+      </div>
+      <div className="settings-section-title">Appearance</div>
+      <div className="card-group">
+        <div className="settings-item" onClick={cycleTheme} style={{ cursor: 'pointer' }}>
+          <div className="settings-icon" style={{ background: appliedTheme === 'dark' ? 'var(--purple-soft)' : 'var(--yellow-soft)', color: appliedTheme === 'dark' ? 'var(--purple)' : 'var(--yellow)' }}>
+            <AppIcon name={appliedTheme === 'dark' ? 'moon' : 'sun'} size={19} />
+          </div>
+          <div className="settings-body">
+            <h4>Theme: {themePreference === 'system' ? 'System' : (themePreference === 'dark' ? 'Dark' : 'Light')}</h4>
+            <p>{themePreference === 'system' ? `Following OS (${appliedTheme})` : `${appliedTheme} mode`}</p>
+          </div>
+          <span className="settings-right">{themePreference.toUpperCase()}</span>
+        </div>
       </div>
       <div className="settings-section-title">App</div>
       <div className="card-group">
         <SettingsItem icon="info" bg="var(--teal-soft)" color="var(--teal)" title="About Xiao" onClick={() => nav('about')} />
-        <SettingsItem icon="info" bg="var(--yellow-soft)" color="var(--yellow)" title="Diagnostics" onClick={() => { load('diagnostics'); nav('diagnostics'); }} />
+        <SettingsItem icon="chat" bg="var(--line)" color="var(--ink-soft)" title="Daemon Logs" onClick={() => { load('logs'); nav('logs'); }} />
       </div>
     </div>;
   }
 
-  /* ========== Shared Card Components ========== */
-  function CardItem({ icon, bg, color, title, badge, desc, right, onClick }) {
-    return <div className="card-item" onClick={onClick}>
-      <div className="card-icon" style={{ background: bg, color }}><AppIcon name={icon} size={21} /></div>
-      <div className="card-body">
-        <h4>{title}{badge && <span className="badge-pro">{badge}</span>}</h4>
-        <p>{desc}</p>
-      </div>
-      {right != null && <span className="card-value">{right}</span>}
-      <span className="card-chevron">›</span>
-    </div>;
-  }
-
-  function SettingsItem({ icon, bg, color, title, right, onClick }) {
-    return <div className="settings-item" onClick={onClick}>
-      <div className="settings-icon" style={{ background: bg, color }}><AppIcon name={icon} size={19} /></div>
-      <div className="settings-body"><h4>{title}</h4></div>
-      {right != null && <span className="card-value">{right}</span>}
-      <span className="card-chevron">›</span>
-    </div>;
-  }
-
-  function SubHeader({ title, onBack, actions }) {
-    return <div className="sub-header">
-      <button className="back-btn" onClick={onBack || back}>←</button>
-      <h2>{title}</h2>
-      {actions}
-    </div>;
-  }
-
-  /* ========== SUB PAGES ========== */
+  /* ===================================================
+     SUB-PAGES
+     =================================================== */
 
   /* Sessions */
   function SessionsPage() {
     const d = data.sessions;
     if (loading.sessions && !d) return <div className="sub-page"><SubHeader title="Sessions" /><Loading /></div>;
     const items = d?.items || d?.sessions || [];
-    const pg = d?.page || 1, pages = d?.pages || 1;
+    const totalPages = d?.total_pages || 1;
+    const curPage = d?.page || 1;
     return <div className="sub-page">
-      <SubHeader title="Sessions" />
+      <SubHeader title="Sessions" actions={<Button tone="primary" onClick={async () => {
+        try {
+          const s = await post('sessions', { action: 'create', name: 'New Session' });
+          toast('Session created', 'ok');
+          load('sessions');
+          load('dashboard');
+        } catch {}
+      }}>+ New</Button>} />
       <div className="sub-content">
-        {items.length === 0 ? <Empty>No sessions yet</Empty> :
+        {items.length === 0 ? <Empty>No sessions found</Empty> : <>
           <div className="card-group">{items.map((s, i) =>
-            <div className="card-item" key={s.id || i} onClick={() => nav('session-detail', s)}>
-              <div className="card-icon" style={{background:'var(--accent-soft)',color:'var(--accent)'}}>💬</div>
+            <div className="card-item" key={s.id || i} onClick={() => nav('session-detail', { session: s })}>
               <div className="card-body">
-                <h4>{s.name || s.topic || s.id?.slice(0, 8)}</h4>
-                <p>{s.provider || '-'} · {s.model || '-'} · {s.message_count || 0} msgs</p>
+                <h4>{s.name || 'Untitled'}</h4>
+                <p>{s.model || '-'} · {s.message_count || 0} messages</p>
               </div>
               <span className="card-chevron">›</span>
             </div>
-          )}</div>}
-        {pages > 1 && <Pagination page={pg} pages={pages} onPage={p => load('sessions', { page: p, limit: 20 })} />}
+          )}</div>
+          {totalPages > 1 && <Pagination page={curPage} pages={totalPages} onPage={p => load('sessions', { page: p })} />}
+        </>}
       </div>
     </div>;
   }
 
+  /* Session Detail */
   function SessionDetailPage() {
-    const s = subArg;
-    if (!s) return null;
+    const s = subArg?.session;
+    if (!s) return <div className="sub-page"><SubHeader title="Session" /><Empty>No session selected</Empty></div>;
     return <div className="sub-page">
-      <SubHeader title={s.name || s.topic || 'Session'} onBack={() => nav('sessions')} />
-      <div className="sub-content">
-        <div className="detail-card">
-          <DL label="ID" mono>{s.id}</DL>
-          <DL label="Provider">{s.provider || '-'}</DL>
-          <DL label="Model">{s.model || '-'}</DL>
-          <DL label="Messages">{s.message_count || 0}</DL>
-          <DL label="Created">{s.created_at || '-'}</DL>
-          {s.account_or_profile_id && <DL label="Profile ID">{s.account_or_profile_id}</DL>}
-        </div>
-        <div style={{display:'flex',gap:8,flexWrap:'wrap',marginTop:16}}>
-          <Button tone="primary" onClick={() => setSessionAiDialogTarget(s)}>Change AI</Button>
+      <SubHeader title={s.name || 'Session Detail'} actions={
+        <div style={{display:'flex',gap:6}}>
+          <Button onClick={() => setSessionAiDialogTarget(s)}>AI Config</Button>
           <Button tone="danger" onClick={async () => {
-            if (!confirm('Delete session?')) return;
+            if (!confirm('Delete this session?')) return;
             try {
               await post('sessions', { action: 'delete', session_id: s.id });
-              toast('Session deleted', 'ok');
-              nav('sessions');
+              toast('Deleted', 'ok');
+              back();
               load('sessions');
+              load('dashboard');
             } catch {}
-          }}>Delete</Button>
+          }}>✕</Button>
+        </div>
+      } />
+      <div className="sub-content">
+        <div className="detail-card">
+          <DL label="Session ID" mono>{s.id}</DL>
+          <DL label="Model">{s.model || '-'}</DL>
+          <DL label="Provider">{s.provider || '-'}</DL>
+          <DL label="YOLO Mode"><Status value={s.yolo_mode ? 'enabled' : 'disabled'} /></DL>
+          <DL label="Messages">{s.message_count || 0}</DL>
+          <DL label="Created">{s.created_at || '-'}</DL>
         </div>
       </div>
     </div>;
@@ -674,26 +837,90 @@ function App() {
     const allModels = [];
     profiles.forEach(p => (p.models || []).forEach(m => allModels.push({ ...m, profileAlias: p.alias, profileId: p.id })));
     const currentModel = ai?.model;
+
+    const handleOverride = async (profileId, modelId, capability, override) => {
+      try {
+        await post('providers/custom', {
+          action: 'capability_override',
+          profile_id: profileId,
+          model: modelId,
+          capability,
+          owner_override: override,
+        });
+        toast(`Capability ${capability} set to ${override}`, 'ok');
+        load('providers');
+      } catch (e) {
+        toast(e.message, 'bad');
+      }
+    };
+
+    const handleProbe = async (profileId, modelId) => {
+      try {
+        await post('providers/custom', { action: 'probe', profile_id: profileId, model: modelId });
+        toast('Model probe completed', 'ok');
+        load('providers');
+      } catch (e) {
+        toast(e.message, 'bad');
+      }
+    };
+
     return <div className="sub-page">
-      <SubHeader title="LLM Model" />
+      <SubHeader title="LLM Models & Capabilities" />
       <div className="sub-content">
         {allModels.length === 0 ? <Empty>No models discovered. Add a Custom Profile first.</Empty> :
           <div className="card-group">{allModels.map((m, i) =>
-            <div className={'model-item' + (m.model_id === currentModel ? ' selected' : '')} key={m.model_id || i} onClick={async () => {
-              try {
-                const sid = ai?.session_id || (data.sessions?.items || data.sessions?.sessions || [])[0]?.id;
-                if (sid) {
-                  await post('sessions', { action: 'ai_config', session_id: sid, provider: 'custom', account_or_profile_id: m.profileId, model: m.model_id });
-                  toast('Model set to ' + m.model_id, 'ok');
-                  load('dashboard');
-                } else {
-                  toast('No active session', 'warn');
-                }
-              } catch {}
-            }}>
-              <div>
-                <h4>{m.model_id} {m.probe_status !== 'probed_ok' && <span className="badge-pro">PRO</span>}</h4>
-                <p>{m.profileAlias} · {m.probe_status || 'unprobed'} · {modelReadiness(m)}</p>
+            <div className={'model-item' + (m.model_id === currentModel ? ' selected' : '')} key={m.model_id || i}>
+              <div style={{ flex: 1, marginRight: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <h4>{m.model_id}</h4>
+                  {m.model_id === currentModel && <span className="tag tag-ok">ACTIVE</span>}
+                </div>
+                <p>{m.profileAlias} · Readiness: <b>{modelReadiness(m)}</b></p>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 8, fontSize: 12 }}>
+                  <div>
+                    <span>Vision: </span>
+                    <select
+                      className="form-select"
+                      style={{ display: 'inline-block', width: 'auto', padding: '2px 6px', fontSize: 12 }}
+                      value={m.vision_override || 'auto'}
+                      onChange={e => handleOverride(m.profileId, m.model_id, 'vision', e.target.value)}
+                    >
+                      <option value="auto">Auto ({m.vision_state || 'unknown'})</option>
+                      <option value="force_supported">Force Supported</option>
+                      <option value="force_unsupported">Force Unsupported</option>
+                    </select>
+                  </div>
+                  <div>
+                    <span>File Input: </span>
+                    <select
+                      className="form-select"
+                      style={{ display: 'inline-block', width: 'auto', padding: '2px 6px', fontSize: 12 }}
+                      value={m.file_input_override || 'auto'}
+                      onChange={e => handleOverride(m.profileId, m.model_id, 'file_input', e.target.value)}
+                    >
+                      <option value="auto">Auto ({m.file_input_state || 'unknown'})</option>
+                      <option value="force_supported">Force Supported</option>
+                      <option value="force_unsupported">Force Unsupported</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <Button btn-sm onClick={() => handleProbe(m.profileId, m.model_id)}>Probe</Button>
+                <Button tone="primary" btn-sm onClick={async () => {
+                  try {
+                    const sid = ai?.session_id || (data.sessions?.items || data.sessions?.sessions || [])[0]?.id;
+                    if (sid) {
+                      await post('sessions', { action: 'ai_config', session_id: sid, provider: 'custom', account_or_profile_id: m.profileId, model: m.model_id });
+                      toast('Model set to ' + m.model_id, 'ok');
+                      load('dashboard');
+                    } else {
+                      toast('No active session', 'warn');
+                    }
+                  } catch (e) {
+                    toast(e.message, 'bad');
+                  }
+                }}>Select</Button>
               </div>
             </div>
           )}</div>}
@@ -723,9 +950,9 @@ function App() {
                 <div style={{fontSize:14,fontWeight:500}}>{m.content || m.value || m.key || '-'}</div>
                 {m.key && <div style={{fontSize:12,color:'var(--muted)',marginTop:4,fontFamily:'var(--font-mono)'}}>{m.key}</div>}
               </div>
-              <Button onClick={async () => {
+              <Button tone="danger" onClick={async () => {
                 try {
-                  await post('memory', { action: 'forget', scope: m.scope || 'user', category: m.category || 'general', key: m.key });
+                  await post('memory', { action: 'delete', scope: m.scope || 'user', category: m.category || 'general', key: m.key });
                   toast('Forgotten', 'ok');
                   load('memory');
                 } catch {}
@@ -750,30 +977,21 @@ function App() {
         } catch {}
       }}>Refresh</Button>} />
       <div className="sub-content">
-        {items.length === 0 ? <Empty>No skills learned yet</Empty> :
-          items.map((sk, i) => <div className="detail-card" key={sk.id || i} style={{marginBottom:10}}>
+        {items.length === 0 ? <Empty>No skills installed</Empty> :
+          items.map((s, i) => <div className="detail-card" key={s.id || i} style={{marginBottom:10}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'start'}}>
               <div>
-                <div style={{fontSize:15,fontWeight:600}}>{sk.name || sk.id || '-'} <span className={`tag ${sk.enabled !== false ? 'tag-ok' : 'tag-warn'}`}>{sk.enabled !== false ? 'enabled' : 'disabled'}</span></div>
-                <div style={{fontSize:13,color:'var(--muted)',marginTop:4}}>{sk.summary || sk.description || '-'}</div>
-                {sk.when_to_use && <div style={{fontSize:12,color:'var(--ink-soft)',marginTop:4}}>When: {sk.when_to_use}</div>}
+                <div style={{fontSize:15,fontWeight:600}}>{s.name || '-'}</div>
+                <div style={{fontSize:13,color:'var(--ink-soft)',marginTop:4}}>{s.summary || s.description || '-'}</div>
               </div>
-              <div style={{display:'flex',gap:6}}>
-                <Button onClick={async () => {
-                  try {
-                    await post('skills', { action: 'set_enabled', skill_id: sk.id, enabled: sk.enabled === false });
-                    toast('Skill updated', 'ok');
-                    load('skills');
-                  } catch {}
-                }}>{sk.enabled !== false ? 'Disable' : 'Enable'}</Button>
-                {sk.source === 'learned' && <Button tone="danger" onClick={async () => {
-                  try {
-                    await post('skills', { action: 'delete', skill_id: sk.id });
-                    toast('Deleted', 'ok');
-                    load('skills');
-                  } catch {}
-                }}>✕</Button>}
-              </div>
+              <Button tone="danger" onClick={async () => {
+                if (!confirm(`Delete skill ${s.name}?`)) return;
+                try {
+                  await post('skills', { action: 'delete', skill_id: s.id || s.name });
+                  toast('Skill deleted', 'ok');
+                  load('skills');
+                } catch {}
+              }}>✕</Button>
             </div>
           </div>)}
       </div>
@@ -786,18 +1004,16 @@ function App() {
     if (loading.tools && !d) return <div className="sub-page"><SubHeader title="Tools" /><Loading /></div>;
     const items = d?.items || d?.tools || [];
     return <div className="sub-page">
-      <SubHeader title="Tools" />
+      <SubHeader title="Tools Surface" />
       <div className="sub-content">
         {items.length === 0 ? <Empty>No tools available</Empty> :
-          <div className="card-group">{items.map((tl, i) =>
-            <div className="card-item" key={tl.name || i}>
-              <div className="card-icon" style={{background:'var(--accent-soft)',color:'var(--accent)'}}>🔧</div>
-              <div className="card-body">
-                <h4>{tl.name || tl.id || '-'}{tl.read_only && <span className="tag tag-info" style={{marginLeft:6}}>read-only</span>}</h4>
-                <p>{tl.description || tl.category || '-'}</p>
-              </div>
+          items.map((t, i) => <div className="detail-card" key={t.name || i} style={{marginBottom:10}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <span style={{fontWeight:600,fontFamily:'var(--font-mono)'}}>{t.name}</span>
+              <Status value={t.risk || 'safe'} />
             </div>
-          )}</div>}
+            <p style={{fontSize:13,color:'var(--muted)',marginTop:4}}>{t.description || '-'}</p>
+          </div>)}
       </div>
     </div>;
   }
@@ -811,21 +1027,28 @@ function App() {
       <SubHeader title="Agent Runs" />
       <div className="sub-content">
         {items.length === 0 ? <Empty>No agent runs yet</Empty> :
-          items.map((r, i) => <div className="detail-card" key={r.id || i} style={{marginBottom:10}}>
+          items.map((r, i) => <div className="detail-card" key={r.id || i} style={{marginBottom:12}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
               <Status value={r.status} />
               <span style={{fontSize:12,color:'var(--muted)'}}>{r.created_at || ''}</span>
             </div>
-            <div style={{fontSize:13}}>{r.provider || '-'} · {r.model || '-'}</div>
-            {r.task && <div style={{fontSize:12,color:'var(--ink-soft)',marginTop:4}}>{r.task}</div>}
+            <div style={{fontSize:13,fontWeight:600}}>{r.provider || '-'} · {r.model || '-'}</div>
+            {r.task && <div style={{fontSize:13,color:'var(--ink)',marginTop:4}}>{r.task}</div>}
             <div style={{fontSize:11,color:'var(--muted)',marginTop:4,fontFamily:'var(--font-mono)'}}>{r.id}</div>
-            {r.status === 'running' && <div style={{marginTop:8}}><Button tone="danger" onClick={async () => {
+            {r.timings && r.timings.length > 0 && <div className="timing-waterfall">
+              <div style={{fontWeight:600,marginBottom:4}}>Timing Waterfall</div>
+              {r.timings.map((t, idx) => <div className="timing-row" key={idx}>
+                <span className="timing-label">{t.kind?.replace(/_/g, ' ')}</span>
+                <span className="timing-value">{t.elapsed_ms} ms</span>
+              </div>)}
+            </div>}
+            {r.status === 'running' && <div style={{marginTop:10}}><Button tone="danger" onClick={async () => {
               try {
                 await post('runs', { action: 'cancel', run_id: r.id });
                 toast('Cancelled', 'ok');
                 load('tasks');
               } catch {}
-            }}>Cancel</Button></div>}
+            }}>Cancel Run</Button></div>}
           </div>)}
       </div>
     </div>;
@@ -876,17 +1099,45 @@ function App() {
       { key: 'plan_cache_enabled', label: 'Plan Cache', type: 'toggle' },
       { key: 'background_learning', label: 'Background Learning', type: 'toggle' },
     ];
+
+    const toggleField = async (key, label, currentVal) => {
+      const newVal = !currentVal;
+      setData(prev => ({
+        ...prev,
+        agent: {
+          ...prev.agent,
+          settings: { ...(prev.agent?.settings || {}), [key]: newVal }
+        }
+      }));
+      try {
+        await post('agent', { action: 'update', [key]: newVal });
+        toast(label + ' ' + (newVal ? 'enabled' : 'disabled'), 'ok');
+        load('agent');
+      } catch {
+        setData(prev => ({
+          ...prev,
+          agent: {
+            ...prev.agent,
+            settings: { ...(prev.agent?.settings || {}), [key]: currentVal }
+          }
+        }));
+      }
+    };
+
     return <div className="sub-page">
       <SubHeader title="Agent Settings" />
       <div className="sub-content">
         {d?.active_runs != null && <div className="notice info"><span className="notice-dot" />{d.active_runs} active runs</div>}
         <div className="detail-card">
           {fields.map(f => f.type === 'toggle' ?
-            <div className="toggle-row" key={f.key}>
+            <div className="toggle-row" key={f.key} onClick={() => toggleField(f.key, f.label, s[f.key])}>
               <label>{f.label}</label>
-              <button className={'toggle-switch' + (s[f.key] ? ' on' : '')} onClick={async () => {
-                try { await post('agent', { action: 'update', [f.key]: !s[f.key] }); toast(f.label + ' toggled', 'ok'); load('agent'); } catch {}
-              }} />
+              <button
+                type="button"
+                className={'toggle-switch' + (s[f.key] ? ' on' : '')}
+                onClick={(e) => { e.stopPropagation(); toggleField(f.key, f.label, s[f.key]); }}
+                aria-label={f.label}
+              />
             </div> :
             <div className="form-group" key={f.key}>
               <label className="form-label">{f.label}</label>
@@ -1024,16 +1275,62 @@ function App() {
   function TelegramPage() {
     const d = data.setup;
     if (loading.setup && !d) return <div className="sub-page"><SubHeader title="Telegram" /><Loading /></div>;
-    const tgData = d || {};
+    const tgData = d?.telegram || d || {};
+
+    const toggleTelegram = async () => {
+      const currentVal = !!tgData.enabled;
+      const newVal = !currentVal;
+      setData(prev => {
+        const prevSetup = prev.setup || {};
+        const prevTg = prevSetup.telegram || prevSetup;
+        return {
+          ...prev,
+          setup: {
+            ...prevSetup,
+            telegram: {
+              ...prevTg,
+              enabled: newVal
+            },
+            enabled: newVal
+          }
+        };
+      });
+      try {
+        await post('telegram', { action: 'configure', enabled: newVal });
+        toast('Telegram ' + (newVal ? 'enabled' : 'disabled'), 'ok');
+        load('setup');
+      } catch {
+        setData(prev => {
+          const prevSetup = prev.setup || {};
+          const prevTg = prevSetup.telegram || prevSetup;
+          return {
+            ...prev,
+            setup: {
+              ...prevSetup,
+              telegram: {
+                ...prevTg,
+                enabled: currentVal
+              },
+              enabled: currentVal
+            }
+          };
+        });
+        toast('Gagal mengubah status Telegram', 'bad');
+      }
+    };
+
     return <div className="sub-page">
       <SubHeader title="Telegram" />
       <div className="sub-content">
         <div className="detail-card">
-          <div className="toggle-row">
+          <div className="toggle-row" onClick={toggleTelegram}>
             <label>Telegram Enabled</label>
-            <button className={'toggle-switch' + (tgData.enabled ? ' on' : '')} onClick={async () => {
-              try { await post('telegram', { action: 'configure', enabled: !tgData.enabled }); toast('Telegram ' + (tgData.enabled ? 'disabled' : 'enabled'), 'ok'); load('setup'); } catch {}
-            }} />
+            <button
+              type="button"
+              className={'toggle-switch' + (tgData.enabled ? ' on' : '')}
+              onClick={(e) => { e.stopPropagation(); toggleTelegram(); }}
+              aria-label="Toggle Telegram"
+            />
           </div>
           <DL label="Owner State"><Status value={tgData.owner_state} /></DL>
           {tgData.owner_user_id && <DL label="Owner User ID">{tgData.owner_user_id}</DL>}
@@ -1085,7 +1382,7 @@ function App() {
               <span className={`tag ${p.api_key_configured ? 'tag-ok' : 'tag-warn'}`}>{p.api_key_configured ? 'Key ✓' : 'No key'}</span>
               <span className="tag tag-info">{p.model_count || (p.models || []).length || 0} models</span>
             </div>
-            <div className="profile-actions">
+            <div className="profile-actions" style={{display:'flex',gap:6,marginTop:8}}>
               <Button onClick={() => nav('profile-edit', { isNew: false, profile: p })}>Edit</Button>
               <Button onClick={async () => {
                 try {
@@ -1095,7 +1392,7 @@ function App() {
                 } catch {}
               }}>Discover</Button>
               <Button tone="danger" onClick={async () => {
-                if (!confirm('Delete "' + p.alias + '"?')) return;
+                if (!confirm('Delete \"' + p.alias + '\"?')) return;
                 try {
                   await post('provider-custom', { action: 'delete', profile_id: p.id });
                   toast('Deleted', 'ok');
@@ -1104,12 +1401,12 @@ function App() {
               }}>Delete</Button>
             </div>
             {(p.models || []).length > 0 && <div style={{marginTop:12}}>
-              <div style={{fontSize:13,fontWeight:600,marginBottom:6}}>Models</div>
+              <div style={{fontSize:13,fontWeight:600,marginBottom:6}}>Discovered Models</div>
               {p.models.map((m, j) => <div key={j} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'6px 0',borderBottom:'1px solid var(--line)',fontSize:13}}>
                 <span style={{fontFamily:'var(--font-mono)',fontSize:12}}>{m.model_id || '-'}</span>
                 <div style={{display:'flex',alignItems:'center',gap:8}}>
                   <Status value={m.probe_status} />
-                  <Button onClick={async () => {
+                  <Button btn-sm onClick={async () => {
                     try {
                       await post('provider-custom', { action: 'probe', profile_id: p.id, model: m.model_id });
                       toast('Model probed', 'ok');
@@ -1206,9 +1503,26 @@ function App() {
         <span className="verified">✓</span>
       </div>
       <div className="header-actions">
-        <button className="header-btn" aria-label="Refresh" onClick={() => { load('dashboard'); load('providers'); }}><AppIcon name="refresh" size={20} /></button>
+        <button
+          className="header-btn"
+          aria-label="Toggle theme"
+          title={`Theme: ${themePreference}`}
+          onClick={cycleTheme}
+        >
+          <AppIcon name={appliedTheme === 'dark' ? 'sun' : 'moon'} size={20} />
+        </button>
+        <button
+          className={`header-btn${refreshing ? ' refreshing' : ''}`}
+          aria-label="Refresh"
+          title={refreshing ? 'Memperbarui...' : 'Perbarui data'}
+          disabled={refreshing}
+          onClick={handleManualRefresh}
+        >
+          <AppIcon name="refresh" size={20} />
+        </button>
       </div>
     </div>
+    {refreshing && <div className="refresh-bar" />}
 
     {tab === 'explore' && <ExploreView />}
     {tab === 'tools' && <ToolsView />}
@@ -1216,11 +1530,15 @@ function App() {
 
     <div className="tab-bar">
       {[['explore','Explore'],['tools','Imagine'],['settings','Settings']].map(([id, label]) =>
-        <button key={id} className={`tab-item${tab === id ? ' active' : ''}`} onClick={() => {
-          setTab(id);
-          if (id === 'explore') load('dashboard');
-          if (id === 'settings') { load('providers'); load('setup'); load('agent'); }
-        }}><AppIcon name={id === 'explore' ? 'spark' : id === 'tools' ? 'search' : 'settings'} size={25} /><span>{label}</span></button>
+        <button
+          key={id}
+          className={`tab-item${tab === id ? ' active' : ''}`}
+          onClick={() => selectTab(id)}
+          aria-label={label}
+        >
+          <AppIcon name={id === 'explore' ? 'spark' : id === 'tools' ? 'search' : 'settings'} size={24} />
+          <span>{label}</span>
+        </button>
       )}
     </div>
     {sessionAiDialogTarget && <SessionAiDialog

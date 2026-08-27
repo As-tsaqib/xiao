@@ -352,3 +352,178 @@ async fn matrix_e6_parallel_cancellation_records_durable_interrupted_rows() {
     let agent_run = storage.agent_run("owner-1", &run_id).unwrap().unwrap();
     assert_eq!(agent_run.status, "interrupted");
 }
+
+#[tokio::test]
+async fn matrix_e7_mixed_batch_parallelizes_reads_and_keeps_write_barrier_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("xiao.db");
+    let storage = Arc::new(Storage::open(&db_path).unwrap());
+    let sessions = Arc::new(SessionManager::new(storage.clone()));
+
+    struct MixedBatchProvider {
+        turn: AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for MixedBatchProvider {
+        fn id(&self) -> &'static str {
+            "custom"
+        }
+        fn models(&self) -> Vec<String> {
+            vec!["mixed-model".into()]
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                text: true,
+                vision: false,
+                file_input: false,
+                native_tools: true,
+                tool_protocol: ToolProtocol::Native,
+                model_discovery: false,
+                structured_output: true,
+                continuation: true,
+                evidence: "mixed test".into(),
+            }
+        }
+        async fn run(
+            &self,
+            _: ProviderRequest,
+            _: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> anyhow::Result<ProviderResponse> {
+            Err(anyhow::anyhow!("run_turn must be used"))
+        }
+        async fn run_turn(
+            &self,
+            _req: ProviderRequest,
+            _continuation: Option<serde_json::Value>,
+            tool_results: Vec<ToolResult>,
+            _progress: Option<mpsc::UnboundedSender<AgentEvent>>,
+        ) -> anyhow::Result<ProviderTurn> {
+            let t = self.turn.fetch_add(1, Ordering::SeqCst);
+            if t == 0 {
+                Ok(ProviderTurn {
+                    step: ProviderStep::ToolCalls(vec![
+                        ToolCall {
+                            call_id: "r1".into(),
+                            name: "slow_read_a".into(),
+                            arguments: json!({}),
+                        },
+                        ToolCall {
+                            call_id: "r2".into(),
+                            name: "slow_read_b".into(),
+                            arguments: json!({}),
+                        },
+                        ToolCall {
+                            call_id: "w1".into(),
+                            name: "side_effect_w".into(),
+                            arguments: json!({}),
+                        },
+                        ToolCall {
+                            call_id: "r3".into(),
+                            name: "slow_read_a".into(),
+                            arguments: json!({}),
+                        },
+                    ]),
+                    continuation: Some(json!({ "turn": 0 })),
+                    events: vec![],
+                })
+            } else {
+                let call_ids: Vec<String> =
+                    tool_results.into_iter().map(|r| r.call_id).collect();
+                Ok(ProviderTurn {
+                    step: ProviderStep::Final(format!("done:{}", call_ids.join(","))),
+                    continuation: None,
+                    events: vec![],
+                })
+            }
+        }
+    }
+
+    struct SideEffectTool;
+    #[async_trait]
+    impl Tool for SideEffectTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "side_effect_w".into(),
+                description: "Write tool".into(),
+                parameters: json!({ "type": "object" }),
+                risk: ToolRisk::SideEffect,
+                origin: ToolOrigin::Builtin,
+                effect: xiao::tools::ToolEffect::NonIdempotent,
+                required_capabilities: vec![],
+                timeout_ms: 5000,
+            }
+        }
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            Ok(json!({ "status": "succeeded", "verified": true, "output": "w1 ok" }).to_string())
+        }
+    }
+
+    let auth = Arc::new(xiao::auth::AuthManager::new(
+        storage.clone(),
+        dir.path().join("secrets"),
+    ));
+    let provider = Arc::new(MixedBatchProvider {
+        turn: AtomicUsize::new(0),
+    });
+    let providers = Arc::new(ProviderRegistry::from_single("custom", provider, auth));
+
+    let active_count = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+
+    let tool_a = SlowReadToolA {
+        active_concurrent: active_count.clone(),
+        max_concurrent_seen: max_seen.clone(),
+    };
+    let tool_b = SlowReadToolB {
+        active_concurrent: active_count.clone(),
+        max_concurrent_seen: max_seen.clone(),
+    };
+
+    let tools = Arc::new(ToolRegistry::new(
+        ToolPolicy::default().allow_side_effect("side_effect_w"),
+        16384,
+    ));
+    tools.register(tool_a).unwrap();
+    tools.register(tool_b).unwrap();
+    tools.register(SideEffectTool).unwrap();
+
+    let config = AgentConfig {
+        parallel_readonly_tools: true,
+        max_parallel_readonly_tools: 8,
+        ..Default::default()
+    };
+
+    let engine = AgentEngine::with_registry(
+        sessions.clone(),
+        storage.clone(),
+        providers,
+        config,
+        tools,
+    );
+    let session = storage
+        .create_session(
+            "owner-1",
+            "Mixed Batch Test",
+            "custom",
+            None,
+            "mixed-model",
+            false,
+            None,
+        )
+        .unwrap();
+
+    let answer = engine
+        .submit_to_session_with_progress("owner-1", &session.id, "run mixed batch", None)
+        .await
+        .unwrap();
+
+    assert_eq!(answer.final_answer, "done:r1,r2,w1,r3");
+    assert!(max_seen.load(Ordering::SeqCst) >= 2);
+}
