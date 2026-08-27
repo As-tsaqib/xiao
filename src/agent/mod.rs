@@ -1382,7 +1382,8 @@ impl AgentEngine {
                             provider_events.push(completed);
                             next.push(result);
                         }
-                        let signature = next.iter().map(|result| format!("{}:{}:{}", result.name, result.is_error, short_hash(&result.output))).collect::<Vec<_>>().join("|");
+                    }
+                    let signature = next.iter().map(|result| format!("{}:{}:{}", result.name, result.is_error, short_hash(&result.output))).collect::<Vec<_>>().join("|");
                         observation_signatures.push_back(signature);
                         let max_signatures = (config.max_no_progress_repeats.max(2) * 2).max(6);
                         while observation_signatures.len() > max_signatures {
