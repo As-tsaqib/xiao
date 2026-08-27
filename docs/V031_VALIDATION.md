@@ -6,8 +6,8 @@ This record captures automated CI verification status and documents device limit
 
 - Branch: `main`
 - Schema migration: 26 → 27
-- Verified CI Run: 33050274827 (Commit `79ea04ea5768800be7444747eb4bb73aa1e428c0`)
-- `rust` job: PASS (cargo check, cargo test with 320 unit/integration tests passing, strict clippy, release build, WebUI build, static acceptance).
+- Verified CI Run: 33068967406 (Commit `b4f95dcb2a382103f901170669aafe24beafc0c2`)
+- `rust` job: PASS (cargo check, cargo test with 321 unit/integration tests passing, strict clippy, release build, WebUI build, static acceptance).
 - `android-arm64` job: PASS (cargo-ndk build, WebUI embed, deterministic module ZIP build and sha256 checksum verification).
 - Local Rust, WebUI, and Android builds/tests: not run (repository policy; all validation via GitHub Actions CI).
 
@@ -77,19 +77,24 @@ This record captures automated CI verification status and documents device limit
 - **Unprivileged Termux Sandbox**: `termux_terminal` executes strictly under the unprivileged Termux app UID with `PR_SET_NO_NEW_PRIVS` and dropped supplementary groups. Arbitrary root escalation is rejected; privileged Android operations route exclusively through the typed Android Broker with exact one-shot approval.
 - **No-Progress Termination**: Agent turns are bounded by `max_turns` (default 150) and `max_no_progress_repeats` (3 repeats) to prevent infinite loops when tools encounter unresolvable environmental blockers.
 
-## Rooted Android manual gates
+## Rooted Android manual gates (A–O)
 
-All remain manual and unverified in this workspace:
+All remain OPEN and unverified on physical hardware in this host CI workspace:
 
-- A: Unknown → Supported real Custom multimodal request
-- B: explicit unsupported exact-model isolation
-- C: Telegram visible SSE draft and single permanent final
-- D: streamed tool continuation without protocol leakage
-- E: controlled task exceeding eight provider turns
-- F: overlapping read-only tool timing with stable order
-- G: `termux_job` under the Termux UID with substep audit
-- H: root escalation denial and typed broker approval/YOLO boundary
-- I: `/stop` during SSE, parallel tools, and `termux_job`
-- J: final delivery before background learning start
+- Gate A: OPEN (Unknown → Supported real Custom multimodal request)
+- Gate B: OPEN (Explicit unsupported exact-model isolation)
+- Gate C: OPEN (Telegram visible SSE draft and single permanent final)
+- Gate D: OPEN (Streamed tool continuation without protocol leakage)
+- Gate E: OPEN (Controlled task exceeding eight provider turns)
+- Gate F: OPEN (Overlapping read-only tool timing with stable order)
+- Gate G: OPEN (termux_job under the Termux UID with substep audit)
+- Gate H: OPEN (Root escalation denial and typed broker approval/YOLO boundary)
+- Gate I: OPEN (/stop cancellation during SSE, parallel tools, and termux_job)
+- Gate J: OPEN (Final delivery before background learning start)
+- Gate K: OPEN (Chat leave/re-enter draft replay)
+- Gate L: OPEN (Direct-final modes true and false)
+- Gate M: OPEN (Long/multilingual PDF artifact delivery)
+- Gate N: OPEN (Same-command repair after observable state change)
+- Gate O: OPEN (WebUI on Android KernelSU)
 
-Required device metadata and measured timings from `XIAO_v0.3.1_ARCHITECTURE/20_REAL_DEVICE_ACCEPTANCE.md` must be recorded here by the device operator before release readiness. Automated verification runs directly on main; release readiness requires real-device evidence.
+Required device metadata and measured timings from `docs/XIAO_v0.3.1_FULL_ARCHITECTURE_REV2/20_REAL_DEVICE_ACCEPTANCE.md` must be recorded here by the device operator before release readiness. Automated verification runs directly on main; release readiness requires real-device evidence.
