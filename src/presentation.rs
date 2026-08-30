@@ -313,7 +313,7 @@ fn streaming_markdown_snapshot(input: &str) -> String {
 
     // Close the most recently opened construct first. This keeps a draft like
     // `**bold \`code` semantically nested without exposing either marker.
-    closers.sort_by(|left, right| right.0.cmp(&left.0));
+    closers.sort_by_key(|left| std::cmp::Reverse(left.0));
     let mut snapshot = input.to_owned();
     for (_, delimiter) in closers {
         snapshot.push_str(delimiter);
