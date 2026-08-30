@@ -3343,9 +3343,7 @@ mod tests {
         assert!(invalid.push(b"data: \xff\n").is_err());
 
         let mut oversized = SseLineDecoder::default();
-        assert!(oversized
-            .push(&vec![b'x'; MAX_SSE_LINE_BYTES + 1])
-            .is_err());
+        assert!(oversized.push(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]).is_err());
     }
     use crate::storage::{ProviderProfileInput, ProviderProfileModelRecord, Storage};
     use axum::{http::HeaderMap, http::StatusCode, routing::post, Json, Router};
