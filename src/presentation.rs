@@ -244,6 +244,81 @@ impl View {
             side_mode,
         }
     }
+
+    /// Build a draft-only semantic view from an answer that may end in the
+    /// middle of an inline Markdown construct. The snapshot balances only
+    /// provisional delimiters for rendering; it never mutates the canonical
+    /// provider output that is persisted or used for the permanent final.
+    pub fn from_streaming_markdown(text: &str, side_mode: bool) -> Self {
+        let snapshot = streaming_markdown_snapshot(text);
+        Self {
+            title: None,
+            blocks: parse_markdown(&snapshot),
+            actions: vec![],
+            side_mode,
+        }
+    }
+}
+
+fn streaming_markdown_snapshot(input: &str) -> String {
+    let mut bold_markers = Vec::new();
+    let mut code_markers = Vec::new();
+    let mut in_fence = false;
+    let mut in_inline_code = false;
+    let mut index = 0usize;
+
+    while index < input.len() {
+        let rest = &input[index..];
+        if rest.starts_with("```") {
+            in_fence = !in_fence;
+            in_inline_code = false;
+            index += 3;
+            continue;
+        }
+
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        if in_fence {
+            index += character.len_utf8();
+            continue;
+        }
+
+        if character == '`' {
+            code_markers.push(index);
+            in_inline_code = !in_inline_code;
+            index += 1;
+            continue;
+        }
+
+        if !in_inline_code && rest.starts_with("**") {
+            bold_markers.push(index);
+            index += 2;
+            continue;
+        }
+
+        index += character.len_utf8();
+    }
+
+    let mut closers = Vec::new();
+    if bold_markers.len() % 2 == 1 {
+        closers.push((*bold_markers.last().unwrap(), "**"));
+    }
+    if code_markers.len() % 2 == 1 {
+        closers.push((*code_markers.last().unwrap(), "`"));
+    }
+    if closers.is_empty() {
+        return input.to_owned();
+    }
+
+    // Close the most recently opened construct first. This keeps a draft like
+    // `**bold \`code` semantically nested without exposing either marker.
+    closers.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut snapshot = input.to_owned();
+    for (_, delimiter) in closers {
+        snapshot.push_str(delimiter);
+    }
+    snapshot
 }
 
 pub fn parse_markdown(input: &str) -> Vec<Block> {
@@ -532,6 +607,43 @@ mod markdown_tests {
         );
         assert!(blocks.iter().any(|b| matches!(b, Block::RichQuote { .. })));
     }
+    #[test]
+    fn streaming_snapshot_hides_provisional_bold_and_code_markers() {
+        let view = View::from_streaming_markdown(
+            "Orbit itu **jatuh terus dan `melengkung",
+            false,
+        );
+        let rendered_plain = view
+            .blocks
+            .iter()
+            .map(block_plain)
+            .collect::<String>();
+        assert_eq!(rendered_plain, "Orbit itu jatuh terus dan melengkung");
+
+        let debug = format!("{:?}", view.blocks);
+        assert!(debug.contains("Bold"));
+        assert!(debug.contains("Code"));
+        assert!(!rendered_plain.contains("**"));
+        assert!(!rendered_plain.contains('`'));
+    }
+
+    #[test]
+    fn streaming_snapshot_does_not_touch_canonical_markdown_parser() {
+        let input = "Broken **bold";
+        let canonical = parse_markdown(input)
+            .iter()
+            .map(block_plain)
+            .collect::<String>();
+        let streaming = View::from_streaming_markdown(input, false)
+            .blocks
+            .iter()
+            .map(block_plain)
+            .collect::<String>();
+
+        assert_eq!(canonical, input);
+        assert_eq!(streaming, "Broken bold");
+    }
+
     #[test]
     fn malformed_markup_preserves_content() {
         let input = "Broken **bold and `code";
