@@ -3340,7 +3340,7 @@ mod tests {
     #[test]
     fn sse_line_decoder_rejects_invalid_utf8_and_oversized_lines() {
         let mut invalid = SseLineDecoder::default();
-        assert!(invalid.push(b"data: \\xff\n").is_err());
+        assert!(invalid.push(b"data: \xff\n").is_err());
 
         let mut oversized = SseLineDecoder::default();
         assert!(oversized
