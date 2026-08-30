@@ -2155,7 +2155,15 @@ impl ProgressAggregator {
             } else {
                 self.visible_text.clone()
             };
-            blocks.push(Block::Paragraph { text: display_text });
+            // Draft answer text must use the same semantic Markdown -> View
+            // pipeline as the permanent final. Sending the accumulated model
+            // text as a plain paragraph exposes Markdown serialization tokens
+            // (**bold**, ### headings, --- dividers, etc.) while "Writing".
+            //
+            // This parse happens only while a draft update is being prepared.
+            // Completion does not emit a second canonical draft: the caller
+            // clears the draft and sends the permanent final exactly once.
+            blocks.extend(View::from_streaming_markdown(&display_text, false).blocks);
         }
         View {
             title: None,
@@ -4131,19 +4139,31 @@ mod tests {
         assert_eq!(progress.visible_text, "Hello ");
         let view = progress.view();
         assert_eq!(view.blocks.len(), 2);
-        if let Block::Paragraph { text } = &view.blocks[1] {
-            assert_eq!(text, "Hello ");
+        if let Block::RichParagraph { content } = &view.blocks[1] {
+            assert_eq!(
+                content
+                    .iter()
+                    .map(crate::presentation::RichText::plain)
+                    .collect::<String>(),
+                "Hello"
+            );
         } else {
-            panic!("expected paragraph block");
+            panic!("expected rich paragraph block");
         }
 
         progress.push(AgentEvent::TextDelta("world!".into()));
         assert_eq!(progress.visible_text, "Hello world!");
         let view = progress.view();
-        if let Block::Paragraph { text } = &view.blocks[1] {
-            assert_eq!(text, "Hello world!");
+        if let Block::RichParagraph { content } = &view.blocks[1] {
+            assert_eq!(
+                content
+                    .iter()
+                    .map(crate::presentation::RichText::plain)
+                    .collect::<String>(),
+                "Hello world!"
+            );
         } else {
-            panic!("expected paragraph block");
+            panic!("expected rich paragraph block");
         }
 
         progress.push(AgentEvent::ToolStarted("terminal".into()));
@@ -4151,6 +4171,46 @@ mod tests {
 
         progress.push(AgentEvent::TextDelta(" Extra".into()));
         assert_eq!(progress.visible_text, "Hello world! Extra");
+    }
+
+    #[test]
+    fn direct_final_draft_renders_markdown_as_native_rich_blocks() {
+        let mut progress = ProgressAggregator::new("normal".into());
+        progress.push(AgentEvent::GenerationStarted);
+        progress.push(AgentEvent::TextDelta(
+            "## Dua Gaya yang Bertarung\n\nOrbit itu **jatuh terus-menerus**.\n\n---\n\n1. **Gravitasi Bumi** — tarik ke bawah\n2. **Kecepatan tangensial** — dorong ke samping"
+                .into(),
+        ));
+
+        let rendered = rich::render(&progress.view(), true);
+        let blocks = rendered["blocks"].as_array().unwrap();
+
+        assert!(blocks.iter().any(|block| block["type"] == "heading"));
+        assert!(blocks.iter().any(|block| block["type"] == "divider"));
+        assert!(blocks.iter().any(|block| block["type"] == "list"));
+        assert!(rendered.to_string().contains("\"type\":\"bold\""));
+
+        let wire = rendered.to_string();
+        assert!(!wire.contains("## Dua Gaya"));
+        assert!(!wire.contains("**jatuh terus-menerus**"));
+        assert!(!wire.contains("**Gravitasi Bumi**"));
+    }
+
+    #[test]
+    fn direct_final_draft_hides_incomplete_inline_markers_without_final_reparse() {
+        let mut progress = ProgressAggregator::new("normal".into());
+        progress.push(AgentEvent::GenerationStarted);
+        progress.push(AgentEvent::TextDelta(
+            "Orbit itu **jatuh terus dan `melengkung".into(),
+        ));
+
+        let rendered = rich::render(&progress.view(), true);
+        let wire = rendered.to_string();
+
+        assert!(wire.contains("\"type\":\"bold\""));
+        assert!(wire.contains("\"type\":\"code\""));
+        assert!(!wire.contains("**jatuh"));
+        assert!(!wire.contains("`melengkung"));
     }
 
     #[test]
