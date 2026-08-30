@@ -27,7 +27,7 @@ impl SecretStore {
         self.root.join(format!("{sanitized}.secret"))
     }
     pub fn put(&self, key: &str, value: &str) -> Result<()> {
-        fs::create_dir_all(&self.root)?;
+        ensure_0700(&self.root)?;
         let path = self.path(key);
         let tmp = path.with_extension("secret.tmp");
         fs::write(&tmp, value.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
@@ -47,6 +47,7 @@ impl SecretStore {
         Ok(reference)
     }
     pub fn get(&self, key: &str) -> Result<Option<String>> {
+        harden_existing_dir(&self.root)?;
         let path = self.path(key);
         if !path.exists() {
             return Ok(None);
@@ -54,6 +55,7 @@ impl SecretStore {
         Ok(Some(fs::read_to_string(path)?))
     }
     pub fn remove(&self, key: &str) -> Result<()> {
+        harden_existing_dir(&self.root)?;
         let p = self.path(key);
         if p.exists() {
             fs::remove_file(p)?;
@@ -61,6 +63,7 @@ impl SecretStore {
         Ok(())
     }
     pub fn exists(&self, key: &str) -> Result<bool> {
+        harden_existing_dir(&self.root)?;
         Ok(self.path(key).exists())
     }
     pub fn staged_key(key: &str) -> String {
@@ -70,10 +73,10 @@ impl SecretStore {
         self.put(&Self::staged_key(key), value)
     }
     pub fn commit_staged(&self, key: &str) -> Result<()> {
+        harden_existing_dir(&self.root)?;
         let staged = self.path(&Self::staged_key(key));
         if staged.exists() {
             let dest = self.path(key);
-            fs::create_dir_all(&self.root)?;
             fs::rename(&staged, &dest)
                 .with_context(|| format!("commit staged {}", dest.display()))?;
             set_0600(&dest)?;
@@ -81,12 +84,35 @@ impl SecretStore {
         Ok(())
     }
     pub fn rollback_staged(&self, key: &str) -> Result<()> {
+        harden_existing_dir(&self.root)?;
         let staged = self.path(&Self::staged_key(key));
         if staged.exists() {
             fs::remove_file(staged)?;
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn ensure_0700(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(path)?;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+#[cfg(not(unix))]
+fn ensure_0700(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn harden_existing_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        ensure_0700(path)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -120,6 +146,34 @@ mod tests {
         );
         store.remove("test_key").unwrap();
         assert!(!store.exists("test_key").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_store_enforces_private_directory_and_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("secrets");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = SecretStore::new(&root);
+        store.put("token", "secret").unwrap();
+
+        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(root.join("token.secret"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(store.get("token").unwrap().as_deref(), Some("secret"));
+        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     #[test]
