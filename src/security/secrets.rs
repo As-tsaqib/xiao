@@ -161,7 +161,10 @@ mod tests {
         let store = SecretStore::new(&root);
         store.put("token", "secret").unwrap();
 
-        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert_eq!(
             fs::metadata(root.join("token.secret"))
                 .unwrap()
@@ -173,7 +176,10 @@ mod tests {
 
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(store.get("token").unwrap().as_deref(), Some("secret"));
-        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]
