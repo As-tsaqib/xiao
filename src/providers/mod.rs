@@ -2903,6 +2903,38 @@ struct StreamedChat {
     continuation: Option<serde_json::Value>,
 }
 
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct SseLineDecoder {
+    pending: Vec<u8>,
+}
+
+impl SseLineDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>> {
+        self.pending.extend_from_slice(chunk);
+        let mut lines = Vec::new();
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            if newline > MAX_SSE_LINE_BYTES {
+                return Err(anyhow!("provider SSE line exceeded 1 MiB"));
+            }
+            let mut raw = self.pending.drain(..=newline).collect::<Vec<_>>();
+            raw.pop();
+            if raw.last() == Some(&b'\r') {
+                raw.pop();
+            }
+            lines.push(
+                String::from_utf8(raw)
+                    .map_err(|_| anyhow!("provider SSE emitted invalid UTF-8"))?,
+            );
+        }
+        if self.pending.len() > MAX_SSE_LINE_BYTES {
+            return Err(anyhow!("provider SSE line exceeded 1 MiB"));
+        }
+        Ok(lines)
+    }
+}
+
 async fn consume_custom_chat_sse(
     response: reqwest::Response,
     progress: Option<mpsc::UnboundedSender<AgentEvent>>,
@@ -2910,7 +2942,7 @@ async fn consume_custom_chat_sse(
     visible_text: bool,
 ) -> Result<StreamedChat> {
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer = SseLineDecoder::default();
     let mut text = String::new();
     let mut calls: HashMap<usize, (String, String, String)> = HashMap::new();
     while let Some(chunk) = stream.next().await {
@@ -2922,10 +2954,7 @@ async fn consume_custom_chat_sse(
                 bytes: chunk.len(),
             },
         );
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer[..pos].trim_end_matches('\r').to_owned();
-            buffer.drain(..=pos);
+        for line in buffer.push(&chunk)? {
             let Some(data) = line.strip_prefix("data:").map(str::trim) else {
                 continue;
             };
@@ -3052,7 +3081,7 @@ async fn consume_responses_sse(
     visible_text: bool,
 ) -> Result<StreamedResponses> {
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer = SseLineDecoder::default();
     let mut text = String::new();
     let mut calls = Vec::new();
     let mut items = Vec::new();
@@ -3068,11 +3097,7 @@ async fn consume_responses_sse(
                 bytes: chunk.len(),
             },
         );
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer[..pos].trim_end_matches('\r').to_owned();
-            buffer.drain(..=pos);
+        for line in buffer.push(&chunk)? {
             let Some(data) = line.strip_prefix("data:").map(str::trim_start) else {
                 continue;
             };
@@ -3199,7 +3224,7 @@ async fn consume_antigravity_sse(
     progress: Option<mpsc::UnboundedSender<AgentEvent>>,
 ) -> Result<AntigravityStream> {
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer = SseLineDecoder::default();
     let mut output = String::new();
     let mut calls = Vec::new();
     let mut function_parts = Vec::new();
@@ -3213,11 +3238,7 @@ async fn consume_antigravity_sse(
                 bytes: chunk.len(),
             },
         );
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer[..pos].trim_end_matches('\r').to_owned();
-            buffer.drain(..=pos);
+        for line in buffer.push(&chunk)? {
             let Some(data) = line.strip_prefix("data:").map(str::trim_start) else {
                 continue;
             };
@@ -3303,6 +3324,29 @@ fn extract_output_text(v: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_line_decoder_preserves_utf8_across_every_chunk_boundary() {
+        let wire = "data: {\"delta\":\"Halo 😀 — 中文 — العربية\"}\r\n";
+        let expected = "data: {\"delta\":\"Halo 😀 — 中文 — العربية\"}";
+        for split in 1..wire.len() {
+            let mut decoder = SseLineDecoder::default();
+            let mut lines = decoder.push(&wire.as_bytes()[..split]).unwrap();
+            lines.extend(decoder.push(&wire.as_bytes()[split..]).unwrap());
+            assert_eq!(lines, vec![expected.to_owned()], "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn sse_line_decoder_rejects_invalid_utf8_and_oversized_lines() {
+        let mut invalid = SseLineDecoder::default();
+        assert!(invalid.push(b"data: \\xff\n").is_err());
+
+        let mut oversized = SseLineDecoder::default();
+        assert!(oversized
+            .push(&vec![b'x'; MAX_SSE_LINE_BYTES + 1])
+            .is_err());
+    }
     use crate::storage::{ProviderProfileInput, ProviderProfileModelRecord, Storage};
     use axum::{http::HeaderMap, http::StatusCode, routing::post, Json, Router};
 
