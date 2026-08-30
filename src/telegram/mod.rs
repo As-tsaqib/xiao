@@ -4145,7 +4145,7 @@ mod tests {
                     .iter()
                     .map(crate::presentation::RichText::plain)
                     .collect::<String>(),
-                "Hello "
+                "Hello"
             );
         } else {
             panic!("expected rich paragraph block");
