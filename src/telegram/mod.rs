@@ -4141,7 +4141,10 @@ mod tests {
         assert_eq!(view.blocks.len(), 2);
         if let Block::RichParagraph { content } = &view.blocks[1] {
             assert_eq!(
-                content.iter().map(crate::presentation::RichText::plain).collect::<String>(),
+                content
+                    .iter()
+                    .map(crate::presentation::RichText::plain)
+                    .collect::<String>(),
                 "Hello "
             );
         } else {
@@ -4153,7 +4156,10 @@ mod tests {
         let view = progress.view();
         if let Block::RichParagraph { content } = &view.blocks[1] {
             assert_eq!(
-                content.iter().map(crate::presentation::RichText::plain).collect::<String>(),
+                content
+                    .iter()
+                    .map(crate::presentation::RichText::plain)
+                    .collect::<String>(),
                 "Hello world!"
             );
         } else {
