@@ -609,15 +609,8 @@ mod markdown_tests {
     }
     #[test]
     fn streaming_snapshot_hides_provisional_bold_and_code_markers() {
-        let view = View::from_streaming_markdown(
-            "Orbit itu **jatuh terus dan `melengkung",
-            false,
-        );
-        let rendered_plain = view
-            .blocks
-            .iter()
-            .map(block_plain)
-            .collect::<String>();
+        let view = View::from_streaming_markdown("Orbit itu **jatuh terus dan `melengkung", false);
+        let rendered_plain = view.blocks.iter().map(block_plain).collect::<String>();
         assert_eq!(rendered_plain, "Orbit itu jatuh terus dan melengkung");
 
         let debug = format!("{:?}", view.blocks);
